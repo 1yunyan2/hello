@@ -1,6 +1,6 @@
 #include <stdio.h>
 
-int one_main(void)
+int app_init(void)
 {
     printf("Hello World!\n");
     return 0;

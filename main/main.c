@@ -13,5 +13,5 @@
 
 void app_main(void)
 {
-    one_main(); 
+    app_init(); 
 }
