@@ -12,7 +12,4 @@
 #include "esp_crt_bundle.h" // 用于 HTTPS 的根证书校验
 #include "cJSON.h"
 
-
-void wifi_main(char *payload, size_t len);
-
-
+void wifi_main();

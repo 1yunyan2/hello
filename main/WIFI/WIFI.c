@@ -1,9 +1,69 @@
 #include "WIFI.h"
 #include <string.h> // 🌟 新增头文件，因为后面用到了 strdup 和 strlen
-static const char *TAG = "XIAOZHI_PROV";
+#include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+// 自定义WiFi重置的引脚
+#define CLEAR_WIFI_BUTTON_PIN GPIO_NUM_0 // boot按键引脚
+static const char *TAG = "EchoPals";     // 定义一个全局的 TAG
 // 定义一个全局事件组，用来同步网络状态
 static EventGroupHandle_t wifi_event_group;
 const int CONNECTED_BIT = BIT0;
+
+void clear_wifi_and_restart(void)
+{
+    ESP_LOGW("WIFI_CLEAR", "🚨 警告：正在清除已保存的 WiFi 账号密码...");
+    esp_err_t err = wifi_prov_mgr_reset_provisioning(); // 清除已保存的 WiFi 账号密码
+    if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "清除成功，设备将回到未配网状态。");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "清除失败: %s", esp_err_to_name(err));
+    }
+    // 稍微等 1 秒钟，让上面的串口日志打印完
+    vTaskDelay(1000);
+    // 强行重启芯片，让它像刚出厂一样重新跑 wifi_main() 里的流程
+    esp_restart();
+}
+static void button_monitor_task(void *pvParameters)
+{
+    // 1. 配置 GPIO 引脚为输入模式，并开启内部上拉电阻
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << CLEAR_WIFI_BUTTON_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE, // 开启内部上拉（平时是高电平）
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE // 我们这里使用轮询方式，不用中断
+    };
+    gpio_config(&io_conf);
+
+    int press_count = 0; // 用于记录按下的时长
+
+    while (1)
+    {
+        // 判断引脚是否为低电平（即按键被按下，连通了 GND）
+        if (gpio_get_level(CLEAR_WIFI_BUTTON_PIN) == 0)
+        {
+            press_count++;
+            // 长按了 3 秒钟
+            if (press_count >= 3)
+            {
+                ESP_LOGW(TAG, "检测到长按操作，准备清除 WiFi 并重启...");
+                clear_wifi_and_restart(); // 调用你已经写好的清除并重启函数
+                press_count = 0;          // 防抖归零
+            }
+        }
+        else
+        {
+            press_count = 0;
+        }
+        vTaskDelay(1000);
+    }
+}
+
 // 回调函数，接收到前端的信息以后触发回调进行逻辑
 static esp_err_t custom_prov_data_handler(uint32_t session_id, const uint8_t *inbuf, ssize_t inlen,
                                           uint8_t **outbuf, ssize_t *outlen, void *priv_data)
@@ -79,38 +139,20 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base, int32_
     }
 }
 
-void clear_wifi_and_restart(void)
-{
-    ESP_LOGW("WIFI_CLEAR", "🚨 警告：正在清除已保存的 WiFi 账号密码...");
-    esp_err_t err = wifi_prov_mgr_reset_provisioning(); // 清除已保存的 WiFi 账号密码
-    if (err == ESP_OK)
-    {
-        ESP_LOGI(TAG, "清除成功，设备将回到未配网状态。");
-    }
-    else
-    {
-        ESP_LOGE(TAG, "清除失败: %s", esp_err_to_name(err));
-    }
-    // 稍微等 1 秒钟，让上面的串口日志打印完
-    vTaskDelay(1000);
-    // 强行重启芯片，让它像刚出厂一样重新跑 wifi_main() 里的流程
-    esp_restart();
-}
-void wifi_main(char *payload, size_t len)
+void wifi_main()
 {
 
     // freertos的事件组，作用是判断网络是否已经连接成功和否已经获取到IP地址
     wifi_event_group = xEventGroupCreate();
-    // 1. 初始化 NVS，官方标准流程，先创建，判断状态来决定后续是否擦除
+    xTaskCreate(button_monitor_task, "button_task", 4096, NULL, 5, NULL);
+    // 1 初始化 NVS
     esp_err_t ret = nvs_flash_init();
-    // 如果已经创建过了，并且满了则擦除
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
-
     // 2. 初始化网络
     ESP_ERROR_CHECK(esp_netif_init());                // 初始化网络接口
     ESP_ERROR_CHECK(esp_event_loop_create_default()); // 创建默认的事件循环
