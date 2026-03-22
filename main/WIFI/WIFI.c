@@ -246,15 +246,15 @@ void wifi_main()
         xEventGroupWaitBits(wifi_event_group, PROV_DONE_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
 
         // 配网完毕，彻底释放管理器和几十KB的蓝牙基带内存
-        wifi_prov_mgr_deinit();
-        esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+        wifi_prov_mgr_deinit(); // 释放管理器内存
+        // esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);//释放蓝牙内存
     }
     else
     {
         ESP_LOGI(TAG, "设备已配网，直接连接...");
         // 已配网状态下，管理器没用了，直接释放，省下蓝牙内存
         wifi_prov_mgr_deinit();
-        esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+        // esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
 
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
         ESP_ERROR_CHECK(esp_wifi_start());

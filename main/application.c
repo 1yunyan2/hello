@@ -36,7 +36,8 @@ void application_init(void)
     }
     // i2s_init();
     // xTaskCreate(play_audio_task, "play_audio", 4096, NULL, 5, NULL);
-    init_spiffs();
+
+    // init_spiffs();
     // 初始化 WiFi 网络
     wifi_main();
 
