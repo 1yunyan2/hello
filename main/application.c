@@ -28,6 +28,12 @@ void init_spiffs(void)
 }
 void application_init(void)
 {
+    // 🌟 1. 初始化唤醒词引擎（目前不设回调，仅初始化）
+    esp_err_t err = custom_wake_word_init(NULL);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "唤醒词引擎初始化失败，请检查模型文件是否在 storage 分区");
+    }
     // i2s_init();
     // xTaskCreate(play_audio_task, "play_audio", 4096, NULL, 5, NULL);
     init_spiffs();
