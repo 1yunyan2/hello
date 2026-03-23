@@ -43,14 +43,22 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 ESP_LOGW(MQTT_TAG, "🚀 准备更新唤醒词为: %s", word->valuestring);
 
                 // 🌟 3. 调用业务层接口更新唤醒词
-                if (custom_wake_word_update(word->valuestring) == ESP_OK)
+
+                // 先检查引擎是否初始化成功
+                esp_err_t update_err = custom_wake_word_update(word->valuestring);
+                if (update_err == ESP_OK)
                 {
-                    ESP_LOGI(MQTT_TAG, "✅ 唤醒词更新并存入 NVS 成功！");
+                    ESP_LOGI(MQTT_TAG, "🎉 唤醒词更新成功！现在可以离线唤醒了！");
+                }
+                else if (!update_err)
+                {
+                    ESP_LOGE(MQTT_TAG, "❌ 唤醒词更新失败");
                 }
             }
             cJSON_Delete(root);
         }
         free(json_data);
+
         break;
 
     case MQTT_EVENT_DISCONNECTED:

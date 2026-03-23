@@ -23,7 +23,7 @@ static size_t input_buffer_len = 0;
 static char current_wake_word[64] = {0};
 
 // 内部函数：从 NVS 读取保存的唤醒词
-static void load_wakeword_from_nvs(char *dest, size_t max_len)
+void load_wakeword_from_nvs(char *dest, size_t max_len)
 {
     nvs_handle_t my_handle;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &my_handle);
@@ -64,10 +64,15 @@ esp_err_t custom_wake_word_init(wake_word_detected_cb_t cb)
 {
     user_callback = cb;
     buffer_mutex = xSemaphoreCreateMutex();
+    if (buffer_mutex == NULL)
+    {
+        ESP_LOGE(TAG, "❌ 互斥锁创建失败！内存不足？");
+        return ESP_FAIL;
+    }
     input_buffer_len = 0;
 
     // 1. 初始化 SR 模型列表
-    models = esp_srmodel_init("storage"); // 假设你的模型在分区表中叫 model
+    models = esp_srmodel_init("srmodel"); // 假设你的模型在分区表中叫 model
     if (models == NULL || models->num == -1)
     {
         ESP_LOGE(TAG, "模型分区初始化失败，请检查 partitions.csv");
@@ -143,6 +148,23 @@ esp_err_t custom_wake_word_update(const char *new_pinyin)
 
     custom_wake_word_start();
     return ESP_OK;
+
+    // ESP_LOGI(TAG, "准备保存唤醒词到NVS: %s", new_pinyin);
+
+    // // 1. 直接保存到NVS
+    // esp_err_t err = save_wakeword_to_nvs(new_pinyin);
+    // if (err == ESP_OK)
+    // {
+    //     // 2. 更新本地缓存（可选，仅用于日志）
+    //     strncpy(current_wake_word, new_pinyin, sizeof(current_wake_word) - 1);
+    //     ESP_LOGI(TAG, "✅ 【核心目标达成】唤醒词已成功保存到NVS闪存！断电不丢失！");
+    //     return ESP_OK;
+    // }
+    // else
+    // {
+    //     ESP_LOGE(TAG, "❌ NVS保存失败");
+    //     return err;
+    // }
 }
 
 size_t custom_wake_word_get_chunksize(void)
