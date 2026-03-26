@@ -1,4 +1,4 @@
-#include "WIFI.h"
+#include "bsp_board.h"
 
 #define CLEAR_WIFI_BUTTON_PIN GPIO_NUM_0
 #define MAX_RETRY_COUNT 5 // 最大重连次数
@@ -13,7 +13,7 @@ const int PROV_DONE_BIT = BIT2; // 配网完成标志
 // 全局状态标志
 static bool s_wifi_prov_initialized = false;
 static bool s_is_provisioning = false; // 是否正在配网中
-static int s_retry_num = 0;
+static int s_retry_num = 0;            // 重连计数器
 
 // 安全重启函数
 void clear_wifi_and_restart(void)
@@ -31,7 +31,7 @@ void clear_wifi_and_restart(void)
 
     // 给日志打印留出时间
     vTaskDelay(pdMS_TO_TICKS(1000));
-    esp_restart();
+    esp_restart(); // 重启
 }
 
 // 优化的按键任务（减小栈内存，加快轮询，增加状态保护）
@@ -161,7 +161,7 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base, int32_
     }
 }
 
-void wifi_main()
+void bsp_board_wifi_main(void)
 {
     // 1. 初始化事件组 (带空指针保护)
     wifi_event_group = xEventGroupCreate();

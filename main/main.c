@@ -3,5 +3,6 @@
 
 void app_main(void)
 {
+
     application_init();
 }

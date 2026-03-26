@@ -36,6 +36,8 @@ extern "C"
      */
     esp_err_t custom_wake_word_init(wake_word_detected_cb_t cb);
 
+    void load_wakeword_from_nvs(char *dest, size_t max_len);
+
     /**
      * @brief 动态更新自定义唤醒词 (通过手机蓝牙接收后调用此函数)
      * @param new_pinyin 新的拼音，格式必须为纯小写且带空格，如 "xiao zhi"

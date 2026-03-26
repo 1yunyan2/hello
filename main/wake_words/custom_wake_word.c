@@ -72,10 +72,12 @@ esp_err_t custom_wake_word_init(wake_word_detected_cb_t cb)
     input_buffer_len = 0;
 
     // 1. 初始化 SR 模型列表
-    models = esp_srmodel_init("srmodel"); // 假设你的模型在分区表中叫 model
+    models = esp_srmodel_init("model"); // 假设你的模型在分区表中叫 model
     if (models == NULL || models->num == -1)
     {
         ESP_LOGE(TAG, "模型分区初始化失败，请检查 partitions.csv");
+        vSemaphoreDelete(buffer_mutex);
+        buffer_mutex = NULL;
         return ESP_FAIL;
     }
 
@@ -89,12 +91,28 @@ esp_err_t custom_wake_word_init(wake_word_detected_cb_t cb)
     if (mn_name == NULL)
     {
         ESP_LOGE(TAG, "加载 MultiNet 失败！引擎指针为空");
+        vSemaphoreDelete(buffer_mutex);
+        buffer_mutex = NULL;
         return ESP_FAIL;
     }
 
     // 3. 创建引擎实例 (3000ms 为支持的最长语音时长)
     multinet_iface = (esp_mn_iface_t *)esp_mn_handle_from_name(mn_name);
+    if (multinet_iface == NULL)
+    {
+        ESP_LOGE(TAG, "获取 MultiNet 句柄失败");
+        vSemaphoreDelete(buffer_mutex);
+        buffer_mutex = NULL;
+        return ESP_FAIL;
+    }
     multinet_model_data = multinet_iface->create(mn_name, 3000);
+    if (multinet_model_data == NULL)
+    {
+        ESP_LOGE(TAG, "创建 MultiNet 模型数据失败");
+        vSemaphoreDelete(buffer_mutex);
+        buffer_mutex = NULL;
+        return ESP_FAIL;
+    }
 
     // 设置识别阈值，小智项目中默认设为 0.2，提高灵敏度
     multinet_iface->set_det_threshold(multinet_model_data, 0.2);
@@ -102,9 +120,9 @@ esp_err_t custom_wake_word_init(wake_word_detected_cb_t cb)
     // 4. 从记忆(NVS)中读取名字并注册
     load_wakeword_from_nvs(current_wake_word, sizeof(current_wake_word));
 
-    esp_mn_commands_clear();
-    esp_mn_commands_add(WAKE_COMMAND_ID, current_wake_word);
-    esp_mn_commands_update();
+    esp_mn_commands_clear();                                 // 清空
+    esp_mn_commands_add(WAKE_COMMAND_ID, current_wake_word); //  添加唤醒词
+    esp_mn_commands_update();                                // 更新
 
     ESP_LOGI(TAG, "自定义唤醒词引擎初始化完成. 当前听命于: [%s]", current_wake_word);
 
@@ -148,23 +166,6 @@ esp_err_t custom_wake_word_update(const char *new_pinyin)
 
     custom_wake_word_start();
     return ESP_OK;
-
-    // ESP_LOGI(TAG, "准备保存唤醒词到NVS: %s", new_pinyin);
-
-    // // 1. 直接保存到NVS
-    // esp_err_t err = save_wakeword_to_nvs(new_pinyin);
-    // if (err == ESP_OK)
-    // {
-    //     // 2. 更新本地缓存（可选，仅用于日志）
-    //     strncpy(current_wake_word, new_pinyin, sizeof(current_wake_word) - 1);
-    //     ESP_LOGI(TAG, "✅ 【核心目标达成】唤醒词已成功保存到NVS闪存！断电不丢失！");
-    //     return ESP_OK;
-    // }
-    // else
-    // {
-    //     ESP_LOGE(TAG, "❌ NVS保存失败");
-    //     return err;
-    // }
 }
 
 size_t custom_wake_word_get_chunksize(void)
@@ -255,7 +256,7 @@ void custom_wake_word_stop(void)
     xSemaphoreGive(buffer_mutex);
 }
 
-void custom_wake_word_start(void)
+void custom_wake_word_start(void) // 启动
 {
     xSemaphoreTake(buffer_mutex, portMAX_DELAY);
     input_buffer_len = 0;

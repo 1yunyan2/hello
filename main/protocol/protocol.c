@@ -50,7 +50,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 {
                     ESP_LOGI(MQTT_TAG, "🎉 唤醒词更新成功！现在可以离线唤醒了！");
                 }
-                else if (!update_err)
+                else
                 {
                     ESP_LOGE(MQTT_TAG, "❌ 唤醒词更新失败");
                 }
@@ -75,7 +75,14 @@ void mqtt_app_start(void)
 {
     // 🌟 核心修复：使用 static 将结构体存入静态区，防止栈溢出导致的崩溃
     static esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = "mqtt://broker.emqx.io:1883",
+        // .broker.address.uri = "mqtt://broker.emqx.io:1883",
+        // .broker.address.uri = "mqtt://broker.hivemq.com:1883",
+
+        .broker.address.uri = "mqtt://122.224.191.2:1883",
+
+        .credentials.username = "xtc",
+        .credentials.authentication.password = "Xtc@12345",
+
     };
 
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);

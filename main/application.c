@@ -2,30 +2,15 @@
 
 static const char *TAG = "application";
 
-// 专门用来初始化 SPIFFS 仓库的函数
-void init_spiffs(void)
+// 🌟 当识别到唤醒词时，底层会自动调用此函数！
+void my_wake_word_callback(const char *wake_word_pinyin)
 {
-    ESP_LOGI(TAG, "正在初始化 SPIFFS 文件系统...");
-    esp_vfs_spiffs_conf_t conf = {
-        .base_path = "/model",        // 我们把仓库的门牌号命名为 /model
-        .partition_label = "srmodel", // 对应 partitions.csv 里的 storage
-        .max_files = 5,
-        .format_if_mount_failed = true // 第一次跑会自动格式化，不用怕
-    };
-
-    esp_err_t ret = esp_vfs_spiffs_register(&conf);
-
-    if (ret == ESP_OK)
-    {
-        size_t total = 0, used = 0;
-        esp_spiffs_info(conf.partition_label, &total, &used);
-        ESP_LOGI(TAG, "✅ SPIFFS 仓库挂载成功！总空间: %d bytes, 已用: %d bytes", total, used);
-    }
-    else
-    {
-        ESP_LOGE(TAG, "❌ SPIFFS 挂载失败 (%s)", esp_err_to_name(ret));
-    }
+    ESP_LOGW("WAKE_UP", "🎯 卧槽！唤醒成功！听到了名字: [%s]", wake_word_pinyin);
+    // 后续我们可以在这里触发录音任务，发往科大讯飞大模型
+    // 注意：未来如果你接了大模型，这句 start 要等大模型播放完语音后再调用
+    custom_wake_word_start();
 }
+
 void application_init(void)
 {
 
@@ -37,26 +22,22 @@ void application_init(void)
         nvs_flash_init();
     }
 
-    init_spiffs(); // 初始化文件系统
+    // init_spiffs(); // 初始化文件系统
 
     // 🌟 1. 初始化唤醒词引擎（目前不设回调，仅初始化）
     esp_err_t err = custom_wake_word_init(NULL);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "唤醒词引擎初始化失败，请检查模型文件是否在 srmodel 分区");
+        ESP_LOGE(TAG, "唤醒词引擎初始化失败，请检查模型文件是否在 model 分区");
     }
 
-    // 【核心新增】单独调用NVS读取，验证永久记录
-    // char temp_wakeword[64] = {0};
-    // load_wakeword_from_nvs(temp_wakeword, sizeof(temp_wakeword));
-    // ESP_LOGI("NVS_CHECK", "✅ 【验证永久记录】从NVS读取到的唤醒词是: %s", temp_wakeword);
-
-    // i2s_init();
-    // xTaskCreate(play_audio_task, "play_audio", 4096, NULL, 5, NULL);
-
+    // 3. 启动 ES8311 麦克风，开启音频采集任务
+    audio_init();
+    // 🌟 修复大坑二：栈内存扩大到 8192，并绑定到 CPU 核心 1 专职运算语音
+    xTaskCreatePinnedToCore(audio_feed_task, "audio_feed", 8192, NULL, 5, NULL, 1);
     // 初始化 WiFi 网络
-    wifi_main();
+    bsp_board_wifi_main();
 
-    // 🌟 在这里插入！确保拿到 IP 后再启动 MQTT
+    // 拿到 IP 后再启动 MQTT
     mqtt_app_start();
 }
