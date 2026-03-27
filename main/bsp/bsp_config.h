@@ -1,24 +1,24 @@
 #pragma once
 
-// #define BSP_LED_PIN 46
+#define BSP_LED_PIN 46
 
-// // #define BSP_CODEC_PA_PIN 7
+// #define BSP_CODEC_PA_PIN 7
+#define BSP_CODEC_SDA_PIN 8
+#define BSP_CODEC_SCL_PIN 15
+#define BSP_CODEC_MCLK_PIN 17
+#define BSP_CODEC_BCLK_PIN 9
+#define BSP_CODEC_WS_PIN 5
+#define BSP_CODEC_DIN_PIN 4
+#define BSP_CODEC_DOUT_PIN 6
 
-// #define BSP_CODEC_SCL_PIN 1
-// #define BSP_CODEC_SDA_PIN 8
-// #define BSP_CODEC_MCLK_PIN 3
-// #define BSP_CODEC_BCLK_PIN 2
-// #define BSP_CODEC_WS_PIN 5
-// #define BSP_CODEC_DIN_PIN 4
-// #define BSP_CODEC_DOUT_PIN 6
-// #define BSP_CODEC_SAMPLE_RATE 16000
-// #define BSP_CODEC_BITS_PER_SAMPLE 16
+#define BSP_CODEC_SAMPLE_RATE 16000
+#define BSP_CODEC_BITS_PER_SAMPLE 16
 
-// #define BSP_LCD_MOSI_PIN 48
-// #define BSP_LCD_SCLK_PIN 47
-// #define BSP_LCD_CS_PIN 21
-// #define BSP_LCD_DC_PIN 45
-// #define BSP_LCD_RST_PIN 16
-// #define BSP_LCD_BK_PIN 40
-// #define BSP_LCD_WIDTH 240
-// #define BSP_LCD_HEIGHT 320
+#define BSP_LCD_MOSI_PIN 48
+#define BSP_LCD_SCLK_PIN 47
+#define BSP_LCD_CS_PIN 21
+#define BSP_LCD_DC_PIN 45
+#define BSP_LCD_RST_PIN 16
+#define BSP_LCD_BK_PIN 40
+#define BSP_LCD_WIDTH 240
+#define BSP_LCD_HEIGHT 320

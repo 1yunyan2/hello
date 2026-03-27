@@ -8,6 +8,7 @@
 #include "driver/i2c_master.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include "bsp/bsp_config.h"
 
 // ES8311 官方驱动头文件
 #include "esp_codec_dev.h"

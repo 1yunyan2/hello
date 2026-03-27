@@ -4,33 +4,49 @@ static const char *TAG = "CustomWakeWordC";
 
 #define WAKE_COMMAND_ID 1
 #define NVS_NAMESPACE "sys_config"
-#define NVS_KEY_WAKEWORD "wakeword"
-#define DEFAULT_WAKEWORD "xiao zhi" // 出厂默认唤醒词拼音
+#define NVS_KEY_WAKEWORD "wakeword" // 键值标签
+#define DEFAULT_WAKEWORD "yun yan"  // 出厂默认唤醒词拼音
 #define AUDIO_BUFFER_MAX 2048       // 音频内部缓存大小
 
 // 全局状态与实例
-static esp_mn_iface_t *multinet_iface = NULL;
-static model_iface_data_t *multinet_model_data = NULL;
-static srmodel_list_t *models = NULL;
+static esp_mn_iface_t *multinet_iface = NULL;          // 模型接口
+static model_iface_data_t *multinet_model_data = NULL; // 模型数据
+static srmodel_list_t *models = NULL;                  // 模型列表
 
-static volatile bool is_running = false;
-static wake_word_detected_cb_t user_callback = NULL;
-static SemaphoreHandle_t buffer_mutex = NULL;
+static volatile bool is_running = false;             // 运行状态
+static wake_word_detected_cb_t user_callback = NULL; // 用户回调
+static SemaphoreHandle_t buffer_mutex = NULL;        // 缓冲锁
 
 // C语言环形缓冲替代 std::vector
-static int16_t input_buffer[AUDIO_BUFFER_MAX];
-static size_t input_buffer_len = 0;
-static char current_wake_word[64] = {0};
+static int16_t input_buffer[AUDIO_BUFFER_MAX]; // 音频缓存
+static size_t input_buffer_len = 0;            // 缓冲长度
+static char current_wake_word[64] = {0};       // 当前唤醒词
 
-// 内部函数：从 NVS 读取保存的唤醒词
+/*
+// API调用链：
+load_wakeword_from_nvs()            // 从NVS加载唤醒词
+├── nvs_open(NVS_NAMESPACE, NVS_READONLY, &my_handle)  // 打开只读命名空间
+├── nvs_get_str(my_handle, NVS_KEY_WAKEWORD, dest, &required_size)  // 读取字符串
+├── nvs_close(my_handle)            // 关闭句柄
+└── strncpy(dest, DEFAULT_WAKEWORD, max_len - 1)  // 默认值回退*/
 void load_wakeword_from_nvs(char *dest, size_t max_len)
 {
     nvs_handle_t my_handle;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &my_handle);
+    esp_err_t err = nvs_open // 打开命名空间
+        (
+            NVS_NAMESPACE, // 命名空间
+            NVS_READONLY,  // 只读
+            &my_handle     // 句柄
+        );
     if (err == ESP_OK)
     {
         size_t required_size = max_len;
-        err = nvs_get_str(my_handle, NVS_KEY_WAKEWORD, dest, &required_size);
+        err = nvs_get_str( // 读取字符串
+            my_handle,
+            NVS_KEY_WAKEWORD,
+            dest,          // 保存的唤醒词
+            &required_size // 保存的长度
+        );
         nvs_close(my_handle);
         if (err == ESP_OK)
         {
@@ -40,21 +56,23 @@ void load_wakeword_from_nvs(char *dest, size_t max_len)
     }
     // 读取失败或首次开机，使用默认值
     ESP_LOGI(TAG, "未找到记忆的唤醒词，使用默认值: %s", DEFAULT_WAKEWORD);
-    strncpy(dest, DEFAULT_WAKEWORD, max_len - 1);
+    strncpy(dest, DEFAULT_WAKEWORD, max_len - 1); // 使用默认值
 }
 
 // 内部函数：保存唤醒词到 NVS
 static esp_err_t save_wakeword_to_nvs(const char *pinyin)
 {
     nvs_handle_t my_handle;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &my_handle);
+    esp_err_t err = nvs_open // 打开命名空间
+        (NVS_NAMESPACE, NVS_READWRITE, &my_handle);
     if (err != ESP_OK)
         return err;
 
-    err = nvs_set_str(my_handle, NVS_KEY_WAKEWORD, pinyin);
+    err = nvs_set_str // 保存唤醒词
+        (my_handle, NVS_KEY_WAKEWORD, pinyin);
     if (err == ESP_OK)
     {
-        err = nvs_commit(my_handle);
+        err = nvs_commit(my_handle); // 保存
     }
     nvs_close(my_handle);
     return err;
@@ -63,7 +81,7 @@ static esp_err_t save_wakeword_to_nvs(const char *pinyin)
 esp_err_t custom_wake_word_init(wake_word_detected_cb_t cb)
 {
     user_callback = cb;
-    buffer_mutex = xSemaphoreCreateMutex();
+    buffer_mutex = xSemaphoreCreateMutex(); // 创建互斥锁
     if (buffer_mutex == NULL)
     {
         ESP_LOGE(TAG, "❌ 互斥锁创建失败！内存不足？");
@@ -76,7 +94,7 @@ esp_err_t custom_wake_word_init(wake_word_detected_cb_t cb)
     if (models == NULL || models->num == -1)
     {
         ESP_LOGE(TAG, "模型分区初始化失败，请检查 partitions.csv");
-        vSemaphoreDelete(buffer_mutex);
+        vSemaphoreDelete(buffer_mutex); // 释放互斥锁
         buffer_mutex = NULL;
         return ESP_FAIL;
     }
@@ -124,7 +142,7 @@ esp_err_t custom_wake_word_init(wake_word_detected_cb_t cb)
     esp_mn_commands_add(WAKE_COMMAND_ID, current_wake_word); //  添加唤醒词
     esp_mn_commands_update();                                // 更新
 
-    ESP_LOGI(TAG, "自定义唤醒词引擎初始化完成. 当前听命于: [%s]", current_wake_word);
+    ESP_LOGI(TAG, "自定义唤醒词引擎初始化完成. [%s]", current_wake_word);
 
     is_running = true;
     return ESP_OK;
@@ -144,7 +162,7 @@ esp_err_t custom_wake_word_update(const char *new_pinyin)
     ESP_LOGI(TAG, "准备更新设备唤醒词为: %s", new_pinyin);
 
     // 更新引擎内部词典
-    esp_mn_commands_clear();
+    esp_mn_commands_clear(); // 清空
     esp_err_t err = esp_mn_commands_add(WAKE_COMMAND_ID, new_pinyin);
     if (err != ESP_OK)
     {
@@ -167,7 +185,6 @@ esp_err_t custom_wake_word_update(const char *new_pinyin)
     custom_wake_word_start();
     return ESP_OK;
 }
-
 size_t custom_wake_word_get_chunksize(void)
 {
     if (multinet_iface && multinet_model_data)
@@ -177,12 +194,13 @@ size_t custom_wake_word_get_chunksize(void)
     return 0;
 }
 
+// 外部函数：将音频数据输入到引擎
 void custom_wake_word_feed(const int16_t *data, size_t len)
 {
     if (!is_running || multinet_model_data == NULL)
         return;
 
-    xSemaphoreTake(buffer_mutex, portMAX_DELAY);
+    xSemaphoreTake(buffer_mutex, portMAX_DELAY); // 获取互斥锁
 
     // 将新数据追加到内部缓冲区
     if (input_buffer_len + len <= AUDIO_BUFFER_MAX)
@@ -226,6 +244,9 @@ void custom_wake_word_feed(const int16_t *data, size_t len)
                     {
                         user_callback(current_wake_word);
                     }
+
+                    // // 解决唤醒词只能设置为一次问题，将标志位置为true重新启动监听，准备下一次唤醒词检测
+                    // is_running = true;
                 }
             }
             // 清理状态机，准备下一次识别
@@ -245,13 +266,13 @@ void custom_wake_word_feed(const int16_t *data, size_t len)
         }
     }
 
-    xSemaphoreGive(buffer_mutex);
+    xSemaphoreGive(buffer_mutex); // 释放互斥锁
 }
 
 void custom_wake_word_stop(void)
 {
     is_running = false;
-    xSemaphoreTake(buffer_mutex, portMAX_DELAY);
+    xSemaphoreTake(buffer_mutex, portMAX_DELAY); // 获取互斥锁
     input_buffer_len = 0;
     xSemaphoreGive(buffer_mutex);
 }

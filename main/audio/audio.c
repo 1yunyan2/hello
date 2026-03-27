@@ -4,13 +4,11 @@ static const char *TAG = "AUDIO_ES8311";
 
 #define I2C_SDA_PIN 8
 #define I2C_SCL_PIN 15
-
-#define I2S_MCLK_PIN 17
-#define I2S_BCLK_PIN 9
+#define I2S_MCLK_PIN 3
+#define I2S_BCLK_PIN 2
 #define I2S_WS_PIN 5
 #define I2S_DIN_PIN 4
 #define I2S_DOUT_PIN 6
-
 // #define PA_PIN 7
 
 // 全局音频设备句柄
@@ -21,6 +19,8 @@ i2s_chan_handle_t tx_handle;
 void audio_init(void)
 {
     ESP_LOGI(TAG, "正在初始化 ES8311...");
+    // 🌟 修复大坑二：栈内存扩大到 8192，并绑定到 CPU 核心 1 专职运算语音
+    xTaskCreatePinnedToCore(audio_feed_task, "audio_feed", 8192, NULL, 5, NULL, 1);
 
     // 1. 初始化 I2C 控制总线
     i2c_master_bus_handle_t bus_handle;
@@ -34,7 +34,7 @@ void audio_init(void)
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_config, &bus_handle));
 
-    ESP_LOGW(TAG, "开始探测 I2C 总线上的设备...");
+    ESP_LOGI(TAG, "开始探测 I2C 总线上的设备...");
     int found = 0;
     for (uint16_t addr = 1; addr < 127; addr++)
     {
@@ -42,20 +42,18 @@ void audio_init(void)
         esp_err_t probe_ret = i2c_master_probe(bus_handle, addr, 50);
         if (probe_ret == ESP_OK)
         {
-            ESP_LOGW(TAG, "🎉 扫到了！设备地址: 0x%02x", addr);
+            ESP_LOGI(TAG, " 扫描的设备地址为: 0x%02x", addr);
             found++;
         }
     }
     if (found == 0)
     {
-        ESP_LOGE(TAG, "❌ 探测完毕：总线上没有任何设备存活！请检查连线！");
+        ESP_LOGE(TAG, " 未扫描到设备地址，请检查SDA/SCL连线！");
     }
 
     audio_codec_i2c_cfg_t i2c_cfg = {
         .bus_handle = bus_handle,
         .addr = ES8311_CODEC_DEFAULT_ADDR,
-        // .addr = 0x18,
-
     };
     const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
 
@@ -78,9 +76,6 @@ void audio_init(void)
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(rx_handle));
     ESP_ERROR_CHECK(i2s_channel_enable(tx_handle));
-
-    ESP_LOGI(TAG, "等待 ES8311 时钟与内部逻辑稳定...");
-    vTaskDelay(pdMS_TO_TICKS(50));
 
     // 3. 组合并打开 ES8311 Codec 设备
     const audio_codec_gpio_if_t *gpio_if = audio_codec_new_gpio();

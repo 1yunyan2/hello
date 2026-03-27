@@ -1,13 +1,13 @@
 #include "bsp_board.h"
 
-#define CLEAR_WIFI_BUTTON_PIN GPIO_NUM_0
-#define MAX_RETRY_COUNT 5 // 最大重连次数
+#define CLEAR_WIFI_BUTTON_PIN GPIO_NUM_0 // 按键引脚
+#define MAX_RETRY_COUNT 5                // 最大重连次数
 
 static const char *TAG = "EchoPals";
 static EventGroupHandle_t wifi_event_group; // 事件组
 
-const int CONNECTED_BIT = BIT0;
-const int WIFI_FAIL_BIT = BIT1;
+const int CONNECTED_BIT = BIT0; // WiFi 连接成功标志
+const int WIFI_FAIL_BIT = BIT1; // WiFi 连接失败标志
 const int PROV_DONE_BIT = BIT2; // 配网完成标志
 
 // 全局状态标志
@@ -38,11 +38,11 @@ void clear_wifi_and_restart(void)
 static void button_monitor_task(void *pvParameters)
 {
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << CLEAR_WIFI_BUTTON_PIN),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE};
+        .pin_bit_mask = (1ULL << CLEAR_WIFI_BUTTON_PIN), // 按键引脚
+        .mode = GPIO_MODE_INPUT,                         // 输入模式
+        .pull_up_en = GPIO_PULLUP_ENABLE,                // 上拉
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,           // 下拉
+        .intr_type = GPIO_INTR_DISABLE};                 // 无中断
     gpio_config(&io_conf);
 
     int press_count = 0;
@@ -51,7 +51,7 @@ static void button_monitor_task(void *pvParameters)
         if (gpio_get_level(CLEAR_WIFI_BUTTON_PIN) == 0)
         {
             press_count++;
-            if (press_count >= 30)
+            if (press_count >= 300)
             { // 30 * 100ms = 3秒
                 if (s_wifi_prov_initialized)
                 { // 确保底层API已就绪
@@ -64,13 +64,12 @@ static void button_monitor_task(void *pvParameters)
         {
             press_count = 0;
         }
-        vTaskDelay(pdMS_TO_TICKS(100)); // 100ms精确延时
+        vTaskDelay(pdMS_TO_TICKS(10)); // 100ms精确延时
     }
 }
 
 // 自定义数据处理（防越界处理）
-static esp_err_t custom_prov_data_handler(uint32_t session_id, const uint8_t *inbuf, ssize_t inlen,
-                                          uint8_t **outbuf, ssize_t *outlen, void *priv_data)
+static esp_err_t custom_prov_data_handler(uint32_t session_id, const uint8_t *inbuf, ssize_t inlen, uint8_t **outbuf, ssize_t *outlen, void *priv_data)
 {
     if (inbuf && inlen > 0 && inlen < 512)
     { // 增加长度限制防御恶意发包
@@ -131,7 +130,7 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base, int32_
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
     {
-        esp_wifi_connect();
+        esp_wifi_connect(); // 启动 WiFi 连接
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
@@ -146,11 +145,11 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base, int32_
             }
             else
             {
-                xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
+                xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT); // 设置失败标志
                 ESP_LOGE(TAG, "重连失败，放弃连接。");
             }
         }
-        xEventGroupClearBits(wifi_event_group, CONNECTED_BIT);
+        xEventGroupClearBits(wifi_event_group, CONNECTED_BIT); // 清除连接标志
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
     {
@@ -195,13 +194,14 @@ void bsp_board_wifi_main(void)
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_ip_event_handler, NULL, &instance_any_id));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_ip_event_handler, NULL, &instance_got_ip));
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT(); // 翻译：默认配置
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
     // 5. 初始化配网管理器
     wifi_prov_mgr_config_t config = {
         .scheme = wifi_prov_scheme_ble,
-        .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM};
+        .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM // 翻译：配网方案 BLE
+    };
     ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
 
     // 标志已初始化，此时按键任务若检测到长按才允许重置
@@ -238,7 +238,10 @@ void bsp_board_wifi_main(void)
             security_key,
             service_name,
             NULL));
-        ESP_ERROR_CHECK(wifi_prov_mgr_endpoint_register("custom-data", custom_prov_data_handler, NULL));
+        ESP_ERROR_CHECK(wifi_prov_mgr_endpoint_register(
+            "custom-data",            // 自定义数据
+            custom_prov_data_handler, // 数据处理函数
+            NULL));                   // 用户数据
 
         ESP_LOGI(TAG, "==== 蓝牙: %s, 密码: %s ====", service_name, security_key);
 
