@@ -39,3 +39,4 @@ typedef struct
 void bsp_board_wifi_main(void);
 
 // void bsp_board_codec_init(bsp_board_t *bsp_board);
+void bsp_board_nvs_init(void);

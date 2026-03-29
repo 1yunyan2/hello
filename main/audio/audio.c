@@ -2,14 +2,13 @@
 
 static const char *TAG = "AUDIO_ES8311";
 
-#define I2C_SDA_PIN 8
-#define I2C_SCL_PIN 15
-#define I2S_MCLK_PIN 3
-#define I2S_BCLK_PIN 2
-#define I2S_WS_PIN 5
-#define I2S_DIN_PIN 4
-#define I2S_DOUT_PIN 6
-// #define PA_PIN 7
+#define I2C_SDA_PIN BSP_CODEC_SDA_PIN
+#define I2C_SCL_PIN BSP_CODEC_SCL_PIN
+#define I2S_MCLK_PIN BSP_CODEC_MCLK_PIN
+#define I2S_BCLK_PIN BSP_CODEC_BCLK_PIN
+#define I2S_WS_PIN BSP_CODEC_WS_PIN
+#define I2S_DIN_PIN BSP_CODEC_DIN_PIN
+#define I2S_DOUT_PIN BSP_CODEC_DOUT_PIN
 
 // 全局音频设备句柄
 esp_codec_dev_handle_t codec_dev;
@@ -116,7 +115,7 @@ void audio_init(void)
 // 录音投喂任务：死循环抓取麦克风声音塞给语音识别引擎
 void audio_feed_task(void *arg)
 {
-    size_t chunk_size = custom_wake_word_get_chunksize();
+    size_t chunk_size = custom_wake_word_get_chunksize(); // 获取唤醒词引擎需要的数据块大小
     if (chunk_size == 0)
         chunk_size = 512;
 

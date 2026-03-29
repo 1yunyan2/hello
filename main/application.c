@@ -8,6 +8,7 @@ void my_wake_word_callback(const char *wake_word_pinyin)
     ESP_LOGW("WAKE_UP", "我的唤醒词为：[%s]", wake_word_pinyin);
     // 后续我们可以在这里触发录音任务，发往科大讯飞大模型
     // 注意：未来如果你接了大模型，这句 start 要等大模型播放完语音后再调用
+
     custom_wake_word_start();
 }
 
@@ -23,15 +24,7 @@ nvs_flash_init()                    // 初始化NVS Flash
 └── ESP_ERR_NVS_NEW_VERSION_FOUND   // 版本不匹配处理
 └── nvs*/
 
-    // 🌟 1. 必须优先初始化 NVS（因为引擎初始化需要去 NVS 读记忆的唤醒词）
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
-    {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        nvs_flash_init();
-    }
-
-    // init_spiffs(); // 初始化文件系统
+    bsp_board_nvs_init();
 
     // 🌟 1. 初始化唤醒词引擎
     esp_err_t err = custom_wake_word_init(my_wake_word_callback);

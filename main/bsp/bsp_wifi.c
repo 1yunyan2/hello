@@ -18,8 +18,8 @@ static int s_retry_num = 0;            // 重连计数器
 // 安全重启函数
 void clear_wifi_and_restart(void)
 {
-    ESP_LOGW(TAG, "🚨 正在清除已保存的 WiFi 账号密码...");
-    esp_err_t err = wifi_prov_mgr_reset_provisioning();
+    ESP_LOGW(TAG, " 正在清除已保存的 WiFi 账号密码...");
+    esp_err_t err = wifi_prov_mgr_reset_provisioning(); // 清除已保存的 WiFi 账号密码
     if (err == ESP_OK)
     {
         ESP_LOGI(TAG, "清除成功，即将重启...");
@@ -134,7 +134,7 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base, int32_
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
-        // 🌟 核心修复：只有不在配网期间，才允许重连
+        // 只有不在配网期间，才允许重连
         if (!s_is_provisioning)
         {
             if (s_retry_num < MAX_RETRY_COUNT)
@@ -149,6 +149,7 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base, int32_
                 ESP_LOGE(TAG, "重连失败，放弃连接。");
             }
         }
+
         xEventGroupClearBits(wifi_event_group, CONNECTED_BIT); // 清除连接标志
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
@@ -170,29 +171,20 @@ void bsp_board_wifi_main(void)
         return;
     }
 
-    // 2. 初始化 NVS
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
-    {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
     // 3. 网络与事件循环初始化 (防止重复创建 panic)
-    ESP_ERROR_CHECK(esp_netif_init());
-    esp_err_t err = esp_event_loop_create_default();
+    ESP_ERROR_CHECK(esp_netif_init());               // 初始化网络
+    esp_err_t err = esp_event_loop_create_default(); // 创建默认的事件循环
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
     {
         ESP_ERROR_CHECK(err);
     }
-    esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_sta(); // 创建默认的 WiFi STA
 
     // 4. 注册事件监听
     esp_event_handler_instance_t instance_any_id, instance_got_ip, prov_end_instance;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID, &prov_event_handler, NULL, &prov_end_instance));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_ip_event_handler, NULL, &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_ip_event_handler, NULL, &instance_got_ip));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID, &prov_event_handler, NULL, &prov_end_instance)); // 配网事件
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_ip_event_handler, NULL, &instance_any_id));     // IP 与 WiFi 事件
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_ip_event_handler, NULL, &instance_got_ip));    // IP 与 WiFi 事件
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT(); // 翻译：默认配置
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -210,7 +202,7 @@ void bsp_board_wifi_main(void)
     xTaskCreate(button_monitor_task, "btn_task", 4096, NULL, 5, NULL);
 
     bool provisioned = false;
-    ESP_ERROR_CHECK(wifi_prov_mgr_is_provisioned(&provisioned));
+    ESP_ERROR_CHECK(wifi_prov_mgr_is_provisioned(&provisioned)); // 检查是否已配网
 
     if (!provisioned)
     {
@@ -232,8 +224,8 @@ void bsp_board_wifi_main(void)
         const char *security_key = "abcd1234";
         char service_name[16];
         snprintf(service_name, sizeof(service_name), "EchoPals-%02X%02X%02X", mac[3], mac[4], mac[5]);
-        ESP_ERROR_CHECK(wifi_prov_mgr_endpoint_create("custom-data"));
-        ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(
+        ESP_ERROR_CHECK(wifi_prov_mgr_endpoint_create("custom-data")); // 创建自定义数据端点
+        ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(              // 启动配网
             WIFI_PROV_SECURITY_1,
             security_key,
             service_name,
@@ -250,14 +242,12 @@ void bsp_board_wifi_main(void)
 
         // 配网完毕，彻底释放管理器和几十KB的蓝牙基带内存
         wifi_prov_mgr_deinit(); // 释放管理器内存
-        // esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);//释放蓝牙内存
     }
     else
     {
         ESP_LOGI(TAG, "设备已配网，直接连接...");
         // 已配网状态下，管理器没用了，直接释放，省下蓝牙内存
         wifi_prov_mgr_deinit();
-        // esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
 
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
         ESP_ERROR_CHECK(esp_wifi_start());
