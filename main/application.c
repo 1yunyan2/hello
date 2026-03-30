@@ -17,7 +17,7 @@ void application_init(void)
 
     /*
 // API调用链：
-nvs_flash_init()                    // 初始化NVS Flash
+bsp_board_nvs_init()                    // 初始化NVS Flash
 ├── ESP_ERR_NVS_NO_FREE_PAGES       // 错误处理分支
 │   └── nvs_flash_erase()           // 擦除NVS分区
 │       └── nvs_flash_init()        // 重新初始化
@@ -26,7 +26,7 @@ nvs_flash_init()                    // 初始化NVS Flash
 
     bsp_board_nvs_init();
 
-    // 🌟 1. 初始化唤醒词引擎
+    //  1. 初始化唤醒词引擎
     esp_err_t err = custom_wake_word_init(my_wake_word_callback);
     if (err != ESP_OK)
     {

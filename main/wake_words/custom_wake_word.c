@@ -12,6 +12,7 @@ static const char *TAG = "CustomWakeWordC";
 static esp_mn_iface_t *multinet_iface = NULL;          // 模型接口
 static model_iface_data_t *multinet_model_data = NULL; // 模型数据
 static srmodel_list_t *models = NULL;                  // 模型列表
+static float multinet_det_treshold = 0.6;              // 模型识别阈值
 
 static volatile bool is_running = false;             // 运行状态
 static wake_word_detected_cb_t user_callback = NULL; // 用户回调
@@ -33,7 +34,7 @@ void load_wakeword_from_nvs(char *dest, size_t max_len)
         nvs_close(my_handle);
         if (err == ESP_OK)
         {
-            ESP_LOGI(TAG, "从 NVS 恢复自定义唤醒词: %s", dest);
+            ESP_LOGW(TAG, "从 NVS 恢复自定义唤醒词: %s", dest);
             return;
         }
     }
@@ -67,7 +68,7 @@ esp_err_t custom_wake_word_init(wake_word_detected_cb_t cb)
 
     if (buffer_mutex == NULL)
     {
-        ESP_LOGE(TAG, "❌ 互斥锁创建失败！内存不足？");
+        ESP_LOGE(TAG, " 互斥锁创建失败！内存不足？");
         return ESP_FAIL;
     }
     input_buffer_len = 0;
@@ -113,7 +114,7 @@ esp_err_t custom_wake_word_init(wake_word_detected_cb_t cb)
     }
 
     // 设置较高阈值防止误触发
-    multinet_iface->set_det_threshold(multinet_model_data, 0.85);
+    multinet_iface->set_det_threshold(multinet_model_data, multinet_det_treshold);
 
     load_wakeword_from_nvs(current_wake_word, sizeof(current_wake_word)); // 恢复唤醒词
 
@@ -122,9 +123,11 @@ esp_err_t custom_wake_word_init(wake_word_detected_cb_t cb)
     esp_mn_commands_add(WAKE_COMMAND_ID, current_wake_word);
     esp_mn_commands_update();
 
-    ESP_LOGI(TAG, "自定义唤醒词引擎初始化完成. [%s]", current_wake_word);
+    ESP_LOGW(TAG, "自定义唤醒词初始化完成. [%s]", current_wake_word);
 
     is_running = true;
+    // xSemaphoreGive(buffer_mutex);
+
     return ESP_OK;
 }
 
@@ -135,7 +138,10 @@ esp_err_t custom_wake_word_update(const char *new_pinyin) // 更新唤醒词
         ESP_LOGE(TAG, "引擎未初始化，无法更新");
         return ESP_FAIL;
     }
-    custom_wake_word_stop();
+    // 添加互斥锁
+    xSemaphoreTake(buffer_mutex, portMAX_DELAY);
+    is_running = false;
+    input_buffer_len = 0;
     ESP_LOGI(TAG, "准备更新设备唤醒词为: %s", new_pinyin);
     memset(current_wake_word, 0, sizeof(current_wake_word));
     strncpy(current_wake_word, new_pinyin, sizeof(current_wake_word) - 1);
@@ -149,14 +155,17 @@ esp_err_t custom_wake_word_update(const char *new_pinyin) // 更新唤醒词
         load_wakeword_from_nvs(current_wake_word, sizeof(current_wake_word));
         esp_mn_commands_add(WAKE_COMMAND_ID, current_wake_word);
         esp_mn_commands_update();
-        custom_wake_word_start();
-        return err;
     }
-
-    esp_mn_commands_update();
-    save_wakeword_to_nvs(current_wake_word); // 保存到 NVS
-    ESP_LOGI(TAG, "设备唤醒词更新成功并已保存到闪存！");
-    custom_wake_word_start();
+    else
+    {
+        // 只有成功才更新
+        esp_mn_commands_update();
+        save_wakeword_to_nvs(current_wake_word); // 保存到 NVS
+        ESP_LOGI(TAG, "设备唤醒词更新成功并已保存到闪存！");
+    }
+    is_running = true;
+    input_buffer_len = 0;
+    xSemaphoreGive(buffer_mutex);
     return ESP_OK;
 }
 
