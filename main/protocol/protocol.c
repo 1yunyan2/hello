@@ -274,7 +274,6 @@ void send_reset_notification(void)
 
     // 添加字段：event（字符串）
     cJSON_AddStringToObject(root, "event", "factory_reset");
-    // // 添加字段：timestamp（数字，对应你原来的 %llu）
     // cJSON_AddNumberToObject(root, "timestamp", (double)timestamp);
 
     // 6. 转为紧凑 JSON 字符串（节省流量）

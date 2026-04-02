@@ -6,6 +6,14 @@
 
 static const char *TAG = "BSP_CODEC";
 
+// 外部模块可注册此钩子，在会话期间持续接收原始 PCM（16-bit 单声道）
+static void (*s_pcm_hook)(const int16_t *data, size_t samples) = NULL;
+
+void audio_set_pcm_hook(void (*hook)(const int16_t *data, size_t samples))
+{
+    s_pcm_hook = hook;
+}
+
 // ==================== 私有硬件初始化函数 ====================
 
 static void bsp_board_codec_i2c_init(bsp_board_t *bsp_board, i2c_master_bus_handle_t *bus_handle)
@@ -156,13 +164,14 @@ void audio_feed_task(void *arg)
     while (1)
     {
         // 从 Codec 设备读取一帧 PCM 数据（阻塞直到数据就绪）
-        esp_err_t ret = esp_codec_dev_read(bsp_board->codec_dev,
-                                           buffer,
-                                           chunk_size * sizeof(int16_t));
+        esp_err_t ret = esp_codec_dev_read(bsp_board->codec_dev, buffer, chunk_size * sizeof(int16_t));
         if (ret == ESP_OK)
         {
             // 将读取到的 PCM 帧喂给唤醒词引擎进行识别
             custom_wake_word_feed(buffer, chunk_size);
+            // 若会话模块已注册钩子（唤醒后），同步转发给编码器
+            if (s_pcm_hook)
+                s_pcm_hook(buffer, chunk_size);
         }
         else
         {

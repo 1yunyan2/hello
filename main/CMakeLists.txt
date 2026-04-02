@@ -5,9 +5,11 @@ idf_component_register(SRCS
 "bsp/bsp_codec.c"
 "wake_word/custom_wake_word.c"
 "protocol/protocol.c"
+"protocol/websocket_client.c"
 "audio/audio_processor.c"
 "audio/audio_encoder.c"
 "audio/audio_decoder.c"
+"session/session.c"
 "application.c"
 INCLUDE_DIRS "."
 )

@@ -53,3 +53,6 @@ bool bsp_board_check_status(bsp_board_t *bsp_board, EventBits_t bits_to_check, T
 // 音频初始化与采集任务
 void audio_init(bsp_board_t *bsp_board);
 void audio_feed_task(void *arg);
+
+// PCM 钩子：会话模块注册后，每帧麦克风数据也会转发到此回调（NULL = 不转发）
+void audio_set_pcm_hook(void (*hook)(const int16_t *data, size_t samples));
