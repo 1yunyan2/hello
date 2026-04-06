@@ -343,7 +343,8 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
         ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, mac));
         char service_name[16];
         snprintf(service_name, sizeof(service_name), "EchoPals-%02X%02X%02X", mac[3], mac[4], mac[5]);
-
+        ESP_LOGE(TAG, " 我的真实MAC地址是: %02x:%02x:%02x:%02x:%02x:%02x 👈👈👈",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         // 使用固定 PoP 密码（生产环境建议换为 MAC 派生的动态密码）
         const char *security_key = "abcd1234";
 
