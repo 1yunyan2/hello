@@ -117,8 +117,12 @@ void bsp_board_codec_init(bsp_board_t *bsp_board)
     };
     bsp_board->codec_dev = esp_codec_dev_new(&codec_config);
 
-    // 强制断言：codec_dev 必须创建成功，否则后续录音/播放无法进行
-    assert(bsp_board->codec_dev);
+    // Codec 设备创建失败：硬件连接异常或内存不足，无法继续
+    if (bsp_board->codec_dev == NULL)
+    {
+        ESP_LOGE(TAG, "Codec 设备创建失败，请检查 ES8311 硬件连接");
+        return;
+    }
 
     // 置位 CODEC_BIT，通知其他等待模块 Codec 硬件已就绪
     xEventGroupSetBits(bsp_board->board_status, CODEC_BIT);

@@ -53,6 +53,15 @@ static void mqtt_credentials_load(void)
 static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 static volatile bool s_mqtt_connected = false;
 
+// ─── 工具函数：获取设备 MAC 后三字节作为短 ID ──────────────────────────────
+// 多处需要 device_id（心跳、订阅、重置通知），统一提取避免重复代码
+static void get_short_device_id(char *out, size_t out_size)
+{
+    uint8_t mac[6];
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+    snprintf(out, out_size, "%02X%02X%02X", mac[3], mac[4], mac[5]);
+}
+
 // 唤醒词更新任务的参数结构体
 typedef struct
 {
@@ -103,10 +112,8 @@ static int get_battery_level(void)
 // 后台心跳发送任务
 static void heartbeat_task(void *arg)
 {
-    uint8_t mac[6];
-    esp_wifi_get_mac(WIFI_IF_STA, mac);
     char device_id[16];
-    snprintf(device_id, sizeof(device_id), "%02X%02X%02X", mac[3], mac[4], mac[5]);
+    get_short_device_id(device_id, sizeof(device_id));
 
     char topic[64];
     snprintf(topic, sizeof(topic), "echopal/device/%s/heartbeat", device_id);
@@ -155,11 +162,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(MQTT_TAG, "MQTT 服务器连接成功！");
         s_mqtt_connected = true;
 
-        uint8_t mac[6];
-        esp_wifi_get_mac(WIFI_IF_STA, mac);
+        char dev_id[16];
+        get_short_device_id(dev_id, sizeof(dev_id));
         char topic[64];
-        snprintf(topic, sizeof(topic), "echopal/device/%02X%02X%02X/wake-word",
-                 mac[3], mac[4], mac[5]);
+        snprintf(topic, sizeof(topic), "echopal/device/%s/wake-word", dev_id);
 
         esp_mqtt_client_subscribe(client, topic, 0);
         ESP_LOGI(MQTT_TAG, "正在监听此主题: %s", topic);
@@ -244,24 +250,19 @@ void protocol_mqtt_start(void)
     xTaskCreate(heartbeat_task, "heartbeat_task", 4096, NULL, 4, NULL);
 };
 
-// 发送设备重置通知到MQTT服务器
-// 发送设备重置通知到MQTT服务器
+// 发送设备重置通知到 MQTT 服务器
 void send_reset_notification(void)
 {
-    // 1. 检查MQTT客户端是否已初始化和连接
+    // 检查 MQTT 客户端是否已初始化和连接
     if (s_mqtt_client == NULL || !s_mqtt_connected)
     {
         ESP_LOGW(MQTT_TAG, "MQTT客户端未就绪，无法发送重置通知");
         return;
     }
 
-    // 2. 获取设备MAC地址作为唯一标识
-    uint8_t mac[6];
-    esp_wifi_get_mac(WIFI_IF_STA, mac);
+    // 获取设备 ID 并构建 MQTT Topic
     char device_id[16];
-    snprintf(device_id, sizeof(device_id), "%02X%02X%02X", mac[3], mac[4], mac[5]);
-
-    // 3. 构建 MQTT Topic
+    get_short_device_id(device_id, sizeof(device_id));
     char topic[64];
     snprintf(topic, sizeof(topic), "echopal/device/%s/reset", device_id);
     ESP_LOGI(MQTT_TAG, "重置DeviceID: %s | Topic: %s", device_id, topic);

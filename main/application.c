@@ -58,7 +58,7 @@ static void wake_word_callback(const char *wake_word_display)
 
     // 播放 880Hz 提示音给用户听觉反馈（提示音结束前麦克风已停止向唤醒引擎投喂）
     play_wake_tone();
-    // bsp_wake_word_start();
+    // bsp_wake_word_start();//如果不适用session_close恢复监听，请取消注释
     // 将控制权交给会话模块：建立 WebSocket、启动编解码管道
     // 会话结束后由 session_close 内部调用 bsp_wake_word_start 恢复监听
     session_on_wake_word(wake_word_display);
@@ -81,7 +81,7 @@ void application_init(void)
     // 必须在唤醒词引擎初始化之后调用，采集任务会立即向引擎投喂音频帧
     audio_init(bsp_board);
 
-    // 步骤 4：启动 WiFi（阻塞直至成功获取 IP 或连接彻底失败后重启）
+       // 步骤 4：启动 WiFi（阻塞直至成功获取 IP 或连接彻底失败后重启）
     // 包含 BLE 配网、自动重连、按键重置等完整流程
     bsp_board_wifi_main(bsp_board);
 

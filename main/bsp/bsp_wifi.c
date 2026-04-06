@@ -82,28 +82,90 @@ static esp_err_t custom_prov_data_handler(uint32_t session_id,
                                           uint8_t **outbuf, ssize_t *outlen,
                                           void *priv_data)
 {
-    // 长度校验：防止空数据或超大恶意数据包越界
-    if (inbuf && inlen > 0 && inlen < 512)
+    ESP_LOGI(TAG, "🟢 自定义端点回调触发！session_id: %lu, 收到数据长度: %d", session_id, (int)inlen);
+
+    // 基础数据校验
+    if (inbuf == NULL || inlen <= 0 || inlen >= 2048)
     {
-        // 安全拷贝：calloc 保证尾部有 '\0'，避免未终止字符串崩溃
-        char *safe_str = calloc(1, inlen + 1);
-        if (safe_str)
-        {
-            memcpy(safe_str, inbuf, inlen);
-            ESP_LOGI(TAG, "收到安全数据: %s", safe_str);
-            // TODO: 解析 safe_str（如 JSON 参数）
-            free(safe_str);
-        }
+        ESP_LOGE(TAG, "收到无效数据，长度异常: %d", (int)inlen);
+        goto send_response;
     }
 
-    // 构造固定响应体
-    const char response[] = "{\"status\":\"OK\"}";
+    // 安全拷贝，保证字符串以\0结尾，避免内存越界
+    char *safe_str = calloc(1, inlen + 1);
+    if (!safe_str)
+    {
+        ESP_LOGE(TAG, "内存分配失败，无法处理数据");
+        goto send_response;
+    }
+    memcpy(safe_str, inbuf, inlen);
+    ESP_LOGI(TAG, "收到原始数据: %s", safe_str);
 
-    // 复制响应到堆内存（协议栈会负责释放）
+    // 解析JSON，增加失败日志
+    cJSON *root = cJSON_Parse(safe_str);
+    if (!root)
+    {
+        ESP_LOGE(TAG, "JSON解析失败！原始数据不是合法JSON格式");
+        free(safe_str);
+        goto send_response;
+    }
+
+    // 提取Token字段，增加合法性校验
+    cJSON *token_item = cJSON_GetObjectItem(root, "token");
+    if (!cJSON_IsString(token_item) || token_item->valuestring == NULL)
+    {
+        ESP_LOGE(TAG, "JSON中未找到token字段，或token不是合法字符串");
+        cJSON_Delete(root);
+        free(safe_str);
+        goto send_response;
+    }
+
+    ESP_LOGI(TAG, "✅ 成功提取到Token: %.20s...", token_item->valuestring);
+
+    // 保存到NVS，完整错误处理
+    nvs_handle_t h;
+    esp_err_t err = nvs_open("net_config", NVS_READWRITE, &h);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "NVS打开失败: %s", esp_err_to_name(err));
+        cJSON_Delete(root);
+        free(safe_str);
+        goto send_response;
+    }
+
+    err = nvs_set_str(h, "ws_token", token_item->valuestring);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Token写入NVS失败: %s", esp_err_to_name(err));
+        nvs_close(h);
+        cJSON_Delete(root);
+        free(safe_str);
+        goto send_response;
+    }
+
+    err = nvs_commit(h);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "NVS数据提交失败: %s", esp_err_to_name(err));
+        nvs_close(h);
+        cJSON_Delete(root);
+        free(safe_str);
+        goto send_response;
+    }
+
+    nvs_close(h);
+    ESP_LOGI(TAG, "✅ Token已永久保存到NVS！");
+
+    // 释放资源
+    cJSON_Delete(root);
+    free(safe_str);
+
+send_response:
+    // 固定响应体
+    const char response[] = "{\"status\":\"OK\"}";
     *outbuf = (uint8_t *)strdup(response);
     if (*outbuf == NULL)
         return ESP_ERR_NO_MEM;
-
     *outlen = strlen(response);
     return ESP_OK;
 }
@@ -218,6 +280,16 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
         return;
     }
 
+    // // 临时硬编码写入 Token，测试用
+    // nvs_handle_t h;
+    // if (nvs_open("net_config", NVS_READWRITE, &h) == ESP_OK)
+    // {
+    //     nvs_set_str(h, "ws_token", "test_token_888");
+    //     nvs_commit(h);
+    //     nvs_close(h);
+    //     ESP_LOGI(TAG, "✅ 测试Token已写入：test_token_888");
+    // }
+
     // 初始化 TCP/IP 网络协议栈
     ESP_ERROR_CHECK(esp_netif_init());
 
@@ -275,7 +347,7 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
         // 使用固定 PoP 密码（生产环境建议换为 MAC 派生的动态密码）
         const char *security_key = "abcd1234";
 
-        // 创建自定义数据端点（用于 APP 下发额外配置）
+        //! 创建自定义数据端点（用于 APP 下发额外配置）,用于接收token
         ESP_ERROR_CHECK(wifi_prov_mgr_endpoint_create("custom-data"));
 
         // 启动 BLE 配网广播（SECURITY_1 = 带 PoP 校验）
@@ -288,9 +360,21 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
 
         ESP_LOGI(TAG, "==== 蓝牙: %s, 密码: %s ====", service_name, security_key);
 
-        // 阻塞等待用户通过 APP 完成配网（直到 PROV_DONE_BIT 被 prov_event_handler 置位）
-        xEventGroupWaitBits(bsp_board->board_status, PROV_DONE_BIT,
-                            pdFALSE, pdFALSE, portMAX_DELAY);
+        // 阻塞等待用户通过 APP 完成配网（添加2分钟超时机制）
+        EventBits_t wait_bits = xEventGroupWaitBits(bsp_board->board_status, PROV_DONE_BIT,
+                                                    pdFALSE, pdFALSE, pdMS_TO_TICKS(120000)); // 120秒超时
+
+        if (!(wait_bits & PROV_DONE_BIT))
+        {
+            ESP_LOGE(TAG, "配网超时，强制退出配网流程");
+            // 清理配网资源防止内存泄漏
+            wifi_prov_mgr_deinit();
+            // 重置状态变量
+            s_wifi_prov_initialized = false;
+            s_is_provisioning = false;
+            // 触发错误处理（可选：重启配网或系统）
+            esp_restart();
+        }
 
         // 配网流程结束，释放配网管理器（回收 BLE 基带内存，约几十 KB）
         wifi_prov_mgr_deinit();

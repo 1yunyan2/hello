@@ -1,38 +1,62 @@
 #pragma once
 
 #include <stddef.h>
-#include "esp_err.h"
-#include <stdbool.h>
+#include <stdint.h>
+#include "esp_event.h"
+#include "cJSON.h"
 
-/**
- * @brief WebSocket 接收数据回调（在 WebSocket 事件任务中调用，勿阻塞）
- * @param data  收到的二进制数据指针（OPUS 帧）
- * @param len   数据字节数
- */
-typedef void (*ws_receive_cb_t)(const void *data, size_t len);
+// 协议事件类型枚举
+typedef enum
+{
+    PROTOCOL_EVENT_CONNECTED,          // 连接成功
+    PROTOCOL_EVENT_DISCONNECTED,       // 连接断开
+    PROTOCOL_EVENT_HELLO,              // 收到服务器 Hello 响应
+    PROTOCOL_EVENT_STT,                // 收到语音识别结果 (event_data: char*)
+    PROTOCOL_EVENT_LLM,                // 收到大模型回复 (event_data: char*)
+    PROTOCOL_EVENT_TTS_START,          // TTS 开始播放
+    PROTOCOL_EVENT_TTS_SENTENCE_START, // TTS 句子开始 (event_data: char*)
+    PROTOCOL_EVENT_TTS_STOP,           // TTS 播放停止
+    PROTOCOL_EVENT_AUDIO,              // 收到音频数据 (event_data: binary_data_t*)
+    PROTOCOL_EVENT_IOT,                // 收到 IoT 控制指令 (event_data: cJSON*)
+} protocol_event_t;
 
-/**
- * @brief 初始化并连接 WebSocket
- * @param uri        服务器地址，如 "ws://192.168.1.100:8080/audio"
- * @param receive_cb 收到数据时调用的回调，传 NULL 则不处理接收
- * @return ESP_OK 成功，ESP_FAIL 连接失败
- */
-esp_err_t ws_client_start(const char *uri, ws_receive_cb_t receive_cb);
+// 监听模式类型
+typedef enum
+{
+    PROTOCOL_LISTEN_TYPE_AUTO,
+    PROTOCOL_LISTEN_TYPE_MANUAL,
+    PROTOCOL_LISTEN_TYPE_REALTIME,
+} protocol_listen_type_t;
 
-/**
- * @brief 断开 WebSocket 并释放资源
- */
-void ws_client_stop(void);
+// IoT 消息类型
+typedef enum
+{
+    MESSAGE_TYPE_DESCRIPTOR,
+    MESSAGE_TYPE_STATE,
+} protocol_iot_message_type_t;
 
-/**
- * @brief 发送二进制帧（OPUS 数据）
- * @param data 数据指针
- * @param len  字节数
- * @return ESP_OK 成功，ESP_FAIL 未连接或发送失败
- */
-esp_err_t ws_client_send_binary(const void *data, size_t len);
+// 二进制数据结构体
+typedef struct
+{
+    void *ptr;
+    size_t size;
+} binary_data_t;
 
-/**
- * @brief 查询当前是否已连接
- */
-bool ws_client_is_connected(void);
+typedef struct protocol protocol_t;
+
+protocol_t *protocol_create(const char *url, const char *token);
+void protocol_destroy(protocol_t *protocol);
+
+void protocol_connect(protocol_t *protocol);
+void protocol_disconnect(protocol_t *protocol);
+bool protocol_is_connected(protocol_t *protocol);
+
+void protocol_send_hello(protocol_t *protocol);
+void protocol_send_wake_word(protocol_t *protocol, const char *wake_word);
+void protocol_send_start_listening(protocol_t *protocol, protocol_listen_type_t type);
+void protocol_send_stop_listening(protocol_t *protocol);
+void protocol_send_audio_data(protocol_t *protocol, binary_data_t *data);
+void protocol_send_abort_speaking(protocol_t *protocol);
+void protocol_send_iot(protocol_t *protocol, protocol_iot_message_type_t type, cJSON *json);
+
+void protocol_register_callback(protocol_t *protocol, esp_event_handler_t callback, void *handler_args);

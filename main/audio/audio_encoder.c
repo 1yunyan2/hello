@@ -37,11 +37,22 @@ void audio_encoder_task(void *arg)
 
     // 分配输入帧缓冲区（存放待编码的原始 PCM 数据）
     void *in_buf = malloc_zeroed(in_frame_size);
-    assert(in_buf);
+    if (in_buf == NULL)
+    {
+        ESP_LOGE(TAG, "输入帧缓冲区分配失败（需要 %d 字节）", in_frame_size);
+        vTaskDelete(NULL);
+        return;
+    }
 
     // 分配输出帧缓冲区（存放编码后的 OPUS 数据）
     void *out_buf = malloc_zeroed(out_frame_size);
-    assert(out_buf);
+    if (out_buf == NULL)
+    {
+        ESP_LOGE(TAG, "输出帧缓冲区分配失败（需要 %d 字节）", out_frame_size);
+        free(in_buf);
+        vTaskDelete(NULL);
+        return;
+    }
 
     // 初始化输入帧描述符
     esp_audio_enc_in_frame_t in_frame = {

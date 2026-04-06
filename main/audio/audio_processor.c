@@ -14,6 +14,13 @@
 #define AUDIO_PROCESSOR_TASK_PRIORITY 5
 #define AUDIO_PROCESSOR_TASK_CORE_ID 0
 
+// 环形缓冲区大小配置（单位：字节）
+// PCM 缓冲使用 BYTEBUF（字节流），OPUS 缓冲使用 NOSPLIT（完整帧不拆分）
+#define ENC_INPUT_BUF_SIZE  20480  // 编码器输入（原始 PCM）：~640ms @16kHz 单声道
+#define ENC_OUTPUT_BUF_SIZE 2560   // 编码器输出（OPUS 帧）
+#define DEC_INPUT_BUF_SIZE  5120   // 解码器输入（OPUS 帧）
+#define DEC_OUTPUT_BUF_SIZE 40960  // 解码器输出（PCM 播放）：~1.28s 缓冲
+
 struct audio_processor
 {
     audio_encoder_t *encoder;
@@ -58,11 +65,11 @@ audio_processor_t *audio_processor_create(void)
     audio_processor->encoder = audio_encoder_create(BSP_CODEC_SAMPLE_RATE, 1);
     audio_processor->decoder = audio_decoder_create(BSP_CODEC_SAMPLE_RATE, 1);
 
-    //! pcm是字节缓存，配置单字节编解码，opus是帧数据，不拆分缓存
-    audio_processor->enc_input = xRingbufferCreateWithCaps(20480, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
-    audio_processor->enc_output = xRingbufferCreateWithCaps(2560, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
-    audio_processor->dec_input = xRingbufferCreateWithCaps(5120, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
-    audio_processor->dec_output = xRingbufferCreateWithCaps(40960, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
+    // PCM 使用字节流缓冲（BYTEBUF），OPUS 使用不拆分缓冲（NOSPLIT 保证帧完整性）
+    audio_processor->enc_input = xRingbufferCreateWithCaps(ENC_INPUT_BUF_SIZE, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
+    audio_processor->enc_output = xRingbufferCreateWithCaps(ENC_OUTPUT_BUF_SIZE, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
+    audio_processor->dec_input = xRingbufferCreateWithCaps(DEC_INPUT_BUF_SIZE, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
+    audio_processor->dec_output = xRingbufferCreateWithCaps(DEC_OUTPUT_BUF_SIZE, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
 
     audio_encoder_set_buffer(audio_processor->encoder, audio_processor->enc_input, audio_processor->enc_output);
     audio_decoder_set_buffer(audio_processor->decoder, audio_processor->dec_input, audio_processor->dec_output);
