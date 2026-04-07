@@ -206,9 +206,13 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
         /* opcode 0x01 = Text Frame → JSON 控制消息 */
         if (data->op_code == 0x01)
         {
+            ESP_LOGI(TAG, "收到文本帧: %.*s", data->data_len, data->data_ptr);
             cJSON *root = cJSON_ParseWithLength(data->data_ptr, data->data_len);
             if (!root)
+            {
+                ESP_LOGW(TAG, "JSON 解析失败");
                 return;
+            }
 
             /* 根据 type 字段路由到对应的消息处理器 */
             cJSON *type = cJSON_GetObjectItem(root, "type");
@@ -276,7 +280,7 @@ protocol_t *protocol_create(const char *url, const char *token)
         .headers = headers,
         .crt_bundle_attach = esp_crt_bundle_attach, // HTTPS 根证书校验（wss:// 需要）
         .network_timeout_ms = 5000,                 // 网络超时 5 秒
-        .reconnect_timeout_ms = 5000,               // 断线重连间隔 5 秒
+        .disable_auto_reconnect = true,             // 禁用自动重连，由 session 层控制退避策略
     };
 
     /* 初始化底层 WebSocket 客户端并注册事件回调 */
@@ -329,6 +333,7 @@ bool protocol_is_connected(protocol_t *protocol)
  */
 void protocol_send_hello(protocol_t *protocol)
 {
+    ESP_LOGI(TAG, "发送 Hello 握手消息...");
     protocol_send_text(protocol, "{\"audio_params\":{\"channels\":1,\"format\":\"opus\",\"frame_duration\":60,\"sample_rate\":16000},\"transport\":\"websocket\",\"type\":\"hello\",\"version\":1}");
 }
 

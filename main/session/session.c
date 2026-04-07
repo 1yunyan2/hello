@@ -43,9 +43,10 @@
 #define TAG "Session"
 
 #define DEFAULT_WS_URI "ws://192.168.1.100:8080/audio"
-#define NVS_NAMESPACE_NET "net_config" // NVS 存储
-#define SESSION_TIMEOUT_MS 60000       // 整体会话超时：60 秒
-#define EOS_SILENCE_MS 800             // 说话结束静音检测：800ms
+#define NVS_NAMESPACE_NET "net_config"     // NVS 存储
+#define SESSION_TIMEOUT_MS 60000           // 整体会话超时：60 秒
+#define EOS_SILENCE_MS 800                 // 说话结束静音检测：800ms
+#define TOKEN_REFRESH_MS (110 * 60 * 1000) // Token 主动刷新：110 分钟（过期时间 2h，提前 10 分钟）
 #define OPUS_SEND_BUF 512
 
 // ─── 事件组位定义 ────────────────────────────────────────────────────────────
@@ -62,16 +63,22 @@ static protocol_t *s_protocol = NULL;
 
 static TimerHandle_t s_session_timer = NULL;
 static TimerHandle_t s_eos_timer = NULL;
+static TimerHandle_t s_token_refresh_timer = NULL; // accessToken 主动刷新定时器（2h 过期，提前 10min 刷新）
 static volatile bool s_speech_detected = false;
 static char s_ws_uri[128] = DEFAULT_WS_URI;
 static char s_ws_token[256] = {0};     // deviceToken（App 绑定时下发的长期凭证）
 static char s_access_token[512] = {0}; // accessToken（通过 device-login 换取的短效令牌）
 static volatile TaskHandle_t s_sender_handle = NULL;
+static volatile TaskHandle_t s_reconnect_handle = NULL; // 重连任务句柄，防止重复创建
+static int s_reconnect_attempts = 0;                    // 连续重连次数，用于指数退避
+#define RECONNECT_MAX_ATTEMPTS 5                        // 最大重连次数，超过后停止重连
+#define RECONNECT_BASE_DELAY_MS 5000                    // 基础退避延迟 5 秒
 static SemaphoreHandle_t s_wake_word_mutex = NULL;
 static char s_current_wake_word[64] = {0};
 
 static void session_close(void);
 static void on_enhanced_pcm(const int16_t *data, size_t samples);
+static void session_reconnect_task(void *arg);
 
 // ─── 定时器回调 ──────────────────────────────────────────────────────────────
 
@@ -88,6 +95,37 @@ static void on_eos_timeout(TimerHandle_t t)
     ESP_LOGI(TAG, "检测到说话结束（VAD 静音 %dms），通知服务器", EOS_SILENCE_MS);
     if (s_protocol && protocol_is_connected(s_protocol))
         protocol_send_stop_listening(s_protocol);
+}
+
+/**
+ * @brief Token 主动刷新定时器回调
+ * accessToken 有效期 2 小时，提前 10 分钟触发刷新。
+ * 只在 IDLE 状态执行（会话中不打断，等会话结束后自然触发下一次）。
+ */
+static void on_token_refresh_timeout(TimerHandle_t t)
+{
+    if (s_state != SESSION_IDLE)
+    {
+        // 会话进行中，延迟 1 分钟后重试
+        ESP_LOGI(TAG, "会话中，Token 刷新延迟 1 分钟");
+        xTimerChangePeriod(s_token_refresh_timer, pdMS_TO_TICKS(60000), 0);
+        return;
+    }
+
+    if (strlen(s_ws_token) == 0)
+        return; // 无 deviceToken，无需刷新
+
+    ESP_LOGI(TAG, "Token 即将过期，主动刷新...");
+    if (s_reconnect_handle == NULL)
+    {
+        xTaskCreatePinnedToCoreWithCaps(session_reconnect_task, "ws_reconn",
+                                        6144, (void *)(intptr_t)0, 3,
+                                        (TaskHandle_t *)&s_reconnect_handle,
+                                        1, MALLOC_CAP_SPIRAM);
+    }
+
+    // 重置定时器为标准周期（如果上面是延迟重试进来的）
+    xTimerChangePeriod(s_token_refresh_timer, pdMS_TO_TICKS(TOKEN_REFRESH_MS), 0);
 }
 
 // ─── 麦克风 PCM 数据回调 ────────────────────────────────────────────────────
@@ -135,6 +173,7 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
     // ── WebSocket 底层连接成功（启动时预连接，或断线重连后）──────────────
     case PROTOCOL_EVENT_CONNECTED:
         ESP_LOGI(TAG, "WebSocket 已连接（预连接就绪）");
+        s_reconnect_attempts = 0; // 连接成功，重置退避计数
         xEventGroupSetBits(s_session_eg, SESSION_WS_CONNECTED_BIT);
 
         // 如果有会话正在等待连接（极少数情况：唤醒时恰好断线重连中）
@@ -209,18 +248,41 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
         }
         break;
 
-    // ── WebSocket 断开 → 标记断开，esp_websocket_client 自动重连 ────────
+    // ── WebSocket 断开 → 退避重连 ─────────────────────────────────────────
     case PROTOCOL_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "❌ WebSocket 已断开连接");
         xEventGroupClearBits(s_session_eg, SESSION_WS_CONNECTED_BIT | SESSION_SERVER_READY_BIT);
 
-        // 如果有活跃会话，给 15 秒等待重连
         if (s_state != SESSION_IDLE)
         {
-            ESP_LOGW(TAG, "会话中断线，等待自动重连...");
+            ESP_LOGW(TAG, "会话中断线，等待重连...");
             xTimerChangePeriod(s_session_timer, pdMS_TO_TICKS(15000), 0);
         }
-        // IDLE 状态断线不需要处理，esp_websocket_client 的 reconnect_timeout_ms=5000 会自动重连
+
+        // 指数退避重连：第 1 次 5 秒，第 2 次 10 秒，第 3 次 20 秒...
+        // 超过最大次数后停止，防止 429 限流导致无限重连风暴
+        if (s_reconnect_handle != NULL)
+        {
+            ESP_LOGW(TAG, "重连任务已在运行中，跳过");
+        }
+        else if (s_reconnect_attempts >= RECONNECT_MAX_ATTEMPTS)
+        {
+            ESP_LOGE(TAG, "已连续重连 %d 次均失败，停止重连。等待下次唤醒或 Token 刷新时重试",
+                     s_reconnect_attempts);
+        }
+        else
+        {
+            s_reconnect_attempts++;
+            int delay_ms = RECONNECT_BASE_DELAY_MS * (1 << (s_reconnect_attempts - 1)); // 指数退避
+            if (delay_ms > 60000)
+                delay_ms = 60000; // 上限 60 秒
+            ESP_LOGW(TAG, "第 %d 次重连，%d 秒后执行...", s_reconnect_attempts, delay_ms / 1000);
+            // 延迟在重连任务内部执行，避免阻塞事件回调
+            xTaskCreatePinnedToCoreWithCaps(session_reconnect_task, "ws_reconn",
+                                            6144, (void *)(intptr_t)delay_ms, 3,
+                                            (TaskHandle_t *)&s_reconnect_handle,
+                                            1, MALLOC_CAP_SPIRAM);
+        }
         break;
 
     default:
@@ -235,8 +297,17 @@ static void ws_sender_task(void *arg)
     uint8_t buf[OPUS_SEND_BUF];
 
     ESP_LOGI(TAG, "发送任务启动，等待服务器就绪...");
-    xEventGroupWaitBits(s_session_eg, SESSION_SERVER_READY_BIT,
-                        pdFALSE, pdFALSE, portMAX_DELAY);
+
+    // 【关键修复】等待期间持续排空编码器输出缓冲区，防止 enc_output 满溢
+    // 之前用 portMAX_DELAY 死等，导致编码器输出无人消费 → 缓冲区满 → 疯狂丢帧报警
+    while (!(xEventGroupGetBits(s_session_eg) & SESSION_SERVER_READY_BIT))
+    {
+        if (s_state != SESSION_LISTENING && s_state != SESSION_PLAYING)
+            goto exit; // 会话已关闭，直接退出
+        // 读出并丢弃：服务器尚未就绪，这些帧无法发送，但必须消费以保持管道畅通
+        audio_processor_read_timeout(s_processor, buf, sizeof(buf), 100);
+    }
+
     ESP_LOGI(TAG, "服务器已就绪，发送任务运行中");
 
     while (s_state == SESSION_LISTENING || s_state == SESSION_PLAYING)
@@ -256,7 +327,71 @@ static void ws_sender_task(void *arg)
         }
     }
 
+exit:
     s_sender_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// ─── Token 刷新 + WebSocket 重连任务 ────────────────────────────────────────
+// 断线时在独立任务中执行：重新认证 → 销毁旧连接 → 创建新连接
+// 不能在 WebSocket 回调中直接 destroy（会死锁），必须在独立任务中执行
+
+static void session_reconnect_task(void *arg)
+{
+    int delay_ms = (int)(intptr_t)arg;
+
+    // 指数退避延迟：在重连前等待，避免 429 限流风暴
+    if (delay_ms > 0)
+    {
+        ESP_LOGI(TAG, "重连退避等待 %d 秒...", delay_ms / 1000);
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
+
+    ESP_LOGI(TAG, "开始 Token 刷新 + 重连流程...");
+
+    // 第一步：用 deviceToken 重新换取 accessToken
+    const char *new_token = "";
+    if (strlen(s_ws_token) > 0)
+    {
+        auth_t *auth = auth_create();
+        auth_perform(auth, s_ws_token);
+
+        if (auth->access_token != NULL)
+        {
+            strncpy(s_access_token, auth->access_token, sizeof(s_access_token) - 1);
+            new_token = s_access_token;
+            ESP_LOGI(TAG, "✅ Token 刷新成功");
+        }
+        else
+        {
+            ESP_LOGW(TAG, "⚠️ Token 刷新失败，使用 NVS 缓存的旧 token");
+            nvs_handle_t nh;
+            if (nvs_open(NVS_NAMESPACE_NET, NVS_READONLY, &nh) == ESP_OK)
+            {
+                size_t at_sz = sizeof(s_access_token);
+                if (nvs_get_str(nh, "access_token", s_access_token, &at_sz) == ESP_OK)
+                    new_token = s_access_token;
+                nvs_close(nh);
+            }
+        }
+        auth_destroy(auth);
+    }
+
+    // 第二步：销毁旧 WebSocket 连接，用新 token 重建
+    if (s_protocol != NULL)
+    {
+        protocol_disconnect(s_protocol);
+        protocol_destroy(s_protocol);
+        s_protocol = NULL;
+    }
+
+    s_protocol = protocol_create(s_ws_uri, new_token);
+    protocol_register_callback(s_protocol, protocol_event_handler, NULL);
+    protocol_connect(s_protocol);
+
+    ESP_LOGI(TAG, "重连完成，WebSocket 正在建立连接... URI: %s", s_ws_uri);
+
+    s_reconnect_handle = NULL;
     vTaskDelete(NULL);
 }
 
@@ -360,14 +495,39 @@ void session_init(const char *ws_uri)
                                pdMS_TO_TICKS(EOS_SILENCE_MS),
                                pdFALSE, NULL, on_eos_timeout);
 
+    // Token 主动刷新定时器：2 小时过期，提前 10 分钟（110 分钟）自动刷新
+    // pdTRUE = 自动重载，周期性执行
+    s_token_refresh_timer = xTimerCreate("token_ref",
+                                         pdMS_TO_TICKS(TOKEN_REFRESH_MS),
+                                         pdTRUE, NULL, on_token_refresh_timeout);
+    if (strlen(s_ws_token) > 0)
+        xTimerStart(s_token_refresh_timer, 0);
+
+    // 【关键】步骤 1：动态拼接 ?token=<accessToken> 到 URL 后面
+    char full_ws_uri[1024] = {0}; // 必须要足够大，因为 accessToken 很长
+
+    if (strlen(ws_bearer_token) > 0)
+    {
+        // 如果有 Token，按后端的格式拼接到网址末尾
+        snprintf(full_ws_uri, sizeof(full_ws_uri), "%s?token=%s", s_ws_uri, ws_bearer_token);
+    }
+    else
+    {
+        // 如果没有，就用原网址
+        strncpy(full_ws_uri, s_ws_uri, sizeof(full_ws_uri) - 1);
+    }
+
+    ESP_LOGW(TAG, "最终请求的完整 WebSocket URI: %s", full_ws_uri);
+
     // 【关键】步骤 1：用 accessToken 预创建并连接 WebSocket
-    s_protocol = protocol_create(s_ws_uri, ws_bearer_token);
+    // 使用拼接好的完整 URL 去建立连接
+    s_protocol = protocol_create(full_ws_uri, ws_bearer_token);
     protocol_register_callback(s_protocol, protocol_event_handler, NULL);
     protocol_connect(s_protocol);
 
     ESP_LOGI(TAG, "会话模块已初始化，WebSocket 预连接中... URI: %s", s_ws_uri);
     if (strlen(s_access_token) > 0)
-        ESP_LOGI(TAG, "已使用 accessToken 认证连接");
+        ESP_LOGI(TAG, "已使用 accessToken 认证连接（%d 分钟后自动刷新）", TOKEN_REFRESH_MS / 60000);
 }
 
 // ─── 公开 API：唤醒词触发 ──────────────────────────────────────────────────

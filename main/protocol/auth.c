@@ -175,13 +175,13 @@ void auth_perform(auth_t *auth, const char *device_token)
     /* 检查请求结果 */
     if (ret != ESP_OK)
     {
-        ESP_LOGW(TAG, "Failed to send OTA request: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "Auth 请求发送失败: %s", esp_err_to_name(ret));
         return;
     }
     // 检查 HTTP 状态码 ，标准协议200为ok
     if (status_code != 200 && status_code != 201)
     {
-        ESP_LOGW(TAG, "OTA request failed with status code: %d", status_code);
+        ESP_LOGW(TAG, "Auth 请求失败，HTTP 状态码: %d", status_code);
         return;
     }
 
