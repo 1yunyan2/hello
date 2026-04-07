@@ -8,7 +8,7 @@
 ## 一、严重问题（7 个）— 必须优先处理
 
 ### BUG-001 | MQTT 硬编码凭证（安全风险）
-- **位置**: `main/protocol/protocol.c:4-6`
+- **位置**: `main/protocol/mqtt_protocol.c:4-6`
 - **问题**: 硬编码了 MQTT broker URI、用户名和密码（`122.224.191.2:1883`, `xtc`, `Xtc@12345`）
 - **风险**: 代码泄露即凭证泄露，生产环境致命
 - **建议**: 移至 NVS 或通过 BLE 配网下发，代码中只放默认公共 broker
@@ -75,7 +75,7 @@
 - **状态**: ⚠️ 已规避（注释掉），未根治
 
 ### BUG-H04 | MQTT 配置结构体栈溢出
-- **位置**: `main/protocol/protocol.c`
+- **位置**: `main/protocol/mqtt_protocol.c`
 - **问题**: `esp_mqtt_client_config_t` 放栈上（>1KB），超出 FreeRTOS 任务栈
 - **修复**: 改为 `static` 静态分配
 - **相关提交**: ba1b8c3, c547cd5
@@ -108,7 +108,7 @@
 - **状态**: ✅ 已恢复
 
 ### BUG-H09 | MQTT 主题硬编码 MAC 地址
-- **位置**: `main/protocol/protocol.c`
+- **位置**: `main/protocol/mqtt_protocol.c`
 - **修复**: 改为动态获取 `esp_wifi_get_mac()` + `snprintf`
 - **相关提交**: ba1b8c3
 - **状态**: ✅ 已修复
@@ -141,7 +141,7 @@
 - **建议**: 从 NVS 动态加载
 
 ### BUG-009 | 设备 ID 仅用 MAC 后 3 字节
-- **位置**: `main/protocol/protocol.c:109`
+- **位置**: `main/protocol/mqtt_protocol.c:109`
 - **问题**: 3 字节仅 16M 种组合，大规模部署可能重复
 - **建议**: 使用完整 6 字节 MAC
 
@@ -172,11 +172,11 @@
 - **问题**: `audio_feed_task` 中 chunk_size 大小的缓冲区在栈上分配
 
 ### BUG-016 | 心跳任务无中止机制
-- **位置**: `main/protocol/protocol.c:118-142`
+- **位置**: `main/protocol/mqtt_protocol.c:118-142`
 - **问题**: `while(1)` 无法被主动停止
 
 ### BUG-017 | 唤醒词更新任务栈 4KB 偏小
-- **位置**: `main/protocol/protocol.c:206-207`
+- **位置**: `main/protocol/mqtt_protocol.c:206-207`
 - **问题**: MultiNet6 推理可能需要更多栈空间，建议 8192
 
 ### BUG-018 | WS 发送任务栈 4KB 偏小
@@ -204,7 +204,7 @@
 - **位置**: `main/bsp/bsp_wifi.c:94`
 
 ### BUG-023 | TODO: ADC 电池电量映射公式
-- **位置**: `main/protocol/protocol.c:93`
+- **位置**: `main/protocol/mqtt_protocol.c:93`
 
 ### BUG-024 | 注释掉的 bsp_wake_word_start()
 - **位置**: `main/application.c:61`

@@ -61,4 +61,4 @@
 ## 待处理 TODO
 
 - `main/bsp/bsp_wifi.c:94` — BLE 配网 JSON 参数解析未实现
-- `main/protocol/protocol.c:93` — ADC 电池电量映射公式需适配硬件
+- `main/protocol/mqtt_protocol.c:93` — ADC 电池电量映射公式需适配硬件

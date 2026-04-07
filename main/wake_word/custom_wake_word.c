@@ -4,15 +4,15 @@
 static const char *TAG = "BSP_WakeWord";
 
 // ─── 常量定义 ────────────────────────────────────────────────────────────
-#define WAKE_COMMAND_ID 1                // 唤醒词在命令词表中的固定 ID（唯一一条命令）
-#define NVS_NAMESPACE "sys_config"       // NVS 命名空间（与其他模块共享）
-#define NVS_KEY_WAKEWORD "wakeword"      // NVS Key：命令词（拼音或英文）
-#define NVS_KEY_DISP_WORD "ww_disp"      // NVS Key：显示文字（用于下次启动判断语言）
-#define DEFAULT_DISP_CN "云炎"           // 出厂默认中文显示词
-#define DEFAULT_WAKEWORD_CN "yun yan"    // 出厂默认中文命令词（拼音）
-#define DEFAULT_DISP_EN "Hello Echo"     // 出厂默认英文显示词
-#define DEFAULT_WAKEWORD_EN "HELLO ECHO" // 出厂默认英文命令词（mn6_en 词表全大写）
-#define AUDIO_BUFFER_MAX 2048            // 音频环形缓冲区最大采样点数
+#define WAKE_COMMAND_ID 1                    // 唤醒词在命令词表中的固定 ID（唯一一条命令）
+#define NVS_NAMESPACE "sys_config"           // NVS 命名空间（与其他模块共享）
+#define NVS_KEY_WAKEWORD "wakeword"          // NVS Key：命令词（拼音或英文）
+#define NVS_KEY_DISP_WORD "ww_disp"          // NVS Key：显示文字（用于下次启动判断语言）
+#define DEFAULT_DISP_CN "你好伙伴"           // 出厂默认中文显示词
+#define DEFAULT_WAKEWORD_CN "ni hao huo ban" // 出厂默认中文命令词（拼音）
+#define DEFAULT_DISP_EN "Hello Echo"         // 出厂默认英文显示词
+#define DEFAULT_WAKEWORD_EN "HELLO ECHO"     // 出厂默认英文命令词（mn6_en 词表全大写）
+#define AUDIO_BUFFER_MAX 2048                // 音频环形缓冲区最大采样点数
 
 // ─── 模块级静态变量 ──────────────────────────────────────────────────────
 static esp_mn_iface_t *multinet_iface = NULL;          // MultiNet 接口函数表指针
@@ -248,7 +248,7 @@ esp_err_t bsp_wake_word_init(wake_word_detected_cb_t cb)
 
     // 从 NVS 读取上次保存的显示词，用于推断上次使用的语言
     nvs_read_str(NVS_KEY_DISP_WORD, current_disp_word,
-                 sizeof(current_disp_word), DEFAULT_DISP_CN);
+                 sizeof(current_disp_word), DEFAULT_DISP_EN);
 
     // 根据显示词语言选择并加载对应 MultiNet6 模型
     const char *lang = is_chinese_text(current_disp_word) ? ESP_MN_CHINESE : ESP_MN_ENGLISH;

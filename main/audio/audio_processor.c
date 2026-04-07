@@ -16,10 +16,10 @@
 
 // 环形缓冲区大小配置（单位：字节）
 // PCM 缓冲使用 BYTEBUF（字节流），OPUS 缓冲使用 NOSPLIT（完整帧不拆分）
-#define ENC_INPUT_BUF_SIZE  20480  // 编码器输入（原始 PCM）：~640ms @16kHz 单声道
-#define ENC_OUTPUT_BUF_SIZE 2560   // 编码器输出（OPUS 帧）
-#define DEC_INPUT_BUF_SIZE  5120   // 解码器输入（OPUS 帧）
-#define DEC_OUTPUT_BUF_SIZE 40960  // 解码器输出（PCM 播放）：~1.28s 缓冲
+#define ENC_INPUT_BUF_SIZE 20480  // 编码器输入（原始 PCM）：~640ms @16kHz 单声道
+#define ENC_OUTPUT_BUF_SIZE 8192  // 2560 编码器输出（OPUS 帧）：增大以容纳握手期间积压
+#define DEC_INPUT_BUF_SIZE 5120   // 解码器输入（OPUS 帧）
+#define DEC_OUTPUT_BUF_SIZE 40960 // 解码器输出（PCM 播放）：~1.28s 缓冲
 
 struct audio_processor
 {
@@ -140,6 +140,18 @@ void audio_processor_write_pcm(audio_processor_t *audio_processor, void *buffer,
 void audio_processor_write(audio_processor_t *audio_processor, void *buffer, size_t size)
 {
     xRingbufferSend(audio_processor->dec_input, buffer, size, portMAX_DELAY);
+}
+
+void audio_processor_flush_output(audio_processor_t *audio_processor)
+{
+    // 清空解码器输入 + 输出缓冲区（停止播放 TTS 残留音频）
+    // 用于语音打断场景：用户唤醒词打断 AI 说话时，立即停止扬声器输出
+    size_t size;
+    void *buf;
+    while ((buf = xRingbufferReceive(audio_processor->dec_input, &size, 0)) != NULL)
+        vRingbufferReturnItem(audio_processor->dec_input, buf);
+    while ((buf = xRingbufferReceive(audio_processor->dec_output, &size, 0)) != NULL)
+        vRingbufferReturnItem(audio_processor->dec_output, buf);
 }
 
 size_t audio_processor_read_timeout(audio_processor_t *audio_processor,

@@ -1,5 +1,5 @@
 #include "bsp_board.h"
-#include "protocol/protocol.h"
+#include "protocol/mqtt_protocol.h"
 
 #define CLEAR_WIFI_BUTTON_PIN GPIO_NUM_0 // 长按清除 WiFi 的按键引脚
 #define MAX_RETRY_COUNT 5                // 断线后最大自动重连次数
@@ -78,8 +78,10 @@ static void button_monitor_task(void *pvParameters)
 // ─── BLE 配网自定义数据处理 ──────────────────────────────────────────────
 
 static esp_err_t custom_prov_data_handler(uint32_t session_id,
-                                          const uint8_t *inbuf, ssize_t inlen,
-                                          uint8_t **outbuf, ssize_t *outlen,
+                                          const uint8_t *inbuf,
+                                          ssize_t inlen,
+                                          uint8_t **outbuf,
+                                          ssize_t *outlen,
                                           void *priv_data)
 {
     ESP_LOGI(TAG, "🟢 自定义端点回调触发！session_id: %lu, 收到数据长度: %d", session_id, (int)inlen);
@@ -343,7 +345,7 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
         ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, mac));
         char service_name[16];
         snprintf(service_name, sizeof(service_name), "EchoPals-%02X%02X%02X", mac[3], mac[4], mac[5]);
-        ESP_LOGE(TAG, " 我的真实MAC地址是: %02x:%02x:%02x:%02x:%02x:%02x 👈👈👈",
+        ESP_LOGE(TAG, " 我的真实MAC地址是: %02x:%02x:%02x:%02x:%02x:%02x",
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         // 使用固定 PoP 密码（生产环境建议换为 MAC 派生的动态密码）
         const char *security_key = "abcd1234";

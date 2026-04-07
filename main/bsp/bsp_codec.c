@@ -202,10 +202,10 @@ void audio_init(bsp_board_t *bsp_board)
     ESP_ERROR_CHECK(esp_codec_dev_open(bsp_board->codec_dev, &sample_info));
 
     // 步骤 3：设置麦克风增益（40 = ~20dB，适合近讲场景）
-    esp_codec_dev_set_in_gain(bsp_board->codec_dev, 40);
+    esp_codec_dev_set_in_gain(bsp_board->codec_dev, 10);
 
     // 步骤 4：设置扬声器音量（0~100，70 为适中音量）
-    esp_codec_dev_set_out_vol(bsp_board->codec_dev, 70);
+    esp_codec_dev_set_out_vol(bsp_board->codec_dev, 60);
 
     ESP_LOGI(TAG, "ES8311 初始化完成！");
 

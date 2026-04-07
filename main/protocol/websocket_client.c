@@ -142,6 +142,16 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
     }
 }
 
+/**
+ * @brief 创建并初始化WebSocket客户端实例
+ * 
+ * 分配内存创建protocol_t结构体，根据传入的URL和Token配置WebSocket连接参数，
+ * 包括自定义HTTP头（Device-Id, Authorization等）。该函数不立即建立连接。
+ * 
+ * @param url WebSocket服务器的完整地址（如 "wss://example.com/audio"）
+ * @param token 用于身份验证的Bearer Token，可为NULL
+ * @return protocol_t* 成功时返回指向新创建实例的指针，失败时返回NULL
+ */
 protocol_t *protocol_create(const char *url, const char *token)
 {
     protocol_t *protocol = (protocol_t *)calloc(1, sizeof(protocol_t));
@@ -168,6 +178,14 @@ protocol_t *protocol_create(const char *url, const char *token)
     return protocol;
 }
 
+/**
+ * @brief 销毁WebSocket客户端实例并释放所有资源
+ * 
+ * 释放session_id内存，销毁底层的esp_websocket_client句柄，并释放protocol_t结构体本身。
+ * 调用此函数后，不应再使用该实例指针。
+ * 
+ * @param protocol 指向要销毁的protocol_t实例的指针
+ */
 void protocol_destroy(protocol_t *protocol)
 {
     if (protocol->session_id)
@@ -176,23 +194,55 @@ void protocol_destroy(protocol_t *protocol)
     free(protocol);
 }
 
+/**
+ * @brief 连接或重新连接到WebSocket服务器
+ * 
+ * 启动底层的WebSocket客户端以建立与服务器的连接。如果已连接，则无操作。
+ * 通常在初始化或断线重连时调用。
+ * 
+ * @param protocol 指向protocol_t实例的指针
+ */
 void protocol_connect(protocol_t *protocol)
 {
     if (!esp_websocket_client_is_connected(protocol->websocket_client))
         esp_websocket_client_start(protocol->websocket_client);
 }
 
+/**
+ * @brief 断开与WebSocket服务器的连接
+ * 
+ * 停止底层的WebSocket客户端。如果未连接，则无操作。
+ * 用于主动关闭会话或准备重启连接。
+ * 
+ * @param protocol 指向protocol_t实例的指针
+ */
 void protocol_disconnect(protocol_t *protocol)
 {
     if (esp_websocket_client_is_connected(protocol->websocket_client))
         esp_websocket_client_stop(protocol->websocket_client);
 }
 
+/**
+ * @brief 查询当前WebSocket连接状态
+ * 
+ * 检查底层WebSocket客户端是否处于已连接状态。
+ * 
+ * @param protocol 指向protocol_t实例的指针
+ * @return bool 如果已连接则返回true，否则返回false
+ */
 bool protocol_is_connected(protocol_t *protocol)
 {
     return esp_websocket_client_is_connected(protocol->websocket_client);
 }
 
+/**
+ * @brief 发送Hello握手消息
+ * 
+ * 向服务器发送一个标准的Hello消息，以协商音频参数（采样率、格式等）和建立会话。
+ * 此消息是启动语音交互前的必要步骤。
+ * 
+ * @param protocol 指向protocol_t实例的指针
+ */
 void protocol_send_hello(protocol_t *protocol)
 {
     protocol_send_text(protocol, "{\"audio_params\":{\"channels\":1,\"format\":\"opus\",\"frame_duration\":60,\"sample_rate\":16000},\"transport\":\"websocket\",\"type\":\"hello\",\"version\":1}");

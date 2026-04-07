@@ -1,9 +1,7 @@
 #include "application.h"
 #include "session/session.h"
-
-// ─── 唤醒提示音 ───────────────────────────────────────────────────────────
-// 880Hz 方波，持续 1 秒，通过 ES8311 DAC 输出到扬声器
-// 方波生成无需浮点运算，在 ESP32-S3 上 CPU 占用极低
+#define PRINT_INTERNAL_HEAP \
+    ESP_LOGE(TAG, "[%s:%d] heap size: %lu", __FILE__, __LINE__, esp_get_free_internal_heap_size())
 
 // ─── 唤醒词触发回调 ───────────────────────────────────────────────────────
 // 由唤醒词引擎在识别到命令词后，从音频投喂上下文中调用

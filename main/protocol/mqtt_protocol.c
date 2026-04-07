@@ -1,4 +1,4 @@
-#include "protocol.h"
+#include "mqtt_protocol.h"
 
 static const char *MQTT_TAG = "MQTT"; // MQTT 凭证（运行时从 NVS 加载，回退到编译期默认值）
 #define MQTT_DEFAULT_URI "mqtt://122.224.191.2:1883"
@@ -55,6 +55,15 @@ static volatile bool s_mqtt_connected = false;
 
 // ─── 工具函数：获取设备 MAC 后三字节作为短 ID ──────────────────────────────
 // 多处需要 device_id（心跳、订阅、重置通知），统一提取避免重复代码
+/**
+ * @brief 从设备MAC地址生成短ID
+ *
+ * 提取WiFi STA模式下的MAC地址后三个字节，并格式化为6位十六进制字符串。
+ * 该短ID用于MQTT主题命名（如 heartbeat、wake-word）以区分不同设备。
+ *
+ * @param[out] out 输出缓冲区，用于存放格式化的短ID字符串
+ * @param out_size 输出缓冲区大小
+ */
 static void get_short_device_id(char *out, size_t out_size)
 {
     uint8_t mac[6];
@@ -70,6 +79,15 @@ typedef struct
 } ww_update_params_t;
 
 // 独立处理唤醒词更新的后台任务
+/**
+ * @brief 异步执行唤醒词更新的任务
+ *
+ * 创建一个独立的FreeRTOS任务来调用wake_word_update接口，
+ * 避免在MQTT事件回调中执行耗时操作而阻塞网络通信。
+ * 任务完成后会释放传入的参数内存并自我删除。
+ *
+ * @param pvParameters 指向ww_update_params_t结构体的指针
+ */
 static void async_update_wakeword_task(void *pvParameters)
 {
     ww_update_params_t *params = (ww_update_params_t *)pvParameters;
@@ -91,6 +109,14 @@ static void async_update_wakeword_task(void *pvParameters)
 
 //!  重要 ❗: 这是一个【示例】函数，用于演示如何读取ADC值作为电量。
 // 您必须根据您的硬件电路设计，修改此函数。
+/**
+ * @brief 获取电池电量百分比
+ *
+ * 【示例代码】通过ADC1通道0读取电池电压，并将其线性映射为0-100%的电量值。
+ * ⚠️ 此函数为示意，您必须根据实际的硬件分压电路参数修改计算公式。
+ *
+ * @return int 电池电量百分比 (0-100)
+ */
 static int get_battery_level(void)
 {
 #define BATT_ADC_CHANNEL ADC1_CHANNEL_0
@@ -110,6 +136,14 @@ static int get_battery_level(void)
 }
 
 // 后台心跳发送任务
+/**
+ * @brief 发送周期性心跳消息的后台任务
+ *
+ * 在独立任务中每5秒向MQTT服务器发布一次包含设备ID、电池电量和Wi-Fi信号强度的JSON消息。
+ * 该任务会持续运行，直到被外部显式删除。
+ *
+ * @param arg 未使用
+ */
 static void heartbeat_task(void *arg)
 {
     char device_id[16];
@@ -150,6 +184,17 @@ static void heartbeat_task(void *arg)
 }
 
 // MQTT 事件回调函数
+/**
+ * @brief MQTT客户端事件处理回调
+ *
+ * 处理MQTT连接、断开、数据接收等事件。在连接成功时订阅唤醒词更新主题；
+ * 在收到特定主题消息时，解析JSON并启动异步任务来更新设备的唤醒词。
+ *
+ * @param handler_args 用户自定义参数（未使用）
+ * @param base 事件基类（ESP_EVENT_ANY_ID）
+ * @param event_id 具体的事件ID（如MQTT_EVENT_CONNECTED）
+ * @param event_data 指向esp_mqtt_event_t结构体的指针，包含事件详情
+ */
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     esp_mqtt_event_handle_t event = event_data;
@@ -234,6 +279,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 }
 
 // 启动 MQTT 客户端
+/**
+ * @brief 初始化并启动MQTT客户端
+ *
+ * 从NVS加载服务器地址和凭证，配置MQTT客户端，注册事件回调，并启动客户端连接。
+ * 连接成功后，会自动创建并启动一个心跳任务以定期发送设备状态。
+ */
 void protocol_mqtt_start(void)
 {
     mqtt_credentials_load();

@@ -51,6 +51,6 @@ echopals/{MAC后3字节}/status       — 状态通知
 ```
 
 ## 影响范围
-- `main/protocol/protocol.c` — MQTT 客户端、心跳任务、唤醒词更新
+- `main/protocol/mqtt_protocol.c` — MQTT 客户端、心跳任务、唤醒词更新
 - `main/protocol/websocket_client.c` — WebSocket 连接管理
 - `main/session/session.c` — 会话管理，协调音频编解码和 WS 传输
