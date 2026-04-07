@@ -103,67 +103,34 @@ static esp_err_t custom_prov_data_handler(uint32_t session_id,
     memcpy(safe_str, inbuf, inlen);
     ESP_LOGI(TAG, "收到原始数据: %s", safe_str);
 
-    // 解析JSON，增加失败日志
-    cJSON *root = cJSON_Parse(safe_str);
-    if (!root)
-    {
-        ESP_LOGE(TAG, "JSON解析失败！原始数据不是合法JSON格式");
-        free(safe_str);
-        goto send_response;
-    }
-
-    // 提取Token字段，增加合法性校验
-    cJSON *token_item = cJSON_GetObjectItem(root, "token");
-    if (!cJSON_IsString(token_item) || token_item->valuestring == NULL)
-    {
-        ESP_LOGE(TAG, "JSON中未找到token字段，或token不是合法字符串");
-        cJSON_Delete(root);
-        free(safe_str);
-        goto send_response;
-    }
-
-    ESP_LOGI(TAG, "✅ 成功提取到Token: %.20s...", token_item->valuestring);
-
-    // 保存到NVS，完整错误处理
+    // 🌟 直接将收到的纯字符串（即 Token）保存到 NVS，不再进行 JSON 解析！
     nvs_handle_t h;
     esp_err_t err = nvs_open("net_config", NVS_READWRITE, &h);
-    if (err != ESP_OK)
+    if (err == ESP_OK)
+    {
+        // 注意：如果你和后端约定叫 device_token，这里可以把 ws_token 改名
+        err = nvs_set_str(h, "ws_token", safe_str);
+        if (err == ESP_OK)
+        {
+            nvs_commit(h);
+            ESP_LOGI(TAG, "✅ Token已永久保存到NVS！Token值: %s", safe_str);
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Token写入NVS失败: %s", esp_err_to_name(err));
+        }
+        nvs_close(h);
+    }
+    else
     {
         ESP_LOGE(TAG, "NVS打开失败: %s", esp_err_to_name(err));
-        cJSON_Delete(root);
-        free(safe_str);
-        goto send_response;
     }
 
-    err = nvs_set_str(h, "ws_token", token_item->valuestring);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Token写入NVS失败: %s", esp_err_to_name(err));
-        nvs_close(h);
-        cJSON_Delete(root);
-        free(safe_str);
-        goto send_response;
-    }
-
-    err = nvs_commit(h);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "NVS数据提交失败: %s", esp_err_to_name(err));
-        nvs_close(h);
-        cJSON_Delete(root);
-        free(safe_str);
-        goto send_response;
-    }
-
-    nvs_close(h);
-    ESP_LOGI(TAG, "✅ Token已永久保存到NVS！");
-
-    // 释放资源
-    cJSON_Delete(root);
+    // 释放内存资源
     free(safe_str);
 
 send_response:
-    // 固定响应体
+    // 固定的 JSON 响应体，告诉前端设备接收成功
     const char response[] = "{\"status\":\"OK\"}";
     *outbuf = (uint8_t *)strdup(response);
     if (*outbuf == NULL)
@@ -171,7 +138,6 @@ send_response:
     *outlen = strlen(response);
     return ESP_OK;
 }
-
 // ─── 配网事件处理 ────────────────────────────────────────────────────────
 
 static void prov_event_handler(void *arg, esp_event_base_t event_base,
@@ -196,6 +162,9 @@ static void prov_event_handler(void *arg, esp_event_base_t event_base,
             ESP_LOGI(TAG, "密码正确！");
             // 验证成功，退出配网保护，允许后续自动重连
             s_is_provisioning = false;
+            // WiFi 已确认连上，手动停止配网（因为禁用了 auto_stop）
+            // 配网管理器会向手机回报 success，然后触发 WIFI_PROV_END
+            wifi_prov_mgr_stop_provisioning();
             break;
 
         case WIFI_PROV_CRED_FAIL:
@@ -230,8 +199,10 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
     {
-        // WiFi STA 驱动启动完成，触发连接到 AP
-        esp_wifi_connect();
+        // 配网期间由配网管理器控制连接，不能抢先调用 connect
+        // 否则会用空凭证连接导致立刻失败，配网管理器状态被污染为 "failed"
+        if (!s_is_provisioning)
+            esp_wifi_connect();
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
@@ -352,7 +323,7 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
 
         //! 创建自定义数据端点（用于 APP 下发额外配置）,用于接收token
         ESP_ERROR_CHECK(wifi_prov_mgr_endpoint_create("custom-data"));
-
+        wifi_prov_mgr_disable_auto_stop(100);
         // 启动 BLE 配网广播（SECURITY_1 = 带 PoP 校验）
         ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(
             WIFI_PROV_SECURITY_1, security_key, service_name, NULL));

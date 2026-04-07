@@ -178,7 +178,7 @@ static void heartbeat_task(void *arg)
             }
             cJSON_Delete(root);
         }
-        vTaskDelay(pdMS_TO_TICKS(5000)); //! 更改心跳速度为5s，
+        vTaskDelay(pdMS_TO_TICKS(50000)); //! 更改心跳速度为5s，
     }
     vTaskDelete(NULL);
 }

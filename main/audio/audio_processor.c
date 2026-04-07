@@ -40,6 +40,16 @@ static void audio_processor_play_task(void *arg)
     audio_processor_t *audio_processor = (audio_processor_t *)arg;
     bsp_board_t *board = bsp_board_get_instance();
 
+    // 防御性检查:BSP 实例与 codec_dev 必须就绪,否则直接退出
+    if (board == NULL || board->codec_dev == NULL)
+    {
+        ESP_LOGE(TAG, "play_task abort: board=%p codec_dev=%p",
+                 board, board ? board->codec_dev : NULL);
+        audio_processor->play_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
     while (audio_processor->is_running)
     {
         size_t size_read = 0;
@@ -71,6 +81,24 @@ audio_processor_t *audio_processor_create(void)
     audio_processor->dec_input = xRingbufferCreateWithCaps(DEC_INPUT_BUF_SIZE, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
     audio_processor->dec_output = xRingbufferCreateWithCaps(DEC_OUTPUT_BUF_SIZE, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
 
+    // 任一 ringbuf 创建失败 → 整体回滚,避免半初始化对象导致后续崩溃
+    if (!audio_processor->enc_input || !audio_processor->enc_output ||
+        !audio_processor->dec_input || !audio_processor->dec_output)
+    {
+        ESP_LOGE(TAG, "audio_processor_create: ringbuf alloc failed, rollback");
+        if (audio_processor->enc_input)
+            vRingbufferDelete(audio_processor->enc_input);
+        if (audio_processor->enc_output)
+            vRingbufferDelete(audio_processor->enc_output);
+        if (audio_processor->dec_input)
+            vRingbufferDelete(audio_processor->dec_input);
+        if (audio_processor->dec_output)
+            vRingbufferDelete(audio_processor->dec_output);
+        audio_encoder_destroy(audio_processor->encoder);
+        audio_decoder_destroy(audio_processor->decoder);
+        free(audio_processor);
+        return NULL;
+    }
     audio_encoder_set_buffer(audio_processor->encoder, audio_processor->enc_input, audio_processor->enc_output);
     audio_decoder_set_buffer(audio_processor->decoder, audio_processor->dec_input, audio_processor->dec_output);
 

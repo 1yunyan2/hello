@@ -23,16 +23,16 @@ typedef enum
 // 监听模式类型
 typedef enum
 {
-    PROTOCOL_LISTEN_TYPE_AUTO,
-    PROTOCOL_LISTEN_TYPE_MANUAL,
-    PROTOCOL_LISTEN_TYPE_REALTIME,
+    PROTOCOL_LISTEN_TYPE_AUTO,     // 自动模式
+    PROTOCOL_LISTEN_TYPE_MANUAL,   // 手动模式
+    PROTOCOL_LISTEN_TYPE_REALTIME, // 实时模式
 } protocol_listen_type_t;
 
 // IoT 消息类型
 typedef enum
 {
-    MESSAGE_TYPE_DESCRIPTOR,
-    MESSAGE_TYPE_STATE,
+    MESSAGE_TYPE_DESCRIPTOR, // 描述符
+    MESSAGE_TYPE_STATE,      // 状态
 } protocol_iot_message_type_t;
 
 // 二进制数据结构体
