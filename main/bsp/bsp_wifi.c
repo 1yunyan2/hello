@@ -109,11 +109,12 @@ static esp_err_t custom_prov_data_handler(uint32_t session_id,
     if (err == ESP_OK)
     {
         // 注意：如果你和后端约定叫 device_token，这里可以把 ws_token 改名
-        err = nvs_set_str(h, "ws_token", safe_str);
+        err = nvs_set_str(h, "device_token", safe_str);
         if (err == ESP_OK)
         {
             nvs_commit(h);
             ESP_LOGI(TAG, "✅ Token已永久保存到NVS！Token值: %s", safe_str);
+            wifi_prov_mgr_stop_provisioning(); // 停止配网
         }
         else
         {
@@ -162,9 +163,7 @@ static void prov_event_handler(void *arg, esp_event_base_t event_base,
             ESP_LOGI(TAG, "密码正确！");
             // 验证成功，退出配网保护，允许后续自动重连
             s_is_provisioning = false;
-            // WiFi 已确认连上，手动停止配网（因为禁用了 auto_stop）
-            // 配网管理器会向手机回报 success，然后触发 WIFI_PROV_END
-            wifi_prov_mgr_stop_provisioning();
+
             break;
 
         case WIFI_PROV_CRED_FAIL:
@@ -199,10 +198,7 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
     {
-        // 配网期间由配网管理器控制连接，不能抢先调用 connect
-        // 否则会用空凭证连接导致立刻失败，配网管理器状态被污染为 "failed"
-        if (!s_is_provisioning)
-            esp_wifi_connect();
+        esp_wifi_connect();
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
@@ -257,7 +253,7 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
     // nvs_handle_t h;
     // if (nvs_open("net_config", NVS_READWRITE, &h) == ESP_OK)
     // {
-    //     nvs_set_str(h, "ws_token", "test_token_888");
+    //     nvs_set_str(h, "device_token", "test_token_888");
     //     nvs_commit(h);
     //     nvs_close(h);
     //     ESP_LOGI(TAG, "✅ 测试Token已写入：test_token_888");

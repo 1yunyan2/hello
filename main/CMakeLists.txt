@@ -11,5 +11,6 @@ idf_component_register(SRCS
 "audio/audio_decoder.c"
 "session/session.c"
 "application.c"
+"protocol/auth.c"
 INCLUDE_DIRS "."
 )

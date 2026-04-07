@@ -38,6 +38,7 @@
 #include "esp_log.h"
 #include "nvs.h"
 #include <string.h>
+#include "protocol/auth.h"
 
 #define TAG "Session"
 
@@ -63,7 +64,8 @@ static TimerHandle_t s_session_timer = NULL;
 static TimerHandle_t s_eos_timer = NULL;
 static volatile bool s_speech_detected = false;
 static char s_ws_uri[128] = DEFAULT_WS_URI;
-static char s_ws_token[256] = {0};
+static char s_ws_token[256] = {0};       // deviceToken（App 绑定时下发的长期凭证）
+static char s_access_token[512] = {0};   // accessToken（通过 device-login 换取的短效令牌）
 static volatile TaskHandle_t s_sender_handle = NULL;
 static SemaphoreHandle_t s_wake_word_mutex = NULL;
 static char s_current_wake_word[64] = {0};
@@ -310,11 +312,45 @@ void session_init(const char *ws_uri)
             nvs_get_str(h, "ws_uri", s_ws_uri, &sz);
         }
         size_t token_sz = sizeof(s_ws_token);
-        nvs_get_str(h, "ws_token", s_ws_token, &token_sz);
+        nvs_get_str(h, "device_token", s_ws_token, &token_sz);
         nvs_close(h);
     }
     if (ws_uri != NULL)
         strncpy(s_ws_uri, ws_uri, sizeof(s_ws_uri) - 1);
+
+    // ── 步骤 2/3：用 deviceToken 调用 /api/auth/device-login 换取 accessToken ──
+    const char *ws_bearer_token = "";
+    if (strlen(s_ws_token) > 0)
+    {
+        ESP_LOGI(TAG, "检测到 deviceToken，正在换取 accessToken...");
+        auth_t *auth = auth_create();
+        auth_perform(auth, s_ws_token);
+
+        if (auth->access_token != NULL)
+        {
+            strncpy(s_access_token, auth->access_token, sizeof(s_access_token) - 1);
+            ws_bearer_token = s_access_token;
+            ESP_LOGI(TAG, "✅ accessToken 获取成功");
+        }
+        else
+        {
+            ESP_LOGW(TAG, "⚠️ accessToken 获取失败，尝试用 NVS 缓存的旧 token 连接");
+            // 尝试从 NVS 读取上次缓存的 accessToken（auth_perform 成功时会存入）
+            nvs_handle_t nh;
+            if (nvs_open(NVS_NAMESPACE_NET, NVS_READONLY, &nh) == ESP_OK)
+            {
+                size_t at_sz = sizeof(s_access_token);
+                if (nvs_get_str(nh, "access_token", s_access_token, &at_sz) == ESP_OK)
+                    ws_bearer_token = s_access_token;
+                nvs_close(nh);
+            }
+        }
+        auth_destroy(auth);
+    }
+    else
+    {
+        ESP_LOGW(TAG, "⚠️ 无 deviceToken，WebSocket 将无认证连接");
+    }
 
     // 创建定时器
     s_session_timer = xTimerCreate("session_to",
@@ -324,14 +360,14 @@ void session_init(const char *ws_uri)
                                pdMS_TO_TICKS(EOS_SILENCE_MS),
                                pdFALSE, NULL, on_eos_timeout);
 
-    // 【关键】预创建并连接 WebSocket —— TLS 握手在此完成，唤醒时无需等待
-    s_protocol = protocol_create(s_ws_uri, s_ws_token);
+    // 【关键】步骤 1：用 accessToken 预创建并连接 WebSocket
+    s_protocol = protocol_create(s_ws_uri, ws_bearer_token);
     protocol_register_callback(s_protocol, protocol_event_handler, NULL);
     protocol_connect(s_protocol);
 
     ESP_LOGI(TAG, "会话模块已初始化，WebSocket 预连接中... URI: %s", s_ws_uri);
-    if (strlen(s_ws_token) > 0)
-        ESP_LOGI(TAG, "已加载 Token: ***");
+    if (strlen(s_access_token) > 0)
+        ESP_LOGI(TAG, "已使用 accessToken 认证连接");
 }
 
 // ─── 公开 API：唤醒词触发 ──────────────────────────────────────────────────
