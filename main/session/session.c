@@ -43,9 +43,9 @@
 #define TAG "Session"
 
 #define DEFAULT_WS_URI "ws://192.168.1.100:8080/audio"
-#define NVS_NAMESPACE_NET "net_config"
-#define SESSION_TIMEOUT_MS 60000 // 整体会话超时：60 秒
-#define EOS_SILENCE_MS 800       // 说话结束静音检测：800ms
+#define NVS_NAMESPACE_NET "net_config" // NVS 存储
+#define SESSION_TIMEOUT_MS 60000       // 整体会话超时：60 秒
+#define EOS_SILENCE_MS 800             // 说话结束静音检测：800ms
 #define OPUS_SEND_BUF 512
 
 // ─── 事件组位定义 ────────────────────────────────────────────────────────────
@@ -64,8 +64,8 @@ static TimerHandle_t s_session_timer = NULL;
 static TimerHandle_t s_eos_timer = NULL;
 static volatile bool s_speech_detected = false;
 static char s_ws_uri[128] = DEFAULT_WS_URI;
-static char s_ws_token[256] = {0};       // deviceToken（App 绑定时下发的长期凭证）
-static char s_access_token[512] = {0};   // accessToken（通过 device-login 换取的短效令牌）
+static char s_ws_token[256] = {0};     // deviceToken（App 绑定时下发的长期凭证）
+static char s_access_token[512] = {0}; // accessToken（通过 device-login 换取的短效令牌）
 static volatile TaskHandle_t s_sender_handle = NULL;
 static SemaphoreHandle_t s_wake_word_mutex = NULL;
 static char s_current_wake_word[64] = {0};
@@ -324,7 +324,7 @@ void session_init(const char *ws_uri)
     {
         ESP_LOGI(TAG, "检测到 deviceToken，正在换取 accessToken...");
         auth_t *auth = auth_create();
-        auth_perform(auth, s_ws_token);
+        auth_perform(auth, s_ws_token); // 调用 /api/auth/device-login
 
         if (auth->access_token != NULL)
         {

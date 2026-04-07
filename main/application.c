@@ -90,7 +90,7 @@ void application_init(void)
 
     // 步骤 7:初始化会话模块(WebSocket 预连接立即建立,唤醒时零延迟)
     // 如需自定义 WebSocket 地址,将字符串改为 "ws://your-server:8080/audio"
-    session_init("wss://api.tenclass.net/xiaozhi/v1/");
+    session_init("ws://122.224.191.2:4888/ws/voice?token=<accessToken>");
     PRINT_INTERNAL_HEAP;
 
     // 步骤 8:启动电源监测(ADC 采样电池电压 + 上报)

@@ -40,9 +40,9 @@
  */
 typedef struct
 {
-    auth_t auth;          // 基类，包含 access_token
-    char *response;       // HTTP 响应体动态缓冲区（realloc 拼接）
-    size_t response_len;  // 当前已接收的响应体字节数
+    auth_t auth;         // 基类，包含 access_token
+    char *response;      // HTTP 响应体动态缓冲区（realloc 拼接）
+    size_t response_len; // 当前已接收的响应体字节数
 } auth_wrapper_t;
 
 /**
@@ -71,7 +71,7 @@ static esp_err_t auth_http_event_handler(esp_http_client_event_t *evt)
     {
         /* 非 200 状态码的响应体不需要收集（可能是错误页面 HTML） */
         int status_code = esp_http_client_get_status_code(evt->client);
-        if (status_code != 200)
+        if (status_code != 200 && status_code != 201)
             return ESP_OK;
 
         /* 动态扩展缓冲区：原有长度 + 本次收到的长度 */
@@ -173,10 +173,16 @@ void auth_perform(auth_t *auth, const char *device_token)
     esp_http_client_cleanup(client); // 释放 HTTP 客户端资源
 
     /* 检查请求结果 */
-    if (ret != ESP_OK || status_code != 200)
+    if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "Login failed, status: %d", status_code);
-        return; // auth->access_token 保持 NULL，调用方据此判断失败
+        ESP_LOGW(TAG, "Failed to send OTA request: %s", esp_err_to_name(ret));
+        return;
+    }
+    // 检查 HTTP 状态码 ，标准协议200为ok
+    if (status_code != 200 && status_code != 201)
+    {
+        ESP_LOGW(TAG, "OTA request failed with status code: %d", status_code);
+        return;
     }
 
     // ── 第二步：解析响应 JSON，提取 accessToken ────────────────────────────
@@ -189,11 +195,14 @@ void auth_perform(auth_t *auth, const char *device_token)
          *   格式 A: {"accessToken": "yyy"}           ← 直接在顶层
          *   格式 B: {"data": {"accessToken": "yyy"}} ← 嵌套在 data 里
          */
+        // todo：A 尝试获取 accessToken
         cJSON *token_item = cJSON_GetObjectItem(resp_json, "accessToken");
         if (!token_item)
         {
+            // todo：B 尝试获取 data
             cJSON *data_item = cJSON_GetObjectItem(resp_json, "data");
             if (data_item)
+                // todo 尝试获取 data.accessToken
                 token_item = cJSON_GetObjectItem(data_item, "accessToken");
         }
 
