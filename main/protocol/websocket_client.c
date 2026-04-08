@@ -218,7 +218,7 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
             cJSON *type = cJSON_GetObjectItem(root, "type");
             if (cJSON_IsString(type))
             {
-                if (strcmp(type->valuestring, "hello") == 0)
+                if (strcmp(type->valuestring, "started") == 0)
                     protocol_hello_handler(protocol, root);
                 else if (strcmp(type->valuestring, "llm") == 0)
                     protocol_llm_handler(protocol, root);
@@ -278,9 +278,10 @@ protocol_t *protocol_create(const char *url, const char *token)
     esp_websocket_client_config_t websocket_cfg = {
         .uri = url,
         .headers = headers,
-        .crt_bundle_attach = esp_crt_bundle_attach, // HTTPS 根证书校验（wss:// 需要）
-        .network_timeout_ms = 5000,                 // 网络超时 5 秒
-        .disable_auto_reconnect = true,             // 禁用自动重连，由 session 层控制退避策略
+        // .crt_bundle_attach = esp_crt_bundle_attach, // HTTPS 根证书校验（wss:// 需要）
+        .network_timeout_ms = 5000,     // 网络超时 5 秒
+        .disable_auto_reconnect = true, // 禁用自动重连，由 session 层控制退避策略
+        // .ping_interval_sec = 30,                    // Ping 间隔 30 秒
     };
 
     /* 初始化底层 WebSocket 客户端并注册事件回调 */
@@ -312,11 +313,22 @@ void protocol_connect(protocol_t *protocol)
         esp_websocket_client_start(protocol->websocket_client);
 }
 
-/** @brief 断开连接（未连接时无操作） */
+/**
+ * @brief 断开连接并确保底层资源完全释放
+ *
+ * 【关键】无论当前连接状态如何都调用 stop，确保：
+ *   1. 向服务端发送 WebSocket close frame（正常关闭握手）
+ *   2. 底层 TCP 连接被正确关闭，服务端释放连接计数
+ *   3. 避免服务端残留"幽灵连接"导致 429 连接超限
+ *
+ * 之前的 bug：只在 is_connected 为 true 时才 stop，
+ * 但断线事件触发时 is_connected 已经为 false，导致 stop 从未被调用，
+ * 服务端无法感知连接关闭，连接数持续累积。
+ */
 void protocol_disconnect(protocol_t *protocol)
 {
-    if (esp_websocket_client_is_connected(protocol->websocket_client))
-        esp_websocket_client_stop(protocol->websocket_client);
+    /* 无论是否 connected 都调用 stop，确保底层 TCP 彻底关闭 */
+    esp_websocket_client_stop(protocol->websocket_client);
 }
 
 /** @brief 查询连接状态 */
@@ -333,8 +345,17 @@ bool protocol_is_connected(protocol_t *protocol)
  */
 void protocol_send_hello(protocol_t *protocol)
 {
-    ESP_LOGI(TAG, "发送 Hello 握手消息...");
-    protocol_send_text(protocol, "{\"audio_params\":{\"channels\":1,\"format\":\"opus\",\"frame_duration\":60,\"sample_rate\":16000},\"transport\":\"websocket\",\"type\":\"hello\",\"version\":1}");
+    ESP_LOGI(TAG, "发送 Start 握手消息...");
+
+    // 获取 MAC 地址后三字节生成 toyId (与 MQTT 一致)
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    char toy_id[16];
+    snprintf(toy_id, sizeof(toy_id), "%02X%02X%02X", mac[3], mac[4], mac[5]);
+
+      protocol_send_text(protocol,
+                       "{\"type\":\"start\",\"format\":\"opus\",\"sampleRate\":16000,\"toyId\":\"%s\"}",
+                       toy_id);
 }
 
 /** @brief 发送唤醒词通知（type=listen, state=detect） */
@@ -360,7 +381,11 @@ void protocol_send_stop_listening(protocol_t *protocol)
 void protocol_send_audio_data(protocol_t *protocol, binary_data_t *data)
 {
     if (esp_websocket_client_is_connected(protocol->websocket_client))
-        esp_websocket_client_send_bin(protocol->websocket_client, data->ptr, data->size, pdMS_TO_TICKS(10000));
+    {
+        // 实时音频场景：100ms 发不出去则丢弃（一帧 OPUS 60ms，阻塞就过时了）
+        // 避免 sender 任务长时间阻塞导致 enc_output 积压溢出
+        esp_websocket_client_send_bin(protocol->websocket_client, data->ptr, data->size, pdMS_TO_TICKS(100));
+    }
 }
 
 /** @brief 发送打断 TTS 指令（type=abort, reason=wake_word_detected） */

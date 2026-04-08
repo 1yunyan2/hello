@@ -16,7 +16,9 @@
 #include "esp_mn_iface.h"
 #include "esp_mn_models.h"
 #include "esp_mn_speech_commands.h"
-#include "esp_vad.h" // vad_state_t: VAD_SILENCE / VAD_SPEECH
+#include "esp_vad.h"            // vad_state_t: VAD_SILENCE / VAD_SPEECH
+#include "esp_afe_sr_iface.h"   // AFE 音频前端（NS 降噪 + VAD）
+#include "esp_afe_sr_models.h"  // esp_afe_handle_from_config
 
 // 唤醒词触发回调，参数为显示文字（如"云炎"或"Hello Echo"）
 typedef void (*wake_word_detected_cb_t)(const char *wake_word_display);
@@ -43,9 +45,16 @@ void bsp_wake_word_load_from_nvs(char *dest, size_t max_len);
 esp_err_t wake_word_update(const char *wake_word_display, const char *wake_word_pinyin);
 
 /**
- * @brief 获取引擎每次需要的音频采样点数量（一般为 512）
+ * @brief 获取 MultiNet 每次需要的音频采样点数量（一般为 512）
  */
 size_t custom_wake_word_get_chunksize(void);
+
+/**
+ * @brief 获取 AFE feed 每次需要的采样点数量
+ * audio_feed_task 必须按此大小投喂原始 PCM，否则 AFE 内部会报错
+ * @return 采样点数（非字节数），0 表示 AFE 未初始化
+ */
+size_t custom_wake_word_get_feed_chunksize(void);
 
 /**
  * @brief 将麦克风采集的 16-bit PCM 数据喂给引擎

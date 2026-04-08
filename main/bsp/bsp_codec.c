@@ -6,14 +6,6 @@
 
 static const char *TAG = "BSP_CODEC";
 
-// 外部模块可注册此钩子，在会话期间持续接收原始 PCM（16-bit 单声道）
-static void (*s_pcm_hook)(const int16_t *data, size_t samples) = NULL;
-
-void audio_set_pcm_hook(void (*hook)(const int16_t *data, size_t samples))
-{
-    s_pcm_hook = hook;
-}
-
 // ==================== 私有硬件初始化函数 ====================
 
 static void bsp_board_codec_i2c_init(bsp_board_t *bsp_board, i2c_master_bus_handle_t *bus_handle)
@@ -144,15 +136,17 @@ bool bsp_board_check_status(bsp_board_t *bsp_board, EventBits_t bits_to_check, T
 
 // ==================== 音频采集任务 ====================
 
-// 录音投喂任务：持续从麦克风读取 PCM 数据，投喂给唤醒词引擎
+// 录音投喂任务：持续从麦克风读取 PCM 数据，投喂给 AFE + MultiNet 引擎
+// 数据流：I2S麦克风 → audio_feed_task → custom_wake_word_feed → AFE(NS+VAD) → MultiNet + 编码器
 void audio_feed_task(void *arg)
 {
     bsp_board_t *bsp_board = (bsp_board_t *)arg;
 
-    // 获取唤醒词引擎每次需要的采样点数（一般为 512）
-    size_t chunk_size = custom_wake_word_get_chunksize();
+    // 【关键】使用 AFE 的 feed chunksize，而非 MultiNet 的 chunksize
+    // AFE 内部要求每次投喂固定大小的帧，否则会报错或丢帧
+    size_t chunk_size = custom_wake_word_get_feed_chunksize();
     if (chunk_size == 0)
-        chunk_size = 512; // 引擎未就绪时使用安全默认值
+        chunk_size = 512; // AFE 未就绪时使用安全默认值
 
     // 分配音频读取缓冲区（16-bit PCM，单声道）
     int16_t *buffer = malloc(chunk_size * sizeof(int16_t));
@@ -163,19 +157,17 @@ void audio_feed_task(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "正在持续监听环境声音...");
+    ESP_LOGI(TAG, "音频采集启动 (AFE feed chunk=%d samples)", (int)chunk_size);
 
     while (1)
     {
-        // 从 Codec 设备读取一帧 PCM 数据（阻塞直到数据就绪）
+        // 从 Codec 设备读取一帧原始 PCM 数据（阻塞直到数据就绪）
         esp_err_t ret = esp_codec_dev_read(bsp_board->codec_dev, buffer, chunk_size * sizeof(int16_t));
         if (ret == ESP_OK)
         {
-            // 将读取到的 PCM 帧喂给唤醒词引擎进行识别
+            // 将原始 PCM 投喂给 custom_wake_word_feed
+            // 内部会：AFE feed → AFE fetch(降噪) → MultiNet 检测 + enhanced_pcm_hook
             custom_wake_word_feed(buffer, chunk_size);
-            // 若会话模块已注册钩子（唤醒后），同步转发给编码器
-            if (s_pcm_hook)
-                s_pcm_hook(buffer, chunk_size);
         }
         else
         {

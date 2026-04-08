@@ -73,7 +73,7 @@ static volatile TaskHandle_t s_reconnect_handle = NULL; // 重连任务句柄，
 static int s_reconnect_attempts = 0;                    // 连续重连次数，用于指数退避
 #define RECONNECT_MAX_ATTEMPTS 5                        // 最大重连次数，超过后停止重连
 #define RECONNECT_BASE_DELAY_MS 5000                    // 基础退避延迟 5 秒
-static SemaphoreHandle_t s_wake_word_mutex = NULL;
+static SemaphoreHandle_t s_wake_word_mutex = NULL;      // 唤醒词锁，防止多线程操作
 static char s_current_wake_word[64] = {0};
 
 static void session_close(void);
@@ -188,12 +188,12 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
     case PROTOCOL_EVENT_HELLO:
         if (s_state == SESSION_IDLE)
             break; // 无活跃会话，忽略
-        ESP_LOGI(TAG, "收到服务器 Hello 响应，会话已建立");
+        ESP_LOGI(TAG, "收到服务器 started 响应，会话已建立");
 
-        xSemaphoreTake(s_wake_word_mutex, portMAX_DELAY);
-        protocol_send_wake_word(s_protocol, s_current_wake_word);
-        xSemaphoreGive(s_wake_word_mutex);
-        protocol_send_start_listening(s_protocol, PROTOCOL_LISTEN_TYPE_AUTO);
+            // xSemaphoreTake(s_wake_word_mutex, portMAX_DELAY);
+        // protocol_send_wake_word(s_protocol, s_current_wake_word);
+        // xSemaphoreGive(s_wake_word_mutex);
+        // protocol_send_start_listening(s_protocol, PROTOCOL_LISTEN_TYPE_AUTO);
 
         // 唤醒发送任务，开始消费 enc_output 中积压的 OPUS 帧
         xEventGroupSetBits(s_session_eg, SESSION_SERVER_READY_BIT);
@@ -320,10 +320,14 @@ static void ws_sender_task(void *arg)
         }
 
         size_t len = audio_processor_read_timeout(s_processor, buf, sizeof(buf), 100);
-        if (len > 0 && s_protocol && protocol_is_connected(s_protocol))
+        if (len > 0)
         {
-            binary_data_t bin = {.ptr = buf, .size = len};
-            protocol_send_audio_data(s_protocol, &bin);
+            if (s_protocol && protocol_is_connected(s_protocol))
+            {
+                binary_data_t bin = {.ptr = buf, .size = len};
+                protocol_send_audio_data(s_protocol, &bin);
+            }
+            // WebSocket 未连接时帧被自然丢弃，保持 enc_output 管道畅通
         }
     }
 
@@ -378,14 +382,25 @@ static void session_reconnect_task(void *arg)
     }
 
     // 第二步：销毁旧 WebSocket 连接，用新 token 重建
+    // 【关键】必须先 disconnect 再 destroy，确保服务端释放连接计数，防止 429
     if (s_protocol != NULL)
     {
-        protocol_disconnect(s_protocol);
+        ESP_LOGI(TAG, "关闭旧 WebSocket 连接（释放服务端连接计数）...");
+        protocol_disconnect(s_protocol); // 发送 close frame，关闭 TCP
         protocol_destroy(s_protocol);
         s_protocol = NULL;
+        // 等待服务端处理关闭，避免新旧连接同时存在
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 
-    s_protocol = protocol_create(s_ws_uri, new_token);
+    // 【关键】重连时也要拼接 ?token=xxx，与 session_init 保持一致
+    char full_ws_uri[1024] = {0};
+    if (strlen(new_token) > 0)
+        snprintf(full_ws_uri, sizeof(full_ws_uri), "%s?token=%s", s_ws_uri, new_token);
+    else
+        strncpy(full_ws_uri, s_ws_uri, sizeof(full_ws_uri) - 1);
+
+    s_protocol = protocol_create(full_ws_uri, new_token);
     protocol_register_callback(s_protocol, protocol_event_handler, NULL);
     protocol_connect(s_protocol);
 
@@ -503,6 +518,14 @@ void session_init(const char *ws_uri)
     if (strlen(s_ws_token) > 0)
         xTimerStart(s_token_refresh_timer, 0);
 
+    // if (s_protocol != NULL)
+    // {
+    //     ESP_LOGW(TAG, "发现残留的协议实例，强制断开并销毁...");
+    //     protocol_disconnect(s_protocol);
+    //     protocol_destroy(s_protocol);
+    //     s_protocol = NULL;
+    // }
+
     // 【关键】步骤 1：动态拼接 ?token=<accessToken> 到 URL 后面
     char full_ws_uri[1024] = {0}; // 必须要足够大，因为 accessToken 很长
 
@@ -525,7 +548,7 @@ void session_init(const char *ws_uri)
     protocol_register_callback(s_protocol, protocol_event_handler, NULL);
     protocol_connect(s_protocol);
 
-    ESP_LOGI(TAG, "会话模块已初始化，WebSocket 预连接中... URI: %s", s_ws_uri);
+    // ESP_LOGI(TAG, "会话模块已初始化，WebSocket 预连接中... URI: %s", s_ws_uri);
     if (strlen(s_access_token) > 0)
         ESP_LOGI(TAG, "已使用 accessToken 认证连接（%d 分钟后自动刷新）", TOKEN_REFRESH_MS / 60000);
 }

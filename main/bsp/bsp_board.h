@@ -118,9 +118,5 @@ void audio_init(bsp_board_t *bsp_board);
  */
 void audio_feed_task(void *arg);
 
-/**
- * @brief 注册 PCM 数据钩子（会话模块用于获取麦克风原始数据）
- * 注册后每帧麦克风数据会同步转发到此回调（NULL = 取消注册）
- * @param hook 回调函数指针，签名为 void(const int16_t*, size_t)
- */
-void audio_set_pcm_hook(void (*hook)(const int16_t *data, size_t samples));
+// audio_set_pcm_hook 已移除：PCM 数据改由 AFE 降噪后通过
+// bsp_wake_word_set_enhanced_pcm_hook → custom_wake_word_feed 内部 fetch 输出
