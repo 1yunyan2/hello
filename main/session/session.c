@@ -39,7 +39,7 @@
 #include "nvs.h"
 #include <string.h>
 #include "protocol/auth.h"
-
+#include "object.h"
 #define TAG "Session"
 
 #define DEFAULT_WS_URI "ws://192.168.1.100:8080/audio"
@@ -190,10 +190,10 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
             break; // 无活跃会话，忽略
         ESP_LOGI(TAG, "收到服务器 started 响应，会话已建立");
 
-            // xSemaphoreTake(s_wake_word_mutex, portMAX_DELAY);
-        // protocol_send_wake_word(s_protocol, s_current_wake_word);
-        // xSemaphoreGive(s_wake_word_mutex);
-        // protocol_send_start_listening(s_protocol, PROTOCOL_LISTEN_TYPE_AUTO);
+        xSemaphoreTake(s_wake_word_mutex, portMAX_DELAY);
+        protocol_send_wake_word(s_protocol, s_current_wake_word);
+        xSemaphoreGive(s_wake_word_mutex);
+        protocol_send_start_listening(s_protocol, PROTOCOL_LISTEN_TYPE_AUTO);
 
         // 唤醒发送任务，开始消费 enc_output 中积压的 OPUS 帧
         xEventGroupSetBits(s_session_eg, SESSION_SERVER_READY_BIT);
@@ -278,10 +278,10 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
                 delay_ms = 60000; // 上限 60 秒
             ESP_LOGW(TAG, "第 %d 次重连，%d 秒后执行...", s_reconnect_attempts, delay_ms / 1000);
             // 延迟在重连任务内部执行，避免阻塞事件回调
-            xTaskCreatePinnedToCoreWithCaps(session_reconnect_task, "ws_reconn",
-                                            6144, (void *)(intptr_t)delay_ms, 3,
-                                            (TaskHandle_t *)&s_reconnect_handle,
-                                            1, MALLOC_CAP_SPIRAM);
+            xTaskCreatePinnedToCore(session_reconnect_task, "ws_reconn",
+                                    6144, (void *)(intptr_t)delay_ms, 3,
+                                    (TaskHandle_t *)&s_reconnect_handle,
+                                    1);
         }
         break;
 
@@ -312,12 +312,13 @@ static void ws_sender_task(void *arg)
 
     while (s_state == SESSION_LISTENING || s_state == SESSION_PLAYING)
     {
-        // 断线期间暂停
-        if (!(xEventGroupGetBits(s_session_eg) & SESSION_SERVER_READY_BIT))
-        {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
+        // todo 为了解决web断开导致opus缓冲区溢出，先去除暂停
+        //  // 断线期间暂停
+        //  if (!(xEventGroupGetBits(s_session_eg) & SESSION_SERVER_READY_BIT))
+        //  {
+        //      vTaskDelay(pdMS_TO_TICKS(100));
+        //      continue;
+        //  }
 
         size_t len = audio_processor_read_timeout(s_processor, buf, sizeof(buf), 100);
         if (len > 0)
@@ -394,18 +395,35 @@ static void session_reconnect_task(void *arg)
     }
 
     // 【关键】重连时也要拼接 ?token=xxx，与 session_init 保持一致
-    char full_ws_uri[1024] = {0};
+    // 使用堆分配，避免在 6KB 任务栈上放置 1KB 大缓冲区导致栈溢出
+    char *full_ws_uri = (char *)malloc_zeroed(1024);
+    if (full_ws_uri == NULL)
+    {
+        ESP_LOGE(TAG, "full_ws_uri 分配失败，放弃重连");
+        s_reconnect_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
     if (strlen(new_token) > 0)
-        snprintf(full_ws_uri, sizeof(full_ws_uri), "%s?token=%s", s_ws_uri, new_token);
+        snprintf(full_ws_uri, 1024, "%s?token=%s", s_ws_uri, new_token);
     else
-        strncpy(full_ws_uri, s_ws_uri, sizeof(full_ws_uri) - 1);
+        strncpy(full_ws_uri, s_ws_uri, 1024 - 1);
 
     s_protocol = protocol_create(full_ws_uri, new_token);
+    if (s_protocol == NULL)
+    {
+        ESP_LOGE(TAG, "protocol_create 失败，内存不足，放弃重连");
+        free(full_ws_uri);
+        s_reconnect_handle = NULL;
+        vTaskDelete(NULL);
+        return; // vTaskDelete 不会返回，但加 return 避免编译器警告
+    }
     protocol_register_callback(s_protocol, protocol_event_handler, NULL);
     protocol_connect(s_protocol);
 
     ESP_LOGI(TAG, "重连完成，WebSocket 正在建立连接... URI: %s", s_ws_uri);
 
+    free(full_ws_uri);
     s_reconnect_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -418,13 +436,15 @@ static void session_close(void)
         return;
 
     ESP_LOGI(TAG, "关闭会话");
-    s_state = SESSION_IDLE;
+    s_state = SESSION_IDLE;    // 先置状态，sender 任务循环条件会检测到退出
     s_speech_detected = false;
 
-    // 释放发送任务的阻塞
-    xEventGroupSetBits(s_session_eg, SESSION_SERVER_READY_BIT);
-    xEventGroupClearBits(s_session_eg, SESSION_SERVER_READY_BIT);
+    // 先停止 PCM Hook，防止新数据继续写入已停止的编码器
     bsp_wake_word_set_enhanced_pcm_hook(NULL);
+
+    // 释放发送任务的阻塞（sender 可能在等待 SERVER_READY_BIT）
+    // s_state 已变为 IDLE，sender 检测到后会走 goto exit 退出
+    xEventGroupSetBits(s_session_eg, SESSION_SERVER_READY_BIT);
 
     xTimerStop(s_session_timer, 0);
     xTimerStop(s_eos_timer, 0);
@@ -435,14 +455,21 @@ static void session_close(void)
     if (s_processor != NULL)
     {
         audio_processor_stop(s_processor);
-        for (int i = 0; i < 5 && s_sender_handle != NULL; i++)
+        // 等待 sender 任务退出（最多 1 秒，每 100ms 检查一次）
+        for (int i = 0; i < 10 && s_sender_handle != NULL; i++)
             vTaskDelay(pdMS_TO_TICKS(100));
+        if (s_sender_handle != NULL)
+            ESP_LOGW(TAG, "sender 任务未能在超时内退出");
         audio_processor_destroy(s_processor);
         s_processor = NULL;
     }
 
+    // 清除事件位（在 sender 退出后再清理，避免竞态）
+    xEventGroupClearBits(s_session_eg, SESSION_SERVER_READY_BIT);
+
     bsp_wake_word_start();
     ESP_LOGI(TAG, "会话已关闭，WebSocket 保持连接，重新监听唤醒词...");
+    PRINT_MEM_INFO(TAG, "对话会话结束清理后");
 }
 
 // ─── 公开 API：初始化 + 预连接 ──────────────────────────────────────────────
@@ -527,17 +554,28 @@ void session_init(const char *ws_uri)
     // }
 
     // 【关键】步骤 1：动态拼接 ?token=<accessToken> 到 URL 后面
-    char full_ws_uri[1024] = {0}; // 必须要足够大，因为 accessToken 很长
+    // 使用堆分配，避免在栈上放置大缓冲区（accessToken 可能很长）
+    char *full_ws_uri = (char *)malloc_zeroed(1024);
+    if (full_ws_uri == NULL)
+    {
+        ESP_LOGE(TAG, "full_ws_uri 分配失败");
+        return;
+    }
 
     if (strlen(ws_bearer_token) > 0)
     {
         // 如果有 Token，按后端的格式拼接到网址末尾
-        snprintf(full_ws_uri, sizeof(full_ws_uri), "%s?token=%s", s_ws_uri, ws_bearer_token);
+        snprintf(full_ws_uri, 1024, "%s?token=%s", s_ws_uri, ws_bearer_token);
+        // 强制清理末尾可能存在的换行/空格
+        for (int i = strlen(full_ws_uri) - 1; i >= 0 && (full_ws_uri[i] == ' ' || full_ws_uri[i] == '\n' || full_ws_uri[i] == '\r'); i--)
+        {
+            full_ws_uri[i] = '\0';
+        }
     }
     else
     {
         // 如果没有，就用原网址
-        strncpy(full_ws_uri, s_ws_uri, sizeof(full_ws_uri) - 1);
+        strncpy(full_ws_uri, s_ws_uri, 1024 - 1);
     }
 
     ESP_LOGW(TAG, "最终请求的完整 WebSocket URI: %s", full_ws_uri);
@@ -545,6 +583,14 @@ void session_init(const char *ws_uri)
     // 【关键】步骤 1：用 accessToken 预创建并连接 WebSocket
     // 使用拼接好的完整 URL 去建立连接
     s_protocol = protocol_create(full_ws_uri, ws_bearer_token);
+    free(full_ws_uri); // URI 已被 protocol_create 内部拷贝，可安全释放
+    full_ws_uri = NULL;
+
+    if (s_protocol == NULL)
+    {
+        ESP_LOGE(TAG, "protocol_create 失败，无法建立 WebSocket 连接");
+        return;
+    }
     protocol_register_callback(s_protocol, protocol_event_handler, NULL);
     protocol_connect(s_protocol);
 
@@ -557,6 +603,7 @@ void session_init(const char *ws_uri)
 
 void session_on_wake_word(const char *display)
 {
+    PRINT_MEM_INFO(TAG, "对话会话开始");
     // ── 场景 1：PLAYING 中打断 ──────────────────────────────────────────
     if (s_state == SESSION_PLAYING)
     {
@@ -593,17 +640,29 @@ void session_on_wake_word(const char *display)
     // 创建音频管道
     s_processor = audio_processor_create();
     if (!s_processor)
+    {
+        ESP_LOGE(TAG, "音频处理器创建失败，内存不足");
         goto error;
+    }
     audio_processor_start(s_processor);
 
     // 立即开启 PCM Hook，音频积压在编码器缓冲区
     bsp_wake_word_set_enhanced_pcm_hook(on_enhanced_pcm);
 
     // 创建发送任务
-    xTaskCreatePinnedToCoreWithCaps(ws_sender_task, "ws_sender",
+    BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(ws_sender_task, "ws_sender",
                                     4096, NULL, 5,
                                     (TaskHandle_t *)&s_sender_handle,
                                     0, MALLOC_CAP_SPIRAM);
+    if (ret != pdPASS)
+    {
+        ESP_LOGE(TAG, "发送任务创建失败");
+        bsp_wake_word_set_enhanced_pcm_hook(NULL);
+        audio_processor_stop(s_processor);
+        audio_processor_destroy(s_processor);
+        s_processor = NULL;
+        goto error;
+    }
 
     // 【关键】WebSocket 已经预连接好，直接发 Hello，无需等待 TLS
     if (xEventGroupGetBits(s_session_eg) & SESSION_WS_CONNECTED_BIT)
@@ -621,8 +680,10 @@ void session_on_wake_word(const char *display)
     return;
 
 error:
-    ESP_LOGE(TAG, "会话启动失败");
+    ESP_LOGE(TAG, "会话启动失败，回滚所有资源");
     s_state = SESSION_IDLE;
+    s_speech_detected = false;
+    xEventGroupClearBits(s_session_eg, SESSION_SERVER_READY_BIT);
     bsp_wake_word_start();
 }
 

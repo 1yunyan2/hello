@@ -1,6 +1,6 @@
 #include "custom_wake_word.h"
 #include "bsp/bsp_board.h"
-
+#include "object.h"
 static const char *TAG = "BSP_WakeWord";
 // 前向声明 afe_fetch_task，解决编译错误 "implicit declaration of function 'afe_fetch_task'"
 static void afe_fetch_task(void *arg);
@@ -232,6 +232,7 @@ static esp_err_t register_command_word(void)
 
 esp_err_t bsp_wake_word_init(wake_word_detected_cb_t cb)
 {
+    PRINT_MEM_INFO(TAG, "唤醒词初始化前");
     // 保存用户回调，唤醒词触发时调用
     user_callback = cb;
 
@@ -296,6 +297,7 @@ esp_err_t bsp_wake_word_init(wake_word_detected_cb_t cb)
     }
 
     s_afe_data = s_afe_iface->create_from_config(afe_cfg);
+    PRINT_MEM_INFO(TAG, "AFE模型加载后");
     afe_config_free(afe_cfg); // 配置已复制到 AFE 内部，可以释放
     afe_cfg = NULL;
     if (s_afe_data == NULL)
@@ -322,6 +324,7 @@ esp_err_t bsp_wake_word_init(wake_word_detected_cb_t cb)
         buffer_mutex = NULL;
         return ESP_FAIL;
     }
+    PRINT_MEM_INFO(TAG, "MultiNet唤醒词模型加载后");
 
     // 从 NVS 加载命令词；英文词自动转全大写（mn6_en 词表要求）
     bsp_wake_word_load_from_nvs(current_wake_word, sizeof(current_wake_word));
@@ -577,6 +580,8 @@ static void afe_fetch_task(void *arg)
         if (wake_triggered && user_callback)
             user_callback(current_disp_word);
     }
+    // 打印任务历史最小剩余栈空间（字节）
+    ESP_LOGD("STACK", "%s 栈剩余: %lu 字节", pcTaskGetName(NULL), (unsigned long)uxTaskGetStackHighWaterMark(NULL));
 }
 
 // ─── 公开 API：音频帧投喂（麦克风采集任务持续调用）────────────────────

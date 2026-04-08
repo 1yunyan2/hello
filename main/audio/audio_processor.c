@@ -31,9 +31,9 @@
 #define TAG "Audio Processor"
 
 /* 播放任务配置 */
-#define AUDIO_PROCESSOR_TASK_STACK_SIZE (4 * 1024)  // 栈大小 4KB（播放逻辑简单，无需更大）
-#define AUDIO_PROCESSOR_TASK_PRIORITY 5             // 优先级（与编解码器任务对称）
-#define AUDIO_PROCESSOR_TASK_CORE_ID 0              // 固定到 CPU 核心 0
+#define AUDIO_PROCESSOR_TASK_STACK_SIZE (4 * 1024) // 栈大小 4KB（播放逻辑简单，无需更大）
+#define AUDIO_PROCESSOR_TASK_PRIORITY 5            // 优先级（与编解码器任务对称）
+#define AUDIO_PROCESSOR_TASK_CORE_ID 0             // 固定到 CPU 核心 0
 
 // ─── 环形缓冲区大小配置（单位：字节）────────────────────────────────────────
 #define ENC_INPUT_BUF_SIZE 20480  // 编码器输入（原始 PCM）：~640ms @16kHz 单声道
@@ -49,16 +49,16 @@
  */
 struct audio_processor
 {
-    audio_encoder_t *encoder;  ///< OPUS 编码器实例（PCM → OPUS）
-    audio_decoder_t *decoder;  ///< OPUS 解码器实例（OPUS → PCM）
+    audio_encoder_t *encoder; ///< OPUS 编码器实例（PCM → OPUS）
+    audio_decoder_t *decoder; ///< OPUS 解码器实例（OPUS → PCM）
 
     RingbufHandle_t enc_input;  ///< 编码器输入缓冲（BYTEBUF：麦克风 PCM 数据入口）
     RingbufHandle_t enc_output; ///< 编码器输出缓冲（NOSPLIT：OPUS 帧，WebSocket 发送任务消费）
     RingbufHandle_t dec_input;  ///< 解码器输入缓冲（NOSPLIT：云端下发的 OPUS 帧）
     RingbufHandle_t dec_output; ///< 解码器输出缓冲（BYTEBUF：解码后 PCM，播放任务消费）
 
-    volatile bool is_running;       ///< 运行标志（控制播放任务循环）
-    TaskHandle_t play_task_handle;  ///< 播放任务句柄（用于等待任务退出）
+    volatile bool is_running;      ///< 运行标志（控制播放任务循环）
+    TaskHandle_t play_task_handle; ///< 播放任务句柄（用于等待任务退出）
 };
 
 // ─── 播放任务 ──────────────────────────────────────────────────────────────
@@ -123,6 +123,18 @@ audio_processor_t *audio_processor_create(void)
     audio_processor->encoder = audio_encoder_create(BSP_CODEC_SAMPLE_RATE, 1);
     audio_processor->decoder = audio_decoder_create(BSP_CODEC_SAMPLE_RATE, 1);
 
+    /* 编解码器创建失败 → 立即回滚，避免后续空指针崩溃 */
+    if (!audio_processor->encoder || !audio_processor->decoder)
+    {
+        ESP_LOGE(TAG, "audio_processor_create: encoder/decoder alloc failed, rollback");
+        if (audio_processor->encoder)
+            audio_encoder_destroy(audio_processor->encoder);
+        if (audio_processor->decoder)
+            audio_decoder_destroy(audio_processor->decoder);
+        free(audio_processor);
+        return NULL;
+    }
+
     /* 创建四个环形缓冲区（全部分配在 SPIRAM，节省内部 SRAM） */
     audio_processor->enc_input = xRingbufferCreateWithCaps(ENC_INPUT_BUF_SIZE, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
     audio_processor->enc_output = xRingbufferCreateWithCaps(ENC_OUTPUT_BUF_SIZE, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
@@ -151,7 +163,7 @@ audio_processor_t *audio_processor_create(void)
     /* 将环形缓冲区绑定到编解码器（编码器：enc_input→enc_output，解码器：dec_input→dec_output） */
     audio_encoder_set_buffer(audio_processor->encoder, audio_processor->enc_input, audio_processor->enc_output);
     audio_decoder_set_buffer(audio_processor->decoder, audio_processor->dec_input, audio_processor->dec_output);
-
+    PRINT_MEM_INFO(TAG, "音频管道环形缓冲区创建后");
     return audio_processor;
 }
 

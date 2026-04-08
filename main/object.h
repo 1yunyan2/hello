@@ -14,6 +14,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include "esp_heap_caps.h"
+#include "esp_log.h"
+
+// 打印当前内存状态的超级宏
+#define PRINT_MEM_INFO(tag, msg)                                                       \
+    do                                                                                 \
+    {                                                                                  \
+        ESP_LOGI(tag, "--- 内存快照: %s ---", msg);                                    \
+        ESP_LOGI(tag, "内部 RAM: 剩余 %lu B (历史最低 %lu B)",                         \
+                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),          \
+                 (unsigned long)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)); \
+        ESP_LOGI(tag, "外部 PSRAM: 剩余 %lu B (历史最低 %lu B)",                       \
+                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),            \
+                 (unsigned long)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM));   \
+    } while (0)
 
 /**
  * @brief 从 SPIRAM 分配指定大小的内存并清零

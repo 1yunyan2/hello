@@ -28,7 +28,7 @@
 #include "esp_mac.h"
 #include "cJSON.h"
 #include <string.h>
-
+#include "object.h"
 /* 定义协议事件基类（用于 esp_event 框架） */
 ESP_EVENT_DEFINE_BASE(PROTOCOL_EVENT);
 
@@ -192,6 +192,7 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
     case WEBSOCKET_EVENT_CONNECTED:
         ESP_LOGI(TAG, "Websocket Connected");
         protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_CONNECTED, NULL);
+        PRINT_MEM_INFO(TAG, "握手后");
         break;
 
     case WEBSOCKET_EVENT_DATA:
@@ -311,6 +312,7 @@ void protocol_connect(protocol_t *protocol)
 {
     if (!esp_websocket_client_is_connected(protocol->websocket_client))
         esp_websocket_client_start(protocol->websocket_client);
+    PRINT_MEM_INFO(TAG, "握手前");
 }
 
 /**
@@ -353,7 +355,7 @@ void protocol_send_hello(protocol_t *protocol)
     char toy_id[16];
     snprintf(toy_id, sizeof(toy_id), "%02X%02X%02X", mac[3], mac[4], mac[5]);
 
-      protocol_send_text(protocol,
+    protocol_send_text(protocol,
                        "{\"type\":\"start\",\"format\":\"opus\",\"sampleRate\":16000,\"toyId\":\"%s\"}",
                        toy_id);
 }
