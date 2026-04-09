@@ -66,6 +66,9 @@ static TimerHandle_t s_session_timer = NULL;
 static TimerHandle_t s_eos_timer = NULL;
 static TimerHandle_t s_token_refresh_timer = NULL; // accessToken 主动刷新定时器（2h 过期，提前 10min 刷新）
 static volatile bool s_speech_detected = false;
+static volatile bool s_stop_sent = false;       // stop 只发一次
+static TickType_t s_vad_ready_tick = 0;          // 服务器就绪时刻（VAD 延迟启动基准）
+#define VAD_GRACE_MS 500                         // 唤醒词尾音消退期：500ms
 static char s_ws_uri[128] = DEFAULT_WS_URI;
 static char s_ws_token[256] = {0};     // deviceToken（App 绑定时下发的长期凭证）
 static char s_access_token[512] = {0}; // accessToken（通过 device-login 换取的短效令牌）
@@ -91,8 +94,9 @@ static void on_session_timeout(TimerHandle_t t)
 
 static void on_eos_timeout(TimerHandle_t t)
 {
-    if (s_state != SESSION_LISTENING)
+    if (s_state != SESSION_LISTENING || s_stop_sent)
         return;
+    s_stop_sent = true; // 防止重复发送
     ESP_LOGI(TAG, "检测到说话结束（VAD 静音 %dms），通知服务器", EOS_SILENCE_MS);
     if (s_protocol && protocol_is_connected(s_protocol))
         protocol_send_stop_listening(s_protocol);
@@ -141,23 +145,27 @@ static void on_enhanced_pcm(const int16_t *data, size_t samples)
     if (s_state != SESSION_LISTENING)
         return;
 
-    // 使用 AFE 内置 WebRTC VAD（比能量阈值更可靠，针对降噪后音频调优）
-    vad_state_t vad = bsp_wake_word_get_vad_state();
+    // ── VAD 检测（仅在服务器就绪 + 消退期后启用）──────────────────
+    // 条件：服务器已就绪、消退期已过、stop 尚未发送
+    if (s_vad_ready_tick != 0 && !s_stop_sent &&
+        (xTaskGetTickCount() - s_vad_ready_tick) >= pdMS_TO_TICKS(VAD_GRACE_MS))
+    {
+        vad_state_t vad = bsp_wake_word_get_vad_state();
 
-    if (vad == VAD_SPEECH)
-    {
-        if (!s_speech_detected)
+        if (vad == VAD_SPEECH)
         {
-            s_speech_detected = true;
-            ESP_LOGI(TAG, "🎤 AFE VAD 检测到语音活动");
+            if (!s_speech_detected)
+            {
+                s_speech_detected = true;
+                ESP_LOGI(TAG, "🎤 AFE VAD 检测到语音活动");
+            }
+            xTimerStop(s_eos_timer, 0);
         }
-        xTimerStop(s_eos_timer, 0);
-    }
-    else if (s_speech_detected)
-    {
-        // 仅在定时器未运行时启动，避免每帧重置 800ms 倒计时
-        if (xTimerIsTimerActive(s_eos_timer) == pdFALSE)
-            xTimerStart(s_eos_timer, 0);
+        else if (s_speech_detected)
+        {
+            if (xTimerIsTimerActive(s_eos_timer) == pdFALSE)
+                xTimerStart(s_eos_timer, 0);
+        }
     }
 
     audio_processor_write_pcm(s_processor, (void *)data, samples * sizeof(int16_t));
@@ -190,8 +198,11 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
             break; // 无活跃会话，忽略
         ESP_LOGI(TAG, "收到服务器 started 响应，会话已建立");
 
-        // 服务器不识别 "type":"listen"，"start" 握手已足够建立会话
-        // 直接标记就绪，开始推送音频流
+        // 重置 VAD 状态，忽略唤醒词尾音；500ms 消退期后才开始检测
+        s_speech_detected = false;
+        s_stop_sent = false;
+        s_vad_ready_tick = xTaskGetTickCount();
+
         xEventGroupSetBits(s_session_eg, SESSION_SERVER_READY_BIT);
         xTimerReset(s_session_timer, 0);
         ESP_LOGI(TAG, "服务器就绪，开始推送 Opus 音频流");
@@ -606,6 +617,8 @@ void session_on_wake_word(const char *display)
     ESP_LOGI(TAG, "会话开始 [%s]", display);
     s_state = SESSION_LISTENING;
     s_speech_detected = false;
+    s_stop_sent = false;
+    s_vad_ready_tick = 0; // 等待服务器就绪后才启动 VAD
     xEventGroupClearBits(s_session_eg, SESSION_SERVER_READY_BIT);
 
     // 暂存唤醒词
