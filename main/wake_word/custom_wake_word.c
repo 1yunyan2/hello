@@ -284,6 +284,7 @@ esp_err_t bsp_wake_word_init(wake_word_detected_cb_t cb)
     afe_cfg->vad_init = true;                                 // ★ 开启 VAD 语音活动检测（核心功能）
     afe_cfg->agc_init = false;                                // AGC 暂不开启，避免增益导致底噪放大
     afe_cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM; // 尽量用 PSRAM 省内部 SRAM
+    afe_cfg->vad_mode = VAD_MODE_3;
 
     // 获取 AFE 接口并创建实例
     s_afe_iface = esp_afe_handle_from_config(afe_cfg);

@@ -37,6 +37,8 @@ typedef enum
     PROTOCOL_EVENT_TTS_STOP,           // TTS 播放结束（服务端推送完毕）
     PROTOCOL_EVENT_AUDIO,              // 收到音频二进制数据 (event_data: binary_data_t*)
     PROTOCOL_EVENT_IOT,                // 收到 IoT 控制指令 (event_data: cJSON* 命令列表)
+    PROTOCOL_EVENT_ERROR,              // <-- 新增：错误事件
+    PROTOCOL_EVENT_COMPLETE            // <-- 新增：完成事件
 } protocol_event_t;
 
 // ─── 监听模式类型 ──────────────────────────────────────────────────────────
@@ -64,8 +66,8 @@ typedef enum
  */
 typedef struct
 {
-    void *ptr;    ///< 数据指针（OPUS 音频帧首地址）
-    size_t size;  ///< 数据大小（字节）
+    void *ptr;   ///< 数据指针（OPUS 音频帧首地址）
+    size_t size; ///< 数据大小（字节）
 } binary_data_t;
 
 // ─── 协议实例（前向声明，内部结构在 .c 中定义）────────────────────────────

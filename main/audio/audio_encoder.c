@@ -130,13 +130,13 @@ audio_encoder_t *audio_encoder_create(int sample_rate, int channels)
         .sample_rate = sample_rate,
         .bits_per_sample = BSP_CODEC_BITS_PER_SAMPLE, // 16-bit
         .channel = channels,
-        .bitrate = 32000,                                    // 比特率：32kbps（VoIP 场景推荐值）
-        .frame_duration = ESP_OPUS_ENC_FRAME_DURATION_60_MS, // 帧时长：60ms（每帧 960 采样点）
-        .complexity = 0,                                     // 复杂度：最低，节省 CPU
+        .bitrate = 24000,                                    // 比特率：32kbps（VoIP 场景推荐值）
+        .frame_duration = ESP_OPUS_ENC_FRAME_DURATION_20_MS, // 帧时长：60ms（每帧 960 采样点）
+        .complexity = 3,                                     // 复杂度：最低，节省 CPU
         .application_mode = ESP_OPUS_ENC_APPLICATION_VOIP,   // 应用模式：VoIP（针对语音优化）
         .enable_fec = false,                                 // 禁用前向纠错（有线/WiFi 不需要）
         .enable_dtx = false,                                 // 禁用不连续传输（保持连续流）
-        .enable_vbr = false,                                 // 禁用可变比特率（保证延迟稳定）
+        .enable_vbr = true,                                  // 禁用可变比特率（保证延迟稳定）
     };
 
     // 封装为通用编码器配置

@@ -151,7 +151,19 @@ static void protocol_tts_handler(protocol_t *protocol, cJSON *root)
             protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_TTS_SENTENCE_START, text->valuestring);
     }
 }
+static void protocol_error_handler(protocol_t *protocol, cJSON *root)
+{
+    cJSON *msg = cJSON_GetObjectItem(root, "message");
+    if (cJSON_IsString(msg))
+    {
+        protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_ERROR, msg->valuestring);
+    }
+}
 
+static void protocol_complete_handler(protocol_t *protocol, cJSON *root)
+{
+    protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_COMPLETE, NULL);
+}
 /**
  * @brief 处理 IoT 控制指令消息
  * 提取 commands 数组通知上层执行设备控制操作
@@ -229,6 +241,10 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
                     protocol_tts_handler(protocol, root);
                 else if (strcmp(type->valuestring, "iot") == 0)
                     protocol_iot_handler(protocol, root);
+                else if (strcmp(type->valuestring, "error") == 0)
+                    protocol_error_handler(protocol, root);
+                else if (strcmp(type->valuestring, "complete") == 0)
+                    protocol_complete_handler(protocol, root);
             }
             cJSON_Delete(root);
         }
@@ -356,21 +372,22 @@ void protocol_send_hello(protocol_t *protocol)
     snprintf(toy_id, sizeof(toy_id), "%02X%02X%02X", mac[3], mac[4], mac[5]);
 
     protocol_send_text(protocol,
-                       "{\"type\":\"start\",\"format\":\"opus\",\"sampleRate\":16000,\"toyId\":\"%s\"}",
+                       "{\"type\":\"start\",\"format\":\"pcm\",\"sampleRate\":16000,\"toyId\":\"%s\"}",
                        toy_id);
 }
 
 /** @brief 发送唤醒词通知（type=listen, state=detect） */
 void protocol_send_wake_word(protocol_t *protocol, const char *wake_word)
 {
-    protocol_send_text(protocol, "{\"session_id\":\"%s\",\"state\":\"detect\",\"text\":\"%s\",\"type\":\"listen\"}", protocol->session_id ? protocol->session_id : "", wake_word);
+    // protocol_send_text(protocol, "{\"session_id\":\"%s\",\"state\":\"detect\",\"text\":\"%s\",\"type\":\"listen\"}", protocol->session_id ? protocol->session_id : "", wake_word);
+    ESP_LOGI("Protocol", "本地已唤醒: %s", wake_word);
 }
 
 /** @brief 发送开始监听指令（type=listen, state=start） */
 void protocol_send_start_listening(protocol_t *protocol, protocol_listen_type_t type)
 {
-    static const char *mode_str[] = {"auto", "manual", "realtime"};
-    protocol_send_text(protocol, "{\"mode\":\"%s\",\"session_id\":\"%s\",\"state\":\"start\",\"type\":\"listen\"}", mode_str[type], protocol->session_id ? protocol->session_id : "");
+    // static const char *mode_str[] = {"auto", "manual", "realtime"};
+    // protocol_send_text(protocol, "{\"mode\":\"%s\",\"session_id\":\"%s\",\"state\":\"start\",\"type\":\"listen\"}", mode_str[type], protocol->session_id ? protocol->session_id : "");
 }
 
 /** @brief 发送停止监听指令（type=listen, state=stop） */
