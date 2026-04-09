@@ -530,11 +530,12 @@ static void afe_fetch_task(void *arg)
             input_buffer_len = 0;
         }
 
-        // MultiNet detect 循环：只要积累够一帧就送入检测
+        // MultiNet detect：每次 fetch 最多做 1 次 detect，确保及时回到 fetch()
+        // 避免 detect 循环长时间占用 CPU 导致 AFE ringbuffer 溢出
         int mn_chunksize = multinet_iface->get_samp_chunksize(multinet_model_data);
         bool wake_triggered = false;
 
-        while (input_buffer_len >= mn_chunksize && is_running)
+        if (input_buffer_len >= mn_chunksize && is_running)
         {
             esp_mn_state_t mn_state = multinet_iface->detect(multinet_model_data, input_buffer);
 
@@ -562,10 +563,8 @@ static void afe_fetch_task(void *arg)
             {
                 is_running = false;
                 input_buffer_len = 0;
-                break;
             }
-
-            if (is_running)
+            else
             {
                 size_t remaining = input_buffer_len - mn_chunksize;
                 memmove(input_buffer, &input_buffer[mn_chunksize], remaining * sizeof(int16_t));

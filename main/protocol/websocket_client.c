@@ -376,7 +376,10 @@ void protocol_send_start_listening(protocol_t *protocol, protocol_listen_type_t 
 /** @brief 发送停止监听指令（type=listen, state=stop） */
 void protocol_send_stop_listening(protocol_t *protocol)
 {
-    protocol_send_text(protocol, "{\"session_id\":\"%s\",\"state\":\"stop\",\"type\":\"listen\"}", protocol->session_id ? protocol->session_id : "");
+    // protocol_send_text(protocol, "{\"session_id\":\"%s\",\"state\":\"stop\",\"type\":\"listen\"}", protocol->session_id ? protocol->session_id : "");
+    // 这里保留了 session_id（通常后端追踪会话都需要）
+    protocol_send_text(protocol, "{\"type\":\"stop\"}");
+    // protocol_send_text(protocol, "{\"session_id\":\"%s\",\"type\":\"stop\"}", protocol->session_id ? protocol->session_id : "");
 }
 
 /** @brief 发送 OPUS 音频二进制帧（Binary Frame） */

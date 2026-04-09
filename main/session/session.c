@@ -39,6 +39,7 @@
 #include "nvs.h"
 #include <string.h>
 #include "protocol/auth.h"
+#include "wake_word/custom_wake_word.h"
 #include "object.h"
 #define TAG "Session"
 
@@ -140,24 +141,23 @@ static void on_enhanced_pcm(const int16_t *data, size_t samples)
     if (s_state != SESSION_LISTENING)
         return;
 
-    // 帧能量 VAD 辅助
-    int64_t energy = 0;
-    for (size_t i = 0; i < samples; i++)
-        energy += (int64_t)data[i] * data[i];
-    energy /= (samples > 0 ? samples : 1);
+    // 使用 AFE 内置 WebRTC VAD（比能量阈值更可靠，针对降噪后音频调优）
+    vad_state_t vad = bsp_wake_word_get_vad_state();
 
-    if (energy > 200000)
+    if (vad == VAD_SPEECH)
     {
         if (!s_speech_detected)
         {
             s_speech_detected = true;
-            ESP_LOGD(TAG, "检测到语音活动 (energy=%lld)", energy);
+            ESP_LOGI(TAG, "🎤 AFE VAD 检测到语音活动");
         }
         xTimerStop(s_eos_timer, 0);
     }
     else if (s_speech_detected)
     {
-        xTimerStart(s_eos_timer, 0);
+        // 仅在定时器未运行时启动，避免每帧重置 800ms 倒计时
+        if (xTimerIsTimerActive(s_eos_timer) == pdFALSE)
+            xTimerStart(s_eos_timer, 0);
     }
 
     audio_processor_write_pcm(s_processor, (void *)data, samples * sizeof(int16_t));
@@ -190,12 +190,8 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
             break; // 无活跃会话，忽略
         ESP_LOGI(TAG, "收到服务器 started 响应，会话已建立");
 
-        xSemaphoreTake(s_wake_word_mutex, portMAX_DELAY);
-        protocol_send_wake_word(s_protocol, s_current_wake_word);
-        xSemaphoreGive(s_wake_word_mutex);
-        protocol_send_start_listening(s_protocol, PROTOCOL_LISTEN_TYPE_AUTO);
-
-        // 唤醒发送任务，开始消费 enc_output 中积压的 OPUS 帧
+        // 服务器不识别 "type":"listen"，"start" 握手已足够建立会话
+        // 直接标记就绪，开始推送音频流
         xEventGroupSetBits(s_session_eg, SESSION_SERVER_READY_BIT);
         xTimerReset(s_session_timer, 0);
         ESP_LOGI(TAG, "服务器就绪，开始推送 Opus 音频流");
@@ -310,16 +306,9 @@ static void ws_sender_task(void *arg)
 
     ESP_LOGI(TAG, "服务器已就绪，发送任务运行中");
 
+    int sent_frames = 0;
     while (s_state == SESSION_LISTENING || s_state == SESSION_PLAYING)
     {
-        // todo 为了解决web断开导致opus缓冲区溢出，先去除暂停
-        //  // 断线期间暂停
-        //  if (!(xEventGroupGetBits(s_session_eg) & SESSION_SERVER_READY_BIT))
-        //  {
-        //      vTaskDelay(pdMS_TO_TICKS(100));
-        //      continue;
-        //  }
-
         size_t len = audio_processor_read_timeout(s_processor, buf, sizeof(buf), 100);
         if (len > 0)
         {
@@ -327,10 +316,13 @@ static void ws_sender_task(void *arg)
             {
                 binary_data_t bin = {.ptr = buf, .size = len};
                 protocol_send_audio_data(s_protocol, &bin);
+                sent_frames++;
+                if (sent_frames % 50 == 1) // 每 50 帧（约 3 秒）打印一次
+                    ESP_LOGI(TAG, "OPUS 发送中: frame#%d size=%d", sent_frames, (int)len);
             }
-            // WebSocket 未连接时帧被自然丢弃，保持 enc_output 管道畅通
         }
     }
+    ESP_LOGI(TAG, "发送任务结束，共发送 %d 帧 OPUS", sent_frames);
 
 exit:
     s_sender_handle = NULL;
@@ -436,7 +428,7 @@ static void session_close(void)
         return;
 
     ESP_LOGI(TAG, "关闭会话");
-    s_state = SESSION_IDLE;    // 先置状态，sender 任务循环条件会检测到退出
+    s_state = SESSION_IDLE; // 先置状态，sender 任务循环条件会检测到退出
     s_speech_detected = false;
 
     // 先停止 PCM Hook，防止新数据继续写入已停止的编码器
@@ -554,18 +546,12 @@ void session_init(const char *ws_uri)
     // }
 
     // 【关键】步骤 1：动态拼接 ?token=<accessToken> 到 URL 后面
-    // 使用堆分配，避免在栈上放置大缓冲区（accessToken 可能很长）
-    char *full_ws_uri = (char *)malloc_zeroed(1024);
-    if (full_ws_uri == NULL)
-    {
-        ESP_LOGE(TAG, "full_ws_uri 分配失败");
-        return;
-    }
+    char full_ws_uri[1024] = {0}; // 必须要足够大，因为 accessToken 很长
 
     if (strlen(ws_bearer_token) > 0)
     {
         // 如果有 Token，按后端的格式拼接到网址末尾
-        snprintf(full_ws_uri, 1024, "%s?token=%s", s_ws_uri, ws_bearer_token);
+        snprintf(full_ws_uri, sizeof(full_ws_uri), "%s?token=%s", s_ws_uri, ws_bearer_token);
         // 强制清理末尾可能存在的换行/空格
         for (int i = strlen(full_ws_uri) - 1; i >= 0 && (full_ws_uri[i] == ' ' || full_ws_uri[i] == '\n' || full_ws_uri[i] == '\r'); i--)
         {
@@ -575,7 +561,7 @@ void session_init(const char *ws_uri)
     else
     {
         // 如果没有，就用原网址
-        strncpy(full_ws_uri, s_ws_uri, 1024 - 1);
+        strncpy(full_ws_uri, s_ws_uri, sizeof(full_ws_uri) - 1);
     }
 
     ESP_LOGW(TAG, "最终请求的完整 WebSocket URI: %s", full_ws_uri);
@@ -583,14 +569,6 @@ void session_init(const char *ws_uri)
     // 【关键】步骤 1：用 accessToken 预创建并连接 WebSocket
     // 使用拼接好的完整 URL 去建立连接
     s_protocol = protocol_create(full_ws_uri, ws_bearer_token);
-    free(full_ws_uri); // URI 已被 protocol_create 内部拷贝，可安全释放
-    full_ws_uri = NULL;
-
-    if (s_protocol == NULL)
-    {
-        ESP_LOGE(TAG, "protocol_create 失败，无法建立 WebSocket 连接");
-        return;
-    }
     protocol_register_callback(s_protocol, protocol_event_handler, NULL);
     protocol_connect(s_protocol);
 
@@ -611,8 +589,7 @@ void session_on_wake_word(const char *display)
         if (s_protocol && protocol_is_connected(s_protocol))
         {
             protocol_send_abort_speaking(s_protocol);
-            protocol_send_wake_word(s_protocol, display);
-            protocol_send_start_listening(s_protocol, PROTOCOL_LISTEN_TYPE_AUTO);
+            // 服务器不识别 "type":"listen"，abort 已足够通知服务端停止 TTS
         }
         // 清空解码器缓冲区（停止 TTS 播放）
         audio_processor_flush_output(s_processor);
@@ -651,9 +628,9 @@ void session_on_wake_word(const char *display)
 
     // 创建发送任务
     BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(ws_sender_task, "ws_sender",
-                                    4096, NULL, 5,
-                                    (TaskHandle_t *)&s_sender_handle,
-                                    0, MALLOC_CAP_SPIRAM);
+                                                     4096, NULL, 5,
+                                                     (TaskHandle_t *)&s_sender_handle,
+                                                     0, MALLOC_CAP_SPIRAM);
     if (ret != pdPASS)
     {
         ESP_LOGE(TAG, "发送任务创建失败");

@@ -333,7 +333,7 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
     s_wifi_prov_initialized = true;
 
     // 启动按键监控任务（检测长按 GPIO0 触发 WiFi 重置）
-    xTaskCreatePinnedToCoreWithCaps(button_monitor_task, "btn_task", 4096, NULL, 5, 0, NULL, MALLOC_CAP_SPIRAM);
+    xTaskCreatePinnedToCoreWithCaps(button_monitor_task, "btn_task", 4096, NULL, 5, NULL, 0, MALLOC_CAP_SPIRAM);
 
     // 查询 NVS 中是否已存储过 WiFi 凭证
     bool provisioned = false;
