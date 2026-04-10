@@ -374,7 +374,7 @@ void protocol_send_hello(protocol_t *protocol)
     snprintf(toy_id, sizeof(toy_id), "%02X%02X%02X", mac[3], mac[4], mac[5]);
 
     protocol_send_text(protocol,
-                       "{\"type\":\"start\",\"format\":\"opus\",\"sampleRate\":16000,\"toyId\":\"%s\"}",
+                       "{\"type\":\"start\",\"format\":\"opus\",\"sampleRate\":16000,\"deviceId\":\"%s\"}",
                        toy_id);
 }
 

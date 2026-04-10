@@ -3,6 +3,7 @@ idf_component_register(SRCS
 "bsp/bsp_board.c"
 "bsp/bsp_wifi.c"
 "bsp/bsp_codec.c"
+"bsp/bsp_lcd.c"
 "wake_word/custom_wake_word.c"
 "protocol/mqtt_protocol.c"
 "protocol/websocket_client.c"

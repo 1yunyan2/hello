@@ -6,207 +6,346 @@
 
 static const char *TAG = "BSP_CODEC";
 
-// ==================== 私有硬件初始化函数 ====================
+// ═══════════════════════════════════════════════════════════════════════════════
+// 私有硬件初始化函数（仅在本文件内使用，外部不可见）
+// ═══════════════════════════════════════════════════════════════════════════════
 
+/**
+ * @brief 创建 I2C 主机总线（ES8311 寄存器控制接口）
+ *
+ * ES8311 使用 I2C 接收来自 ESP32 的寄存器读写命令，用于配置：
+ * 工作模式（全双工）、麦克风增益、ADC/DAC 参数等。
+ * I2C 为低速控制总线，仅在初始化阶段使用，运行期间很少调用。
+ *
+ * @param bsp_board  BSP 实例指针（当前未使用，预留扩展用）
+ * @param bus_handle 输出参数：创建成功的 I2C 主机总线句柄
+ * @return void（失败时 ESP_ERROR_CHECK 触发系统重启）
+ *
+ * @note 调用者：bsp_board_codec_init()（内部私有调用）
+ * @note 引脚：SDA=GPIO8，SCL=GPIO15（定义在 bsp_config.h）
+ */
 static void bsp_board_codec_i2c_init(bsp_board_t *bsp_board, i2c_master_bus_handle_t *bus_handle)
 {
-    // 配置 I2C 总线参数（ES8311 控制接口）
+    // ── 配置 I2C 主机总线参数 ────────────────────────────────────────────────
     i2c_master_bus_config_t i2c_bus_config = {
-        .i2c_port = I2C_NUM_0,                // 使用 I2C 端口 0
-        .sda_io_num = BSP_CODEC_SDA_PIN,      // SDA 数据线引脚
-        .scl_io_num = BSP_CODEC_SCL_PIN,      // SCL 时钟线引脚
-        .clk_source = I2C_CLK_SRC_DEFAULT,    // 使用默认时钟源
-        .glitch_ignore_cnt = 7,               // 毛刺滤波计数（过滤线路噪声）
-        .flags.enable_internal_pullup = true, // 启用内部上拉（省去外部电阻）
+        .i2c_port = I2C_NUM_0,                // 使用 I2C 控制器 0（ESP32-S3 共有 2 个）
+        .sda_io_num = BSP_CODEC_SDA_PIN,      // SDA 数据线（GPIO8），双向数据传输
+        .scl_io_num = BSP_CODEC_SCL_PIN,      // SCL 时钟线（GPIO15），单向时钟输出
+        .clk_source = I2C_CLK_SRC_DEFAULT,    // 使用默认时钟源（APB 时钟，约 80MHz）
+        .glitch_ignore_cnt = 7,               // 毛刺滤波：忽略 7 个时钟周期以内的干扰脉冲
+        .flags.enable_internal_pullup = true, // 启用芯片内部上拉电阻，省去外部 4.7kΩ 上拉电阻
     };
-    // 创建 I2C 主机总线，句柄存入 bus_handle 供后续使用
+
+    // ── 创建 I2C 主机总线，句柄输出到 bus_handle ────────────────────────────
+    // 失败原因：引脚被其他外设占用，或 I2C 控制器已初始化
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_config, bus_handle));
 }
 
+/**
+ * @brief 创建 I2S 双向通道（ES8311 音频数据接口）
+ *
+ * I2S（Inter-IC Sound）是专用音频总线，负责传输 PCM 原始音频数据。
+ * 与 I2C 分工：I2C 负责控制（配置寄存器），I2S 负责高速数据流传输。
+ * 同时创建 TX（播放）和 RX（录音）通道，实现全双工音频收发。
+ *
+ * @param bsp_board  BSP 实例指针（当前未使用，预留扩展用）
+ * @param rx_handle  输出参数：创建成功的 I2S 接收通道句柄（麦克风→ESP32）
+ * @param tx_handle  输出参数：创建成功的 I2S 发送通道句柄（ESP32→扬声器）
+ * @return void（失败时 ESP_ERROR_CHECK 触发系统重启）
+ *
+ * @note 调用者：bsp_board_codec_init()（内部私有调用）
+ * @note 引脚：MCLK=GPIO17, BCLK=GPIO9, WS=GPIO5, DIN=GPIO4, DOUT=GPIO6
+ * @note 参数：16kHz / 16-bit / 单声道 Philips 标准格式
+ */
 static void bsp_board_codec_i2s_init(bsp_board_t *bsp_board,
                                      i2s_chan_handle_t *rx_handle,
                                      i2s_chan_handle_t *tx_handle)
 {
-    // 创建 I2S 通道配置（Master 模式，设备编号 0）
+    // ── 步骤 1：配置 I2S 通道基础参数（Master 模式）───────────────────────────
+    // Master 模式：ESP32 提供 BCLK 和 WS 时钟，ES8311 作为 Slave 跟随时钟
     i2s_chan_config_t i2s_chan_config = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
 
-    // 启用回调后自动清零 DMA 缓冲区，防止上一帧数据被循环重放
+    // 启用回调后自动清零 DMA 缓冲区：防止上一帧数据在缓冲区循环时被重复播放
+    // 对于语音对话场景特别重要：避免播放完毕后出现杂音"尾巴"
     i2s_chan_config.auto_clear_after_cb = true;
 
-    // 同时创建发送（TX）和接收（RX）通道，共用同一 I2S 控制器
+    // ── 步骤 2：同时创建 TX（发送）和 RX（接收）通道 ─────────────────────────
+    // 两个通道共享同一 I2S 控制器（I2S_NUM_0），时序严格同步
     ESP_ERROR_CHECK(i2s_new_channel(&i2s_chan_config, tx_handle, rx_handle));
 
-    // 配置 I2S 标准（Philips）模式参数
+    // ── 步骤 3：配置 I2S 标准（Philips 格式）音频参数 ───────────────────────
     i2s_std_config_t std_config = {
-        // 时钟：根据采样率自动计算 MCLK / BCLK 分频
+        // 时钟配置：根据采样率 16kHz 自动计算 MCLK/BCLK 分频比
+        // MCLK = 采样率 × 256 = 4.096 MHz（ES8311 需要的 Master Clock）
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(BSP_CODEC_SAMPLE_RATE),
-        // 槽位：Philips 格式，16-bit，单声道
-        .slot_cfg = I2S_STD_PHILIP_SLOT_DEFAULT_CONFIG(BSP_CODEC_BITS_PER_SAMPLE, I2S_SLOT_MODE_MONO),
-        // GPIO 引脚映射
+
+        // 槽位配置：Philips 格式（数据延迟 1 个 BCLK），16-bit，单声道
+        // 单声道：左右声道数据相同，减少数据量，适合麦克风和单扬声器
+        .slot_cfg = I2S_STD_PHILIP_SLOT_DEFAULT_CONFIG(
+            BSP_CODEC_BITS_PER_SAMPLE, I2S_SLOT_MODE_MONO),
+
+        // GPIO 引脚映射（对应 bsp_config.h 中的引脚定义）
         .gpio_cfg = {
-            .mclk = BSP_CODEC_MCLK_PIN, // 主时钟（提供给 ES8311 作为参考时钟）
-            .bclk = BSP_CODEC_BCLK_PIN, // 位时钟
-            .ws = BSP_CODEC_WS_PIN,     // 字选择（左右声道同步）
-            .dout = BSP_CODEC_DOUT_PIN, // 数据输出（ESP → ES8311 → 扬声器）
-            .din = BSP_CODEC_DIN_PIN,   // 数据输入（麦克风 → ES8311 → ESP）
+            .mclk = BSP_CODEC_MCLK_PIN, // GPIO17：主时钟，ES8311 内部 PLL 参考源
+            .bclk = BSP_CODEC_BCLK_PIN, // GPIO9：位时钟，每个采样位一个脉冲
+            .ws   = BSP_CODEC_WS_PIN,   // GPIO5：字选择/帧同步，16kHz = 16000次/秒切换
+            .dout = BSP_CODEC_DOUT_PIN, // GPIO6：播放数据（ESP32→ES8311→扬声器）
+            .din  = BSP_CODEC_DIN_PIN,  // GPIO4：录音数据（麦克风→ES8311→ESP32）
         },
     };
 
-    // 将 RX / TX 通道分别初始化为标准 I2S 模式
+    // ── 步骤 4：将两个通道初始化为标准 I2S 模式 ──────────────────────────────
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(*rx_handle, &std_config));
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(*tx_handle, &std_config));
 
-    // 使能 RX 通道（开始接收麦克风数据）
-    ESP_ERROR_CHECK(i2s_channel_enable(*rx_handle));
-    // 使能 TX 通道（开始发送播放数据）
-    ESP_ERROR_CHECK(i2s_channel_enable(*tx_handle));
+    // ── 步骤 5：使能通道，开始工作 ───────────────────────────────────────────
+    // 使能后 DMA 开始工作：RX 持续从麦克风采集数据，TX 持续向扬声器输出数据
+    ESP_ERROR_CHECK(i2s_channel_enable(*rx_handle)); // 录音通道：开始采集麦克风数据
+    ESP_ERROR_CHECK(i2s_channel_enable(*tx_handle)); // 播放通道：开始向扬声器输出
 }
 
-// ==================== 公开 BSP 初始化函数 ====================
+// ═══════════════════════════════════════════════════════════════════════════════
+// 公开 BSP 初始化函数
+// ═══════════════════════════════════════════════════════════════════════════════
 
+/**
+ * @brief ES8311 音频编解码器完整初始化（I2C + I2S + Codec 驱动 + 设备句柄）
+ *
+ * 整合 I2C 控制接口、I2S 数据接口和 ES8311 Codec 驱动，创建顶层音频设备句柄。
+ * 使用 esp_codec_dev 中间件层统一管理，上层只需通过 esp_codec_dev_read/write
+ * 操作音频数据，无需直接操作 I2C/I2S 底层 API。
+ *
+ * @param bsp_board BSP 实例指针
+ *                  - 输入：board_status（置位 CODEC_BIT 用）
+ *                  - 输出：codec_dev 字段由此函数填充，后续音频读写依赖此句柄
+ * @return void（任一步骤失败时 ESP_ERROR_CHECK 触发系统重启）
+ *
+ * @note 调用者：bsp_codec.c → audio_init()（内部调用）
+ * @note 完成后置位 CODEC_BIT，通知其他模块音频硬件已就绪
+ * @note codec_dev 全双工：同时支持录音（RX）和播放（TX）
+ */
 void bsp_board_codec_init(bsp_board_t *bsp_board)
 {
-    // ── 步骤 1：创建 I2C 控制总线 ──────────────────────────────────────────
+    // ── 步骤 1：创建 I2C 控制总线（ES8311 寄存器读写接口）────────────────────
     i2c_master_bus_handle_t bus_handle = NULL;
     bsp_board_codec_i2c_init(bsp_board, &bus_handle);
 
-    // 封装 I2C 句柄为 Codec 控制接口（用于向 ES8311 发送寄存器命令）
+    // 将 I2C 总线句柄封装为 Codec 控制接口（统一抽象层）
+    // ES8311_CODEC_DEFAULT_ADDR = 0x18（ES8311 固定 I2C 地址，ADDR 引脚接地）
     audio_codec_i2c_cfg_t i2c_cfg = {
         .bus_handle = bus_handle,
-        .addr = ES8311_CODEC_DEFAULT_ADDR, // ES8311 I2C 地址（默认 0x18）
+        .addr = ES8311_CODEC_DEFAULT_ADDR, // ES8311 I2C 设备地址 0x18
     };
     const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
 
-    // ── 步骤 2：创建 GPIO 控制接口（PA 使能等 GPIO 操作的抽象层）──────────
+    // ── 步骤 2：创建 GPIO 控制接口（功放 PA 使能等 GPIO 操作的抽象层）──────
+    // 即使 PA 引脚未使用（pa_pin = -1），GPIO 接口也必须创建（框架要求）
     const audio_codec_gpio_if_t *gpio_if = audio_codec_new_gpio();
 
-    // ── 步骤 3：配置并创建 ES8311 Codec 驱动实例 ──────────────────────────
+    // ── 步骤 3：创建并配置 ES8311 Codec 驱动实例 ─────────────────────────────
     es8311_codec_cfg_t es8311_cfg = {
-        .ctrl_if = ctrl_if,
-        .gpio_if = gpio_if,
-        .pa_pin = -1,                               // PA 使能引脚（-1 = 不使用，PA 直接连电源）
-        .codec_mode = ESP_CODEC_DEV_WORK_MODE_BOTH, // 全双工：同时支持录音和播放
-        .use_mclk = true,                           // 使用 MCLK 作为 ES8311 时钟参考
+        .ctrl_if    = ctrl_if,                       // I2C 控制接口（寄存器操作）
+        .gpio_if    = gpio_if,                       // GPIO 接口（PA 控制等）
+        .pa_pin     = -1,                            // 功放使能引脚：-1 = 未使用（PA 常开）
+        .codec_mode = ESP_CODEC_DEV_WORK_MODE_BOTH,  // 全双工：同时支持录音和播放
+        .use_mclk   = true,                          // 使用 MCLK 作为 ES8311 内部 PLL 参考
     };
     const audio_codec_if_t *codec_if = es8311_codec_new(&es8311_cfg);
 
-    // ── 步骤 4：创建 I2S 数据通道 ──────────────────────────────────────────
+    // ── 步骤 4：创建 I2S 数据通道（音频 PCM 数据传输接口）───────────────────
     i2s_chan_handle_t rx_handle = NULL, tx_handle = NULL;
     bsp_board_codec_i2s_init(bsp_board, &rx_handle, &tx_handle);
 
-    // 封装 I2S RX/TX 句柄为 Codec 数据接口
+    // 将 I2S TX/RX 句柄封装为 Codec 数据接口（统一抽象层）
     audio_codec_i2s_cfg_t i2s_config = {
-        .rx_handle = rx_handle, // 接收（录音）通道
-        .tx_handle = tx_handle, // 发送（播放）通道
+        .rx_handle = rx_handle, // 接收通道：麦克风采集方向（INPUT）
+        .tx_handle = tx_handle, // 发送通道：扬声器播放方向（OUTPUT）
     };
     const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&i2s_config);
 
-    // ── 步骤 5：创建顶层音频设备句柄，存入 bsp_board 供其他模块使用 ────────
+    // ── 步骤 5：创建顶层音频设备句柄，挂载到 bsp_board ──────────────────────
+    // 顶层句柄整合了控制接口（I2C）和数据接口（I2S），上层只需操作此句柄
     esp_codec_dev_cfg_t codec_config = {
-        .dev_type = ESP_CODEC_DEV_TYPE_IN_OUT, // 同时支持输入（麦克风）和输出（扬声器）
-        .codec_if = codec_if,                  // Codec 控制接口（I2C 寄存器操作）
-        .data_if = data_if,                    // Codec 数据接口（I2S 音频流）
+        .dev_type  = ESP_CODEC_DEV_TYPE_IN_OUT, // 全双工：INPUT（麦克风）+ OUTPUT（扬声器）
+        .codec_if  = codec_if,                  // ES8311 Codec 控制接口
+        .data_if   = data_if,                   // I2S 数据接口
     };
     bsp_board->codec_dev = esp_codec_dev_new(&codec_config);
 
-    // Codec 设备创建失败：硬件连接异常或内存不足，无法继续
+    // ── 步骤 6：检查 codec_dev 是否创建成功 ───────────────────────────────────
     if (bsp_board->codec_dev == NULL)
     {
-        ESP_LOGE(TAG, "Codec 设备创建失败，请检查 ES8311 硬件连接");
-        return;
+        // 可能原因：ES8311 硬件未连接、I2C 地址错误、内存不足
+        ESP_LOGE(TAG, "Codec 设备创建失败，请检查 ES8311 硬件连接（SDA=%d SCL=%d）",
+                 BSP_CODEC_SDA_PIN, BSP_CODEC_SCL_PIN);
+        return; // 不触发 panic，允许系统在无音频情况下继续运行（调试用）
     }
 
-    // 置位 CODEC_BIT，通知其他等待模块 Codec 硬件已就绪
+    // ── 步骤 7：置位 CODEC_BIT，通知其他模块音频硬件已就绪 ──────────────────
     xEventGroupSetBits(bsp_board->board_status, CODEC_BIT);
 }
 
+/**
+ * @brief 检查指定状态位是否全部就绪（AND 等待）
+ *
+ * 封装 FreeRTOS xEventGroupWaitBits() 的 AND 模式等待，
+ * 所有指定位同时满足才返回 true，任一位未满足则返回 false（超时后）。
+ *
+ * @param bsp_board      BSP 实例指针（访问 board_status 事件组）
+ * @param bits_to_check  要检查的位掩码（多个位：NVS_BIT | WIFI_BIT 等）
+ * @param wait_ticks     等待超时（FreeRTOS tick 数）
+ *                       - 0 = 立即检查，不等待
+ *                       - portMAX_DELAY = 永久等待直到满足
+ * @return true  所有指定位均已置位
+ * @return false 超时，部分位尚未置位
+ *
+ * @note 调用者：bsp_wifi.c → bsp_board_wifi_main()（前置条件检查）
+ */
 bool bsp_board_check_status(bsp_board_t *bsp_board, EventBits_t bits_to_check, TickType_t wait_ticks)
 {
-    // 等待指定的状态位全部置位（pdTRUE = AND 等待）
+    // ── 等待所有指定位同时置位（AND 模式）───────────────────────────────────
     EventBits_t bits = xEventGroupWaitBits(
-        bsp_board->board_status,
-        bits_to_check, // 需要检查的位掩码
-        pdFALSE,       // 返回时不清除位
-        pdTRUE,        // 所有位都满足才返回（AND 模式）
-        wait_ticks);   // 超时时间（0 = 立即返回）
+        bsp_board->board_status, // 要等待的事件组
+        bits_to_check,           // 要检查的位掩码
+        pdFALSE,                 // 返回时不清除位（其他模块可能也在等待同一位）
+        pdTRUE,                  // AND 模式：所有位都满足才返回
+        wait_ticks);             // 超时时间
 
-    // 判断所有请求的位是否均已置位
+    // 检查所有请求的位是否均已置位（位运算：返回值与掩码 AND 后等于掩码）
     return (bits & bits_to_check) == bits_to_check;
 }
 
-// ==================== 音频采集任务 ====================
+// ═══════════════════════════════════════════════════════════════════════════════
+// 音频采集任务与完整初始化
+// ═══════════════════════════════════════════════════════════════════════════════
 
-// 录音投喂任务：持续从麦克风读取 PCM 数据，投喂给 AFE + MultiNet 引擎
-// 数据流：I2S麦克风 → audio_feed_task → custom_wake_word_feed → AFE(NS+VAD) → MultiNet + 编码器
+/**
+ * @brief 麦克风采集任务（持续采集 PCM，投喂给 AFE + MultiNet 唤醒引擎）
+ *
+ * 数据流向：I2S DMA → buffer → custom_wake_word_feed()
+ *                               ↓
+ *                          AFE 内部处理：
+ *                           - NS 降噪（消除背景噪音）
+ *                           - VAD 语音活动检测
+ *                          ↓              ↓
+ *                   enhanced_pcm_hook  MultiNet6 检测
+ *                   （→ 编码器入口）   （→ 唤醒词回调）
+ *
+ * @param arg bsp_board_t* 实例指针（通过 arg 传入，使用 codec_dev 读取音频）
+ * @return 无（任务永远运行，除非 FreeRTOS 调度器停止）
+ *
+ * @note 调用者：audio_init() 通过 xTaskCreatePinnedToCore() 自动创建
+ * @note 运行核心：CPU1（避免与 WiFi 协议栈竞争 CPU0）
+ * @note 栈大小：8192 字节，优先级：5
+ * @note chunk_size 来自 AFE 的 feed_chunksize，必须严格按此大小投喂
+ */
 void audio_feed_task(void *arg)
 {
     bsp_board_t *bsp_board = (bsp_board_t *)arg;
 
-    // 【关键】使用 AFE 的 feed chunksize，而非 MultiNet 的 chunksize
-    // AFE 内部要求每次投喂固定大小的帧，否则会报错或丢帧
+    // ── 步骤 1：获取 AFE 要求的每次投喂采样点数 ──────────────────────────────
+    // AFE 内部要求每次 feed 固定数量的采样点（通常是 512 点 = 32ms@16kHz）
+    // 投喂量不对会导致 AFE 内部缓冲溢出或欠采样，产生 VAD 误检
     size_t chunk_size = custom_wake_word_get_feed_chunksize();
     if (chunk_size == 0)
-        chunk_size = 512; // AFE 未就绪时使用安全默认值
+    {
+        // AFE 未就绪时使用安全默认值（避免任务立即 crash）
+        chunk_size = 512;
+        ESP_LOGW(TAG, "AFE 未就绪，使用默认 chunk_size=%d", (int)chunk_size);
+    }
 
-    // 分配音频读取缓冲区（16-bit PCM，单声道）
+    // ── 步骤 2：分配 PCM 采集缓冲区 ─────────────────────────────────────────
+    // 大小 = 采样点数 × 每点字节数（16-bit = 2 字节）
     int16_t *buffer = malloc(chunk_size * sizeof(int16_t));
     if (buffer == NULL)
     {
-        ESP_LOGE(TAG, "audio_feed_task: 内存不足，无法分配音频缓冲区");
-        vTaskDelete(NULL);
+        ESP_LOGE(TAG, "audio_feed_task: 内存不足，无法分配 %d 字节采集缓冲区",
+                 (int)(chunk_size * sizeof(int16_t)));
+        vTaskDelete(NULL); // 分配失败，删除自己避免空指针访问
         return;
     }
 
-    ESP_LOGI(TAG, "音频采集启动 (AFE feed chunk=%d samples)", (int)chunk_size);
+    ESP_LOGI(TAG, "音频采集任务启动 (AFE feed chunk=%d samples, %d bytes)",
+             (int)chunk_size, (int)(chunk_size * sizeof(int16_t)));
 
+    // ── 步骤 3：主采集循环（永不退出）───────────────────────────────────────
     while (1)
     {
-        // 从 Codec 设备读取一帧原始 PCM 数据（阻塞直到数据就绪）
-        esp_err_t ret = esp_codec_dev_read(bsp_board->codec_dev, buffer, chunk_size * sizeof(int16_t));
+        // 从 ES8311 编解码器读取一帧 PCM 数据（阻塞直到 DMA 缓冲区就绪）
+        // esp_codec_dev_read 内部调用 i2s_channel_read，等待 I2S RX DMA 完成
+        esp_err_t ret = esp_codec_dev_read(
+            bsp_board->codec_dev,             // ES8311 设备句柄
+            buffer,                           // 目标缓冲区
+            chunk_size * sizeof(int16_t));    // 读取字节数（固定帧大小）
+
         if (ret == ESP_OK)
         {
-            // 将原始 PCM 投喂给 custom_wake_word_feed
-            // 内部会：AFE feed → AFE fetch(降噪) → MultiNet 检测 + enhanced_pcm_hook
+            // 将原始 PCM 投喂给 AFE + MultiNet 引擎
+            // 内部流程：AFE.feed() → AFE.fetch()（降噪）→ PCM钩子 + MultiNet检测
             custom_wake_word_feed(buffer, chunk_size);
         }
         else
         {
-            // 读取失败（如 DMA 未就绪），延迟 10ms 后重试
+            // 读取失败（DMA 未就绪或 I2S 错误），延迟 10ms 后重试
+            // 避免 CPU 空转，给底层驱动时间恢复
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
+    // 注意：此处代码不可达，malloc 的 buffer 在任务生命周期内始终有效
 }
 
-// 音频完整初始化：硬件初始化 + 打开设备 + 创建采集任务
+/**
+ * @brief 完整音频初始化：硬件 + 设备打开 + 增益设置 + 采集任务
+ *
+ * 依次执行：
+ *   1. bsp_board_codec_init()：初始化 I2C+I2S+ES8311 硬件（置位 CODEC_BIT）
+ *   2. esp_codec_dev_open()：打开音频设备，配置采样参数
+ *   3. 设置麦克风输入增益和扬声器输出音量
+ *   4. xTaskCreatePinnedToCore(audio_feed_task)：启动麦克风采集任务
+ *
+ * @param bsp_board BSP 实例指针（codec_dev 在此函数完成后可用）
+ * @return void
+ *
+ * @note 调用者：application.c → application_init()（步骤 4）
+ * @note 前置条件：bsp_wake_word_init() 必须先完成（采集任务立即向引擎投喂）
+ * @note 采集任务绑定 CPU1，与 WiFi（CPU0）隔离，保证实时性
+ */
 void audio_init(bsp_board_t *bsp_board)
 {
-    ESP_LOGI(TAG, "正在初始化 ES8311 音频...");
+    ESP_LOGI(TAG, "正在初始化 ES8311 音频编解码器...");
 
-    // 步骤 1：初始化 I2C + I2S + ES8311 硬件，置位 CODEC_BIT
+    // ── 步骤 1：硬件初始化（I2C + I2S + ES8311 + codec_dev 句柄）─────────────
     bsp_board_codec_init(bsp_board);
 
-    // 步骤 2：打开音频设备，配置采样参数（采样率/位深/声道）
+    // ── 步骤 2：打开音频设备，配置采样参数 ────────────────────────────────────
+    // open() 会向 ES8311 写入寄存器：配置 ADC/DAC 工作参数、PLL 分频等
     esp_codec_dev_sample_info_t sample_info = {
-        .sample_rate = BSP_CODEC_SAMPLE_RATE,         // 16000 Hz
-        .bits_per_sample = BSP_CODEC_BITS_PER_SAMPLE, // 16-bit
-        .channel = 1,                                 // 单声道
+        .sample_rate    = BSP_CODEC_SAMPLE_RATE,         // 16000 Hz
+        .bits_per_sample = BSP_CODEC_BITS_PER_SAMPLE,   // 16-bit
+        .channel        = 1,                             // 单声道（节省带宽和内存）
     };
     ESP_ERROR_CHECK(esp_codec_dev_open(bsp_board->codec_dev, &sample_info));
 
-    // 步骤 3：设置麦克风增益（40 = ~20dB，适合近讲场景）
+    // ── 步骤 3：设置麦克风增益（40 ≈ 20dB，适合近讲场景）───────────────────
+    // 增益过小：语音信号弱，VAD 和 ASR 识别率下降
+    // 增益过大：产生饱和失真，同样影响识别率
     esp_codec_dev_set_in_gain(bsp_board->codec_dev, 40);
 
-    // 步骤 4：设置扬声器音量（0~100，70 为适中音量）
+    // ── 步骤 4：设置扬声器音量（0~100，60 为适中音量）──────────────────────
+    // 音量过大可能导致 ES8311 内部 DAC 饱和，产生爆音
     esp_codec_dev_set_out_vol(bsp_board->codec_dev, 60);
 
-    ESP_LOGI(TAG, "ES8311 初始化完成！");
+    ESP_LOGI(TAG, "ES8311 初始化完成（增益=40, 音量=60）");
 
-    // 步骤 5：所有硬件就绪后创建音频采集任务（固定到 CPU 核心 1，避免与 WiFi 竞争）
-    // 注意：必须在 codec_dev 完全打开后才创建任务，否则 read 会失败
-    xTaskCreatePinnedToCore(audio_feed_task, "audio_feed",
-                            8192,      // 栈大小（含 DMA 缓冲区，不可太小）
-                            bsp_board, // 传入 bsp_board 指针供任务使用
-                            5,         // 优先级（高于普通任务，保证实时性）
-                            NULL,      // 不需要保存任务句柄
-                            1);        // 绑定到 CPU 核心 1
+    // ── 步骤 5：创建麦克风采集任务 ────────────────────────────────────────────
+    // 任务立即开始从 I2S DMA 读取 PCM 数据并投喂给 AFE/MultiNet
+    // 必须在 codec_dev 完全打开后才能创建，否则 read() 会失败
+    xTaskCreatePinnedToCore(
+        audio_feed_task, // 任务函数
+        "audio_feed",    // 任务名称（用于 FreeRTOS 调试工具显示）
+        8192,            // 栈大小（8KB：含 DMA 缓冲区指针和局部变量）
+        bsp_board,       // 传入 bsp_board 指针（任务需要 codec_dev 读取音频）
+        5,               // 优先级（与编解码任务对称，保证实时性）
+        NULL,            // 不需要保存任务句柄（任务永远运行，无需管理）
+        1);              // 固定到 CPU 核心 1（WiFi 协议栈默认用 CPU0，避免竞争）
 }
