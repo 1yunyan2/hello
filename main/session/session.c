@@ -449,7 +449,7 @@ static void ws_sender_task(void *arg)
             // 【核心阀门机制】
             // 只有当前拥有 SERVER_READY 权限（且连接正常），才往外发包
             if ((xEventGroupGetBits(s_session_eg) & SESSION_SERVER_READY_BIT) &&
-                s_protocol && protocol_is_connected(s_protocol))
+                s_protocol && protocol_is_connected(s_protocol) && !s_stop_sent)
             {
                 binary_data_t bin = {.ptr = buf, .size = len};
                 protocol_send_audio_data(s_protocol, &bin);

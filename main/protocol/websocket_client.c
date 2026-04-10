@@ -235,8 +235,8 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
                     protocol_hello_handler(protocol, root);
                 else if (strcmp(type->valuestring, "llm") == 0)
                     protocol_llm_handler(protocol, root);
-                else if (strcmp(type->valuestring, "stt") == 0)
-                    protocol_stt_handler(protocol, root);
+                // else if (strcmp(type->valuestring, "stt") == 0)
+                //     protocol_stt_handler(protocol, root);
                 else if (strcmp(type->valuestring, "tts") == 0)
                     protocol_tts_handler(protocol, root);
                 else if (strcmp(type->valuestring, "iot") == 0)
@@ -245,6 +245,8 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
                     protocol_error_handler(protocol, root);
                 else if (strcmp(type->valuestring, "complete") == 0)
                     protocol_complete_handler(protocol, root);
+                else if (strcmp(type->valuestring, "transcript") == 0)
+                    protocol_stt_handler(protocol, root); // 假设你的 stt_handler 是处理文字结果的
             }
             cJSON_Delete(root);
         }
@@ -372,7 +374,7 @@ void protocol_send_hello(protocol_t *protocol)
     snprintf(toy_id, sizeof(toy_id), "%02X%02X%02X", mac[3], mac[4], mac[5]);
 
     protocol_send_text(protocol,
-                       "{\"type\":\"start\",\"format\":\"pcm\",\"sampleRate\":16000,\"toyId\":\"%s\"}",
+                       "{\"type\":\"start\",\"format\":\"opus\",\"sampleRate\":16000,\"toyId\":\"%s\"}",
                        toy_id);
 }
 

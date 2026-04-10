@@ -136,7 +136,7 @@ audio_encoder_t *audio_encoder_create(int sample_rate, int channels)
         .application_mode = ESP_OPUS_ENC_APPLICATION_VOIP,   // 应用模式：VoIP（针对语音优化）
         .enable_fec = false,                                 // 禁用前向纠错（有线/WiFi 不需要）
         .enable_dtx = false,                                 // 禁用不连续传输（保持连续流）
-        .enable_vbr = true,                                  // 禁用可变比特率（保证延迟稳定）
+        .enable_vbr = false,                                 // 禁用可变比特率（保证延迟稳定）
     };
 
     // 封装为通用编码器配置
