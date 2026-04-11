@@ -1,64 +1,35 @@
-# Echo2 项目记忆存放点
+# 记忆索引
 
-> 此目录是 Claude Code 自动记忆系统的**可见副本**，方便用户随时查阅。
-> 系统记忆源文件位于：`C:\Users\esthe\.claude\projects\d--new-Echopals-Echo2\memory\`
-
----
-
-## 记忆索引
-
-### 用户信息
 - [用户语言偏好](user_language.md) — 用户是中国人，所有对话必须使用中文
-
-### 用户偏好 / 反馈
+- [项目概况](project_overview.md) — ESP32-S3 智能语音助手，唤醒→ASR→LLM→TTS 完整对话流程
+- [开发环境](reference_dev_env.md) — ESP-IDF v5.3.4 路径和工具链配置
+- [大类指令清单](reference_commands.md) — 10 大类 30 个子能力完整清单
+- [四大场景命令](reference_scenarios.md) — 查看结构/修复bug/添加功能/优化代码
 - [用户偏好风格](feedback_style.md) — 喜欢总分总结构的分析和规划方式
 - [新文件追踪偏好](feedback_new_file_tracking.md) — 每次使用新文件时记住问题并主动总结
 - [自动记忆写入偏好](feedback_auto_memory.md) — 主动记录对话细节、偏好、错误点、修改记录
 - [主动建议偏好](feedback_proactive.md) — 用户鼓励主动发挥，提出良性建议
 - [坑点记录规范](feedback_bug_detail.md) — 所有坑点必须标注精确文件路径和行号
-
-### 项目信息
-- [项目概况](project_overview.md) — ESP32-S3 智能语音助手，唤醒→ASR→LLM→TTS 完整对话流程
-
-### 参考资料
-- [开发环境](reference_dev_env.md) — ESP-IDF v5.3.4 路径和工具链配置
-- [大类指令清单](reference_commands.md) — 10 大类 30 个子能力，说大类名自动全部执行
-- [四大场景命令](reference_scenarios.md) — 查看结构/修复bug/添加功能/优化代码 四大标准流程
-
----
-
-## 踩坑日志 — [ALL_BUGS.md](bugs/ALL_BUGS.md)（合并版，共 33 条）
-
-| 类别 | 数量 | 说明 |
-|------|------|------|
-| 严重（未处理） | 7 | 凭证泄露、崩溃、内存泄漏、死锁 |
-| 历史已修复 | 12 | 分区名、栈溢出、引脚配错、并发 |
-| 中等（待处理） | 14 | 硬编码、缓冲区、返回值未检查 |
-| 低优先级 | 6 | TODO 标记、注释代码 |
-
----
-
-## 决策记录 (`decisions/`)
-
-| 编号 | 决策 | 关键内容 |
-|------|------|---------|
-| [DEC-001](decisions/DEC-001-es8311-codec.md) | ES8311 替代 MAX98357A | 全双工音频，I2C+I2S 双总线，含对比表 |
-| [DEC-002](decisions/DEC-002-opus-codec.md) | OPUS 编码 16kHz/24kbps | 压缩比 10:1，20ms 帧长，含编码参数配置 |
-| [DEC-003](decisions/DEC-003-websocket-realtime.md) | WS 语音 + MQTT 控制 | 双协议分工，含 MQTT 主题设计 |
-| [DEC-004](decisions/DEC-004-bsp-architecture.md) | BSP 板级支持包 | 模块划分、初始化顺序、演进历史 |
-| [DEC-005](decisions/DEC-005-pin-assignment.md) | 引脚分配方案 v2 | 新增舵机×3+震动+铜箔×3+ST7789，移除LED |
-
----
-
-## 每日总结 (`daily/`)
-
-| 日期 | 摘要 |
-|------|------|
-| [2026-04-03](daily/2026-04-03.md) | 记忆系统建设、辅助功能全部启用、33 条坑点提取 |
-
----
-
-## 待处理 TODO
-
-- `main/bsp/bsp_wifi.c:94` — BLE 配网 JSON 参数解析未实现
-- `main/protocol/mqtt_protocol.c:93` — ADC 电池电量映射公式需适配硬件
+- [修改记录写入memory规范](feedback_changes_in_memory.md) — 代码改动必须实时同步到memory/可见文件，不能只留在对话上下文
+- [系统memory与项目memory双写规范](feedback_dual_memory_sync.md) — 写系统memory时必须同步写项目memory，CHANGELOG.html尤其要及时更新
+- [分类指令批量执行](feedback_batch_execute.md) — 说大类名自动执行所有子能力
+- [用户积极性](feedback_enthusiasm.md) — 用户愿意全面启用所有辅助能力
+- [Token预算意识](feedback_token_budget.md) — 回答前先评估token够不够，避免半途浪费
+- 踩坑日志：[BUG-001](bugs/BUG-001.md) 蓝牙释放崩溃 | [BUG-002](bugs/BUG-002.md) SPIFFS内存冲突 | [BUG-003](bugs/BUG-003.md) 任务参数顺序错 | [BUG-004](bugs/BUG-004.md) WS握手类型错 | [BUG-005](bugs/BUG-005.md) HTTP 201未兼容 | [BUG-006](bugs/BUG-006.md) MultiNet CPU占满 | [BUG-007](bugs/BUG-007.md) 唤醒尾音误触EOS
+- 决策记录：[DEC-001](decisions/DEC-001.md) OPUS 24kbps CBR | [DEC-002](decisions/DEC-002.md) 四层环形缓冲 | [DEC-003](decisions/DEC-003.md) Token双重刷新 | [DEC-004](decisions/DEC-004.md) AFE WebRTC VAD | [DEC-005](decisions/DEC-005.md) GPIO引脚分配
+- [Bug汇总索引](bugs/ALL_BUGS.md) — BUG-001~007 快速查表，按模块分类
+- [CHANGELOG.html](CHANGELOG.html) — 可点击查看每次提交的修改前后 diff（浏览器打开）
+- [早期历史 2026-03-17~03-31](daily/2026-03-17_to_03-31.md) — 项目起步→BSP体系→音频三层架构，14次提交+4个早期坑点
+- [每日总结 2026-04-03](daily/2026-04-03.md) — 记忆系统建设、全部辅助功能启用
+- [每日总结 2026-04-06](daily/2026-04-06.md) — WebSocket提交+session大改未提交+LCD新增
+- [每日总结 2026-04-07](daily/2026-04-07.md) — auth健壮性+WS地址切换+LCD新增，认证全链路打通
+- [每日总结 2026-04-08](daily/2026-04-08.md) — AFE集成+PCM数据流重构+WS握手协议修复+内存安全增强
+- [每日总结 2026-04-09](daily/2026-04-09.md) — VAD延迟启动+AFE WebRTC VAD+OPUS参数调优+session事件队列
+- [每日总结 2026-04-10](daily/2026-04-10.md) — 禁用VBR+协议修复+LCD BSP集成+大规模文档补全
+- [每日总结 2026-04-11](daily/2026-04-11.md) — LCD业务层+触摸/舵机模块+端到端链路联调
+- [总结自动流程](feedback_summary_flow.md) — 说"总结"自动记忆+提交+坑点记录，无需询问
+- [总结文档放置规范](feedback_summary_placement.md) — 总结放 memory/ 目录，更新时保留旧版本并注释相似点
+- [周报 W14](weekly/2026-W14.md) — 音频模块→WebSocket协议栈全链路搭建，7次提交
+- [Token刷新机制](project_token_refresh.md) — accessToken 2h过期，主动+被动双重刷新
+- [项目全量技术总结 v1 2026-04-10](summaries/project_full_summary.md) — 总分总结构，5模块详解+设计亮点+技术难点+文件速查
+- [项目目录结构](reference_project_structure.md) — 完整目录树+模块依赖关系+数据流+关键文件速查（2026-04-11基准）

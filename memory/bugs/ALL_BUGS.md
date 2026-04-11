@@ -206,7 +206,7 @@
 ### BUG-023 | TODO: ADC 电池电量映射公式
 - **位置**: `main/protocol/mqtt_protocol.c:93`
 
-### BUG-024 | 注释掉的 bsp_wake_word_start()
+### BUG-024 | 注释掉的 wake_word_start()
 - **位置**: `main/application.c:61`
 
 ### BUG-025 | 注释掉的 power_monitor_init()
@@ -236,3 +236,46 @@
 | 中等（待处理） | 14 | 稳定性和健壮性 |
 | 低优先级 | 6 | TODO 和代码清理 |
 | **合计** | **33** | |
+
+---
+
+## 开发期 BUG 修复时间线（BUG-001~007）
+
+> 以下为 2026-04 开发期实际踩坑记录，独立详情见 `bugs/BUG-XXX.md`
+
+### 2026-04-07（提交 `d5adbba`）
+| 类型 | 内容 | 文件 |
+|------|------|------|
+| 修复 [BUG-005](BUG-005.md) | HTTP 认证兼容 201 状态码 | `auth.c:74` `auth.c:182` |
+| 新增 | LCD 驱动初始代码 | `bsp_lcd.c`（新文件） |
+| 改进 | WS 连接地址切换为带 Token 的正式接口 | `application.c:93` |
+
+### 2026-04-08（提交 `e96b8bc` `0bbfe76`）
+| 类型 | 内容 | 文件 |
+|------|------|------|
+| 修复 [BUG-004](BUG-004.md) | WS 握手 `"type":"hello"` → `"type":"started"` | `websocket_client.c` |
+| 修复 [BUG-003](BUG-003.md) | `xTaskCreatePinnedToCoreWithCaps` 参数顺序修正 | `bsp_wifi.c` |
+| 集成 | ESP-AFE 音频前端框架（NS 降噪 + WebRTC VAD） | `custom_wake_word.c/h` |
+| 改进 | 音频发送超时 10s → 100ms | `websocket_client.c` |
+| 改进 | 编解码器创建失败回滚逻辑（防内存泄漏） | `audio_processor.c` |
+| 修复 | 重连任务内存泄漏，堆分配替代栈分配 | `session.c` |
+
+### 2026-04-09（提交 `24d10cc` `aee301c` `0153c28`）
+| 类型 | 内容 | 文件 |
+|------|------|------|
+| 修复 [BUG-006](BUG-006.md) | MultiNet 每次 fetch 限制 1 次 detect，防 CPU 占满 | `custom_wake_word.c` |
+| 修复 [BUG-007](BUG-007.md) | 引入 VAD_GRACE_MS=500ms 消退保护期 | `session.c` |
+| 改进 | session 事件队列架构（定时器只 xQueueSend，防栈溢出） | `session.c` |
+| 调参 | OPUS 比特率 32→24kbps，复杂度 0→3 | `audio_encoder.c` |
+| ⚠️ 临时错误 | 启用 VBR — 次日发现延迟抖动，已回退 | `audio_encoder.c` |
+| ⚠️ 临时错误 | 数据格式改为 `pcm` — 次日改回 `opus` | `websocket_client.c` |
+
+### 2026-04-10（提交 `7279cc6` `a884816`）
+| 类型 | 内容 | 文件 |
+|------|------|------|
+| 回退修复 | 禁用 VBR（昨日开启后发现延迟抖动），确立 DEC-001 | `audio_encoder.c` |
+| 回退修复 | 音频格式从 `pcm` 改回 `opus`（协议对齐） | `websocket_client.c` |
+| 修复 | 新增 `transcript` 类型路由到 stt 处理器 | `websocket_client.c` |
+| 修复 | ws_sender_task 增加 `!s_stop_sent` 防重复发送 | `session.c` |
+| 集成 | `bsp_lcd.c` 加入 CMakeLists（ST7789 驱动正式入构建） | `CMakeLists.txt` |
+| 文档 | 13 个文件大规模注释补全（+1553 行） | 全模块 |
