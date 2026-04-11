@@ -88,9 +88,9 @@ static void bsp_board_codec_i2s_init(bsp_board_t *bsp_board,
         .gpio_cfg = {
             .mclk = BSP_CODEC_MCLK_PIN, // GPIO17：主时钟，ES8311 内部 PLL 参考源
             .bclk = BSP_CODEC_BCLK_PIN, // GPIO9：位时钟，每个采样位一个脉冲
-            .ws   = BSP_CODEC_WS_PIN,   // GPIO5：字选择/帧同步，16kHz = 16000次/秒切换
+            .ws = BSP_CODEC_WS_PIN,     // GPIO5：字选择/帧同步，16kHz = 16000次/秒切换
             .dout = BSP_CODEC_DOUT_PIN, // GPIO6：播放数据（ESP32→ES8311→扬声器）
-            .din  = BSP_CODEC_DIN_PIN,  // GPIO4：录音数据（麦克风→ES8311→ESP32）
+            .din = BSP_CODEC_DIN_PIN,   // GPIO4：录音数据（麦克风→ES8311→ESP32）
         },
     };
 
@@ -144,17 +144,22 @@ void bsp_board_codec_init(bsp_board_t *bsp_board)
 
     // ── 步骤 3：创建并配置 ES8311 Codec 驱动实例 ─────────────────────────────
     es8311_codec_cfg_t es8311_cfg = {
-        .ctrl_if    = ctrl_if,                       // I2C 控制接口（寄存器操作）
-        .gpio_if    = gpio_if,                       // GPIO 接口（PA 控制等）
-        .pa_pin     = -1,                            // 功放使能引脚：-1 = 未使用（PA 常开）
-        .codec_mode = ESP_CODEC_DEV_WORK_MODE_BOTH,  // 全双工：同时支持录音和播放
-        .use_mclk   = true,                          // 使用 MCLK 作为 ES8311 内部 PLL 参考
+        .ctrl_if = ctrl_if,                         // I2C 控制接口（寄存器操作）
+        .gpio_if = gpio_if,                         // GPIO 接口（PA 控制等）
+        .pa_pin = -1,                               // 功放使能引脚：-1 = 未使用（PA 常开）
+        .codec_mode = ESP_CODEC_DEV_WORK_MODE_BOTH, // 全双工：同时支持录音和播放
+        .use_mclk = true,                           // 使用 MCLK 作为 ES8311 内部 PLL 参考
     };
     const audio_codec_if_t *codec_if = es8311_codec_new(&es8311_cfg);
 
     // ── 步骤 4：创建 I2S 数据通道（音频 PCM 数据传输接口）───────────────────
     i2s_chan_handle_t rx_handle = NULL, tx_handle = NULL;
     bsp_board_codec_i2s_init(bsp_board, &rx_handle, &tx_handle);
+
+    // 保存 TX 句柄到 bsp_board，供 play_task 绕过 codec_dev mutex 直接写入
+    // 背景：codec_dev(IN_OUT) read/write 共享同一把 mutex，play_task 持锁 ~64ms
+    //       会导致 audio_feed_task 无法及时 read，AFE FEED ringbuffer 溢出
+    bsp_board->i2s_tx_handle = tx_handle;
 
     // 将 I2S TX/RX 句柄封装为 Codec 数据接口（统一抽象层）
     audio_codec_i2s_cfg_t i2s_config = {
@@ -166,9 +171,9 @@ void bsp_board_codec_init(bsp_board_t *bsp_board)
     // ── 步骤 5：创建顶层音频设备句柄，挂载到 bsp_board ──────────────────────
     // 顶层句柄整合了控制接口（I2C）和数据接口（I2S），上层只需操作此句柄
     esp_codec_dev_cfg_t codec_config = {
-        .dev_type  = ESP_CODEC_DEV_TYPE_IN_OUT, // 全双工：INPUT（麦克风）+ OUTPUT（扬声器）
-        .codec_if  = codec_if,                  // ES8311 Codec 控制接口
-        .data_if   = data_if,                   // I2S 数据接口
+        .dev_type = ESP_CODEC_DEV_TYPE_IN_OUT, // 全双工：INPUT（麦克风）+ OUTPUT（扬声器）
+        .codec_if = codec_if,                  // ES8311 Codec 控制接口
+        .data_if = data_if,                    // I2S 数据接口
     };
     bsp_board->codec_dev = esp_codec_dev_new(&codec_config);
 
@@ -255,6 +260,13 @@ void audio_feed_task(void *arg)
     }
 
     // ── 步骤 2：分配 PCM 采集缓冲区 ─────────────────────────────────────────
+
+    // // 【修改点 1】增加通道数变量，计算真实的字节数
+    // int feed_channel = 2; // 因为配了 "MR"，这里必须是 2
+    // size_t alloc_size = chunk_size * feed_channel * sizeof(int16_t);
+
+    // // 【修改点 2】按新计算的大小分配内存
+    // int16_t *buffer = malloc(alloc_size);
     // 大小 = 采样点数 × 每点字节数（16-bit = 2 字节）
     int16_t *buffer = malloc(chunk_size * sizeof(int16_t));
     if (buffer == NULL)
@@ -274,9 +286,11 @@ void audio_feed_task(void *arg)
         // 从 ES8311 编解码器读取一帧 PCM 数据（阻塞直到 DMA 缓冲区就绪）
         // esp_codec_dev_read 内部调用 i2s_channel_read，等待 I2S RX DMA 完成
         esp_err_t ret = esp_codec_dev_read(
-            bsp_board->codec_dev,             // ES8311 设备句柄
-            buffer,                           // 目标缓冲区
-            chunk_size * sizeof(int16_t));    // 读取字节数（固定帧大小）
+            bsp_board->codec_dev,        // ES8311 设备句柄
+            buffer,                      // 目标缓冲区
+            chunk_size * sizeof(int16_t) // 读取字节数（固定帧大小）
+            // alloc_size
+        );
 
         if (ret == ESP_OK)
         {
@@ -307,7 +321,7 @@ void audio_feed_task(void *arg)
  * @return void
  *
  * @note 调用者：application.c → application_init()（步骤 4）
- * @note 前置条件：bsp_wake_word_init() 必须先完成（采集任务立即向引擎投喂）
+ * @note 前置条件：wake_word_init() 必须先完成（采集任务立即向引擎投喂）
  * @note 采集任务绑定 CPU1，与 WiFi（CPU0）隔离，保证实时性
  */
 void audio_init(bsp_board_t *bsp_board)
@@ -320,9 +334,9 @@ void audio_init(bsp_board_t *bsp_board)
     // ── 步骤 2：打开音频设备，配置采样参数 ────────────────────────────────────
     // open() 会向 ES8311 写入寄存器：配置 ADC/DAC 工作参数、PLL 分频等
     esp_codec_dev_sample_info_t sample_info = {
-        .sample_rate    = BSP_CODEC_SAMPLE_RATE,         // 16000 Hz
-        .bits_per_sample = BSP_CODEC_BITS_PER_SAMPLE,   // 16-bit
-        .channel        = 1,                             // 单声道（节省带宽和内存）
+        .sample_rate = BSP_CODEC_SAMPLE_RATE,         // 16000 Hz
+        .bits_per_sample = BSP_CODEC_BITS_PER_SAMPLE, // 16-bit
+        .channel = 1,                                 // 单声道（节省带宽和内存）
     };
     ESP_ERROR_CHECK(esp_codec_dev_open(bsp_board->codec_dev, &sample_info));
 

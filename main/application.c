@@ -9,7 +9,7 @@
  *   BSP → NVS → 唤醒词引擎 → 音频硬件 → WiFi → MQTT → Session → 电源监测
  *
  * 修复记录:
- *   - BUG-024: 显式调用 bsp_wake_word_start() 确保引擎进入监听态
+ *   - BUG-024: 显式调用 wake_word_start() 确保引擎进入监听态
  *   - BUG-025: 启用 power_monitor_init() 电源监测
  */
 
@@ -41,7 +41,7 @@ static void wake_word_callback(const char *wake_word_display)
 {
     ESP_LOGW("WAKE_UP", "唤醒词触发: [%s]", wake_word_display);
 
-    // 会话结束后由 session_close 内部调用 bsp_wake_word_start 恢复监听
+    // 会话结束后由 session_close 内部调用 wake_word_start 恢复监听
     session_on_wake_word(wake_word_display);
 }
 
@@ -65,12 +65,12 @@ void application_init(void)
 
     // 步骤 3:初始化唤醒词引擎,注册触发回调
     // 从 NVS 加载上次保存的唤醒词和语言,加载对应 MultiNet6 模型
-    bsp_wake_word_init(wake_word_callback);
+    wake_word_init(wake_word_callback);
 
     // 【BUG-024 修复】显式启动唤醒词引擎监听
-    // 原代码此处被注释,依赖 bsp_wake_word_init 内部隐式启动,
+    // 原代码此处被注释,依赖 wake_word_init 内部隐式启动,
     // 在重构后该假设不再成立 → 显式调用确保监听态
-    bsp_wake_word_start();
+    wake_word_start();
     PRINT_INTERNAL_HEAP;
 
     // 步骤 4:初始化音频硬件(I2C + I2S + ES8311 Codec)并启动麦克风采集任务

@@ -1,16 +1,11 @@
 /**
  * @file auth.c
- * @brief 设备认证模块 — 用 deviceToken 换取 accessToken
+ * @brief 设备认证模块实现 — 用 deviceToken 换取 accessToken
  *
  * 整体流程：
- *   App 绑定玩具时下发 deviceToken（长期凭证，存在 NVS）
- *   设备每次联网后，拿 deviceToken 调用后端 HTTP 接口换取 accessToken（短效凭证）
- *   accessToken 用于 WebSocket 连接的 Bearer 认证
- *
- * 接口信息：
- *   POST http://122.224.191.2:4888/api/auth/device-login
- *   请求体: {"deviceToken": "xxx"}
- *   响应体: {"accessToken": "yyy"} 或 {"data": {"accessToken": "yyy"}}
+ * App 绑定玩具时下发 deviceToken（长期凭证，存在 NVS）
+ * 设备每次联网后，拿 deviceToken 调用后端 HTTP 接口换取 accessToken（短效凭证）
+ * accessToken 用于 WebSocket 连接的 Bearer 认证
  */
 
 #include "auth.h"
@@ -20,47 +15,33 @@
 #include "cJSON.h"
 #include "nvs.h"
 
+/** @brief 模块日志标签 */
 #define TAG "Auth"
 
 /**
- * @brief 内部扩展结构体（对外隐藏实现细节）
+ * @brief 内部扩展结构体（面向对象封装设计）
  *
- * auth_t 是公开的，只暴露 access_token 字段；
- * auth_wrapper_t 在此基础上追加了 HTTP 响应缓冲区，
- * 通过强制类型转换 (auth_t*) ↔ (auth_wrapper_t*) 实现"继承"。
- *
- * 内存布局：
- *   ┌─────────────────────┐
- *   │ auth_t              │  ← 对外可见部分
- *   │   └─ access_token   │
- *   ├─────────────────────┤
- *   │ response            │  ← 内部私有：HTTP 响应体缓冲区指针
- *   │ response_len        │  ← 内部私有：已接收的响应体长度
- *   └─────────────────────┘
+ * auth_t 对外公开；auth_wrapper_t 在此基础上追加了 HTTP 响应相关的运行时缓冲区。
  */
 typedef struct
 {
-    auth_t auth;         // 基类，包含 access_token
-    char *response;      // HTTP 响应体动态缓冲区（realloc 拼接）
-    size_t response_len; // 当前已接收的响应体字节数
+    auth_t auth;         ///< 基类，包含对外的 access_token
+    char *response;      ///< 内部私有：HTTP 响应体动态缓冲区（通过 realloc 拼接）
+    size_t response_len; ///< 内部私有：当前已接收的响应体字节数
 } auth_wrapper_t;
 
 /**
- * @brief HTTP 事件回调 — 负责将分片到达的响应数据拼接成完整 JSON
- *
- * esp_http_client 的数据是分块到达的（chunked transfer），
- * 每收到一块数据触发 HTTP_EVENT_ON_DATA，我们用 realloc 动态扩展缓冲区，
- * 把碎片拼接在一起，最终在 auth_perform() 中统一解析。
- *
- * 回调时序：
- *   HTTP_EVENT_ON_DATA  → 可能触发多次，每次追加数据到 response
- *   HTTP_EVENT_ON_FINISH → 请求完成，打印完整响应（调试用）
- *   HTTP_EVENT_ERROR     → 网络/协议错误
+ * @brief HTTP 客户端事件回调
+ * * @param[in] evt HTTP 客户端事件指针，包含事件类型、数据等信息
+ * @return esp_err_t 总是返回 ESP_OK（内存不足导致拼接失败会记录但不中断整个框架机制）
+ * @note 调用者：ESP HTTP Client 底层回调触发
  */
 static esp_err_t auth_http_event_handler(esp_http_client_event_t *evt)
 {
-    /* user_data 在 esp_http_client_config_t 中设置，指向我们的 wrapper */
+    // ─── 逻辑块 1：获取绑定的扩展实例 ────────────────────────────
+    // 说明：从 evt->user_data 强转取出我们的内部封装结构 auth_wrapper_t
     auth_wrapper_t *wrapper = (auth_wrapper_t *)evt->user_data;
+
     switch (evt->event_id)
     {
     case HTTP_EVENT_ERROR:
@@ -69,18 +50,19 @@ static esp_err_t auth_http_event_handler(esp_http_client_event_t *evt)
 
     case HTTP_EVENT_ON_DATA:
     {
-        /* 非 200 状态码的响应体不需要收集（可能是错误页面 HTML） */
+        // ─── 逻辑块 2：处理分块传输到达的数据 ────────────────────────
+        // 说明：校验状态码（仅收录 200/201 的正常 JSON 体）。扩展缓冲区内存大小并将新的 chunk 拷入末尾。
+        // API：esp_http_client_get_status_code, realloc, memcpy
+        // 数据：修改 wrapper->response 和 wrapper->response_len
         int status_code = esp_http_client_get_status_code(evt->client);
         if (status_code != 200 && status_code != 201)
             return ESP_OK;
 
-        /* 动态扩展缓冲区：原有长度 + 本次收到的长度 */
         size_t new_len = wrapper->response_len + evt->data_len;
         char *new_buffer = realloc(wrapper->response, new_len);
         if (!new_buffer)
             return ESP_FAIL; // 内存不足，通知上层失败
 
-        /* 把本次数据追加到缓冲区尾部 */
         memcpy(new_buffer + wrapper->response_len, evt->data, evt->data_len);
         wrapper->response = new_buffer;
         wrapper->response_len = new_len;
@@ -88,7 +70,8 @@ static esp_err_t auth_http_event_handler(esp_http_client_event_t *evt)
     }
 
     case HTTP_EVENT_ON_FINISH:
-        /* 请求完成，打印完整响应便于调试 */
+        // ─── 逻辑块 3：请求接收完毕 ──────────────────────────────────
+        // 说明：日志打印完整的响应体，便于调试。
         ESP_LOGI(TAG, "Auth API Response: %.*s", wrapper->response_len, wrapper->response);
         break;
 
@@ -98,130 +81,117 @@ static esp_err_t auth_http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-// ─── 公开 API ──────────────────────────────────────────────────────────────
-
 /**
  * @brief 创建认证实例
- * @return auth_t* 认证实例指针（实际分配的是 auth_wrapper_t，内部扩展）
+ * * @param 无
+ * @return auth_t* 认证实例指针
+ * @note 调用者：session.c -> session_init(), session_reconnect_task()
  */
 auth_t *auth_create(void)
 {
+    // 说明：通过 object.h 的 malloc_zeroed 在 SPIRAM 分配空间（强制转换为基类暴露给外部）
     auth_wrapper_t *wrapper = malloc_zeroed(sizeof(auth_wrapper_t));
     return (auth_t *)wrapper;
 }
 
 /**
- * @brief 销毁认证实例，释放所有动态内存
- * @param auth 认证实例指针
+ * @brief 销毁认证实例并释放内存
+ * * @param[in] auth 认证实例指针
+ * @return 无
+ * @note 调用者：session.c -> session_init(), session_reconnect_task()
  */
 void auth_destroy(auth_t *auth)
 {
+    // 说明：强转回 wrapper 类型，彻底释放结构体中管理的子内存后，再释放本体
     auth_wrapper_t *wrapper = (auth_wrapper_t *)auth;
-    free(wrapper->response);          // 释放 HTTP 响应缓冲区
-    free(wrapper->auth.access_token); // 释放 accessToken 字符串
-    free(wrapper);                    // 释放结构体本身
+    free(wrapper->response);
+    free(wrapper->auth.access_token);
+    free(wrapper);
 }
 
 /**
- * @brief 执行设备登录 — 用 deviceToken 换取 accessToken
- *
- * 完整流程：
- *   1. 构建 JSON 请求体 {"deviceToken": "xxx"}
- *   2. POST 到后端 /api/auth/device-login
- *   3. 解析响应 JSON，提取 accessToken
- *   4. 成功则存入 NVS 缓存（下次启动可作为备用）
- *
- * 调用后通过 auth->access_token 获取结果：
- *   - 非 NULL → 登录成功
- *   - NULL    → 登录失败（网络错误/服务端拒绝/JSON解析失败）
- *
- * @param auth         认证实例指针
- * @param device_token App 绑定时下发的长期凭证（从 NVS 读取）
+ * @brief 发起 HTTP 请求，执行登录获取 AccessToken
+ * * @param[in,out] auth         认证实例指针
+ * @param[in]     device_token NVS 中缓存的长期凭证
+ * @return 无
+ * @note 调用者：session.c -> session_init(), session_reconnect_task()
  */
 void auth_perform(auth_t *auth, const char *device_token)
 {
     auth_wrapper_t *wrapper = (auth_wrapper_t *)auth;
 
-    /* 清空上一次的响应缓冲区（支持重复调用） */
+    // ─── 逻辑块 1：清空历史状态 ──────────────────────────────────
+    // 说明：释放并重置 response 内部缓冲，确保对象能够重复用于下一次请求。
+    // API：free
     free(wrapper->response);
     wrapper->response = NULL;
     wrapper->response_len = 0;
 
-    // ── 第一步：配置并发起 HTTP POST 请求 ──────────────────────────────────
-
+    // ─── 逻辑块 2：配置并发起 HTTP POST 请求 ─────────────────────
+    // 说明：组装 JSON 格式的 deviceToken 字段，调用 ESP-IDF HTTP 客户端发起 POST 阻塞请求。
+    // API：esp_http_client_init, esp_http_client_set_header, cJSON_CreateObject, cJSON_AddStringToObject, cJSON_PrintUnformatted, esp_http_client_set_post_field, esp_http_client_perform, esp_http_client_cleanup
+    // 数据：构建 post_body 字符串用于请求体发送。
     esp_http_client_config_t config = {
-        .url = AUTH_LOGIN_URL,                    // "http://122.224.191.2:4888/api/auth/device-login"
-        .method = HTTP_METHOD_POST,               // POST 方法
-        .event_handler = auth_http_event_handler, // 数据到达时的回调
-        .user_data = wrapper,                     // 回调中通过 evt->user_data 拿到 wrapper
+        .url = AUTH_LOGIN_URL,
+        .method = HTTP_METHOD_POST,
+        .event_handler = auth_http_event_handler,
+        .user_data = wrapper,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_http_client_set_header(client, "Content-Type", "application/json");
 
-    /* 构建请求体 JSON: {"deviceToken": "xxx"} */
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "deviceToken", device_token);
-    char *post_body = cJSON_PrintUnformatted(root); // 序列化为字符串（无格式化）
-    cJSON_Delete(root);                             // JSON 对象用完即释放
+    char *post_body = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
 
-    /* 发送请求（阻塞式，返回时数据已全部收到） */
     esp_http_client_set_post_field(client, post_body, strlen(post_body));
     esp_err_t ret = esp_http_client_perform(client);
-    free(post_body); // 请求发完，释放请求体
+    free(post_body);
 
     int status_code = esp_http_client_get_status_code(client);
-    esp_http_client_cleanup(client); // 释放 HTTP 客户端资源
+    esp_http_client_cleanup(client);
 
-    /* 检查请求结果 */
     if (ret != ESP_OK)
     {
         ESP_LOGW(TAG, "Auth 请求发送失败: %s", esp_err_to_name(ret));
         return;
     }
-    // 检查 HTTP 状态码 ，标准协议200为ok
     if (status_code != 200 && status_code != 201)
     {
         ESP_LOGW(TAG, "Auth 请求失败，HTTP 状态码: %d", status_code);
         return;
     }
 
-    // ── 第二步：解析响应 JSON，提取 accessToken ────────────────────────────
-
+    // ─── 逻辑块 3：解析响应 JSON，提取并持久化 accessToken ──────────
+    // 说明：利用 cJSON 解析返回数据（兼容多层结构格式），提取到 token 后立即缓存至 NVS 中作为兜底机制。
+    // API：cJSON_ParseWithLength, cJSON_GetObjectItem, strdup, nvs_open, nvs_set_str, nvs_commit, nvs_close, cJSON_Delete
+    // 数据：修改 wrapper->auth.access_token，并在 NVS 写入。
     cJSON *resp_json = cJSON_ParseWithLength(wrapper->response, wrapper->response_len);
     if (resp_json)
     {
-        /*
-         * 兼容后端两种可能的响应格式：
-         *   格式 A: {"accessToken": "yyy"}           ← 直接在顶层
-         *   格式 B: {"data": {"accessToken": "yyy"}} ← 嵌套在 data 里
-         */
-        // todo：A 尝试获取 accessToken
         cJSON *token_item = cJSON_GetObjectItem(resp_json, "accessToken");
         if (!token_item)
         {
-            // todo：B 尝试获取 data
             cJSON *data_item = cJSON_GetObjectItem(resp_json, "data");
             if (data_item)
-                // todo 尝试获取 data.accessToken
                 token_item = cJSON_GetObjectItem(data_item, "accessToken");
         }
 
         if (cJSON_IsString(token_item))
         {
-            /* 拿到 accessToken，复制一份存到 auth 结构体 */
             free(wrapper->auth.access_token);
             wrapper->auth.access_token = strdup(token_item->valuestring);
             ESP_LOGI(TAG, "✅ 成功拿到 accessToken: %s", wrapper->auth.access_token);
 
-            // ── 第三步：存入 NVS 缓存（断网时可用旧 token 兜底）────────────
             nvs_handle_t h;
             if (nvs_open("net_config", NVS_READWRITE, &h) == ESP_OK)
             {
                 nvs_set_str(h, "access_token", wrapper->auth.access_token);
-                nvs_commit(h); // 写入闪存（不 commit 只在 RAM 中）
+                nvs_commit(h);
                 nvs_close(h);
             }
         }
-        cJSON_Delete(resp_json); // 释放 JSON 解析树
+        cJSON_Delete(resp_json);
     }
 }

@@ -26,6 +26,7 @@
 #include "freertos/ringbuf.h"
 #include "object.h"
 #include "bsp/bsp_board.h"
+#include "driver/i2s_std.h"
 #include "esp_log.h"
 
 #define TAG "Audio Processor"
@@ -38,8 +39,12 @@
 // ─── 环形缓冲区大小配置（单位：字节）────────────────────────────────────────
 #define ENC_INPUT_BUF_SIZE 20480  // 编码器输入（原始 PCM）：~640ms @16kHz 单声道
 #define ENC_OUTPUT_BUF_SIZE 8192  // 编码器输出（OPUS 帧）：增大以容纳 Hello 握手期间积压的帧
-#define DEC_INPUT_BUF_SIZE 5120   // 解码器输入（OPUS 帧）：云端下发的音频缓冲
+#define DEC_INPUT_BUF_SIZE 16384  //! 原为5120 解码器输入（OPUS 帧）：云端下发的音频缓冲,
 #define DEC_OUTPUT_BUF_SIZE 40960 // 解码器输出（PCM 播放）：~1.28s 缓冲，保证播放流畅
+// AEC 参考缓冲区：play_task 写入 I2S 时同步推送一份副本，audio_feed_task 读取后
+// 作为 AFE AEC 算法的参考信号（从麦克风中消除扬声器回声）。
+// 大小 8192 字节 ≈ 256ms @16kHz，足够吸收 play_task(CPU0) 和 feed_task(CPU1) 的速率差。
+#define AEC_REF_BUF_SIZE 8192
 
 /**
  * @brief 音频处理器内部结构体
@@ -56,6 +61,8 @@ struct audio_processor
     RingbufHandle_t enc_output; ///< 编码器输出缓冲（NOSPLIT：OPUS 帧，WebSocket 发送任务消费）
     RingbufHandle_t dec_input;  ///< 解码器输入缓冲（NOSPLIT：云端下发的 OPUS 帧）
     RingbufHandle_t dec_output; ///< 解码器输出缓冲（BYTEBUF：解码后 PCM，播放任务消费）
+    RingbufHandle_t aec_ref_buf; ///< AEC 参考缓冲（BYTEBUF：play_task 写入 I2S 时推送副本）
+                                  ///< audio_feed_task 读取后交给 AFE AEC 算法消除回声
 
     volatile bool is_running;      ///< 运行标志（控制播放任务循环）
     TaskHandle_t play_task_handle; ///< 播放任务句柄（用于等待任务退出）
@@ -77,11 +84,11 @@ static void audio_processor_play_task(void *arg)
     audio_processor_t *audio_processor = (audio_processor_t *)arg;
     bsp_board_t *board = bsp_board_get_instance();
 
-    /* 防御性检查：BSP 实例与 codec_dev 必须就绪，否则直接退出 */
-    if (board == NULL || board->codec_dev == NULL)
+    /* 防御性检查：BSP 实例与 i2s_tx_handle 必须就绪，否则直接退出 */
+    if (board == NULL || board->i2s_tx_handle == NULL)
     {
-        ESP_LOGE(TAG, "play_task abort: board=%p codec_dev=%p",
-                 board, board ? board->codec_dev : NULL);
+        ESP_LOGE(TAG, "play_task abort: board=%p i2s_tx_handle=%p",
+                 board, board ? board->i2s_tx_handle : NULL);
         audio_processor->play_task_handle = NULL;
         vTaskDelete(NULL);
         return;
@@ -95,9 +102,37 @@ static void audio_processor_play_task(void *arg)
                                            pdMS_TO_TICKS(100), 2048);
         if (buf)
         {
-            /* 将 PCM 数据写入 Codec 设备（阻塞直到 I2S DMA 发送完毕） */
-            esp_codec_dev_write(board->codec_dev, buf, size_read);
+            /* 直接写 I2S TX 通道，完全绕过 codec_dev mutex。
+             * 修复原因：codec_dev(IN_OUT) 的 read/write 共享同一把 mutex；
+             *   旧方案 esp_codec_dev_write 持锁 ~64ms，CPU1 的 audio_feed_task
+             *   调用 esp_codec_dev_read 时长期等锁 → AFE FEED ringbuffer 溢出
+             *   → MultiNet 拿不到音频 → 唤醒词无法检测 → TTS 期间无法打断。
+             * I2S TX 和 RX 是独立 DMA 通道，硬件层无冲突，可以完全并发。 */
+            size_t bytes_written = 0;
+            i2s_channel_write(board->i2s_tx_handle, buf, size_read,
+                              &bytes_written, portMAX_DELAY);
+            /* 向 AEC 参考缓冲推送一份副本（0 超时：丢满则弃，不阻塞播放） */
+            xRingbufferSend(audio_processor->aec_ref_buf, buf, size_read, 0);
             vRingbufferReturnItem(audio_processor->dec_output, buf);
+        }
+    }
+
+    /* ── 排水阶段：is_running 变 false 后 dec_output 里可能仍有已解码PCM。
+     * 原因：audio_decoder 把最后几帧写入 dec_output 后 drain_done=true，
+     *       audio_processor_stop 立即置 is_running=false，play_task 在
+     *       while 条件检查时退出，跳过了 dec_output 中剩余的 PCM 数据，
+     *       导致 TTS 末尾几个字被截断（通常 ~5 字，约 1~2 帧）。
+     * 修复：继续把 dec_output 剩余数据全部播完，200ms 超时（队列空即退出）。 */
+    {
+        size_t drain_size = 0;
+        void *drain_buf = NULL;
+        while ((drain_buf = xRingbufferReceiveUpTo(audio_processor->dec_output,
+                                                   &drain_size, pdMS_TO_TICKS(200), 2048)) != NULL)
+        {
+            size_t written = 0;
+            i2s_channel_write(board->i2s_tx_handle, drain_buf, drain_size, &written, portMAX_DELAY);
+            xRingbufferSend(audio_processor->aec_ref_buf, drain_buf, drain_size, 0);
+            vRingbufferReturnItem(audio_processor->dec_output, drain_buf);
         }
     }
 
@@ -135,25 +170,25 @@ audio_processor_t *audio_processor_create(void)
         return NULL;
     }
 
-    /* 创建四个环形缓冲区（全部分配在 SPIRAM，节省内部 SRAM） */
-    audio_processor->enc_input = xRingbufferCreateWithCaps(ENC_INPUT_BUF_SIZE, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
+    /* 创建五个环形缓冲区（全部分配在 SPIRAM，节省内部 SRAM） */
+    audio_processor->enc_input  = xRingbufferCreateWithCaps(ENC_INPUT_BUF_SIZE,  RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
     audio_processor->enc_output = xRingbufferCreateWithCaps(ENC_OUTPUT_BUF_SIZE, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
-    audio_processor->dec_input = xRingbufferCreateWithCaps(DEC_INPUT_BUF_SIZE, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
+    audio_processor->dec_input  = xRingbufferCreateWithCaps(DEC_INPUT_BUF_SIZE,  RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
     audio_processor->dec_output = xRingbufferCreateWithCaps(DEC_OUTPUT_BUF_SIZE, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
+    /* AEC 参考缓冲：BYTEBUF，play_task → I2S 写入时推副本，feed_task 读取供 AFE AEC */
+    audio_processor->aec_ref_buf = xRingbufferCreateWithCaps(AEC_REF_BUF_SIZE,   RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
 
     /* 任一 ringbuf 创建失败 → 整体回滚，避免半初始化对象导致后续崩溃 */
     if (!audio_processor->enc_input || !audio_processor->enc_output ||
-        !audio_processor->dec_input || !audio_processor->dec_output)
+        !audio_processor->dec_input || !audio_processor->dec_output ||
+        !audio_processor->aec_ref_buf)
     {
         ESP_LOGE(TAG, "audio_processor_create: ringbuf alloc failed, rollback");
-        if (audio_processor->enc_input)
-            vRingbufferDelete(audio_processor->enc_input);
-        if (audio_processor->enc_output)
-            vRingbufferDelete(audio_processor->enc_output);
-        if (audio_processor->dec_input)
-            vRingbufferDelete(audio_processor->dec_input);
-        if (audio_processor->dec_output)
-            vRingbufferDelete(audio_processor->dec_output);
+        if (audio_processor->enc_input)   vRingbufferDelete(audio_processor->enc_input);
+        if (audio_processor->enc_output)  vRingbufferDelete(audio_processor->enc_output);
+        if (audio_processor->dec_input)   vRingbufferDelete(audio_processor->dec_input);
+        if (audio_processor->dec_output)  vRingbufferDelete(audio_processor->dec_output);
+        if (audio_processor->aec_ref_buf) vRingbufferDelete(audio_processor->aec_ref_buf);
         audio_encoder_destroy(audio_processor->encoder);
         audio_decoder_destroy(audio_processor->decoder);
         free(audio_processor);
@@ -177,6 +212,7 @@ void audio_processor_destroy(audio_processor_t *audio_processor)
     vRingbufferDelete(audio_processor->enc_output);
     vRingbufferDelete(audio_processor->dec_input);
     vRingbufferDelete(audio_processor->dec_output);
+    vRingbufferDelete(audio_processor->aec_ref_buf);
 
     audio_encoder_destroy(audio_processor->encoder);
     audio_decoder_destroy(audio_processor->decoder);
@@ -206,16 +242,33 @@ void audio_processor_start(audio_processor_t *audio_processor)
 
 /**
  * @brief 停止音频处理器
- * 停止编解码器任务，等待播放任务退出（最多 300ms）
+ *
+ * 停止顺序（顺序不可调换）：
+ *   1. 停编码器（上行停止，不影响下行播放）
+ *   2. 等解码器排水（decoder 把 dec_input 剩余帧全部写入 dec_output）
+ *      ── 此阶段 is_running 仍为 true，play_task 继续消耗 dec_output ──
+ *   3. 排水完成后才停 play_task（is_running = false）
+ *      play_task 继续运行直到 dec_output 清空后自然退出
+ *   4. 等待 play_task 彻底退出（最多 2 秒）
+ *
+ * 结果：TTS 末尾音频完整播放，不截断。
+ * 打断场景：audio_processor_flush_output() 已清空 dec_input，
+ *           排水立即完成，本函数退出不会延迟。
  */
 void audio_processor_stop(audio_processor_t *audio_processor)
 {
-    audio_processor->is_running = false;
+    /* ① 停编码器（上行） */
     audio_encoder_stop(audio_processor->encoder);
+
+    /* ② 等解码器把 dec_input 剩余帧全部播完（play_task 此时仍在运行） */
     audio_decoder_stop(audio_processor->decoder);
-    /* 等待 play_task 退出（最多 300ms，每 100ms 检查一次） */
-    for (int i = 0; i < 3 && audio_processor->play_task_handle != NULL; i++)
-        vTaskDelay(pdMS_TO_TICKS(100));
+
+    /* ③ 解码排水完成，停播放任务 */
+    audio_processor->is_running = false;
+
+    /* ④ 等 play_task 退出（每次消耗 2048 字节 PCM，最多等 2 秒） */
+    for (int i = 0; i < 10 && audio_processor->play_task_handle != NULL; i++)
+        vTaskDelay(pdMS_TO_TICKS(200));
 }
 
 // ─── 公开 API：数据读写 ────────────────────────────────────────────────────
@@ -306,4 +359,44 @@ size_t audio_processor_read_timeout(audio_processor_t *audio_processor,
     memcpy(buffer, buf_read, size_read);
     vRingbufferReturnItem(audio_processor->enc_output, buf_read);
     return size_read;
+}
+
+/**
+ * @brief 读取 AEC 回声消除参考 PCM（非阻塞，不足时零填充）
+ *
+ * play_task 写入 I2S 时同步向 aec_ref_buf 推送副本；本函数由
+ * session.c 注册的 aec_ref_provider 回调调用，供 AFE AEC 使用。
+ *
+ * 实现：尝试从 aec_ref_buf 读取 samples 个采样点，
+ *       读到多少算多少（BYTEBUF 可能分段返回），不足部分用零填充。
+ *       零填充等价于"无播放声"，AEC 不会对该段做减法 → 安全退化。
+ *
+ * @param audio_processor 音频处理器实例指针
+ * @param buf             输出缓冲区（int16_t，调用方分配）
+ * @param samples         需要的采样点数
+ */
+void audio_processor_read_ref_pcm(audio_processor_t *audio_processor,
+                                  int16_t *buf, size_t samples)
+{
+    size_t bytes_needed = samples * sizeof(int16_t);
+    size_t bytes_filled = 0;
+
+    while (bytes_filled < bytes_needed)
+    {
+        size_t sz = 0;
+        void *item = xRingbufferReceiveUpTo(audio_processor->aec_ref_buf,
+                                            &sz,
+                                            0, /* 非阻塞 */
+                                            bytes_needed - bytes_filled);
+        if (!item)
+            break; /* 缓冲区已空，剩余部分用零填充 */
+
+        memcpy((uint8_t *)buf + bytes_filled, item, sz);
+        vRingbufferReturnItem(audio_processor->aec_ref_buf, item);
+        bytes_filled += sz;
+    }
+
+    /* 不足部分置零 → AEC 参考 = 静音 → 不做回声消除（安全退化）*/
+    if (bytes_filled < bytes_needed)
+        memset((uint8_t *)buf + bytes_filled, 0, bytes_needed - bytes_filled);
 }

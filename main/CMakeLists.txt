@@ -4,6 +4,8 @@ idf_component_register(SRCS
 "bsp/bsp_wifi.c"
 "bsp/bsp_codec.c"
 "bsp/bsp_lcd.c"
+"bsp/bsp_touch.c"
+"bsp/bsp_servo.c"
 "wake_word/custom_wake_word.c"
 "protocol/mqtt_protocol.c"
 "protocol/websocket_client.c"
@@ -13,5 +15,6 @@ idf_component_register(SRCS
 "session/session.c"
 "application.c"
 "protocol/auth.c"
+"ui/interaction.c"
 INCLUDE_DIRS "."
 )

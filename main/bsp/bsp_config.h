@@ -20,20 +20,20 @@
 // I2C: 低速控制总线（初始化时配置 ES8311 工作模式、增益等）
 // I2S: 高速数据总线（运行时传输 16kHz / 16-bit 音频流）
 
-#define BSP_CODEC_SDA_PIN  8   ///< ES8311 I2C 数据线（SDA），配置编解码器寄存器
-#define BSP_CODEC_SCL_PIN  15  ///< ES8311 I2C 时钟线（SCL）
+#define BSP_CODEC_SDA_PIN 8  ///< ES8311 I2C 数据线（SDA），配置编解码器寄存器
+#define BSP_CODEC_SCL_PIN 15 ///< ES8311 I2C 时钟线（SCL）
 
-#define BSP_CODEC_MCLK_PIN 17  ///< I2S 主时钟（MCLK），提供给 ES8311 作为参考时钟源
-#define BSP_CODEC_BCLK_PIN 9   ///< I2S 位时钟（BCLK），每个采样位产生一个时钟沿
-#define BSP_CODEC_WS_PIN   5   ///< I2S 帧同步（WS / LRCK），区分左右声道，单声道时也必须保留
-#define BSP_CODEC_DIN_PIN  4   ///< I2S 数据输入（DIN）：麦克风采集数据流向 ESP32
-#define BSP_CODEC_DOUT_PIN 6   ///< I2S 数据输出（DOUT）：ESP32 播放数据流向 ES8311 → 扬声器
+#define BSP_CODEC_MCLK_PIN 17 ///< I2S 主时钟（MCLK），提供给 ES8311 作为参考时钟源
+#define BSP_CODEC_BCLK_PIN 9  ///< I2S 位时钟（BCLK），每个采样位产生一个时钟沿
+#define BSP_CODEC_WS_PIN 5    ///< I2S 帧同步（WS / LRCK），区分左右声道，单声道时也必须保留
+#define BSP_CODEC_DIN_PIN 4   ///< I2S 数据输入（DIN）：麦克风采集数据流向 ESP32
+#define BSP_CODEC_DOUT_PIN 6  ///< I2S 数据输出（DOUT）：ESP32 播放数据流向 ES8311 → 扬声器
 
 // ─── 2. 音频采样参数 ─────────────────────────────────────────────────────────
 // 这些参数必须与 AFE（音频前端）和 OPUS 编解码器的配置保持一致
 
-#define BSP_CODEC_SAMPLE_RATE    16000 ///< 采样率 16kHz（AFE、MultiNet、OPUS 的标准输入要求）
-#define BSP_CODEC_BITS_PER_SAMPLE 16   ///< 采样位深 16-bit（每个采样点占 2 字节）
+#define BSP_CODEC_SAMPLE_RATE 16000  ///< 采样率 16kHz（AFE、MultiNet、OPUS 的标准输入要求）
+#define BSP_CODEC_BITS_PER_SAMPLE 16 ///< 采样位深 16-bit（每个采样点占 2 字节）
 
 // ─── 3. 触摸铜箔引脚 ─────────────────────────────────────────────────────────
 // ESP32-S3 内置电容触摸检测，触摸铜箔直接连接到对应 GPIO
@@ -47,22 +47,35 @@
 // ST7789 使用 SPI 接口，仅支持写入（没有 MISO），时钟可高达 80MHz
 // DC 引脚区分数据（高电平）和命令（低电平）
 
-#define BSP_LCD_CS_PIN   10  ///< LCD 片选（CS/NSS），低电平激活
-#define BSP_LCD_MOSI_PIN 11  ///< LCD 数据线（MOSI），主发从收，单向写
-#define BSP_LCD_SCLK_PIN 12  ///< LCD 时钟线（SCLK），最高 80MHz
-#define BSP_LCD_DC_PIN   13  ///< LCD 数据/命令选择（D/C）：高=数据，低=命令
-#define BSP_LCD_RST_PIN  14  ///< LCD 硬件复位（RST），低电平触发复位
-#define BSP_LCD_BK_PIN   48  ///< LCD 背光控制（BK），高电平开启背光
+#define BSP_LCD_CS_PIN 10   ///< LCD 片选（CS/NSS），低电平激活
+#define BSP_LCD_MOSI_PIN 11 ///< LCD 数据线（MOSI），主发从收，单向写
+#define BSP_LCD_SCLK_PIN 12 ///< LCD 时钟线（SCLK），最高 80MHz
+#define BSP_LCD_DC_PIN 13   ///< LCD 数据/命令选择（D/C）：高=数据，低=命令
+#define BSP_LCD_RST_PIN 14  ///< LCD 硬件复位（RST），低电平触发复位
+#define BSP_LCD_BK_PIN 48   ///< LCD 背光控制（BK），高电平开启背光
 
-#define BSP_LCD_WIDTH    240 ///< LCD 屏幕宽度（像素，横向）
-#define BSP_LCD_HEIGHT   320 ///< LCD 屏幕高度（像素，纵向）
+#define BSP_LCD_WIDTH 240  ///< LCD 屏幕宽度（像素，横向）
+#define BSP_LCD_HEIGHT 320 ///< LCD 屏幕高度（像素，纵向）
 
 // ─── 5. 运动与反馈外设引脚 ──────────────────────────────────────────────────
 // 所有运动外设通过 PWM 信号驱动
 // 震动马达：提供触觉反馈（如唤醒、提醒）
 // 舵机（Servo）：控制机器人肢体姿态，范围通常 0~180°
 
-#define BSP_MOTOR_VIB_PIN   16  ///< 震动马达 PWM 引脚（触觉反馈）
-#define BSP_SERVO_R_ARM_PIN 21  ///< 右臂舵机 PWM 引脚
-#define BSP_SERVO_HEAD_PIN  38  ///< 头部舵机 PWM 引脚
-#define BSP_SERVO_L_ARM_PIN 47  ///< 左臂舵机 PWM 引脚
+#define BSP_MOTOR_VIB_PIN 16   ///< 震动马达 PWM 引脚（触觉反馈）
+#define BSP_SERVO_R_ARM_PIN 21 ///< 右臂舵机 PWM 引脚
+#define BSP_SERVO_HEAD_PIN 38  ///< 头部舵机 PWM 引脚
+#define BSP_SERVO_L_ARM_PIN 47 ///< 左臂舵机 PWM 引脚
+// 舵机逻辑通道映射 (供上层调用)
+#define CH_HEAD  0 ///< 头部舵机逻辑通道编号（对应 LEDC_CHANNEL_0，引脚 GPIO38）
+#define CH_L_ARM 1 ///< 左臂舵机逻辑通道编号（对应 LEDC_CHANNEL_1，引脚 GPIO47）
+#define CH_R_ARM 2 ///< 右臂舵机逻辑通道编号（对应 LEDC_CHANNEL_2，引脚 GPIO21）
+
+// 舵机推荐的速度档位 (step_ms 延时，数值越大运动越慢)
+#define SERVO_SPEED_INSTANT 0  ///< 瞬间到位（无平滑过渡，危险，上电归中禁止使用）
+#define SERVO_SPEED_FAST    5  ///< 快速（约 5ms/度，适合挥手、点头等活泼动作）
+#define SERVO_SPEED_MID     15 ///< 中速（约 15ms/度，适合大多数情绪动作）
+#define SERVO_SPEED_SLOW    30 ///< 慢速（约 30ms/度，适合慵懒、委屈等缓慢动作）
+
+// 设备状态标志位 (添加舵机的 BIT)
+#define BOARD_STATUS_SERVO_READY (1 << 3) ///< 舵机已初始化就绪（向 board_status 事件组置位）

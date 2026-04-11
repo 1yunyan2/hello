@@ -1,14 +1,44 @@
+/**
+ * @file mqtt_protocol.c
+ * @brief MQTT 设备管理协议实现（心跳上报、唤醒词热更新、重置通知）
+ *
+ * 内部模块结构：
+ *   protocol_mqtt_start()
+ *     ├─ mqtt_credentials_load()     从 NVS 加载凭证
+ *     ├─ esp_mqtt_client_init/start   创建并启动 MQTT 客户端
+ *     └─ heartbeat_task               后台心跳任务（每 50s 上报）
+ *
+ *   mqtt_event_handler（MQTT 事件回调）
+ *     ├─ CONNECTED  → 订阅 wake-word 主题
+ *     └─ DATA       → 解析 JSON → async_update_wakeword_task（异步更新唤醒词）
+ *
+ *   async_update_wakeword_task → wake_word_update()（唤醒词引擎）
+ */
 #include "mqtt_protocol.h"
 
-static const char *MQTT_TAG = "MQTT"; // MQTT 凭证（运行时从 NVS 加载，回退到编译期默认值）
-#define MQTT_DEFAULT_URI "mqtt://122.224.191.2:1883"
-#define MQTT_DEFAULT_USER "xtc"
-#define MQTT_DEFAULT_PASS "Xtc@12345"
+static const char *MQTT_TAG = "MQTT"; ///< 日志 TAG
 
-static char s_mqtt_uri[128] = MQTT_DEFAULT_URI;
-static char s_mqtt_user[64] = MQTT_DEFAULT_USER;
-static char s_mqtt_pass[64] = MQTT_DEFAULT_PASS;
+// ─── MQTT 凭证（运行时从 NVS 加载，回退到编译期默认值）────────────────────
+#define MQTT_DEFAULT_URI  "mqtt://122.224.191.2:1883" ///< 默认 Broker 地址（测试环境）
+#define MQTT_DEFAULT_USER "xtc"                        ///< 默认 MQTT 用户名
+#define MQTT_DEFAULT_PASS "Xtc@12345"                  ///< 默认 MQTT 密码
 
+// 运行时凭证缓冲区（由 mqtt_credentials_load 从 NVS 填充，否则保持默认值）
+static char s_mqtt_uri[128]  = MQTT_DEFAULT_URI;
+static char s_mqtt_user[64]  = MQTT_DEFAULT_USER;
+static char s_mqtt_pass[64]  = MQTT_DEFAULT_PASS;
+
+/**
+ * @brief 从 NVS "mqtt_creds" 命名空间加载 MQTT 凭证
+ *
+ * 依次尝试读取 broker_url、username、password 三个键。
+ * 任意一项读取失败时，该项保持编译期默认值，其他项不受影响。
+ * 命名空间不存在时（如首次上电），直接返回使用全部默认值。
+ *
+ * @return void
+ *
+ * @note 调用者：protocol_mqtt_start()（启动 MQTT 前的第一步）
+ */
 static void mqtt_credentials_load(void)
 {
     nvs_handle_t nvs;
@@ -71,11 +101,16 @@ static void get_short_device_id(char *out, size_t out_size)
     snprintf(out, out_size, "%02X%02X%02X", mac[3], mac[4], mac[5]);
 }
 
-// 唤醒词更新任务的参数结构体
+/**
+ * @brief 异步执行唤醒词更新的后台任务参数结构体
+ *
+ * 由 mqtt_event_handler 在堆上分配并传给 async_update_wakeword_task，
+ * 任务执行完毕后由任务内部 free() 释放。
+ */
 typedef struct
 {
-    char display[64]; // 显示文字，如"云炎""Hello Echo"（用于自动判断语言）
-    char pinyin[64];  // 命令词，中文拼音或英文单词
+    char display[64]; ///< 显示文字（如 "云炎"、"Hello Echo"），用于自动检测语言
+    char pinyin[64];  ///< 命令词（中文拼音 "yun yan" 或英文单词 "hello echo"）
 } ww_update_params_t;
 
 // 独立处理唤醒词更新的后台任务
@@ -280,10 +315,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
 // 启动 MQTT 客户端
 /**
- * @brief 初始化并启动MQTT客户端
+ * @brief 初始化并启动 MQTT 客户端（见 .h 文件 Doxygen 说明）
  *
- * 从NVS加载服务器地址和凭证，配置MQTT客户端，注册事件回调，并启动客户端连接。
- * 连接成功后，会自动创建并启动一个心跳任务以定期发送设备状态。
+ * @note 调用者：application.c → application_init()（Wi-Fi 就绪后）
  */
 void protocol_mqtt_start(void)
 {
@@ -301,7 +335,13 @@ void protocol_mqtt_start(void)
     xTaskCreate(heartbeat_task, "heartbeat_task", 4096, NULL, 4, NULL);
 };
 
-// 发送设备重置通知到 MQTT 服务器
+/**
+ * @brief 发送设备重置通知（见 .h 文件 Doxygen 说明）
+ *
+ * 消息格式：{"event":"factory_reset"}，QoS 1 发布到 echopal/device/{id}/reset。
+ *
+ * @note 调用者：出厂重置逻辑
+ */
 void send_reset_notification(void)
 {
     // 检查 MQTT 客户端是否已初始化和连接

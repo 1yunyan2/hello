@@ -12,7 +12,7 @@
  * 启动顺序约束（由 application.c 严格保证，不可调换）：
  *   bsp_board_get_instance()
  *     → bsp_board_nvs_init()        [NVS_BIT]
- *     → bsp_wake_word_init()        [引擎就绪]
+ *     → wake_word_init()        [引擎就绪]
  *     → audio_init()                [CODEC_BIT + 采集任务]
  *     → bsp_board_wifi_main()       [WIFI_BIT]
  *     → protocol_mqtt_start()       [MQTT连接]
@@ -45,6 +45,7 @@
 #include "esp_random.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_dev.h"
+#include "iot_servo.h"
 
 // ─── 设备状态位定义（统一使用 board_status EventGroup）─────────────────────
 // 各模块完成初始化或达到特定状态时置位对应 BIT，其他模块通过 WaitBits 同步等待。
@@ -52,12 +53,10 @@
 //   置位 → xEventGroupSetBits(bsp->board_status, XXX_BIT)
 //   等待 → bsp_board_check_status(bsp, XXX_BIT, timeout) 或直接 xEventGroupWaitBits
 
-#define LED_BIT       BIT0 ///< LED 初始化完成（当前未使用）
-#define BUTTON_BIT    BIT1 ///< 按钮初始化完成（当前未使用）
-#define WIFI_BIT      BIT2 ///< WiFi 连接成功且已获取有效 IP 地址
-#define NVS_BIT       BIT3 ///< NVS Flash 初始化完成，可读写非易失配置
-#define CODEC_BIT     BIT4 ///< ES8311 音频编解码器初始化完成，可开始录音/播放
-#define LCD_BIT       BIT5 ///< LCD 显示屏初始化完成（当前未自动置位）
+#define WIFI_BIT BIT2      ///< WiFi 连接成功且已获取有效 IP 地址
+#define NVS_BIT BIT3       ///< NVS Flash 初始化完成，可读写非易失配置
+#define CODEC_BIT BIT4     ///< ES8311 音频编解码器初始化完成，可开始录音/播放
+#define LCD_BIT BIT5       ///< LCD 显示屏初始化完成（当前未自动置位）
 #define WIFI_FAIL_BIT BIT6 ///< WiFi 连接彻底失败（超过最大重试次数），系统将重启
 #define PROV_DONE_BIT BIT7 ///< BLE 配网流程结束（无论成功/超时），解除配网阻塞
 
@@ -76,10 +75,14 @@
  */
 typedef struct
 {
-    EventGroupHandle_t board_status;   ///< 设备状态事件组（FreeRTOS），各模块通过此实现就绪同步
-    esp_codec_dev_handle_t codec_dev;  ///< ES8311 音频编解码器设备句柄，由 audio_init() 填充
-    esp_lcd_panel_io_handle_t lcd_io;  ///< LCD SPI 传输接口句柄，由 bsp_board_lcd_init() 填充
-    esp_lcd_panel_handle_t lcd_panel;  ///< LCD ST7789 面板驱动句柄，由 bsp_board_lcd_init() 填充
+    EventGroupHandle_t board_status;  ///< 设备状态事件组（FreeRTOS），各模块通过此实现就绪同步
+    esp_codec_dev_handle_t codec_dev; ///< ES8311 音频编解码器设备句柄，由 audio_init() 填充
+    i2s_chan_handle_t i2s_tx_handle;  ///< I2S TX 通道句柄（播放专用），由 bsp_board_codec_init() 填充
+                                      ///< play_task 直接调用 i2s_channel_write 绕过 codec_dev mutex，
+                                      ///< 使 audio_feed_task 的 read 与播放真正并发，消除 AFE FEED 溢出
+    esp_lcd_panel_io_handle_t lcd_io; ///< LCD SPI 传输接口句柄，由 bsp_board_lcd_init() 填充
+    esp_lcd_panel_handle_t lcd_panel; ///< LCD ST7789 面板驱动句柄，由 bsp_board_lcd_init() 填充
+    bool servo_initialized;           ///< 记录舵机是否成功初始化
 } bsp_board_t;
 
 // ─── 公开 API：生命周期管理 ───────────────────────────────────────────────────
@@ -177,12 +180,12 @@ bool bsp_board_check_status(bsp_board_t *bsp_board, EventBits_t bits_to_check, T
  *   3. 设置麦克风增益（40 ≈ 20dB）和扬声器音量（60/100）
  *   4. xTaskCreatePinnedToCore(audio_feed_task, CPU1)：启动麦克风采集任务
  *
- * 必须在 bsp_wake_word_init() 之后调用，因为采集任务启动后立即向引擎投喂音频。
+ * 必须在 wake_word_init() 之后调用，因为采集任务启动后立即向引擎投喂音频。
  *
  * @param bsp_board BSP 实例指针
  *
  * @note 调用者：application.c → application_init()（步骤 4）
- * @note 前置条件：bsp_wake_word_init() 已完成（AFE/MultiNet 引擎就绪）
+ * @note 前置条件：wake_word_init() 已完成（AFE/MultiNet 引擎就绪）
  */
 void audio_init(bsp_board_t *bsp_board);
 
@@ -244,3 +247,19 @@ void bsp_board_lcd_on(bsp_board_t *bsp_board);
  * @note 前置条件：bsp_board_lcd_init() 已调用
  */
 void bsp_board_lcd_off(bsp_board_t *bsp_board);
+
+void touch_scan_task(bsp_board_t *pvParameters);
+// ========== 3. 在 API 声明区添加 ==========
+/**
+ * @brief 初始化躯体三轴舵机
+ * @param bsp_board BSP 实例指针
+ */
+void bsp_board_servo_init(bsp_board_t *bsp_board);
+
+/**
+ * @brief 安全平滑地移动指定舵机
+ * @param channel   舵机通道 (CH_HEAD, CH_L_ARM, CH_R_ARM)
+ * @param target    目标角度 (0.0 ~ 180.0，自动受限于内部软限位)
+ * @param step_ms   步进延时，数值越大动作越慢 (推荐使用 SERVO_SPEED_xxx 宏)
+ */
+void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms);

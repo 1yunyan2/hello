@@ -29,6 +29,7 @@
 #include "cJSON.h"
 #include <string.h>
 #include "object.h"
+
 /* 定义协议事件基类（用于 esp_event 框架） */
 ESP_EVENT_DEFINE_BASE(PROTOCOL_EVENT);
 
@@ -76,6 +77,11 @@ struct protocol
 /**
  * @brief 处理服务端 Hello 响应
  * 提取 session_id 并保存，通知上层握手完成
+ *
+ * @param protocol 协议实例指针
+ * @param root JSON根对象指针
+ *
+ * 调用者：protocol_websocket_event_handler中的WEBSOCKET_EVENT_DATA事件处理
  */
 static void protocol_hello_handler(protocol_t *protocol, cJSON *root)
 {
@@ -100,6 +106,11 @@ static void protocol_hello_handler(protocol_t *protocol, cJSON *root)
 /**
  * @brief 处理大模型情感状态消息
  * 提取 emotion 字段（如 "happy" / "thinking"）通知上层
+ *
+ * @param protocol 协议实例指针
+ * @param root JSON根对象指针
+ *
+ * 调用者：protocol_websocket_event_handler中的WEBSOCKET_EVENT_DATA事件处理
  */
 static void protocol_llm_handler(protocol_t *protocol, cJSON *root)
 {
@@ -113,6 +124,11 @@ static void protocol_llm_handler(protocol_t *protocol, cJSON *root)
 /**
  * @brief 处理语音识别（STT）结果消息
  * 提取 text 字段（识别出的文本）通知上层
+ *
+ * @param protocol 协议实例指针
+ * @param root JSON根对象指针
+ *
+ * 调用者：protocol_websocket_event_handler中的WEBSOCKET_EVENT_DATA事件处理
  */
 static void protocol_stt_handler(protocol_t *protocol, cJSON *root)
 {
@@ -129,6 +145,11 @@ static void protocol_stt_handler(protocol_t *protocol, cJSON *root)
  *   "start"          → TTS_START（开始播放）
  *   "stop"           → TTS_STOP（播放结束）
  *   "sentence_start" → TTS_SENTENCE_START（新句子开始，附带文本）
+ *
+ * @param protocol 协议实例指针
+ * @param root JSON根对象指针
+ *
+ * 调用者：protocol_websocket_event_handler中的WEBSOCKET_EVENT_DATA事件处理
  */
 static void protocol_tts_handler(protocol_t *protocol, cJSON *root)
 {
@@ -151,6 +172,16 @@ static void protocol_tts_handler(protocol_t *protocol, cJSON *root)
             protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_TTS_SENTENCE_START, text->valuestring);
     }
 }
+
+/**
+ * @brief 处理错误消息
+ * 提取错误信息并通知上层
+ *
+ * @param protocol 协议实例指针
+ * @param root JSON根对象指针
+ *
+ * 调用者：protocol_websocket_event_handler中的WEBSOCKET_EVENT_DATA事件处理
+ */
 static void protocol_error_handler(protocol_t *protocol, cJSON *root)
 {
     cJSON *msg = cJSON_GetObjectItem(root, "message");
@@ -160,13 +191,42 @@ static void protocol_error_handler(protocol_t *protocol, cJSON *root)
     }
 }
 
+/**
+ * @brief 处理会话完成消息
+ * 通知上层会话已完成
+ *
+ * @param protocol 协议实例指针
+ * @param root JSON根对象指针
+ *
+ * 调用者：protocol_websocket_event_handler中的WEBSOCKET_EVENT_DATA事件处理
+ */
 static void protocol_complete_handler(protocol_t *protocol, cJSON *root)
 {
     protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_COMPLETE, NULL);
 }
+
+/**
+ * @brief 处理会话完成消息
+ * 通知上层会话已完成
+ *
+ * @param protocol 协议实例指针
+ * @param root JSON根对象指针
+ *
+ * 调用者：protocol_websocket_event_handler中的WEBSOCKET_EVENT_DATA事件处理
+ */
+static void protocol_complete_handler(protocol_t *protocol, cJSON *root)
+{
+    protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_COMPLETE, NULL);
+}
+
 /**
  * @brief 处理 IoT 控制指令消息
  * 提取 commands 数组通知上层执行设备控制操作
+ *
+ * @param protocol 协议实例指针
+ * @param root JSON根对象指针
+ *
+ * 调用者：protocol_websocket_event_handler中的WEBSOCKET_EVENT_DATA事件处理
  */
 static void protocol_iot_handler(protocol_t *protocol, cJSON *root)
 {
@@ -187,6 +247,13 @@ static void protocol_iot_handler(protocol_t *protocol, cJSON *root)
  *
  * Binary Frame（opcode 0x02）：直接封装为 binary_data_t 传递音频数据
  * Text Frame（opcode 0x01）：解析 JSON，根据 type 字段路由到对应 handler
+ *
+ * @param handler_args 用户自定义参数（此处为protocol_t指针）
+ * @param base 事件基类（WEBSOCKET_EVENT）
+ * @param event_id 具体事件ID
+ * @param event_data 事件相关数据
+ *
+ * 调用者：ESP-IDF WebSocket客户端底层事件系统
  */
 static void protocol_websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
@@ -197,16 +264,42 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
 
     switch (event_id)
     {
+    // ── WebSocket错误事件处理 ────────────────────────────────────────────────
+    /**
+     * @brief WebSocket错误事件处理
+     * 
+     * 说明：处理WebSocket底层错误事件，记录错误日志。
+     * API：ESP_LOGE
+     * 数据：无状态修改
+     */
     case WEBSOCKET_EVENT_ERROR:
         ESP_LOGE(TAG, "Websocket Error");
         break;
 
+    // ── WebSocket连接成功事件处理 ────────────────────────────────────────────
+    /**
+     * @brief WebSocket连接成功事件处理
+     * 
+     * 说明：处理WebSocket连接成功的事件，通知上层连接已建立，
+     *       并打印内存使用情况快照用于调试。
+     * API：protocol->callback, PRINT_MEM_INFO
+     * 数据：通过回调通知PROTOCOL_EVENT_CONNECTED事件
+     */
     case WEBSOCKET_EVENT_CONNECTED:
         ESP_LOGI(TAG, "Websocket Connected");
         protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_CONNECTED, NULL);
         PRINT_MEM_INFO(TAG, "握手后");
         break;
 
+    // ── WebSocket数据接收事件处理 ────────────────────────────────────────────
+    /**
+     * @brief WebSocket数据接收事件处理
+     * 
+     * 说明：处理接收到的数据事件，区分Binary Frame（音频数据）和Text Frame（JSON控制消息），
+     *       对Text Frame进行JSON解析并根据type字段路由到对应的处理器。
+     * API：cJSON_ParseWithLength, cJSON_GetObjectItem, strcmp, cJSON_Delete
+     * 数据：根据消息类型调用不同的处理器函数
+     */
     case WEBSOCKET_EVENT_DATA:
         /* opcode 0x02 = Binary Frame → 云端下发的 OPUS 音频帧 */
         if (data->op_code == 0x02)
@@ -252,7 +345,14 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
         }
         break;
 
-    /* 连接断开或结束 → 通知上层 */
+    // ── WebSocket断开连接事件处理 ────────────────────────────────────────────
+    /**
+     * @brief WebSocket断开连接事件处理
+     * 
+     * 说明：处理WebSocket断开连接或结束的事件，通知上层连接已断开。
+     * API：protocol->callback
+     * 数据：通过回调通知PROTOCOL_EVENT_DISCONNECTED事件
+     */
     case WEBSOCKET_EVENT_DISCONNECTED:
     case WEBSOCKET_EVENT_FINISH:
         protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_DISCONNECTED, NULL);
@@ -277,6 +377,8 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
  * @param url   WebSocket 服务器的完整地址（如 "wss://example.com/audio"）
  * @param token 用于身份验证的 Bearer Token（accessToken），可为 NULL
  * @return protocol_t* 成功时返回指向新创建实例的指针，失败时返回 NULL
+ *
+ * 调用者：session_init函数
  */
 protocol_t *protocol_create(const char *url, const char *token)
 {
@@ -301,6 +403,7 @@ protocol_t *protocol_create(const char *url, const char *token)
         .network_timeout_ms = 5000,     // 网络超时 5 秒
         .disable_auto_reconnect = true, // 禁用自动重连，由 session 层控制退避策略
         // .ping_interval_sec = 30,                    // Ping 间隔 30 秒
+        .buffer_size = 8192, //! 增加了缓存，防止接收数据过大 默认接收缓冲区大小是 1024 字节
     };
 
     /* 初始化底层 WebSocket 客户端并注册事件回调 */
@@ -313,7 +416,10 @@ protocol_t *protocol_create(const char *url, const char *token)
 
 /**
  * @brief 销毁 WebSocket 客户端实例并释放所有资源
+ *
  * @param protocol 协议实例指针，调用后不应再使用
+ *
+ * 调用者：session_reconnect_task、session_close等需要清理资源的地方
  */
 void protocol_destroy(protocol_t *protocol)
 {
@@ -325,7 +431,14 @@ void protocol_destroy(protocol_t *protocol)
 
 // ─── 公开 API：连接控制 ────────────────────────────────────────────────────
 
-/** @brief 建立连接（已连接时无操作） */
+/**
+ * @brief 建立 WebSocket 连接
+ * 如果已经连接则不执行任何操作
+ *
+ * @param protocol 协议实例指针
+ *
+ * 调用者：session_init、session_reconnect_task
+ */
 void protocol_connect(protocol_t *protocol)
 {
     if (!esp_websocket_client_is_connected(protocol->websocket_client))
@@ -334,7 +447,7 @@ void protocol_connect(protocol_t *protocol)
 }
 
 /**
- * @brief 断开连接并确保底层资源完全释放
+ * @brief 断开 WebSocket 连接并确保底层资源完全释放
  *
  * 【关键】无论当前连接状态如何都调用 stop，确保：
  *   1. 向服务端发送 WebSocket close frame（正常关闭握手）
@@ -344,6 +457,10 @@ void protocol_connect(protocol_t *protocol)
  * 之前的 bug：只在 is_connected 为 true 时才 stop，
  * 但断线事件触发时 is_connected 已经为 false，导致 stop 从未被调用，
  * 服务端无法感知连接关闭，连接数持续累积。
+ *
+ * @param protocol 协议实例指针
+ *
+ * 调用者：session_reconnect_task、session_close
  */
 void protocol_disconnect(protocol_t *protocol)
 {
@@ -351,7 +468,14 @@ void protocol_disconnect(protocol_t *protocol)
     esp_websocket_client_stop(protocol->websocket_client);
 }
 
-/** @brief 查询连接状态 */
+/**
+ * @brief 查询 WebSocket 连接状态
+ *
+ * @param protocol 协议实例指针
+ * @return bool 连接状态，true表示已连接，false表示未连接
+ *
+ * 调用者：ws_sender_task、session_on_wake_word等需要检查连接状态的地方
+ */
 bool protocol_is_connected(protocol_t *protocol)
 {
     return esp_websocket_client_is_connected(protocol->websocket_client);
@@ -362,6 +486,10 @@ bool protocol_is_connected(protocol_t *protocol)
 /**
  * @brief 发送 Hello 握手消息
  * 协商音频参数：单声道 / OPUS 编码 / 60ms 帧时长 / 16kHz 采样率
+ *
+ * @param protocol 协议实例指针
+ *
+ * 调用者：session_on_wake_word、PROTOCOL_EVENT_CONNECTED事件处理
  */
 void protocol_send_hello(protocol_t *protocol)
 {
@@ -378,21 +506,41 @@ void protocol_send_hello(protocol_t *protocol)
                        toy_id);
 }
 
-/** @brief 发送唤醒词通知（type=listen, state=detect） */
+/**
+ * @brief 发送唤醒词通知（type=listen, state=detect）
+ *
+ * @param protocol 协议实例指针
+ * @param wake_word 唤醒词字符串
+ *
+ * 调用者：目前未使用，仅打印日志
+ */
 void protocol_send_wake_word(protocol_t *protocol, const char *wake_word)
 {
     // protocol_send_text(protocol, "{\"session_id\":\"%s\",\"state\":\"detect\",\"text\":\"%s\",\"type\":\"listen\"}", protocol->session_id ? protocol->session_id : "", wake_word);
     ESP_LOGI("Protocol", "本地已唤醒: %s", wake_word);
 }
 
-/** @brief 发送开始监听指令（type=listen, state=start） */
+/**
+ * @brief 发送开始监听指令（type=listen, state=start）
+ *
+ * @param protocol 协议实例指针
+ * @param type 监听类型（未使用）
+ *
+ * 调用者：目前未使用
+ */
 void protocol_send_start_listening(protocol_t *protocol, protocol_listen_type_t type)
 {
     // static const char *mode_str[] = {"auto", "manual", "realtime"};
     // protocol_send_text(protocol, "{\"mode\":\"%s\",\"session_id\":\"%s\",\"state\":\"start\",\"type\":\"listen\"}", mode_str[type], protocol->session_id ? protocol->session_id : "");
 }
 
-/** @brief 发送停止监听指令（type=listen, state=stop） */
+/**
+ * @brief 发送停止监听指令（type=listen, state=stop）
+ *
+ * @param protocol 协议实例指针
+ *
+ * 调用者：on_eos_timeout定时器回调
+ */
 void protocol_send_stop_listening(protocol_t *protocol)
 {
     // protocol_send_text(protocol, "{\"session_id\":\"%s\",\"state\":\"stop\",\"type\":\"listen\"}", protocol->session_id ? protocol->session_id : "");
@@ -401,7 +549,14 @@ void protocol_send_stop_listening(protocol_t *protocol)
     // protocol_send_text(protocol, "{\"session_id\":\"%s\",\"type\":\"stop\"}", protocol->session_id ? protocol->session_id : "");
 }
 
-/** @brief 发送 OPUS 音频二进制帧（Binary Frame） */
+/**
+ * @brief 发送 OPUS 音频二进制帧（Binary Frame）
+ *
+ * @param protocol 协议实例指针
+ * @param data 二进制数据结构体指针，包含数据指针和大小
+ *
+ * 调用者：ws_sender_task
+ */
 void protocol_send_audio_data(protocol_t *protocol, binary_data_t *data)
 {
     if (esp_websocket_client_is_connected(protocol->websocket_client))
@@ -412,7 +567,13 @@ void protocol_send_audio_data(protocol_t *protocol, binary_data_t *data)
     }
 }
 
-/** @brief 发送打断 TTS 指令（type=abort, reason=wake_word_detected） */
+/**
+ * @brief 发送打断 TTS 指令（type=abort, reason=wake_word_detected）
+ *
+ * @param protocol 协议实例指针
+ *
+ * 调用者：session_on_wake_word（打断场景）
+ */
 void protocol_send_abort_speaking(protocol_t *protocol)
 {
     protocol_send_text(protocol, "{\"reason\":\"wake_word_detected\",\"session_id\":\"%s\",\"type\":\"abort\"}", protocol->session_id ? protocol->session_id : "");
@@ -420,8 +581,12 @@ void protocol_send_abort_speaking(protocol_t *protocol)
 
 /**
  * @brief 发送 IoT 消息（设备能力描述 / 状态上报）
+ *
+ * @param protocol 协议实例指针
  * @param type 消息类型（descriptors / states）
  * @param json cJSON 对象，函数内部会接管所有权并添加到消息中
+ *
+ * 调用者：应用层需要上报设备状态或能力时
  */
 void protocol_send_iot(protocol_t *protocol, protocol_iot_message_type_t type, cJSON *json)
 {
@@ -449,7 +614,16 @@ void protocol_send_iot(protocol_t *protocol, protocol_iot_message_type_t type, c
 
 // ─── 公开 API：回调注册 ────────────────────────────────────────────────────
 
-/** @brief 注册协议事件回调，所有事件通过此回调分发给上层（session 模块） */
+/**
+ * @brief 注册协议事件回调
+ * 所有协议事件通过此回调分发给上层（session 模块）
+ *
+ * @param protocol 协议实例指针
+ * @param callback 事件回调函数指针
+ * @param handler_args 回调函数的用户自定义参数
+ *
+ * 调用者：session_init
+ */
 void protocol_register_callback(protocol_t *protocol, esp_event_handler_t callback, void *handler_args)
 {
     protocol->callback = callback;

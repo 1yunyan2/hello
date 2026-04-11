@@ -36,7 +36,7 @@
  *   1. NVS 已初始化（bsp_board_nvs_init）
  *   2. 音频已初始化（audio_init）
  *   3. WiFi 已连接（bsp_board_wifi_main 完成并置 WIFI_BIT）
- *   4. 唤醒词引擎已初始化（bsp_wake_word_init）
+ *   4. 唤醒词引擎已初始化（wake_word_init）
  */
 
 // ─── 会话状态枚举 ─────────────────────────────────────────────────────────────

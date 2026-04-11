@@ -1,9 +1,9 @@
 #include "bsp_board.h"
 #include "protocol/mqtt_protocol.h"
-
+#include "protocol/auth.h"
 // ─── 模块常量 ─────────────────────────────────────────────────────────────────
 #define CLEAR_WIFI_BUTTON_PIN GPIO_NUM_0 ///< 清除 WiFi 凭证的长按按键（Boot 按钮）
-#define MAX_RETRY_COUNT       5          ///< WiFi 断线后最大自动重连次数
+#define MAX_RETRY_COUNT 5                ///< WiFi 断线后最大自动重连次数
 
 static const char *TAG = "EchoPals";
 
@@ -33,14 +33,38 @@ static int s_retry_num = 0;
 void clear_wifi_and_restart(void)
 {
     ESP_LOGW(TAG, "正在清除已保存的 WiFi 账号密码...");
-
+    ESP_LOGW(TAG, "正在清除已保存的driver-token...");
     // ── 向 MQTT 发送重置通知（让服务端知道设备主动重置）─────────────────────
     // 注意：此时 WiFi 可能仍然连接，发送还能成功
     send_reset_notification();
 
+    // ── 清除 NVS 中的认证 Token ──────────────────────────────────────────────
+    nvs_handle_t h;
+    esp_err_t err = nvs_open("net_config", NVS_READWRITE, &h);
+    if (err == ESP_OK)
+    {
+        // 清除 device token (ws_token) 和 access token
+        err = nvs_erase_key(h, "ws_token");
+        if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND)
+            ESP_LOGW(TAG, "清除 ws_token 时出错: %s", esp_err_to_name(err));
+
+        err = nvs_erase_key(h, "access_token");
+        if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND)
+            ESP_LOGW(TAG, "清除 access_token 时出错: %s", esp_err_to_name(err));
+
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGI(TAG, "Driver token 和 Access token 清除成功");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "无法打开 net_config 命名空间清除 tokens: %s", esp_err_to_name(err));
+    }
+
     // ── 清除 NVS 中的 WiFi 凭证 ──────────────────────────────────────────────
     // wifi_prov_mgr_reset_provisioning() 内部删除 WiFi 配置分区中的 SSID/密码键值对
-    esp_err_t err = wifi_prov_mgr_reset_provisioning();
+    // err = wifi_prov_mgr_reset_provisioning();
+    err = esp_wifi_restore(); // 它可以在任何状态下安全地抹除 WiFi 配置
     if (err == ESP_OK)
         ESP_LOGI(TAG, "WiFi 凭证清除成功，即将重启...");
     else
@@ -75,11 +99,11 @@ static void button_monitor_task(void *pvParameters)
     // ── 步骤 1：配置 GPIO0 为输入模式（内部上拉，轮询检测）─────────────────
     // Boot 按键（GPIO0）通过 10kΩ 上拉连接到 3.3V，按下时接地，电平变低
     gpio_config_t io_conf = {
-        .pin_bit_mask  = (1ULL << CLEAR_WIFI_BUTTON_PIN), // 只配置 GPIO0
-        .mode          = GPIO_MODE_INPUT,                  // 输入模式
-        .pull_up_en    = GPIO_PULLUP_ENABLE,               // 启用内部上拉（按键断开时保持高电平）
-        .pull_down_en  = GPIO_PULLDOWN_DISABLE,            // 禁用下拉
-        .intr_type     = GPIO_INTR_DISABLE,                // 不使用中断（轮询模式）
+        .pin_bit_mask = (1ULL << CLEAR_WIFI_BUTTON_PIN), // 只配置 GPIO0
+        .mode = GPIO_MODE_INPUT,                         // 输入模式
+        .pull_up_en = GPIO_PULLUP_ENABLE,                // 启用内部上拉（按键断开时保持高电平）
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,           // 禁用下拉
+        .intr_type = GPIO_INTR_DISABLE,                  // 不使用中断（轮询模式）
     };
     gpio_config(&io_conf);
 
@@ -97,7 +121,7 @@ static void button_monitor_task(void *pvParameters)
                 // 前置检查：确保配网管理器已初始化，避免过早调用导致崩溃
                 if (s_wifi_prov_initialized)
                     clear_wifi_and_restart(); // 触发清除和重启（不会返回）
-                press_count = 0; // 不可达代码，保险起见重置计数
+                press_count = 0;              // 不可达代码，保险起见重置计数
             }
         }
         else
@@ -442,7 +466,7 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
     // scheme_ble：使用蓝牙 BLE 作为配网传输通道
     // FREE_BTDM：配网结束后自动释放 BLE 基带内存（约 60KB），回收给系统使用
     wifi_prov_mgr_config_t config = {
-        .scheme               = wifi_prov_scheme_ble,
+        .scheme = wifi_prov_scheme_ble,
         .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM,
     };
     ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
@@ -451,12 +475,17 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
     s_wifi_prov_initialized = true;
 
     // ── 步骤 6：启动按键监控任务（GPIO0 长按 3s 触发 WiFi 重置）─────────────
-    xTaskCreatePinnedToCoreWithCaps(
+    // xTaskCreatePinnedToCoreWithCaps(
+    //     button_monitor_task, "btn_task",
+    //     4096, NULL, 5, NULL,
+    //     0,                  // CPU0
+    //     MALLOC_CAP_SPIRAM); // 栈分配在外部 SPIRAM（节省内部 SRAM）
+
+    // 使用了分配内存的api，导致和nvs冲突了？因为清除token需要写nvs_erase_key，但是外部psram访问不到nvs？
+    xTaskCreatePinnedToCore(
         button_monitor_task, "btn_task",
         4096, NULL, 5, NULL,
-        0,                    // CPU0
-        MALLOC_CAP_SPIRAM);   // 栈分配在外部 SPIRAM（节省内部 SRAM）
-
+        0);
     // ── 步骤 7：检查是否已配网 ───────────────────────────────────────────────
     bool provisioned = false;
     ESP_ERROR_CHECK(wifi_prov_mgr_is_provisioned(&provisioned));

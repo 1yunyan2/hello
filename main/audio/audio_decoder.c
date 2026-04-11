@@ -22,9 +22,9 @@
 #define TAG "[AP] Decoder"
 
 // ─── 解码器任务配置宏 ─────────────────────────────────────────────────────────
-#define AUDIO_DECODER_TASK_CORE_ID    0      ///< 解码任务绑定 CPU0（与编码/播放同核）
-#define AUDIO_DECODER_TASK_STACK_SIZE 32768  ///< 栈大小 32KB（OPUS 解码需要较大栈）
-#define AUDIO_DECODER_TASK_PRIORITY   5      ///< 优先级 5（与编码器对称）
+#define AUDIO_DECODER_TASK_CORE_ID 0        ///< 解码任务绑定 CPU0（与编码/播放同核）
+#define AUDIO_DECODER_TASK_STACK_SIZE 32768 ///< 栈大小 32KB（OPUS 解码需要较大栈）
+#define AUDIO_DECODER_TASK_PRIORITY 5       ///< 优先级 5（与编码器对称）
 
 /**
  * @brief 解码器内部结构体（对外不透明，通过 audio_decoder_t* 访问）
@@ -46,7 +46,8 @@ struct audio_decoder
     int sample_rate; ///< 采样率（Hz），用于计算 PCM 输出缓冲区大小
     int channels;    ///< 声道数
 
-    bool is_running; ///< 任务运行标志：false 时解码循环退出，任务自删除
+    bool is_running;           ///< 任务运行标志：false 时解码主循环退出
+    volatile bool drain_done;  ///< 排水完成标志：主循环退出后排完 dec_input 剩余帧后置 true
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -78,18 +79,20 @@ void audio_decoder_task(void *arg)
     // 公式：采样率 × 声道数 × 每采样字节数 × 帧时长(ms) / 1000
     // 例：16000Hz × 1ch × 2bytes × 60ms / 1000 = 1920 字节/帧
     // 注意：云端编码时使用 60ms 帧，此处解码输出也必须是 60ms 的 PCM
-    size_t out_buffer_size = (size_t)audio_decoder->sample_rate  // 采样率 16000
-                             * audio_decoder->channels            // 声道数 1
-                             * 2                                  // 16-bit = 2 字节/采样
-                             / 1000                               // 换算 ms → s
-                             * 60;                                // 帧时长 60ms
+    // size_t out_buffer_size = (size_t)audio_decoder->sample_rate // 采样率 16000
+    //                          * audio_decoder->channels          // 声道数 1
+    //                          * 2                                // 16-bit = 2 字节/采样
+    //                          / 1000                             // 换算 ms → s
+    //                          * 60;                              // 帧时长 60ms
+
+    size_t out_buffer_size = 8192; //! 分配固定大小ram内存，放置解析数据过大卡死
 
     // ── 步骤 2：分配 PCM 输出缓冲区 ─────────────────────────────────────────
     void *out_buffer = malloc_zeroed(out_buffer_size); // 1920 字节（清零防止噪音）
 
     esp_audio_dec_out_frame_t out_frame = {
-        .buffer = out_buffer,      // 解码输出目标地址
-        .len    = out_buffer_size, // 最大可容纳字节数
+        .buffer = out_buffer,   // 解码输出目标地址
+        .len = out_buffer_size, // 最大可容纳字节数
     };
 
     // ── 步骤 3：解码主循环 ────────────────────────────────────────────────────
@@ -108,9 +111,13 @@ void audio_decoder_task(void *arg)
 
         // 构造解码输入帧描述符（指向 RingBuf 内部内存，避免拷贝）
         esp_audio_dec_in_raw_t in_frame = {
-            .buffer = buf_read,   // OPUS 帧数据指针（指向 RingBuf 内部）
-            .len    = size_read,  // 帧大小（字节，由编码端决定，约 20~100 字节）
+            .buffer = buf_read, // OPUS 帧数据指针（指向 RingBuf 内部）
+            .len = size_read,   // 帧大小（字节，由编码端决定，约 20~100 字节）
         };
+
+        // 🌟 救命修复 1：每次解码前，必须重置 out_frame.len！
+        // 否则底层解码器会越改越小，导致后续解码全部报 error:-4
+        out_frame.len = out_buffer_size;
 
         // 执行 OPUS 解码（1920字节 PCM → out_frame）
         esp_audio_err_t ret = esp_audio_dec_process(
@@ -129,23 +136,57 @@ void audio_decoder_task(void *arg)
         }
 
         if (ret != ESP_OK)
-            continue; // 解码失败（数据损坏），丢弃本帧，继续处理下一帧
+        {
 
+            // 🌟 救命修复 2：解码失败时，必须延时释放 CPU，喂看门狗！
+            // 防止程序瞬间进入死循环吃满 CPU，解决喇叭兹拉声和 AFE 溢出问题
+            vTaskDelay(1);
+            continue; // 解码失败（数据损坏），丢弃本帧，继续处理下一帧
+        }
         // ── 将解码后的 PCM 数据写入播放缓冲区 ─────────────────────────────
         // BYTEBUF 类型：支持分段写入，PCM 数据无帧边界约束
-        // 超时为 0：dec_output 满时立即返回失败（丢帧），保证解码不被播放阻塞
-        BaseType_t buf_ret = xRingbufferSend(
+        // 使用 portMAX_DELAY：dec_output 满时阻塞等待 play_task 消耗，形成背压。
+        // 背压链路：play_task(I2S实时) → dec_output → decoder 等待 → dec_input 积压
+        // → audio_processor_write 阻塞 → WebSocket 接收自然降速。
+        // 这样解码速率与播放速率自动对齐，彻底避免 PCM 丢帧和快进卡顿。
+        xRingbufferSend(
             audio_decoder->output_buffer,
             out_frame.buffer,
-            out_frame.decoded_size, // 实际解码输出字节数（通常就是 out_buffer_size）
-            0);                     // 超时 0ms：满了立即返回 pdFALSE
+            out_frame.decoded_size, // 实际解码输出字节数
+            portMAX_DELAY);         // 阻塞等待，不丢帧
+    }
 
-        if (buf_ret != pdTRUE)
+    // ── 排水阶段：主循环退出后，继续把 dec_input 剩余帧解码写入 dec_output ──
+    // 此时 audio_processor->is_running 仍为 true，play_task 仍在消耗 dec_output。
+    // portMAX_DELAY 写入安全：play_task 不停则 dec_output 始终有人消费。
+    // 退出条件：dec_input 为空（非阻塞读返回 NULL）。
+    {
+        size_t drain_size = 0;
+        void *drain_buf = NULL;
+        while ((drain_buf = xRingbufferReceive(
+                    audio_decoder->input_buffer, &drain_size, 0)) != NULL)
         {
-            // dec_output 40KB 通常不会满（1.28s 缓冲），满了说明播放任务异常
-            ESP_LOGW(TAG, "dec_output 缓冲区满，丢弃一帧 PCM 数据（播放可能卡顿）");
+            esp_audio_dec_in_raw_t drain_in = {
+                .buffer = drain_buf,
+                .len    = drain_size,
+            };
+            out_frame.len = out_buffer_size; // 每次重置，防止底层覆盖
+
+            esp_audio_err_t ret = esp_audio_dec_process(
+                audio_decoder->dec, &drain_in, &out_frame);
+            vRingbufferReturnItem(audio_decoder->input_buffer, drain_buf);
+
+            if (ret != ESP_OK)
+                continue; // 帧损坏，跳过
+
+            // 写入 dec_output：play_task 仍运行，portMAX_DELAY 不会死锁
+            xRingbufferSend(audio_decoder->output_buffer,
+                            out_frame.buffer, out_frame.decoded_size,
+                            portMAX_DELAY);
         }
     }
+    // 通知 audio_decoder_stop() 排水完成，可以停止 play_task
+    audio_decoder->drain_done = true;
 
     // ── 任务退出：释放 PCM 输出缓冲区，自删除 ────────────────────────────────
     free(out_buffer);
@@ -172,24 +213,24 @@ audio_decoder_t *audio_decoder_create(int sample_rate, int channels)
 
     // 保存采样参数（任务内计算 PCM 输出缓冲区大小时使用）
     audio_decoder->sample_rate = sample_rate;
-    audio_decoder->channels    = channels;
+    audio_decoder->channels = channels;
 
     // ── 步骤 2：注册 OPUS 解码器 ──────────────────────────────────────────────
     ESP_ERROR_CHECK(esp_opus_dec_register());
 
     // ── 步骤 3：配置解码参数（必须与编码端严格一致）─────────────────────────
     esp_opus_dec_cfg_t opus_cfg = {
-        .sample_rate    = sample_rate,                          // 采样率：16000Hz
-        .channel        = channels,                             // 声道数：1
-        .frame_duration = ESP_OPUS_DEC_FRAME_DURATION_60_MS,   // 帧时长：60ms（与编码端对齐！）
-        .self_delimited = false,                                // 标准 OPUS 封包格式（非自分界）
+        .sample_rate = sample_rate,                          // 采样率：16000Hz
+        .channel = channels,                                 // 声道数：1
+        .frame_duration = ESP_OPUS_DEC_FRAME_DURATION_60_MS, // 帧时长：60ms（与编码端对齐！）
+        .self_delimited = false,                             // 标准 OPUS 封包格式（非自分界）
     };
 
     // 封装为通用解码器配置
     esp_audio_dec_cfg_t dec_cfg = {
-        .cfg    = &opus_cfg,
+        .cfg = &opus_cfg,
         .cfg_sz = sizeof(esp_opus_dec_cfg_t),
-        .type   = ESP_AUDIO_TYPE_OPUS,
+        .type = ESP_AUDIO_TYPE_OPUS,
     };
 
     // ── 步骤 4：打开解码器，获取句柄 ─────────────────────────────────────────
@@ -230,7 +271,7 @@ void audio_decoder_set_buffer(audio_decoder_t *audio_decoder,
                               RingbufHandle_t input_buffer,
                               RingbufHandle_t output_buffer)
 {
-    audio_decoder->input_buffer  = input_buffer;  // OPUS 来源（WebSocket 接收链路）
+    audio_decoder->input_buffer = input_buffer;   // OPUS 来源（WebSocket 接收链路）
     audio_decoder->output_buffer = output_buffer; // PCM 去向（播放任务链路入口）
 }
 
@@ -255,14 +296,14 @@ void audio_decoder_start(audio_decoder_t *audio_decoder)
 
     // ── 创建解码任务（栈分配在 SPIRAM）───────────────────────────────────────
     xTaskCreatePinnedToCoreWithCaps(
-        audio_decoder_task,              // 任务函数
-        "decoder_task",                  // 任务名称
-        AUDIO_DECODER_TASK_STACK_SIZE,   // 栈大小：32KB
-        audio_decoder,                   // 任务参数：解码器实例指针
-        AUDIO_DECODER_TASK_PRIORITY,     // 优先级：5
-        NULL,                            // 不保存任务句柄
-        AUDIO_DECODER_TASK_CORE_ID,      // 绑定核心：CPU0
-        MALLOC_CAP_SPIRAM);              // 栈内存来源：外部 SPIRAM
+        audio_decoder_task,            // 任务函数
+        "decoder_task",                // 任务名称
+        AUDIO_DECODER_TASK_STACK_SIZE, // 栈大小：32KB
+        audio_decoder,                 // 任务参数：解码器实例指针
+        AUDIO_DECODER_TASK_PRIORITY,   // 优先级：5
+        NULL,                          // 不保存任务句柄
+        AUDIO_DECODER_TASK_CORE_ID,    // 绑定核心：CPU0
+        MALLOC_CAP_SPIRAM);            // 栈内存来源：外部 SPIRAM
 }
 
 /**
@@ -274,9 +315,16 @@ void audio_decoder_start(audio_decoder_t *audio_decoder)
  */
 void audio_decoder_stop(audio_decoder_t *audio_decoder)
 {
-    // 清除运行标志，任务在下次 xRingbufferReceive 超时（100ms）后检测到并退出
+    // 清除运行标志：主循环在当前 portMAX_DELAY 完成后检测到 is_running=false 退出
     audio_decoder->is_running = false;
 
-    // 等待 200ms 确保任务安全退出（与编码器保持对称）
-    vTaskDelay(pdMS_TO_TICKS(200));
+    // 等待排水完成（最多 30 秒）：
+    //   解码器退出主循环后会进入排水阶段，把 dec_input 剩余帧全部写入 dec_output，
+    //   drain_done 置 true 后才返回，play_task 随后播完所有积压的 PCM。
+    // 若用户打断（audio_processor_flush_output 已清空 dec_input），排水立即完成。
+    for (int i = 0; i < 300 && !audio_decoder->drain_done; i++)
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+    if (!audio_decoder->drain_done)
+        ESP_LOGW(TAG, "解码器排水超时（30s），可能丢失末尾音频");
 }

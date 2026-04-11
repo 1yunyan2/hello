@@ -12,7 +12,7 @@
 #define TAG "[AP] Encoder"
 
 // ─── 编码器任务配置宏 ─────────────────────────────────────────────────────────
-#define AUDIO_ENCODER_TASK_CORE_ID   0     ///< 编码任务绑定 CPU0（与解码/播放同核，减少核间通信）
+#define AUDIO_ENCODER_TASK_CORE_ID   0     ///< 编码任务绑定 CPU0（CPU1 被 audio_feed_task 独占，编码与播放同核靠 vTaskDelay 让步）
 #define AUDIO_ENCODER_TASK_STACK_SIZE 32768 ///< 栈大小 32KB（OPUS 编码运算需要较大栈，含 FFT 等中间状态）
 #define AUDIO_ENCODER_TASK_PRIORITY  5     ///< 优先级 5（与解码器、播放任务对称）
 
@@ -142,6 +142,10 @@ void audio_encoder_task(void *arg)
             // 正常情况下不会发生（enc_output 8KB 足够缓冲数秒音频）
             ESP_LOGW(TAG, "enc_output 缓冲区满，丢弃一帧 OPUS 数据");
         }
+
+        // 每编码完一帧主动让出 CPU 1 个 tick，防止紧循环饿死低优先级任务（IDLE/WDT）
+        // AFE 每 20ms 产生一帧，此处 1ms 让步不影响实时性
+        vTaskDelay(1);
     }
 
     // ── 任务退出：释放帧缓冲区，自删除 ──────────────────────────────────────
