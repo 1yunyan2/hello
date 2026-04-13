@@ -160,9 +160,9 @@ void audio_decoder_task(void *arg)
             if (xRingbufferSend(
                     audio_decoder->output_buffer,
                     out_frame.buffer,
-                    out_frame.decoded_size, // 实际解码输出字节数
-                    pdMS_TO_TICKS(100)))    // 100ms 超时，失败则检查 is_running 后重试
-                break;                      // 写入成功，跳出重试循环
+                    out_frame.decoded_size,        // 实际解码输出字节数
+                    pdMS_TO_TICKS(100)) == pdTRUE) // 100ms 超时，失败则检查 is_running 后重试
+                break;                             // 写入成功，跳出重试循环
         }
     }
 

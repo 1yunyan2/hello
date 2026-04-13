@@ -304,10 +304,19 @@ size_t audio_processor_read(audio_processor_t *audio_processor, void *buffer, si
 /**
  * @brief 将麦克风采集的 PCM 数据写入编码器输入缓冲区
  * 这是音频上行链路的数据入口（麦克风 PCM → 编码器）
+ *
+ * 【关键】本函数在 afe_fetch_task（CPU1）中通过 on_enhanced_pcm 调用，
+ * 绝不能用 portMAX_DELAY！否则 enc_input 满时阻塞 afe_fetch_task，
+ * 导致 AFE fetch 停止 → AFE FEED ringbuffer 溢出 → VAD/唤醒词全部失效。
+ * 使用 50ms 超时：写不进去就丢帧，丢几帧上行 PCM 只影响 ASR 质量，
+ * 远好于卡死整个 AFE 链路。
  */
 void audio_processor_write_pcm(audio_processor_t *audio_processor, void *buffer, size_t size)
 {
-    xRingbufferSend(audio_processor->enc_input, buffer, size, portMAX_DELAY);
+    if (xRingbufferSend(audio_processor->enc_input, buffer, size, pdMS_TO_TICKS(50)) != pdTRUE)
+    {
+        ESP_LOGW(TAG, "enc_input 满，丢弃 PCM 帧 (%d bytes)", (int)size);
+    }
 }
 
 /**
