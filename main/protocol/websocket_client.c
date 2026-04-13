@@ -206,20 +206,6 @@ static void protocol_complete_handler(protocol_t *protocol, cJSON *root)
 }
 
 /**
- * @brief 处理会话完成消息
- * 通知上层会话已完成
- *
- * @param protocol 协议实例指针
- * @param root JSON根对象指针
- *
- * 调用者：protocol_websocket_event_handler中的WEBSOCKET_EVENT_DATA事件处理
- */
-static void protocol_complete_handler(protocol_t *protocol, cJSON *root)
-{
-    protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_COMPLETE, NULL);
-}
-
-/**
  * @brief 处理 IoT 控制指令消息
  * 提取 commands 数组通知上层执行设备控制操作
  *
@@ -267,7 +253,7 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
     // ── WebSocket错误事件处理 ────────────────────────────────────────────────
     /**
      * @brief WebSocket错误事件处理
-     * 
+     *
      * 说明：处理WebSocket底层错误事件，记录错误日志。
      * API：ESP_LOGE
      * 数据：无状态修改
@@ -279,7 +265,7 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
     // ── WebSocket连接成功事件处理 ────────────────────────────────────────────
     /**
      * @brief WebSocket连接成功事件处理
-     * 
+     *
      * 说明：处理WebSocket连接成功的事件，通知上层连接已建立，
      *       并打印内存使用情况快照用于调试。
      * API：protocol->callback, PRINT_MEM_INFO
@@ -294,7 +280,7 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
     // ── WebSocket数据接收事件处理 ────────────────────────────────────────────
     /**
      * @brief WebSocket数据接收事件处理
-     * 
+     *
      * 说明：处理接收到的数据事件，区分Binary Frame（音频数据）和Text Frame（JSON控制消息），
      *       对Text Frame进行JSON解析并根据type字段路由到对应的处理器。
      * API：cJSON_ParseWithLength, cJSON_GetObjectItem, strcmp, cJSON_Delete
@@ -348,7 +334,7 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
     // ── WebSocket断开连接事件处理 ────────────────────────────────────────────
     /**
      * @brief WebSocket断开连接事件处理
-     * 
+     *
      * 说明：处理WebSocket断开连接或结束的事件，通知上层连接已断开。
      * API：protocol->callback
      * 数据：通过回调通知PROTOCOL_EVENT_DISCONNECTED事件

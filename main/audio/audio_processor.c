@@ -57,12 +57,12 @@ struct audio_processor
     audio_encoder_t *encoder; ///< OPUS 编码器实例（PCM → OPUS）
     audio_decoder_t *decoder; ///< OPUS 解码器实例（OPUS → PCM）
 
-    RingbufHandle_t enc_input;  ///< 编码器输入缓冲（BYTEBUF：麦克风 PCM 数据入口）
-    RingbufHandle_t enc_output; ///< 编码器输出缓冲（NOSPLIT：OPUS 帧，WebSocket 发送任务消费）
-    RingbufHandle_t dec_input;  ///< 解码器输入缓冲（NOSPLIT：云端下发的 OPUS 帧）
-    RingbufHandle_t dec_output; ///< 解码器输出缓冲（BYTEBUF：解码后 PCM，播放任务消费）
+    RingbufHandle_t enc_input;   ///< 编码器输入缓冲（BYTEBUF：麦克风 PCM 数据入口）
+    RingbufHandle_t enc_output;  ///< 编码器输出缓冲（NOSPLIT：OPUS 帧，WebSocket 发送任务消费）
+    RingbufHandle_t dec_input;   ///< 解码器输入缓冲（NOSPLIT：云端下发的 OPUS 帧）
+    RingbufHandle_t dec_output;  ///< 解码器输出缓冲（BYTEBUF：解码后 PCM，播放任务消费）
     RingbufHandle_t aec_ref_buf; ///< AEC 参考缓冲（BYTEBUF：play_task 写入 I2S 时推送副本）
-                                  ///< audio_feed_task 读取后交给 AFE AEC 算法消除回声
+                                 ///< audio_feed_task 读取后交给 AFE AEC 算法消除回声
 
     volatile bool is_running;      ///< 运行标志（控制播放任务循环）
     TaskHandle_t play_task_handle; ///< 播放任务句柄（用于等待任务退出）
@@ -171,12 +171,12 @@ audio_processor_t *audio_processor_create(void)
     }
 
     /* 创建五个环形缓冲区（全部分配在 SPIRAM，节省内部 SRAM） */
-    audio_processor->enc_input  = xRingbufferCreateWithCaps(ENC_INPUT_BUF_SIZE,  RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
+    audio_processor->enc_input = xRingbufferCreateWithCaps(ENC_INPUT_BUF_SIZE, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
     audio_processor->enc_output = xRingbufferCreateWithCaps(ENC_OUTPUT_BUF_SIZE, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
-    audio_processor->dec_input  = xRingbufferCreateWithCaps(DEC_INPUT_BUF_SIZE,  RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
+    audio_processor->dec_input = xRingbufferCreateWithCaps(DEC_INPUT_BUF_SIZE, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
     audio_processor->dec_output = xRingbufferCreateWithCaps(DEC_OUTPUT_BUF_SIZE, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
     /* AEC 参考缓冲：BYTEBUF，play_task → I2S 写入时推副本，feed_task 读取供 AFE AEC */
-    audio_processor->aec_ref_buf = xRingbufferCreateWithCaps(AEC_REF_BUF_SIZE,   RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
+    audio_processor->aec_ref_buf = xRingbufferCreateWithCaps(AEC_REF_BUF_SIZE, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
 
     /* 任一 ringbuf 创建失败 → 整体回滚，避免半初始化对象导致后续崩溃 */
     if (!audio_processor->enc_input || !audio_processor->enc_output ||
@@ -184,11 +184,16 @@ audio_processor_t *audio_processor_create(void)
         !audio_processor->aec_ref_buf)
     {
         ESP_LOGE(TAG, "audio_processor_create: ringbuf alloc failed, rollback");
-        if (audio_processor->enc_input)   vRingbufferDelete(audio_processor->enc_input);
-        if (audio_processor->enc_output)  vRingbufferDelete(audio_processor->enc_output);
-        if (audio_processor->dec_input)   vRingbufferDelete(audio_processor->dec_input);
-        if (audio_processor->dec_output)  vRingbufferDelete(audio_processor->dec_output);
-        if (audio_processor->aec_ref_buf) vRingbufferDelete(audio_processor->aec_ref_buf);
+        if (audio_processor->enc_input)
+            vRingbufferDelete(audio_processor->enc_input);
+        if (audio_processor->enc_output)
+            vRingbufferDelete(audio_processor->enc_output);
+        if (audio_processor->dec_input)
+            vRingbufferDelete(audio_processor->dec_input);
+        if (audio_processor->dec_output)
+            vRingbufferDelete(audio_processor->dec_output);
+        if (audio_processor->aec_ref_buf)
+            vRingbufferDelete(audio_processor->aec_ref_buf);
         audio_encoder_destroy(audio_processor->encoder);
         audio_decoder_destroy(audio_processor->decoder);
         free(audio_processor);
@@ -308,10 +313,20 @@ void audio_processor_write_pcm(audio_processor_t *audio_processor, void *buffer,
 /**
  * @brief 将云端下发的 OPUS 数据写入解码器输入缓冲区
  * 这是音频下行链路的数据入口（WebSocket 接收 → 解码器）
+ *
+ * 【关键】本函数在 WebSocket 事件回调中调用（protocol_event_handler → PROTOCOL_EVENT_AUDIO），
+ * 绝不能用 portMAX_DELAY！否则 dec_input 满时会阻塞整个 WebSocket 接收线程，
+ * 导致 STT 文本、TTS_STOP 等控制消息全部收不到 → 会话超时。
+ * 使用 100ms 超时：写不进去就丢帧，丢几帧 OPUS 只是轻微卡顿，远好于卡死整条链路。
  */
 void audio_processor_write(audio_processor_t *audio_processor, void *buffer, size_t size)
 {
-    xRingbufferSend(audio_processor->dec_input, buffer, size, portMAX_DELAY);
+    //  xRingbufferSend(audio_processor->dec_input, buffer, size, portMAX_DELAY);
+
+    if (xRingbufferSend(audio_processor->dec_input, buffer, size, pdMS_TO_TICKS(100)) != pdTRUE)
+    {
+        ESP_LOGW(TAG, "dec_input 满，丢弃 OPUS 帧 (%d bytes)", (int)size);
+    }
 }
 
 /**

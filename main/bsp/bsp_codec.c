@@ -190,35 +190,35 @@ void bsp_board_codec_init(bsp_board_t *bsp_board)
     xEventGroupSetBits(bsp_board->board_status, CODEC_BIT);
 }
 
-/**
- * @brief 检查指定状态位是否全部就绪（AND 等待）
- *
- * 封装 FreeRTOS xEventGroupWaitBits() 的 AND 模式等待，
- * 所有指定位同时满足才返回 true，任一位未满足则返回 false（超时后）。
- *
- * @param bsp_board      BSP 实例指针（访问 board_status 事件组）
- * @param bits_to_check  要检查的位掩码（多个位：NVS_BIT | WIFI_BIT 等）
- * @param wait_ticks     等待超时（FreeRTOS tick 数）
- *                       - 0 = 立即检查，不等待
- *                       - portMAX_DELAY = 永久等待直到满足
- * @return true  所有指定位均已置位
- * @return false 超时，部分位尚未置位
- *
- * @note 调用者：bsp_wifi.c → bsp_board_wifi_main()（前置条件检查）
- */
-bool bsp_board_check_status(bsp_board_t *bsp_board, EventBits_t bits_to_check, TickType_t wait_ticks)
-{
-    // ── 等待所有指定位同时置位（AND 模式）───────────────────────────────────
-    EventBits_t bits = xEventGroupWaitBits(
-        bsp_board->board_status, // 要等待的事件组
-        bits_to_check,           // 要检查的位掩码
-        pdFALSE,                 // 返回时不清除位（其他模块可能也在等待同一位）
-        pdTRUE,                  // AND 模式：所有位都满足才返回
-        wait_ticks);             // 超时时间
+// /**
+//  * @brief 检查指定状态位是否全部就绪（AND 等待）
+//  *
+//  * 封装 FreeRTOS xEventGroupWaitBits() 的 AND 模式等待，
+//  * 所有指定位同时满足才返回 true，任一位未满足则返回 false（超时后）。
+//  *
+//  * @param bsp_board      BSP 实例指针（访问 board_status 事件组）
+//  * @param bits_to_check  要检查的位掩码（多个位：NVS_BIT | WIFI_BIT 等）
+//  * @param wait_ticks     等待超时（FreeRTOS tick 数）
+//  *                       - 0 = 立即检查，不等待
+//  *                       - portMAX_DELAY = 永久等待直到满足
+//  * @return true  所有指定位均已置位
+//  * @return false 超时，部分位尚未置位
+//  *
+//  * @note 调用者：bsp_wifi.c → bsp_board_wifi_main()（前置条件检查）
+//  */
+// bool bsp_board_check_status(bsp_board_t *bsp_board, EventBits_t bits_to_check, TickType_t wait_ticks)
+// {
+//     // ── 等待所有指定位同时置位（AND 模式）───────────────────────────────────
+//     EventBits_t bits = xEventGroupWaitBits(
+//         bsp_board->board_status, // 要等待的事件组
+//         bits_to_check,           // 要检查的位掩码
+//         pdFALSE,                 // 返回时不清除位（其他模块可能也在等待同一位）
+//         pdTRUE,                  // AND 模式：所有位都满足才返回
+//         wait_ticks);             // 超时时间
 
-    // 检查所有请求的位是否均已置位（位运算：返回值与掩码 AND 后等于掩码）
-    return (bits & bits_to_check) == bits_to_check;
-}
+//     // 检查所有请求的位是否均已置位（位运算：返回值与掩码 AND 后等于掩码）
+//     return (bits & bits_to_check) == bits_to_check;
+// }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 音频采集任务与完整初始化

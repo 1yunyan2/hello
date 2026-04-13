@@ -46,8 +46,8 @@ struct audio_decoder
     int sample_rate; ///< 采样率（Hz），用于计算 PCM 输出缓冲区大小
     int channels;    ///< 声道数
 
-    bool is_running;           ///< 任务运行标志：false 时解码主循环退出
-    volatile bool drain_done;  ///< 排水完成标志：主循环退出后排完 dec_input 剩余帧后置 true
+    bool is_running;          ///< 任务运行标志：false 时解码主循环退出
+    volatile bool drain_done; ///< 排水完成标志：主循环退出后排完 dec_input 剩余帧后置 true
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -145,15 +145,25 @@ void audio_decoder_task(void *arg)
         }
         // ── 将解码后的 PCM 数据写入播放缓冲区 ─────────────────────────────
         // BYTEBUF 类型：支持分段写入，PCM 数据无帧边界约束
-        // 使用 portMAX_DELAY：dec_output 满时阻塞等待 play_task 消耗，形成背压。
         // 背压链路：play_task(I2S实时) → dec_output → decoder 等待 → dec_input 积压
         // → audio_processor_write 阻塞 → WebSocket 接收自然降速。
+        // 使用 100ms 超时循环重试：既保留背压不丢帧，又能及时响应 stop 信号。
+        // 旧方案 portMAX_DELAY 会导致 stop 时任务无法及时退出。
         // 这样解码速率与播放速率自动对齐，彻底避免 PCM 丢帧和快进卡顿。
-        xRingbufferSend(
-            audio_decoder->output_buffer,
-            out_frame.buffer,
-            out_frame.decoded_size, // 实际解码输出字节数
-            portMAX_DELAY);         // 阻塞等待，不丢帧
+        // xRingbufferSend(
+        //     audio_decoder->output_buffer,
+        //     out_frame.buffer,
+        //     out_frame.decoded_size, // 实际解码输出字节数
+        //     portMAX_DELAY);         // 阻塞等待，不丢帧
+        while (audio_decoder->is_running)
+        {
+            if (xRingbufferSend(
+                    audio_decoder->output_buffer,
+                    out_frame.buffer,
+                    out_frame.decoded_size, // 实际解码输出字节数
+                    pdMS_TO_TICKS(100)))    // 100ms 超时，失败则检查 is_running 后重试
+                break;                      // 写入成功，跳出重试循环
+        }
     }
 
     // ── 排水阶段：主循环退出后，继续把 dec_input 剩余帧解码写入 dec_output ──
@@ -168,7 +178,7 @@ void audio_decoder_task(void *arg)
         {
             esp_audio_dec_in_raw_t drain_in = {
                 .buffer = drain_buf,
-                .len    = drain_size,
+                .len = drain_size,
             };
             out_frame.len = out_buffer_size; // 每次重置，防止底层覆盖
 

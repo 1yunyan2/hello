@@ -63,7 +63,12 @@ void application_init(void)
     bsp_board_nvs_init(bsp_board);
     PRINT_INTERNAL_HEAP;
 
-    // 步骤 3:初始化唤醒词引擎,注册触发回调
+    // 步骤 3:初始化音频硬件(I2C + I2S + ES8311 Codec)并启动麦克风采集任务
+    // 必须在唤醒词引擎初始化之后调用,采集任务会立即向引擎投喂音频帧
+    audio_init(bsp_board);
+    PRINT_INTERNAL_HEAP;
+
+    // 步骤 4:初始化唤醒词引擎,注册触发回调
     // 从 NVS 加载上次保存的唤醒词和语言,加载对应 MultiNet6 模型
     wake_word_init(wake_word_callback);
 
@@ -71,11 +76,6 @@ void application_init(void)
     // 原代码此处被注释,依赖 wake_word_init 内部隐式启动,
     // 在重构后该假设不再成立 → 显式调用确保监听态
     wake_word_start();
-    PRINT_INTERNAL_HEAP;
-
-    // 步骤 4:初始化音频硬件(I2C + I2S + ES8311 Codec)并启动麦克风采集任务
-    // 必须在唤醒词引擎初始化之后调用,采集任务会立即向引擎投喂音频帧
-    audio_init(bsp_board);
     PRINT_INTERNAL_HEAP;
 
     // 步骤 5:启动 WiFi(阻塞直至成功获取 IP 或连接彻底失败后重启)
@@ -93,11 +93,6 @@ void application_init(void)
     //  session_init("wss://api.tenclass.net/xiaozhi/v1/");
     // session_init("ws://122.224.191.2:4888/ws/voice?token=<accessToken>");
     session_init("ws://122.224.191.2:4888/ws/voice");
-    PRINT_INTERNAL_HEAP;
-
-    // 步骤 8:启动电源监测(ADC 采样电池电压 + 上报)
-    // 【BUG-025 修复】原代码被注释,导致设备无电量上报
-    // power_monitor_init();
     PRINT_INTERNAL_HEAP;
 
     ESP_LOGI(TAG, "application_init complete, system ready");
