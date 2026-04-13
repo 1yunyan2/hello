@@ -318,6 +318,12 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
                 //     protocol_stt_handler(protocol, root);
                 else if (strcmp(type->valuestring, "tts") == 0)
                     protocol_tts_handler(protocol, root);
+                //  兼容你服务端的 tts_start
+                else if (strcmp(type->valuestring, "tts_start") == 0)
+                    protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_TTS_START, NULL);
+                //  兼容你服务端的 tts_end，这会触发上面我们刚写的方案A关机！
+                else if (strcmp(type->valuestring, "tts_end") == 0)
+                    protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_TTS_STOP, NULL);
                 else if (strcmp(type->valuestring, "iot") == 0)
                     protocol_iot_handler(protocol, root);
                 else if (strcmp(type->valuestring, "error") == 0)

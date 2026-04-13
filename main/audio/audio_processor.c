@@ -330,14 +330,20 @@ void audio_processor_write_pcm(audio_processor_t *audio_processor, void *buffer,
  */
 void audio_processor_write(audio_processor_t *audio_processor, void *buffer, size_t size)
 {
-    //  xRingbufferSend(audio_processor->dec_input, buffer, size, portMAX_DELAY);
+    if (audio_processor == NULL || audio_processor->dec_input == NULL)
+        return;
 
-    if (xRingbufferSend(audio_processor->dec_input, buffer, size, pdMS_TO_TICKS(100)) != pdTRUE)
+    // ✅ 核心修复：绝对不能丢帧！大模型语速快，扬声器播得慢。
+    // 用 while 循环等待扬声器消化缓冲，保证十几秒的语音一字不漏！
+    while (audio_processor->is_running)
     {
-        ESP_LOGW(TAG, "dec_input 满，丢弃 OPUS 帧 (%d bytes)", (int)size);
+        if (xRingbufferSend(audio_processor->dec_input, buffer, size, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            break; // 写入成功，跳出循环接下一帧
+        }
+        // 如果 100ms 还没写进去，不会丢弃，而是继续下一轮 while 等待
     }
 }
-
 /**
  * @brief 清空解码器输入和输出缓冲区
  *
