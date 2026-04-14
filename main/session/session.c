@@ -218,7 +218,14 @@ static void session_event_task(void *arg)
 static void on_session_timeout(TimerHandle_t t)
 {
     ESP_LOGW(TAG, "会话超时（%d 秒无活动），关闭会话", SESSION_TIMEOUT_MS / 1000);
-    session_close();
+    // session_close();  // ❌ 必须删掉！定时器里直接关机会导致栈溢出死机！
+
+    // ✅ 修复：通过专用的会话事件队列发送关闭信号，安全可靠
+    if (s_session_evt_queue != NULL)
+    {
+        session_evt_t evt = SESSION_EVT_CLOSE;
+        xQueueSend(s_session_evt_queue, &evt, 0);
+    }
 }
 
 /**
@@ -437,19 +444,22 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
      * 数据：修改s_state, s_speech_detected, s_stop_sent, s_is_continuous_turn
      */
     case PROTOCOL_EVENT_TTS_STOP:
-        ESP_LOGI(TAG, "[TTS] TTS 播放结束，恢复对话");
+#if 0 // 💡 这里暂时设为 0，启用方案 A（一问一答）。未来上市改 1 就是方案 B 连麦
+        ESP_LOGI(TAG, "[TTS] TTS 播放结束，恢复对话 (方案 B)");
         s_state = SESSION_LISTENING;
         s_speech_detected = false;
         s_stop_sent = false;
         s_is_continuous_turn = true;
-
         xTimerReset(s_session_timer, 0);
-        // 【修复】TTS_STOP 不关闭会话！
-        // 会话关闭由 PROTOCOL_EVENT_COMPLETE 负责。
-        // 之前在这里发 SESSION_EVT_CLOSE 导致：
-        //   1. 音频还没播完就被清掉（说几个字就截断）
-        //   2. session_close 阻塞 drain → afe_fetch 卡死 → AFE FEED 溢出
-        //   3. 下次对话 VAD 错乱 → stop_listening 发不出 → 服务器超时
+#else
+        ESP_LOGI(TAG, "[TTS] TTS 播放结束，安全退出会话 (方案 A)");
+        s_is_continuous_turn = false;
+        if (s_session_evt_queue != NULL)
+        {
+            session_evt_t evt = SESSION_EVT_CLOSE;
+            xQueueSend(s_session_evt_queue, &evt, 0);
+        }
+#endif
         break;
 
     case PROTOCOL_EVENT_STT:
@@ -554,11 +564,11 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
         // （drain 可能耗时数秒，直接调会阻塞 WebSocket 任务导致连接断线）。
         ESP_LOGI(TAG, "会话完成");
         s_is_continuous_turn = false;
-        // if (s_session_evt_queue != NULL)
-        // {
-        //     session_evt_t evt = SESSION_EVT_CLOSE;
-        //     xQueueSend(s_session_evt_queue, &evt, 0);
-        // }
+        if (s_session_evt_queue != NULL)
+        {
+            session_evt_t evt = SESSION_EVT_CLOSE;
+            xQueueSend(s_session_evt_queue, &evt, 0);
+        }
         break;
     default:
         break;

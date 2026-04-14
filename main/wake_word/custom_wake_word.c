@@ -6,7 +6,7 @@
  *   wake_word_init()
  *     ├─ nvs_read_str()          从 NVS 读取上次配置
  *     ├─ load_model_for_lang()   加载 MultiNet6 语言模型
- *     ├─ bsp_wake_word_load_from_nvs()  读取命令词
+ *     ├─ wake_word_load_from_nvs()  读取命令词
  *     ├─ count_words()           校验词数 ≥ 2
  *     ├─ register_command_word() 注册命令词到 FST
  *     └─ afe_fetch_task          启动 AFE 消费任务
@@ -36,7 +36,7 @@ static void afe_fetch_task(void *arg);
 #define AUDIO_BUFFER_MAX 2048                // MultiNet 音频积累缓冲区最大采样点数
 // AEC 交织缓冲区大小：最大 feed chunksize（每通道）* 2 通道
 // 通常 chunksize = 512，因此此处取保守上限 1024 * 2 = 2048 个 int16_t
-#define AEC_MAX_FEED_SAMPLES 1024            // 每通道最大采样点数
+#define AEC_MAX_FEED_SAMPLES 1024 // 每通道最大采样点数
 
 // ─── 模块级静态变量 ──────────────────────────────────────────────────────
 static esp_mn_iface_t *multinet_iface = NULL;          // MultiNet 接口函数表指针
@@ -64,7 +64,7 @@ static SemaphoreHandle_t buffer_mutex = NULL;        // 保护 input_buffer 的�
 static volatile aec_ref_cb_t s_aec_ref_cb = NULL;
 
 // AEC 交织缓冲区（静态：单任务调用 custom_wake_word_feed，无并发风险）
-static int16_t s_aec_ref[AEC_MAX_FEED_SAMPLES];            // 参考信号（临时）
+static int16_t s_aec_ref[AEC_MAX_FEED_SAMPLES];             // 参考信号（临时）
 static int16_t s_aec_interleaved[AEC_MAX_FEED_SAMPLES * 2]; // MR 交织输入送 AFE
 
 // ─── VAD / 增强 PCM 接口回调状态 ────────────────────────────────────────
@@ -92,7 +92,7 @@ static size_t input_buffer_len = 0;            // 缓冲区当前有效采样点
  * @return true  字符串中含有汉字（判定为中文）
  * @return false 全为 ASCII 字符（判定为英文）
  *
- * @note 调用者：wake_word_init()、wake_word_update()、bsp_wake_word_load_from_nvs()
+ * @note 调用者：wake_word_init()、wake_word_update()、wake_word_load_from_nvs()
  */
 static bool is_chinese_text(const char *s)
 {
@@ -121,7 +121,9 @@ static bool is_chinese_text(const char *s)
  * @param fallback 读取失败时使用的默认字符串
  * @return void
  *
- * @note 调用者：wake_word_init()、bsp_wake_word_load_from_nvs()
+ * @note 调用者：wake_word_init()、wake_word_load_from_nvs()
+ * !键名是公共数据入口，dest是私有的存储数据的
+ *
  */
 static void nvs_read_str(const char *key, char *dest, size_t max_len, const char *fallback)
 {
@@ -174,7 +176,7 @@ static void nvs_write_str(const char *key, const char *value)
 }
 
 // 公开接口：根据当前显示词语言，从 NVS 读取对应命令词到 dest
-void bsp_wake_word_load_from_nvs(char *dest, size_t max_len)
+void wake_word_load_from_nvs(char *dest, size_t max_len)
 {
     // 根据当前已记录的显示词判断语言，选择对应的回退默认值
     bool cn = is_chinese_text(current_disp_word);
@@ -378,12 +380,13 @@ esp_err_t wake_word_init(wake_word_detected_cb_t cb)
 
     // 扫描 SPIFFS "model" 分区，建立模型文件列表
     models = esp_srmodel_init("model");
+    //=-1 是 esp_srmodel_init 在分区未挂载或缺失时的错误标志
     if (models == NULL || models->num == -1)
     {
         // 分区未挂载或 partitions.csv 中 model 分区缺失
         ESP_LOGE(TAG, "模型分区初始化失败，请检查 partitions.csv");
         vSemaphoreDelete(buffer_mutex);
-        buffer_mutex = NULL;
+        buffer_mutex = NULL; //! 锁的顺序不能错，先删除锁再置 NULL
         return ESP_FAIL;
     }
 
@@ -461,7 +464,7 @@ esp_err_t wake_word_init(wake_word_detected_cb_t cb)
     PRINT_MEM_INFO(TAG, "MultiNet唤醒词模型加载后");
 
     // 从 NVS 加载命令词；英文词自动转全大写（mn6_en 词表要求）
-    bsp_wake_word_load_from_nvs(current_wake_word, sizeof(current_wake_word));
+    wake_word_load_from_nvs(current_wake_word, sizeof(current_wake_word));
     if (!is_chinese_text(current_disp_word))
     {
         for (int i = 0; current_wake_word[i]; i++)
@@ -791,8 +794,8 @@ void custom_wake_word_feed(const int16_t *data, size_t len)
     // 交织为 [mic, ref, mic, ref, ...]
     for (size_t i = 0; i < len; i++)
     {
-        s_aec_interleaved[2 * i]     = data[i];       // 麦克风采样
-        s_aec_interleaved[2 * i + 1] = s_aec_ref[i];  // 参考采样（扬声器回声）
+        s_aec_interleaved[2 * i] = data[i];          // 麦克风采样
+        s_aec_interleaved[2 * i + 1] = s_aec_ref[i]; // 参考采样（扬声器回声）
     }
 
     // 投喂 AFE（内部线程安全）

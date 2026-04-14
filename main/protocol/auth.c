@@ -182,7 +182,7 @@ void auth_perform(auth_t *auth, const char *device_token)
         {
             free(wrapper->auth.access_token);
             wrapper->auth.access_token = strdup(token_item->valuestring);
-            ESP_LOGI(TAG, "✅ 成功拿到 accessToken: %s", wrapper->auth.access_token);
+            ESP_LOGI(TAG, "[OK] 成功拿到 accessToken: %s", wrapper->auth.access_token);
 
             nvs_handle_t h;
             if (nvs_open("net_config", NVS_READWRITE, &h) == ESP_OK)

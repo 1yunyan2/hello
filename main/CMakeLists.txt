@@ -16,5 +16,6 @@ idf_component_register(SRCS
 "application.c"
 "protocol/auth.c"
 "ui/interaction.c"
+"ui/reminder.c"
 INCLUDE_DIRS "."
 )

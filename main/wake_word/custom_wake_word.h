@@ -90,8 +90,9 @@ esp_err_t wake_word_init(wake_word_detected_cb_t cb);
  * @return void
  *
  * @note 调用者：wake_word_init()（初始化时内部调用）
+ *
  */
-void bsp_wake_word_load_from_nvs(char *dest, size_t max_len);
+void wake_word_load_from_nvs(char *dest, size_t max_len);
 
 /**
  * @brief 更新唤醒词（MQTT 收到指令后调用）

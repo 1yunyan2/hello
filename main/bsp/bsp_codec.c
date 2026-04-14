@@ -159,7 +159,7 @@ void bsp_board_codec_init(bsp_board_t *bsp_board)
     // 保存 TX 句柄到 bsp_board，供 play_task 绕过 codec_dev mutex 直接写入
     // 背景：codec_dev(IN_OUT) read/write 共享同一把 mutex，play_task 持锁 ~64ms
     //       会导致 audio_feed_task 无法及时 read，AFE FEED ringbuffer 溢出
-    bsp_board->i2s_tx_handle = tx_handle;
+    bsp_board->i2s_tx_handle = tx_handle; //! 这一步不属于 Codec 初始化，但为了性能优化需要在这里保存 TX 句柄
 
     // 将 I2S TX/RX 句柄封装为 Codec 数据接口（统一抽象层）
     audio_codec_i2s_cfg_t i2s_config = {
@@ -189,36 +189,6 @@ void bsp_board_codec_init(bsp_board_t *bsp_board)
     // ── 步骤 7：置位 CODEC_BIT，通知其他模块音频硬件已就绪 ──────────────────
     xEventGroupSetBits(bsp_board->board_status, CODEC_BIT);
 }
-
-// /**
-//  * @brief 检查指定状态位是否全部就绪（AND 等待）
-//  *
-//  * 封装 FreeRTOS xEventGroupWaitBits() 的 AND 模式等待，
-//  * 所有指定位同时满足才返回 true，任一位未满足则返回 false（超时后）。
-//  *
-//  * @param bsp_board      BSP 实例指针（访问 board_status 事件组）
-//  * @param bits_to_check  要检查的位掩码（多个位：NVS_BIT | WIFI_BIT 等）
-//  * @param wait_ticks     等待超时（FreeRTOS tick 数）
-//  *                       - 0 = 立即检查，不等待
-//  *                       - portMAX_DELAY = 永久等待直到满足
-//  * @return true  所有指定位均已置位
-//  * @return false 超时，部分位尚未置位
-//  *
-//  * @note 调用者：bsp_wifi.c → bsp_board_wifi_main()（前置条件检查）
-//  */
-// bool bsp_board_check_status(bsp_board_t *bsp_board, EventBits_t bits_to_check, TickType_t wait_ticks)
-// {
-//     // ── 等待所有指定位同时置位（AND 模式）───────────────────────────────────
-//     EventBits_t bits = xEventGroupWaitBits(
-//         bsp_board->board_status, // 要等待的事件组
-//         bits_to_check,           // 要检查的位掩码
-//         pdFALSE,                 // 返回时不清除位（其他模块可能也在等待同一位）
-//         pdTRUE,                  // AND 模式：所有位都满足才返回
-//         wait_ticks);             // 超时时间
-
-//     // 检查所有请求的位是否均已置位（位运算：返回值与掩码 AND 后等于掩码）
-//     return (bits & bits_to_check) == bits_to_check;
-// }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 音频采集任务与完整初始化

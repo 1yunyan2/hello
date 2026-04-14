@@ -3,3 +3,4 @@ dependencies:
   espressif/esp_codec_dev: "^1.5.4"
   espressif/esp_audio_codec: ^2.4.0
   espressif/esp_websocket_client: ^1.6.0
+  espressif/servo: ^0.1.0
