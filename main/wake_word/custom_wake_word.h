@@ -196,7 +196,7 @@ typedef void (*enhanced_pcm_cb_t)(const int16_t *data, size_t samples);
  * @param cb 回调函数指针，NULL = 注销当前回调
  * @return void
  *
- * @note 调用者：session.c（当前未使用，VAD 通过 bsp_wake_word_get_vad_state 轮询）
+ * @note 调用者：session.c（当前未使用，VAD 通过 wake_word_get_vad_state 轮询）
  */
 void bsp_wake_word_set_vad_callback(vad_state_cb_t cb);
 
@@ -212,7 +212,7 @@ void bsp_wake_word_set_vad_callback(vad_state_cb_t cb);
  * @note 调用者：session.c → session_on_wake_word()（会话启动时注册）、
  *              session_close()（会话结束时注销，传 NULL）
  */
-void bsp_wake_word_set_enhanced_pcm_hook(enhanced_pcm_cb_t hook);
+void wake_word_set_enhanced_pcm_hook(enhanced_pcm_cb_t hook);
 
 /**
  * @brief 查询当前 VAD 状态（线程安全只读）
@@ -221,7 +221,7 @@ void bsp_wake_word_set_enhanced_pcm_hook(enhanced_pcm_cb_t hook);
  *
  * @note 调用者：session.c → on_enhanced_pcm()（PCM 钩子内轮询 VAD 状态）
  */
-vad_state_t bsp_wake_word_get_vad_state(void);
+vad_state_t wake_word_get_vad_state(void);
 
 // ─── AEC 参考信号接口 ────────────────────────────────────────────────────
 

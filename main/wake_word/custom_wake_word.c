@@ -49,12 +49,13 @@ static srmodel_list_t *models = NULL;                  // SPIFFS 模型分区扫
 //   参考信号(play_task当前播放的PCM) → 交织为 [mic,ref,mic,ref,...] → AFE.feed()
 //   AFE 内部：AEC(消除回声) → NS(降噪) → VAD → 干净单通道 PCM → fetch()
 //     → MultiNet(命令词检测) + enhanced_pcm_hook(→编码器→云端)
-static const esp_afe_sr_iface_t *s_afe_iface = NULL; // AFE 接口函数表（只读，库提供）
+
+static const esp_afe_sr_iface_t *s_afe_iface = NULL; // AFE 接口函数表（只读，库提供）//! 接口是相当于一个函数指针表，存储的是数据的指针地址
 static esp_afe_sr_data_t *s_afe_data = NULL;         // AFE 运行时数据（需要 destroy 释放）
 static int s_afe_feed_chunksize = 0;                 // AFE feed 每次需要的采样点数（audio_feed_task 按此投喂）
 static int s_afe_fetch_chunksize = 0;                // AFE fetch 每次输出的采样点数
 
-static volatile bool is_running = false;             // 引擎运行标志（volatile：可能在中断/任务间读写）
+static volatile bool is_running = false;             // 引擎运行标志（volatile：可能在中断/任务间读写）// 供 custom_wake_word_feed 和 afe_fetch_task 访问
 static wake_word_detected_cb_t user_callback = NULL; // 用户注册的触发回调
 static SemaphoreHandle_t buffer_mutex = NULL;        // 保护 input_buffer 的互斥锁
 
@@ -69,7 +70,7 @@ static int16_t s_aec_interleaved[AEC_MAX_FEED_SAMPLES * 2]; // MR 交织输入�
 
 // ─── VAD / 增强 PCM 接口回调状态 ────────────────────────────────────────
 static vad_state_cb_t s_vad_cb = NULL;                         // VAD 状态回调
-static enhanced_pcm_cb_t s_enhanced_pcm_hook = NULL;           // 降噪后 PCM 数据钩子（AFE 输出）
+static enhanced_pcm_cb_t s_enhanced_pcm_hook = NULL;           // 降噪后 PCM 数据钩子:AFE输出;增强PCM数据回调（供编码器使用）
 static volatile vad_state_t s_current_vad_state = VAD_SILENCE; // 当前 VAD 状态
 
 static char current_wake_word[64] = {0}; // 当前生效的命令词（拼音或全大写英文）
@@ -291,8 +292,10 @@ static esp_err_t load_model_for_lang(const char *lang)
 // ─── 命令词注册 ───────────────────────────────────────────────────────────
 
 /**
+ * !FST是：命令词识别模型，用于识别用户输入的命令词。
+ * !SR是：语音识别模型，用于识别用户输入的语音内容。
  * @brief 向当前 MultiNet6 模型注册命令词并重建 FST
- *
+ * 模型创建，注册，更新
  * 步骤：
  *   1. alloc 命令词槽（清除旧词表）
  *   2. 尝试注册 current_wake_word，失败则回退到对应语言的出厂默认词
@@ -433,6 +436,7 @@ esp_err_t wake_word_init(wake_word_detected_cb_t cb)
         return ESP_FAIL;
     }
 
+    // 创建数据，复制到 s_afe_data ，销毁 afe_cfg 释放内存
     s_afe_data = s_afe_iface->create_from_config(afe_cfg);
     PRINT_MEM_INFO(TAG, "AFE模型加载后");
     afe_config_free(afe_cfg); // 配置已复制到 AFE 内部，可以释放
@@ -441,12 +445,21 @@ esp_err_t wake_word_init(wake_word_detected_cb_t cb)
     {
         ESP_LOGE(TAG, "AFE 实例创建失败（内存不足？）");
         s_afe_iface = NULL;
+        /**
+        // !为什么置为空？因为后续代码会检查 s_afe_iface 是否为 NULL
+        来判断是否初始化成功，如果不置空可能会误以为 AFE 初始化成功了，
+         从而导致程序无法运行
+         */
         vSemaphoreDelete(buffer_mutex);
         buffer_mutex = NULL;
         return ESP_FAIL;
     }
 
     // 缓存 AFE 的帧大小，供 audio_feed_task 和 fetch 逻辑使用
+    /**
+     * 统一的 chunksize，系统可以确保音频数据流的同步性和处理效率
+     * 避免缓冲区溢出或欠载的问题。
+     */
     s_afe_feed_chunksize = s_afe_iface->get_feed_chunksize(s_afe_data);
     s_afe_fetch_chunksize = s_afe_iface->get_fetch_chunksize(s_afe_data);
     ESP_LOGI(TAG, "AFE 初始化完成: feed_chunk=%d, fetch_chunk=%d",
@@ -457,18 +470,20 @@ esp_err_t wake_word_init(wake_word_detected_cb_t cb)
 
     if (load_model_for_lang(lang) != ESP_OK)
     {
+        ESP_LOGE(TAG, "MultiNet唤醒词模型加载失败");
         vSemaphoreDelete(buffer_mutex);
         buffer_mutex = NULL;
         return ESP_FAIL;
     }
     PRINT_MEM_INFO(TAG, "MultiNet唤醒词模型加载后");
 
-    // 从 NVS 加载命令词；英文词自动转全大写（mn6_en 词表要求）
+    //! 从 NVS 加载命令词；英文词自动转全大写（mn6_en 词表要求）
     wake_word_load_from_nvs(current_wake_word, sizeof(current_wake_word));
     if (!is_chinese_text(current_disp_word))
     {
         for (int i = 0; current_wake_word[i]; i++)
             current_wake_word[i] = toupper((unsigned char)current_wake_word[i]);
+        // toupper() 函数将小写字母转换为大写字母，如果字符不是小写字母，则返回原字符不变。
     }
 
     // 安全校验：词数 < 2 说明 NVS 中存的是旧版单音节词，强制回退默认值
@@ -620,44 +635,44 @@ size_t custom_wake_word_get_chunksize(void)
 }
 
 // ─── AFE fetch 任务（独立任务，与 feed 并行运行）─────────────────────
-//
 // 数据流：AFE fetch(降噪+VAD) → 降噪PCM → MultiNet detect
-//                                        → enhanced_pcm_hook → 编码器 → 云端
-//
-// 【关键设计】AFE 要求 feed 和 fetch 在不同任务中并行执行：
+//  → enhanced_pcm_hook → 编码器 → 云端
+//! 【关键设计】AFE 要求 feed 和 fetch 在不同任务中"并行执行"：
+// !  若 feed 和 fetch 在同一任务中"串行"，fetch 阻塞时 feed 停止，ringbuffer 永远空。
 //   - audio_feed_task（bsp_codec.c）：持续调 s_afe_iface->feed() 投喂原始 PCM
 //   - afe_fetch_task（本函数）：持续调 s_afe_iface->fetch() 取出降噪后 PCM
-//   若 feed 和 fetch 在同一任务中串行，fetch 阻塞时 feed 停止，ringbuffer 永远空。
-
 /**
  * @brief AFE 降噪输出消费任务（持续从 AFE 取帧，分发给 VAD/编码器/MultiNet）
- *
  * 数据流（每帧循环）：
  *   s_afe_iface->fetch()  →  更新 s_current_vad_state，触发 s_vad_cb
  *                         →  调用 s_enhanced_pcm_hook（→ 编码器 → 云端）
  *                         →  积累到 input_buffer，凑满 mn_chunksize 后送 detect
  *                         →  detect 命中 → 置 wake_triggered，锁外调 user_callback
- *
  * @param arg FreeRTOS 任务参数（未使用，传 NULL）
  * @return void（任务不返回，永久循环直到设备复位）
- *
  * @note 调用者：wake_word_init()（xTaskCreatePinnedToCore，CPU1，优先级 5）
  * @note 必须与 audio_feed_task 在不同任务中并行运行，否则 AFE ringbuffer 饿死
  */
 static void afe_fetch_task(void *arg)
 {
     ESP_LOGI(TAG, "AFE fetch 任务启动");
-
-    // 注意：CPU1 的 IDLE 任务 WDT 监控已在 sdkconfig 中关闭
+    /**
+     * 风险：
+如果你的 CPU1 音频任务真的因为 Bug 死循环了，由于 WDT 关了，CPU1 就真的永久卡死了，
+只能靠 CPU0 的重启逻辑或硬件复位来恢复。
+通常在音视频产品中，更规范的做法不是关 IDLE WDT，而是：
+在长时间循环中主动插入 vTaskDelay(1) 喂狗。
+或者把耗时处理切碎，让 IDLE 有机会运行。
+     */
+    // !注意：CPU1 的 IDLE 任务 WDT 监控已在 sdkconfig 中关闭
     // （CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1 = n）
     // 原因：afe_fetch + audio_feed 都在 CPU1 优先级 5 运行，设计上占满 CPU1，
     // IDLE1 无法运行是正常行为，不是故障。
-
     while (1)
     {
-
         // 阻塞等待 AFE 输出一帧降噪后的 PCM（内部自动同步 feed 速率）
         afe_fetch_result_t *res = s_afe_iface->fetch(s_afe_data);
+        // 如果ress 为空或者失败，则跳过本帧数据，继续等待下一帧
         if (res == NULL || res->ret_value == ESP_FAIL)
         {
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -671,6 +686,12 @@ static void afe_fetch_task(void *arg)
 
         // ── 降噪 PCM 送给增强钩子（→ 编码器 → 云端）──────────────────
         // 无论 MultiNet 是否在运行，钩子都需要收到数据
+        /**
+         * res->data: AFE 降噪后的 16-bit PCM 音频数据
+         * res->data_size / sizeof(int16_t): 计算有多少个采样点（因为每个采样点是2字节）
+         * if (s_enhanced_pcm_hook): 检查是否有模块注册了这个回调
+         * 调用回调: 将处理好的音频数据传递给注册的模块
+         */
         if (s_enhanced_pcm_hook)
             s_enhanced_pcm_hook(res->data, res->data_size / sizeof(int16_t));
 
@@ -689,7 +710,7 @@ static void afe_fetch_task(void *arg)
         }
 
         // 将 AFE 输出的降噪 PCM 追加到 MultiNet 积累缓冲区
-        size_t enhanced_samples = res->data_size / sizeof(int16_t);
+        size_t enhanced_samples = res->data_size / sizeof(int16_t); // 降噪 PCM 采样点数
         if (input_buffer_len + enhanced_samples <= AUDIO_BUFFER_MAX)
         {
             memcpy(&input_buffer[input_buffer_len], res->data, res->data_size);
@@ -705,16 +726,17 @@ static void afe_fetch_task(void *arg)
 
         // MultiNet detect：每次 fetch 最多做 1 次 detect，确保及时回到 fetch()
         // 避免 detect 循环长时间占用 CPU 导致 AFE ringbuffer 溢出
-        int mn_chunksize = multinet_iface->get_samp_chunksize(multinet_model_data);
-        bool wake_triggered = false;
+        int mn_chunksize = multinet_iface->get_samp_chunksize(multinet_model_data); // MN 输入采样点数
+        bool wake_triggered = false;                                                // 是否已触发唤醒
 
         if (input_buffer_len >= mn_chunksize && is_running)
         {
             esp_mn_state_t mn_state = multinet_iface->detect(multinet_model_data, input_buffer);
+            // 送 detect 处理当前缓冲区前 mn_chunksize 大小的音频数据
 
-            if (mn_state == ESP_MN_STATE_DETECTED)
+            if (mn_state == ESP_MN_STATE_DETECTED) // 检测到唤醒词
             {
-                esp_mn_results_t *mn_result = multinet_iface->get_results(multinet_model_data);
+                esp_mn_results_t *mn_result = multinet_iface->get_results(multinet_model_data); // 获取结果
                 for (int i = 0; i < mn_result->num; i++)
                 {
                     if (mn_result->command_id[i] == WAKE_COMMAND_ID)
@@ -725,22 +747,26 @@ static void afe_fetch_task(void *arg)
                         break;
                     }
                 }
-                multinet_iface->clean(multinet_model_data);
+                multinet_iface->clean(multinet_model_data); // 检测后清除状态，准备下一轮检测
             }
-            else if (mn_state == ESP_MN_STATE_TIMEOUT)
+            else if (mn_state == ESP_MN_STATE_TIMEOUT) // 超时
             {
                 multinet_iface->clean(multinet_model_data);
             }
 
-            if (wake_triggered)
+            if (wake_triggered) // 唤醒词被触发
             {
                 is_running = false;
                 input_buffer_len = 0;
             }
             else
             {
-                size_t remaining = input_buffer_len - mn_chunksize;
-                memmove(input_buffer, &input_buffer[mn_chunksize], remaining * sizeof(int16_t));
+                /**
+                 * 保留未处理的数据: 只移除已经送入模型检测的那部分数据
+                 * 释放为新数据腾出空间: 将剩余数据移到缓冲区开头，后面就可以继续追加新的音频帧
+                 */
+                size_t remaining = input_buffer_len - mn_chunksize;                              // ：计算剩余未处理的采样点数
+                memmove(input_buffer, &input_buffer[mn_chunksize], remaining * sizeof(int16_t)); // 将剩余的采样点移动到缓冲区开头，覆盖已处理的部分
                 input_buffer_len = remaining;
             }
         }
@@ -786,12 +812,13 @@ void custom_wake_word_feed(const int16_t *data, size_t len)
     // 等价于纯 NS 模式，安全退化。
 
     // 获取参考信号：清零后尝试从回调填充（无播放时保持零）
-    memset(s_aec_ref, 0, len * sizeof(int16_t));
-    aec_ref_cb_t cb = s_aec_ref_cb; // 读一次，避免并发改变
+    memset(s_aec_ref, 0, len * sizeof(int16_t)); // 先清零，确保回调不填充时参考为零
+    aec_ref_cb_t cb = s_aec_ref_cb;              // 读一次，避免并发改变
     if (cb)
-        cb(s_aec_ref, len);
+        cb(s_aec_ref, len); // 从回调获取当前播放的音频
 
     // 交织为 [mic, ref, mic, ref, ...]
+    // todo: 为什么要交织？因为 AFE 的 "MR" 模式设计就是要求输入数据按照麦克风和参考信号交织的格式提供，
     for (size_t i = 0; i < len; i++)
     {
         s_aec_interleaved[2 * i] = data[i];          // 麦克风采样
@@ -844,7 +871,7 @@ void wake_word_start(void)
     input_buffer_len = 0;
     // 重置 AFE 内部 ringbuf，丢弃积压的旧音频数据
     if (s_afe_iface && s_afe_data)
-        s_afe_iface->reset_buffer(s_afe_data);
+        s_afe_iface->reset_buffer(s_afe_data); // 重要！重置 AFE 内部状态，确保旧数据不干扰新检测
     is_running = true;
     xSemaphoreGive(buffer_mutex);
 }
@@ -862,6 +889,7 @@ void wake_word_start(void)
 size_t custom_wake_word_get_feed_chunksize(void)
 {
     // audio_feed_task 必须按此大小投喂原始 PCM 给 AFE
+    // 463 s_afe_feed_chunksize = s_afe_iface->get_feed_chunksize(s_afe_data);
     return (s_afe_feed_chunksize > 0) ? (size_t)s_afe_feed_chunksize : 512;
 }
 
@@ -872,14 +900,17 @@ void bsp_wake_word_set_vad_callback(vad_state_cb_t cb)
     s_vad_cb = cb;
 }
 
-void bsp_wake_word_set_enhanced_pcm_hook(enhanced_pcm_cb_t hook)
+/**
+ * @brief 注册增强 PCM 数据回调（供编码器使用）
+ */
+void wake_word_set_enhanced_pcm_hook(enhanced_pcm_cb_t hook)
 {
     // AFE 已就位：降噪后的 PCM 在 custom_wake_word_feed() 的 fetch 回调中输出
     // 不再需要底层 audio_set_pcm_hook 临时桥接
-    s_enhanced_pcm_hook = hook;
+    s_enhanced_pcm_hook = hook; // 这样设计的目的是为了让编码器能够直接获取到经过 AFE 处理的音频数据
 }
 
-vad_state_t bsp_wake_word_get_vad_state(void)
+vad_state_t wake_word_get_vad_state(void) // 获取当前 VAD 状态
 {
     return s_current_vad_state;
 }

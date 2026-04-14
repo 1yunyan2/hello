@@ -295,7 +295,7 @@ static void on_token_refresh_timeout(TimerHandle_t t)
  * @param data PCM音频数据指针
  * @param samples 采样点数量
  *
- * 调用者：bsp_wake_word_set_enhanced_pcm_hook设置的回调
+ * 调用者：wake_word_set_enhanced_pcm_hook设置的回调
  */
 static void on_enhanced_pcm(const int16_t *data, size_t samples)
 {
@@ -316,7 +316,7 @@ static void on_enhanced_pcm(const int16_t *data, size_t samples)
     if (s_vad_ready_tick != 0 && !s_stop_sent &&
         (xTaskGetTickCount() - s_vad_ready_tick) >= pdMS_TO_TICKS(VAD_GRACE_MS))
     {
-        vad_state_t vad = bsp_wake_word_get_vad_state();
+        vad_state_t vad = wake_word_get_vad_state();
 
         if (vad == VAD_SPEECH)
         {
@@ -749,7 +749,7 @@ static void session_close(void)
     s_speech_detected = false;
 
     // 先停止 PCM Hook，防止新数据继续写入已停止的编码器
-    bsp_wake_word_set_enhanced_pcm_hook(NULL);
+    wake_word_set_enhanced_pcm_hook(NULL);
     // 注销 AEC 参考回调：之后 feed 使用零参考，AEC 退化为纯 NS，不影响唤醒词检测
     custom_wake_word_set_aec_ref(NULL);
 
@@ -971,7 +971,7 @@ void session_on_wake_word(const char *display)
     // 注册 AEC 参考回调：play_task 向 aec_ref_buf 推副本，feed 时提供给 AFE AEC
     custom_wake_word_set_aec_ref(aec_ref_provider);
 
-    bsp_wake_word_set_enhanced_pcm_hook(on_enhanced_pcm);
+    wake_word_set_enhanced_pcm_hook(on_enhanced_pcm);
 
     BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(ws_sender_task, "ws_sender",
                                                      4096, NULL, 5,
@@ -980,7 +980,7 @@ void session_on_wake_word(const char *display)
     if (ret != pdPASS)
     {
         ESP_LOGE(TAG, "发送任务创建失败");
-        bsp_wake_word_set_enhanced_pcm_hook(NULL);
+        wake_word_set_enhanced_pcm_hook(NULL);
         audio_processor_stop(s_processor);
         audio_processor_destroy(s_processor);
         s_processor = NULL;

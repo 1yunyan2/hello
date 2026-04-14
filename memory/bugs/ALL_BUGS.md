@@ -1,274 +1,78 @@
-# Echo2 踩坑日志（完整版）
+# Echo2 BUG 总表
 
-> 从 Git 历史 + 代码深度扫描 交叉提取，共 33 个坑点
-> 最后更新：2026-04-03
+> 所有已记录的 Bug，按发现日期排序。每条 bug 有独立详情文件，此处为快速索引。
 
----
-
-## 一、严重问题（7 个）— 必须优先处理
-
-### BUG-001 | MQTT 硬编码凭证（安全风险）
-- **位置**: `main/protocol/mqtt_protocol.c:4-6`
-- **问题**: 硬编码了 MQTT broker URI、用户名和密码（`122.224.191.2:1883`, `xtc`, `Xtc@12345`）
-- **风险**: 代码泄露即凭证泄露，生产环境致命
-- **建议**: 移至 NVS 或通过 BLE 配网下发，代码中只放默认公共 broker
-- **状态**: ❌ 未处理 ：我认为无事
-
-### BUG-002 | malloc 返回值用 assert 检查
-- **位置**: `main/audio/audio_encoder.c:39-44` / `main/bsp/bsp_codec.c:118-121`
-- **问题**: `assert(ptr)` 在 Release 模式下会被编译器移除，SPIRAM 分配失败直接崩溃无日志
-- **根因**: `object.h:5-14` 中的 `malloc_zeroed()` 所有调用点都缺乏正确检查
-- **修复**: audio_encoder.c 改为 NULL 检查 + ESP_LOGE + 安全退出；bsp_codec.c 改为 NULL 检查 + return
-- **状态**: ✅ 已修复（2026-04-03 场景4优化）
-
-### BUG-003 | 唤醒词互斥锁 portMAX_DELAY 死锁风险
-- **位置**: `main/wake_word/custom_wake_word.c:376,444,451`
-- **问题**: `xSemaphoreTake(buffer_mutex, portMAX_DELAY)` 无限等待，若 AFE fetch 任务持锁卡住则整个系统死锁
-- **建议**: 改为 `pdMS_TO_TICKS(500)` 并处理超时
-- **状态**: ❌ 未处理
-
-### BUG-004 | NVS 句柄泄漏
-- **位置**: `main/wake_word/custom_wake_word.c:57-74`
-- **问题**: `nvs_read_str()` 和 `nvs_write_str()` 中多个 return 路径未调用 `nvs_close(h)`
-- **建议**: 使用 goto 清理模式确保所有路径都关闭句柄
-- **状态**: ❌ 未处理
-
-### BUG-005 | BLE 配网 strdup 内存泄漏
-- **位置**: `main/bsp/bsp_wifi.c:103`
-- **问题**: `custom_prov_data_handler` 中 `strdup()` 分配内存，注释说"协议栈负责释放"但无保证
-- **建议**: 改用静态缓冲区或验证协议栈释放机制
-- **状态**: ❌ 未处理
-
-### BUG-006 | 会话定时器未检查创建结果
-- **位置**: `main/session/session.c:226-232`
-- **问题**: `xTimerCreate()` 内存不足返回 NULL，后续 `xTimerStart/Stop` 直接崩溃
-- **建议**: 添加 NULL 检查和错误处理
-- **状态**: ❌ 未处理
-
-### BUG-007 | WebSocket mutex 未在 stop 时销毁
-- **位置**: `main/protocol/websocket_client.c:65,116-127`
-- **问题**: `s_mutex` 在 `ws_client_start()` 创建，`ws_client_stop()` 未删除，反复启停会泄漏
-- **建议**: stop 时添加 `vSemaphoreDelete(s_mutex); s_mutex = NULL;`
-- **状态**: ❌ 未处理
+| 编号 | 标题 | 状态 | 发现日期 | 修复日期 | 关联文件 |
+|------|------|------|----------|----------|----------|
+| [BUG-001](BUG-001.md) | 蓝牙内存释放崩溃 | 已规避 | 2026-03-22 | 2026-03-22 | `bsp_wifi.c` |
+| [BUG-002](BUG-002.md) | SPIFFS + SPIRAM 初始化内存冲突 | 已规避 | 2026-03-31 | 2026-03-31 | 启动初始化 |
+| [BUG-003](BUG-003.md) | xTaskCreatePinnedToCoreWithCaps 参数顺序错误 | 已修复 | 2026-04-08 | 2026-04-08~09 | `bsp_wifi.c` |
+| [BUG-004](BUG-004.md) | WebSocket 握手消息类型字段错误 | 已修复 | 2026-04-08 | 2026-04-08 | `websocket_client.c` |
+| [BUG-005](BUG-005.md) | HTTP 认证返回 201 被当作失败处理 | 已修复 | 2026-04-07 | 2026-04-07 | `auth.c:74` `auth.c:182` |
+| [BUG-006](BUG-006.md) | MultiNet 检测循环占满 CPU 导致 AFE ringbuffer 溢出 | 已修复 | 2026-04-09 | 2026-04-09 | `custom_wake_word.c` |
+| [BUG-007](BUG-007.md) | 唤醒词尾音误触发 EOS 静音检测 | 已修复 | 2026-04-09 | 2026-04-09 | `session.c` |
+| [BUG-008](BUG-008.md) | 定时器回调直接调 session_close 导致栈溢出 | 已修复 | 2026-04-14 | 2026-04-14 | `session.c` |
 
 ---
 
-## 二、已修复的历史坑点（12 个）— 防止重蹈覆辙
+## 按模块分类
 
-### BUG-H01 | SPIFFS 分区名反复修改 ⭐
-- **位置**: `partitions.csv`
-- **历程**: `storage`(edbed9a) → `srmodel`(edbed9a) → `model`(ee3c02c)，改了 3 次
-- **教训**: 分区名修改必须同步检查 partitions.csv + 代码中所有 `esp_spiffs_init()` 调用
-- **相关提交**: edbed9a, ee3c02c
-- **状态**: ✅ 已修复（最终使用 `model`）
+### 硬件 / BSP 层
+- **BUG-001** — 蓝牙内存释放时机不对，`esp_bt_mem_release()` 过早调用
+- **BUG-002** — SPIFFS 与 SPIRAM 地址映射冲突，改用 NVS 规避
+- **BUG-003** — `xTaskCreatePinnedToCoreWithCaps` API 参数顺序与 `xTaskCreate` 不同
 
-### BUG-H02 | 蓝牙内存释放导致系统崩溃 ⭐
-- **位置**: 原 `main/WIFI/WIFI.c`（现已重构为 bsp_wifi）
-- **问题**: `esp_bt_controller_mem_release(ESP_BT_MODE_BTDM)` 导致系统不稳定
-- **相关提交**: 1de38fb
-- **状态**: ⚠️ 已规避（注释掉），未根治
+### 协议层
+- **BUG-004** — WebSocket `type:"hello"` → 应为 `type:"started"`（服务端协议字段）
+- **BUG-005** — HTTP POST 创建资源返回 201，但原代码只接受 200
 
-### BUG-H03 | SPIFFS 初始化内存冲突 ⭐
-- **位置**: `main/application.c:39`（当时的行号）
-- **问题**: `init_spiffs()` 与其他模块内存冲突
-- **相关提交**: 1de38fb
-- **状态**: ⚠️ 已规避（注释掉），未根治
+### 音频 / AI 处理层
+- **BUG-006** — MultiNet detect 未限频，紧凑循环抢占 CPU 导致 AFE 缓冲溢出
+- **BUG-007** — 唤醒词尾音静音被误判为 EOS，引入 500ms 消退保护期（VAD_GRACE_MS）
 
-### BUG-H04 | MQTT 配置结构体栈溢出
-- **位置**: `main/protocol/mqtt_protocol.c`
-- **问题**: `esp_mqtt_client_config_t` 放栈上（>1KB），超出 FreeRTOS 任务栈
-- **修复**: 改为 `static` 静态分配
-- **相关提交**: ba1b8c3, c547cd5
-- **状态**: ✅ 已修复
-
-### BUG-H05 | I2S 音频引脚配置错误
-- **位置**: `main/bsp/bsp_config.h`（引脚定义）
-- **历程**: MCLK=17,BCLK=9 → MCLK=3,BCLK=2 → 又改回 MCLK=17,BCLK=9
-- **⚠️ 注意**: 当前 bsp_config.h 的值与 c547cd5 提交时不同，需验证硬件文档
-- **相关提交**: c547cd5, dd0b7bd
-- **状态**: ⚠️ 需验证当前值是否正确
-
-### BUG-H06 | 唤醒词引擎多线程并发
-- **位置**: `main/wake_word/custom_wake_word.c`
-- **问题**: 音频缓冲区和状态标志无锁保护
-- **修复**: 添加 `buffer_mutex` 互斥锁
-- **相关提交**: dd0b7bd, e7ad379
-- **状态**: ✅ 已修复（但锁策略仍有 BUG-003 的死锁风险）
-
-### BUG-H07 | 音频任务栈溢出
-- **位置**: `main/audio/audio.c`（已重构）
-- **修复**: 栈大小 4096 → 8192，绑定 CPU1
-- **相关提交**: c547cd5
-- **状态**: ✅ 已修复
-
-### BUG-H08 | 唤醒词代码被全部注释掉
-- **位置**: `main/wake_word/custom_wake_word.c` + `.h`（242+72 行全注释）
-- **原因**: 可能临时规避某问题
-- **相关提交**: 4a4f816（注释）→ ba1b8c3（恢复）
-- **状态**: ✅ 已恢复
-
-### BUG-H09 | MQTT 主题硬编码 MAC 地址
-- **位置**: `main/protocol/mqtt_protocol.c`
-- **修复**: 改为动态获取 `esp_wifi_get_mac()` + `snprintf`
-- **相关提交**: ba1b8c3
-- **状态**: ✅ 已修复
-
-### BUG-H10 | NVS 初始化代码分散重复
-- **位置**: 原 `main/application.c` 多处重复
-- **修复**: 封装为 `bsp_board_nvs_init()`
-- **相关提交**: dd0b7bd
-- **状态**: ✅ 已修复
-
-### BUG-H11 | 串口号 COM4/COM5 反复切换
-- **位置**: VSCode 配置文件
-- **教训**: 更换 USB 口后 Windows 可能分配不同 COM 端口，烧录前先确认
-- **相关提交**: ee3c02c, edbed9a
-- **状态**: ✅ 已知问题
-
-### BUG-H12 | 唤醒词阈值硬编码
-- **位置**: `main/wake_word/custom_wake_word.c`
-- **修复**: 添加 `multinet_det_treshold` 可配置变量，默认 0.85→0.6
-- **相关提交**: e7ad379
-- **状态**: ✅ 已修复
+### 会话管理层
+- **BUG-008** — 定时器回调中直接调 `session_close()` 栈溢出死机，改用事件队列投递
 
 ---
 
-## 三、中等问题（14 个）— 建议近期处理
-
-### BUG-008 | WebSocket 地址硬编码
-- **位置**: `main/session/session.c:37`
-- **问题**: 硬编码 `ws://192.168.1.100:8080/audio`，无法切换服务器
-- **建议**: 从 NVS 动态加载
-
-### BUG-009 | 设备 ID 仅用 MAC 后 3 字节
-- **位置**: `main/protocol/mqtt_protocol.c:109`
-- **问题**: 3 字节仅 16M 种组合，大规模部署可能重复
-- **建议**: 使用完整 6 字节 MAC
-
-### BUG-010 | 音频编码器内存泄漏
-- **位置**: `main/audio/audio_encoder.c:102-103`
-- **问题**: 编码器创建失败时 `in_frame.buffer` 和 `out_frame.buffer` 未释放
-
-### BUG-011 | 解码器缓冲区大小硬编码
-- **位置**: `main/audio/audio_decoder.c:44-45`
-- **问题**: PCM 输出缓冲固定按 60ms 帧计算，帧时长变化会出错
-
-### BUG-012 | Ring Buffer 大小硬编码
-- **位置**: `main/audio/audio_processor.c:62-65`
-- **问题**: 20480/2560/5120/40960 字节写死，音频参数变化会溢出
-- **修复**: 提取为 `ENC_INPUT_BUF_SIZE` 等命名常量，便于统一调整
-- **状态**: ✅ 已修复（2026-04-03 场景4优化）
-
-### BUG-013 | esp_codec_dev_write 返回值未检查
-- **位置**: `main/audio/audio_processor.c:44`
-- **问题**: DMA 写入失败无法感知
-
-### BUG-014 | AFE fetch 任务无优雅退出机制
-- **位置**: `main/wake_word/custom_wake_word.c:183`
-- **问题**: `while(1)` 无法被外部控制停止
-
-### BUG-015 | bsp_codec 大缓冲区栈分配
-- **位置**: `main/bsp/bsp_codec.c:154`
-- **问题**: `audio_feed_task` 中 chunk_size 大小的缓冲区在栈上分配
-
-### BUG-016 | 心跳任务无中止机制
-- **位置**: `main/protocol/mqtt_protocol.c:118-142`
-- **问题**: `while(1)` 无法被主动停止
-
-### BUG-017 | 唤醒词更新任务栈 4KB 偏小
-- **位置**: `main/protocol/mqtt_protocol.c:206-207`
-- **问题**: MultiNet6 推理可能需要更多栈空间，建议 8192
-
-### BUG-018 | WS 发送任务栈 4KB 偏小
-- **位置**: `main/session/session.c:281-283`
-- **问题**: 音频编码 + WebSocket 发送可能栈溢出，建议 8192
-
-### BUG-019 | audio_processor 播放任务未检查 board 指针
-- **位置**: `main/audio/audio_processor.c:34,44`
-- **问题**: `bsp_board_get_instance()` 返回 NULL 则直接崩溃
-
-### BUG-020 | SPIRAM 分配无回退
-- **位置**: `main/audio/audio_processor.c:62-65`
-- **问题**: Ring buffer 约 68KB 在 SPIRAM 分配，SPIRAM 初始化失败则全部失败
-
-### BUG-021 | NVS 命名空间分散
-- **位置**: `main/wake_word/custom_wake_word.c:8` + `main/session/session.c:38`
-- **问题**: "sys_config"、"mqtt_creds"、"net_config" 散落各处，易冲突
-- **建议**: 集中到 `bsp_config.h` 定义
-
----
-
-## 四、低优先级（6 个）— 可择机处理
-
-### BUG-022 | TODO: BLE 配网数据未解析
-- **位置**: `main/bsp/bsp_wifi.c:94`
-
-### BUG-023 | TODO: ADC 电池电量映射公式
-- **位置**: `main/protocol/mqtt_protocol.c:93`
-
-### BUG-024 | 注释掉的 wake_word_start()
-- **位置**: `main/application.c:61`
-
-### BUG-025 | 注释掉的 power_monitor_init()
-- **位置**: `main/application.c:97`
-
-### BUG-026 | LED/LCD 配置全部被注释
-- **位置**: `main/bsp/bsp_config.h:3,15,17-22`
-
-### BUG-028 | session.c s_current_wake_word 多任务竞态
-- **位置**: `main/session/session.c:57,271`
-- **问题**: `s_current_wake_word` 在 `session_on_wake_word`（主任务）写入，`protocol_event_handler`（事件任务）读取，无同步
-- **修复**: 添加 `s_wake_word_mutex` 互斥锁保护读写
-- **状态**: ✅ 已修复（2026-04-03 场景4优化）
-
-### BUG-027 | WiFi 失败后硬等 30 秒
-- **位置**: `main/bsp/bsp_wifi.c:326`
-- **问题**: `vTaskDelay(30000)` 阻塞，用户无法在等待期间操作
-
----
-
-## 统计
-
-| 类别 | 数量 | 说明 |
-|------|------|------|
-| 严重（未处理） | 7 | 安全、崩溃、内存泄漏 |
-| 历史已修复 | 12 | 防止回退 |
-| 中等（待处理） | 14 | 稳定性和健壮性 |
-| 低优先级 | 6 | TODO 和代码清理 |
-| **合计** | **33** | |
-
----
-
-## 开发期 BUG 修复时间线（BUG-001~007）
-
-> 以下为 2026-04 开发期实际踩坑记录，独立详情见 `bugs/BUG-XXX.md`
+## 每日修复时间线
 
 ### 2026-04-07（提交 `d5adbba`）
 | 类型 | 内容 | 文件 |
 |------|------|------|
-| 修复 [BUG-005](BUG-005.md) | HTTP 认证兼容 201 状态码 | `auth.c:74` `auth.c:182` |
+| 修复 BUG-005 | HTTP 认证兼容 201 状态码 | `auth.c:74` `auth.c:182` |
 | 新增 | LCD 驱动初始代码 | `bsp_lcd.c`（新文件） |
 | 改进 | WS 连接地址切换为带 Token 的正式接口 | `application.c:93` |
+
+---
 
 ### 2026-04-08（提交 `e96b8bc` `0bbfe76`）
 | 类型 | 内容 | 文件 |
 |------|------|------|
-| 修复 [BUG-004](BUG-004.md) | WS 握手 `"type":"hello"` → `"type":"started"` | `websocket_client.c` |
-| 修复 [BUG-003](BUG-003.md) | `xTaskCreatePinnedToCoreWithCaps` 参数顺序修正 | `bsp_wifi.c` |
+| 修复 BUG-004 | WS 握手 `"type":"hello"` → `"type":"started"` | `websocket_client.c` |
+| 修复 BUG-003 | `xTaskCreatePinnedToCoreWithCaps` 参数顺序修正 | `bsp_wifi.c` |
 | 集成 | ESP-AFE 音频前端框架（NS 降噪 + WebRTC VAD） | `custom_wake_word.c/h` |
-| 改进 | 音频发送超时 10s → 100ms | `websocket_client.c` |
+| 改进 | 音频发送超时 10s → 100ms（实时场景要求） | `websocket_client.c` |
+| 改进 | BLE 配网 Token 接收增加 JSON 格式验证 | `bsp_wifi.c` |
 | 改进 | 编解码器创建失败回滚逻辑（防内存泄漏） | `audio_processor.c` |
 | 修复 | 重连任务内存泄漏，堆分配替代栈分配 | `session.c` |
+
+---
 
 ### 2026-04-09（提交 `24d10cc` `aee301c` `0153c28`）
 | 类型 | 内容 | 文件 |
 |------|------|------|
-| 修复 [BUG-006](BUG-006.md) | MultiNet 每次 fetch 限制 1 次 detect，防 CPU 占满 | `custom_wake_word.c` |
-| 修复 [BUG-007](BUG-007.md) | 引入 VAD_GRACE_MS=500ms 消退保护期 | `session.c` |
+| 修复 BUG-006 | MultiNet 每次 fetch 限制 1 次 detect，防 CPU 占满 | `custom_wake_word.c` |
+| 修复 BUG-007 | 引入 VAD_GRACE_MS=500ms 消退保护期 | `session.c` |
+| 决策 DEC-004 | 改用 AFE 内置 WebRTC VAD 替代帧能量检测 | `session.c` |
+| 改进 | 移除 `"type":"listen"` 指令，服务端不支持 | `websocket_client.c` `session.c` |
 | 改进 | session 事件队列架构（定时器只 xQueueSend，防栈溢出） | `session.c` |
-| 调参 | OPUS 比特率 32→24kbps，复杂度 0→3 | `audio_encoder.c` |
+| 调参 | OPUS 比特率 32→24kbps，帧长 60→20ms，复杂度 0→3 | `audio_encoder.c` |
+| 调参 | 麦克风增益 10→40（适配近讲） | `bsp_codec.c` |
 | ⚠️ 临时错误 | 启用 VBR — 次日发现延迟抖动，已回退 | `audio_encoder.c` |
 | ⚠️ 临时错误 | 数据格式改为 `pcm` — 次日改回 `opus` | `websocket_client.c` |
+
+---
 
 ### 2026-04-10（提交 `7279cc6` `a884816`）
 | 类型 | 内容 | 文件 |
@@ -279,3 +83,38 @@
 | 修复 | ws_sender_task 增加 `!s_stop_sent` 防重复发送 | `session.c` |
 | 集成 | `bsp_lcd.c` 加入 CMakeLists（ST7789 驱动正式入构建） | `CMakeLists.txt` |
 | 文档 | 13 个文件大规模注释补全（+1553 行） | 全模块 |
+
+---
+
+### 2026-04-14（提交 `c2df9e1`）
+| 类型 | 内容 | 文件 |
+|------|------|------|
+| 修复 BUG-008 | 定时器超时回调改用事件队列投递，防栈溢出 | `session.c` |
+| 改进 | TTS_STOP 方案 A/B 双模式预留（`#if 0/1` 切换） | `session.c` |
+| 改进 | COMPLETE 事件恢复会话关闭逻辑 | `session.c` |
+| 重命名 | `bsp_wake_word_load_from_nvs` → `wake_word_load_from_nvs` | `custom_wake_word.c/h` |
+| 清理 | 删除 `bsp_board_check_status()` 30 行死代码 | `bsp_codec.c` |
+| 修正 | 日志 emoji → 文本标记（串口兼容） | `auth.c` |
+| 新增 | 舵机三轴 PWM 控制模块 | `bsp_servo.c` |
+| 新增 | 电容触摸 + 震动马达模块 | `bsp_touch.c` |
+| 新增 | UI 交互层 + 提醒系统框架 | `ui/interaction.c/h` `ui/reminder.c/h` |
+| 依赖 | 新增 `espressif/servo ^0.1.0` 组件 | `idf_component.yml` |
+
+---
+
+## 尚未解决 / 待观察
+
+| 编号 | 描述 | 备注 |
+|------|------|------|
+| BUG-001 | 蓝牙内存未回收，约 40KB SPIRAM 浪费 | 当前可接受，后续版本修复 |
+
+---
+
+## 新增 Bug 规范
+
+新增 Bug 时：
+1. 在 `bugs/` 目录创建 `BUG-XXX.md`，编号连续
+2. 在本表格**总表**末尾追加一行索引
+3. 在**每日修复时间线**对应日期追加记录
+4. 在 `MEMORY.md` 的踩坑日志行追加链接
+5. 标注精确文件路径和行号（见 `feedback_bug_detail.md`）

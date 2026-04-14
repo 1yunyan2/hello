@@ -231,9 +231,10 @@ void audio_feed_task(void *arg)
 
     // ── 步骤 2：分配 PCM 采集缓冲区 ─────────────────────────────────────────
 
-    // // 【修改点 1】增加通道数变量，计算真实的字节数
-    // int feed_channel = 2; // 因为配了 "MR"，这里必须是 2
-    // size_t alloc_size = chunk_size * feed_channel * sizeof(int16_t);
+    // 因为使用的是软件的回音消除，是单声道，所以每个采样点是一个 int16_t（16-bit），不需要乘以通道数。
+    //  // 【修改点 1】增加通道数变量，计算真实的字节数
+    //  int feed_channel = 2; // 因为配了 "MR"，这里必须是 2
+    //  size_t alloc_size = chunk_size * feed_channel * sizeof(int16_t);
 
     // // 【修改点 2】按新计算的大小分配内存
     // int16_t *buffer = malloc(alloc_size);

@@ -15,10 +15,11 @@
 - [分类指令批量执行](feedback_batch_execute.md) — 说大类名自动执行所有子能力
 - [用户积极性](feedback_enthusiasm.md) — 用户愿意全面启用所有辅助能力
 - [Token预算意识](feedback_token_budget.md) — 回答前先评估token够不够，避免半途浪费
-- 踩坑日志：[BUG-001](bugs/BUG-001.md) 蓝牙释放崩溃 | [BUG-002](bugs/BUG-002.md) SPIFFS内存冲突 | [BUG-003](bugs/BUG-003.md) 任务参数顺序错 | [BUG-004](bugs/BUG-004.md) WS握手类型错 | [BUG-005](bugs/BUG-005.md) HTTP 201未兼容 | [BUG-006](bugs/BUG-006.md) MultiNet CPU占满 | [BUG-007](bugs/BUG-007.md) 唤醒尾音误触EOS
+- 踩坑日志：[BUG-001](bugs/BUG-001.md) 蓝牙释放崩溃 | [BUG-002](bugs/BUG-002.md) SPIFFS内存冲突 | [BUG-003](bugs/BUG-003.md) 任务参数顺序错 | [BUG-004](bugs/BUG-004.md) WS握手类型错 | [BUG-005](bugs/BUG-005.md) HTTP 201未兼容 | [BUG-006](bugs/BUG-006.md) MultiNet CPU占满 | [BUG-007](bugs/BUG-007.md) 唤醒尾音误触EOS | [BUG-008](bugs/BUG-008.md) 定时器栈溢出
 - 决策记录：[DEC-001](decisions/DEC-001.md) OPUS 24kbps CBR | [DEC-002](decisions/DEC-002.md) 四层环形缓冲 | [DEC-003](decisions/DEC-003.md) Token双重刷新 | [DEC-004](decisions/DEC-004.md) AFE WebRTC VAD | [DEC-005](decisions/DEC-005.md) GPIO引脚分配
-- [Bug汇总索引](bugs/ALL_BUGS.md) — BUG-001~007 快速查表，按模块分类
+- [Bug汇总索引](bugs/ALL_BUGS.md) — BUG-001~008 快速查表，按模块分类
 - [CHANGELOG.html](CHANGELOG.html) — 可点击查看每次提交的修改前后 diff（浏览器打开）
+- [API 调用可视化](api_visualization.html) — 129+ API 调用，饼图/条形图/矩阵/数据流图，可筛选搜索（2026-04-14）
 - [早期历史 2026-03-17~03-31](daily/2026-03-17_to_03-31.md) — 项目起步→BSP体系→音频三层架构，14次提交+4个早期坑点
 - [每日总结 2026-04-03](daily/2026-04-03.md) — 记忆系统建设、全部辅助功能启用
 - [每日总结 2026-04-06](daily/2026-04-06.md) — WebSocket提交+session大改未提交+LCD新增
@@ -27,6 +28,7 @@
 - [每日总结 2026-04-09](daily/2026-04-09.md) — VAD延迟启动+AFE WebRTC VAD+OPUS参数调优+session事件队列
 - [每日总结 2026-04-10](daily/2026-04-10.md) — 禁用VBR+协议修复+LCD BSP集成+大规模文档补全
 - [每日总结 2026-04-11](daily/2026-04-11.md) — LCD业务层+触摸/舵机模块+端到端链路联调
+- [每日总结 2026-04-14](daily/2026-04-14.md) — session方案A/B切换+定时器栈溢出修复+servo/touch/reminder新模块
 - [总结自动流程](feedback_summary_flow.md) — 说"总结"自动记忆+提交+坑点记录，无需询问
 - [总结文档放置规范](feedback_summary_placement.md) — 总结放 memory/ 目录，更新时保留旧版本并注释相似点
 - [周报 W14](weekly/2026-W14.md) — 音频模块→WebSocket协议栈全链路搭建，7次提交

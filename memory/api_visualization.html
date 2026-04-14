@@ -1,0 +1,1085 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Echo2 项目 API 调用可视化图表</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #c9d1d9; --muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --orange: #d29922; --red: #f85149; --purple: #bc8cff;
+    --teal: #39d353; --yellow: #e3b341; --pink: #f778ba;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; font-size: 14px; line-height: 1.6; }
+  h1 { text-align: center; padding: 32px 0 8px; font-size: 24px; color: var(--accent); letter-spacing: 1px; }
+  .subtitle { text-align: center; color: var(--muted); margin-bottom: 32px; }
+  .container { max-width: 1400px; margin: 0 auto; padding: 0 20px 60px; }
+
+  /* ── 统计卡片 ── */
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 36px; }
+  .stat-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px; text-align: center; transition: transform .15s;
+  }
+  .stat-card:hover { transform: translateY(-3px); }
+  .stat-card .num { font-size: 32px; font-weight: 700; }
+  .stat-card .label { color: var(--muted); font-size: 12px; margin-top: 4px; }
+
+  /* ── 饼图 ── */
+  .charts-row { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 36px; }
+  @media(max-width: 800px) { .charts-row { grid-template-columns: 1fr; } }
+  .chart-box { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 20px; }
+  .chart-box h2 { font-size: 15px; color: var(--accent); margin-bottom: 16px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+
+  /* SVG 饼图 */
+  svg.pie { display: block; margin: 0 auto; overflow: visible; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 14px; justify-content: center; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+
+  /* 横向条形图 */
+  .bar-chart { width: 100%; }
+  .bar-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .bar-label { width: 130px; text-align: right; font-size: 12px; color: var(--muted); flex-shrink: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .bar-track { flex: 1; background: #21262d; border-radius: 4px; height: 20px; position: relative; }
+  .bar-fill { height: 100%; border-radius: 4px; display: flex; align-items: center; padding-left: 8px; font-size: 11px; font-weight: 600; color: #fff; transition: width .6s; }
+  .bar-count { width: 28px; text-align: right; font-size: 12px; font-weight: 700; }
+
+  /* ── 模块依赖矩阵 ── */
+  .matrix-wrap { overflow-x: auto; margin-bottom: 36px; }
+  .matrix-box { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 20px; }
+  .matrix-box h2 { font-size: 15px; color: var(--accent); margin-bottom: 16px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+  table.matrix { border-collapse: collapse; font-size: 11px; min-width: 700px; }
+  table.matrix th, table.matrix td { border: 1px solid #21262d; padding: 6px 8px; text-align: center; white-space: nowrap; }
+  table.matrix th { background: #21262d; color: var(--muted); }
+  table.matrix td.has { background: #1f6feb44; color: var(--accent); font-weight: 700; }
+  table.matrix td.no { color: #30363d; }
+  table.matrix td.row-label { text-align: left; font-weight: 600; color: var(--text); padding-left: 12px; }
+
+  /* ── API 详情表 ── */
+  .table-box { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 36px; }
+  .table-box h2 { font-size: 15px; color: var(--accent); margin-bottom: 12px; border-bottom: 1px solid var(--border); padding-bottom: 8px; display: flex; align-items: center; gap: 10px; }
+  .filter-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+  .filter-btn {
+    padding: 4px 12px; border-radius: 20px; border: 1px solid var(--border); background: transparent;
+    color: var(--muted); cursor: pointer; font-size: 12px; transition: all .15s;
+  }
+  .filter-btn:hover, .filter-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  input.search-box {
+    background: #21262d; border: 1px solid var(--border); color: var(--text); border-radius: 6px;
+    padding: 6px 12px; font-size: 13px; width: 240px; outline: none;
+  }
+  input.search-box:focus { border-color: var(--accent); }
+  table.api-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.api-table thead tr { background: #21262d; }
+  table.api-table th { padding: 8px 10px; text-align: left; color: var(--muted); font-weight: 600; white-space: nowrap; }
+  table.api-table tbody tr { border-bottom: 1px solid #21262d; transition: background .1s; }
+  table.api-table tbody tr:hover { background: #1c2128; }
+  table.api-table td { padding: 7px 10px; vertical-align: top; }
+  table.api-table td:nth-child(3) { font-family: 'Consolas', monospace; color: #79c0ff; }
+  table.api-table td:nth-child(4) { color: var(--muted); font-size: 11px; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 12px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+  .count-badge { display: inline-block; background: #1f6feb; color: #fff; border-radius: 10px; padding: 1px 7px; font-size: 11px; margin-left: 6px; }
+
+  /* 数据流图 */
+  .flow-box { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 36px; overflow-x: auto; }
+  .flow-box h2 { font-size: 15px; color: var(--accent); margin-bottom: 16px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+  svg.flow { display: block; min-width: 800px; }
+
+  /* 隐藏行 */
+  .hidden { display: none !important; }
+
+  /* ── 参数展开面板 ── */
+  table.api-table tbody tr.api-main { cursor: pointer; }
+  table.api-table tbody tr.api-main:hover td:nth-child(3)::after {
+    content: ' ▶'; color: var(--accent); font-size: 10px;
+  }
+  table.api-table tbody tr.api-main.expanded td:nth-child(3)::after {
+    content: ' ▼'; color: var(--accent); font-size: 10px;
+  }
+  tr.param-row td { padding: 0 !important; background: #0d1117; border-bottom: 2px solid var(--border) !important; }
+  .param-panel { padding: 12px 20px 14px 36px; }
+  .param-title { font-size: 11px; color: var(--muted); margin-bottom: 8px; letter-spacing: .5px; }
+  table.param-table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  table.param-table th { padding: 5px 10px; background: #161b22; color: var(--muted); font-weight: 600; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  table.param-table td { padding: 5px 10px; border-bottom: 1px solid #21262d; vertical-align: top; }
+  table.param-table td:nth-child(1) { color: var(--muted); font-size: 11px; width: 28px; text-align: center; }
+  table.param-table td:nth-child(2) { font-family: 'Consolas', monospace; color: #79c0ff; width: 180px; }
+  table.param-table td:nth-child(3) { color: #e3b341; width: 160px; font-family: 'Consolas', monospace; font-size: 11px; }
+  table.param-table td:nth-child(4) { color: var(--text); }
+  .ret-row td { background: #1a2332 !important; }
+  .ret-row td:nth-child(2) { color: #3fb950 !important; }
+  .no-params { color: var(--muted); font-style: italic; font-size: 12px; padding: 6px 0; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Echo2 项目 API 调用可视化</h1>
+  <p class="subtitle">扫描日期：2026-04-14 · 覆盖文件：31 个 · API 调用总量：129+</p>
+
+  <!-- ──────────────── 统计卡片 ──────────────── -->
+  <div class="stat-grid">
+    <div class="stat-card"><div class="num" style="color:#58a6ff">31</div><div class="label">扫描源文件</div></div>
+    <div class="stat-card"><div class="num" style="color:#3fb950">129+</div><div class="label">API 调用总量</div></div>
+    <div class="stat-card"><div class="num" style="color:#d29922">10</div><div class="label">API 类别</div></div>
+    <div class="stat-card"><div class="num" style="color:#f85149">26</div><div class="label">RTOS 任务/同步 API</div></div>
+    <div class="stat-card"><div class="num" style="color:#bc8cff">23</div><div class="label">NVS 存储 API</div></div>
+    <div class="stat-card"><div class="num" style="color:#39d353">5</div><div class="label">环形缓冲类型</div></div>
+  </div>
+
+  <!-- ──────────────── 图表区 ──────────────── -->
+  <div class="charts-row">
+    <!-- 饼图 -->
+    <div class="chart-box">
+      <h2>API 分类占比（饼图）</h2>
+      <svg class="pie" width="220" height="220" viewBox="-110 -110 220 220">
+        <g id="pie-slices"></g>
+      </svg>
+      <div class="legend" id="pie-legend"></div>
+    </div>
+
+    <!-- 横向条形图 -->
+    <div class="chart-box">
+      <h2>各类别 API 调用数量（条形图）</h2>
+      <div class="bar-chart" id="bar-chart"></div>
+    </div>
+  </div>
+
+  <!-- ──────────────── 模块 × API 矩阵 ──────────────── -->
+  <div class="matrix-wrap">
+    <div class="matrix-box">
+      <h2>模块 × API 类别使用矩阵（● = 使用）</h2>
+      <table class="matrix" id="matrix-table"></table>
+    </div>
+  </div>
+
+  <!-- ──────────────── 数据流 SVG ──────────────── -->
+  <div class="flow-box">
+    <h2>音频数据流 API 链路图</h2>
+    <svg class="flow" width="900" height="320" viewBox="0 0 900 320">
+      <defs>
+        <marker id="arr" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+          <polygon points="0 0,8 3,0 6" fill="#58a6ff"/>
+        </marker>
+      </defs>
+      <!-- 节点 -->
+      <g id="flow-nodes"></g>
+      <!-- 箭头线 -->
+      <g id="flow-edges"></g>
+    </svg>
+  </div>
+
+  <!-- ──────────────── API 详情表 ──────────────── -->
+  <div class="table-box">
+    <h2>API 详情速查 <span id="visible-count" class="count-badge">129</span> <span style="font-size:11px;color:var(--muted);font-weight:400">· 点击任意行展开参数说明</span></h2>
+    <div class="filter-row">
+      <input class="search-box" type="text" id="search-input" placeholder="搜索 API 名称 / 文件 / 说明…">
+      <button class="filter-btn active" data-cat="all">全部</button>
+      <button class="filter-btn" data-cat="音频编解码">音频编解码</button>
+      <button class="filter-btn" data-cat="RTOS">RTOS</button>
+      <button class="filter-btn" data-cat="环形缓冲">环形缓冲</button>
+      <button class="filter-btn" data-cat="WebSocket网络">WebSocket网络</button>
+      <button class="filter-btn" data-cat="NVS存储">NVS存储</button>
+      <button class="filter-btn" data-cat="WiFi">WiFi</button>
+      <button class="filter-btn" data-cat="唤醒词AFE">唤醒词AFE</button>
+      <button class="filter-btn" data-cat="LCD显示">LCD显示</button>
+      <button class="filter-btn" data-cat="GPIO外设">GPIO外设</button>
+      <button class="filter-btn" data-cat="内存管理">内存管理</button>
+    </div>
+    <table class="api-table" id="api-table">
+      <thead>
+        <tr>
+          <th>类别</th>
+          <th>文件</th>
+          <th>API 函数</th>
+          <th>关键参数 / 功能</th>
+          <th>所在模块</th>
+        </tr>
+      </thead>
+      <tbody id="api-tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════
+//  数据
+// ═══════════════════════════════════════════
+const CAT_COLORS = {
+  "RTOS":        "#58a6ff",
+  "NVS存储":     "#bc8cff",
+  "环形缓冲":    "#3fb950",
+  "WebSocket网络":"#f78166",
+  "音频编解码":  "#d29922",
+  "WiFi":        "#39d353",
+  "唤醒词AFE":   "#e3b341",
+  "LCD显示":     "#f778ba",
+  "GPIO外设":    "#79c0ff",
+  "内存管理":    "#ff7b72",
+};
+
+const CATEGORIES = {
+  "RTOS":        26,
+  "NVS存储":     23,
+  "环形缓冲":    13,
+  "WebSocket网络":13,
+  "音频编解码":  14,
+  "WiFi":        12,
+  "唤醒词AFE":   9,
+  "LCD显示":     7,
+  "GPIO外设":    8,
+  "内存管理":    4,
+};
+
+const APIS = [
+  /* ── RTOS ── */
+  ["RTOS","session.c","xTaskCreatePinnedToCoreWithCaps","(\"ws_reconn\", 6144, …, MALLOC_CAP_SPIRAM)  创建 WS 重连任务（SPIRAM栈）","session"],
+  ["RTOS","session.c","xTaskCreatePinnedToCoreWithCaps","(\"session_evt_tsk\", 8192, …, MALLOC_CAP_SPIRAM)  会话事件任务","session"],
+  ["RTOS","session.c","xTaskCreatePinnedToCoreWithCaps","(\"ws_sender\", 4096, …, MALLOC_CAP_SPIRAM)  WS 发送任务","session"],
+  ["RTOS","audio_encoder.c","xTaskCreatePinnedToCoreWithCaps","(\"encoder_task\", 32768, …, MALLOC_CAP_SPIRAM)  OPUS 编码任务（32KB栈）","audio"],
+  ["RTOS","audio_decoder.c","xTaskCreatePinnedToCoreWithCaps","(\"decoder_task\", 32768, …, MALLOC_CAP_SPIRAM)  OPUS 解码任务","audio"],
+  ["RTOS","audio_processor.c","xTaskCreatePinnedToCore","(\"play_task\", …)  音频播放任务","audio"],
+  ["RTOS","custom_wake_word.c","xTaskCreatePinnedToCoreWithCaps","(\"afe_fetch\", 8192, priority=22, …)  AFE 消费任务（最高优先级）","wake_word"],
+  ["RTOS","bsp_wifi.c","xTaskCreatePinnedToCore","(\"btn_task\", 4096, …)  按钮监控任务","bsp"],
+  ["RTOS","mqtt_protocol.c","xTaskCreate","(\"heartbeat_task\", 4096, …)  MQTT 心跳任务","protocol"],
+  ["RTOS","mqtt_protocol.c","xTaskCreate","(\"async_ww_update\", 4096, …)  异步唤醒词更新任务","protocol"],
+  ["RTOS","session.c","vTaskDelay","(pdMS_TO_TICKS(20)) 短暂让步 CPU","session"],
+  ["RTOS","bsp_wifi.c","vTaskDelay","(pdMS_TO_TICKS(30000)) WiFi失败后延迟30s重启","bsp"],
+  ["RTOS","bsp_touch.c","vTaskDelay","(pdMS_TO_TICKS(20/50/100)) 触摸/马达时序控制","bsp"],
+  ["RTOS","session.c","xQueueCreate","(5, sizeof(session_evt_t)) 会话事件队列","session"],
+  ["RTOS","session.c","xEventGroupCreate","() 会话事件组","session"],
+  ["RTOS","bsp_board.c","xEventGroupCreate","() BSP 状态事件组","bsp"],
+  ["RTOS","session.c","xSemaphoreCreateMutex","() 唤醒词互斥锁","session"],
+  ["RTOS","custom_wake_word.c","xSemaphoreCreateMutex","() 输入缓冲区互斥锁","wake_word"],
+  ["RTOS","session.c","xTimerCreate","(\"session_to\", 60s, pdFALSE) 会话超时定时器","session"],
+  ["RTOS","session.c","xTimerCreate","(\"eos_to\", 500ms, pdFALSE) EOS 检测定时器","session"],
+  ["RTOS","session.c","xTimerCreate","(\"token_ref\", 110min, pdTRUE) Token 刷新定时器","session"],
+  ["RTOS","bsp_board.h","xEventGroupSetBits","(board_status, NVS_BIT) 置位状态位","bsp"],
+  ["RTOS","bsp_board.h","xEventGroupClearBits","(board_status, bit) 清除状态位","bsp"],
+  ["RTOS","bsp_board.h","xEventGroupWaitBits","(board_status, bits, 10s超时) 等待状态位","bsp"],
+  ["RTOS","session.c","xQueueSend","(s_session_evt_queue, &evt, 0) 发送会话事件","session"],
+  ["RTOS","session.c","xQueueReceive","(s_session_evt_queue, &evt, portMAX_DELAY) 接收会话事件","session"],
+
+  /* ── NVS存储 ── */
+  ["NVS存储","bsp_board.c","nvs_flash_init","() 初始化 NVS Flash 分区","bsp"],
+  ["NVS存储","bsp_board.c","nvs_flash_erase","() 擦除 NVS 分区（版本不匹配时）","bsp"],
+  ["NVS存储","custom_wake_word.c","nvs_open","(NVS_NAMESPACE, NVS_READONLY) 读取唤醒词配置","wake_word"],
+  ["NVS存储","custom_wake_word.c","nvs_get_str","(h, key, dest, &sz) 读取唤醒词字符串","wake_word"],
+  ["NVS存储","custom_wake_word.c","nvs_open","(NVS_NAMESPACE, NVS_READWRITE) 写入唤醒词配置","wake_word"],
+  ["NVS存储","custom_wake_word.c","nvs_set_str","(h, key, value) 写唤醒词字符串","wake_word"],
+  ["NVS存储","custom_wake_word.c","nvs_commit","(h) 提交 NVS 写操作","wake_word"],
+  ["NVS存储","custom_wake_word.c","nvs_close","(h) 关闭 NVS 句柄","wake_word"],
+  ["NVS存储","auth.c","nvs_open","(\"net_config\", NVS_READWRITE) 保存 Token","protocol"],
+  ["NVS存储","auth.c","nvs_set_str","(h, \"access_token\", token) 写入 accessToken","protocol"],
+  ["NVS存储","auth.c","nvs_commit","(h) 提交 Token 写入","protocol"],
+  ["NVS存储","auth.c","nvs_close","(h) 关闭句柄","protocol"],
+  ["NVS存储","bsp_wifi.c","nvs_open","(\"net_config\", NVS_READWRITE) WiFi凭证管理","bsp"],
+  ["NVS存储","bsp_wifi.c","nvs_erase_key","(h, \"ws_token\") 清除 ws_token","bsp"],
+  ["NVS存储","bsp_wifi.c","nvs_erase_key","(h, \"access_token\") 清除 access_token","bsp"],
+  ["NVS存储","bsp_wifi.c","nvs_commit","(h) 提交删除","bsp"],
+  ["NVS存储","mqtt_protocol.c","nvs_open","(\"mqtt_creds\", NVS_READONLY) 读取 MQTT 凭证","protocol"],
+  ["NVS存储","mqtt_protocol.c","nvs_get_str","(nvs, \"broker_url\") 读取 MQTT URI","protocol"],
+  ["NVS存储","mqtt_protocol.c","nvs_get_str","(nvs, \"username\") 读取 MQTT 用户名","protocol"],
+  ["NVS存储","mqtt_protocol.c","nvs_get_str","(nvs, \"password\") 读取 MQTT 密码","protocol"],
+  ["NVS存储","mqtt_protocol.c","nvs_close","(nvs) 关闭句柄","protocol"],
+  ["NVS存储","session.c","nvs_get_str","(h, \"ws_uri\") 读取 WS 地址","session"],
+  ["NVS存储","session.c","nvs_get_str","(h, \"ws_token\") 读取 WS Token","session"],
+
+  /* ── 环形缓冲 ── */
+  ["环形缓冲","audio_processor.c","xRingbufferCreateWithCaps","(ENC_INPUT_BUF_SIZE, BYTEBUF, SPIRAM) 编码输入缓冲","audio"],
+  ["环形缓冲","audio_processor.c","xRingbufferCreateWithCaps","(ENC_OUTPUT_BUF_SIZE, NOSPLIT, SPIRAM) 编码输出缓冲","audio"],
+  ["环形缓冲","audio_processor.c","xRingbufferCreateWithCaps","(DEC_INPUT_BUF_SIZE, NOSPLIT, SPIRAM) 解码输入缓冲","audio"],
+  ["环形缓冲","audio_processor.c","xRingbufferCreateWithCaps","(DEC_OUTPUT_BUF_SIZE, BYTEBUF, SPIRAM) 解码输出缓冲","audio"],
+  ["环形缓冲","audio_processor.c","xRingbufferCreateWithCaps","(AEC_REF_BUF_SIZE, BYTEBUF, SPIRAM) AEC 参考缓冲","audio"],
+  ["环形缓冲","audio_processor.c","xRingbufferReceiveUpTo","(dec_output, &size, 100ms, 2048) 从解码输出读最多2KB","audio"],
+  ["环形缓冲","audio_processor.c","xRingbufferSend","(aec_ref_buf, buf, size, 0) 推送AEC参考数据（不阻塞）","audio"],
+  ["环形缓冲","audio_processor.c","vRingbufferReturnItem","(dec_output, buf) 归还缓冲区项目","audio"],
+  ["环形缓冲","audio_decoder.c","xRingbufferReceive","(input_buffer, &size, 100ms) 读取一帧 OPUS 数据","audio"],
+  ["环形缓冲","audio_decoder.c","xRingbufferSend","(output_buffer, pcm, size, 0) 推送解码 PCM","audio"],
+  ["环形缓冲","audio_encoder.c","xRingbufferReceiveUpTo","(input_buffer, &size, 100ms, frame_size) 读PCM一帧","audio"],
+  ["环形缓冲","audio_encoder.c","xRingbufferSend","(output_buffer, opus, size, 0) 推送编码 OPUS 帧","audio"],
+  ["环形缓冲","audio_processor.c","xRingbufferSend","(enc_input, buf, size, 50ms) 写编码输入（阻塞50ms）","audio"],
+
+  /* ── WebSocket网络 ── */
+  ["WebSocket网络","websocket_client.c","esp_websocket_client_init","(&websocket_cfg) 初始化 WS 客户端","protocol"],
+  ["WebSocket网络","websocket_client.c","esp_websocket_register_events","(client, ANY, handler, ctx) 注册事件回调","protocol"],
+  ["WebSocket网络","websocket_client.c","esp_websocket_client_start","(client) 启动 WS 连接","protocol"],
+  ["WebSocket网络","websocket_client.c","esp_websocket_client_stop","(client) 停止 WS 连接","protocol"],
+  ["WebSocket网络","websocket_client.c","esp_websocket_client_is_connected","(client) 检查连接状态","protocol"],
+  ["WebSocket网络","websocket_client.c","esp_websocket_client_send_text","(client, msg, len, 5000ms超时) 发文本帧","protocol"],
+  ["WebSocket网络","websocket_client.c","esp_websocket_client_send_bin","(client, data, size, 100ms超时) 发二进制帧","protocol"],
+  ["WebSocket网络","websocket_client.c","esp_websocket_client_destroy","(client) 销毁客户端","protocol"],
+  ["WebSocket网络","auth.c","esp_http_client_init","(&config) 初始化 HTTP 客户端（认证用）","protocol"],
+  ["WebSocket网络","auth.c","esp_http_client_set_header","(client, \"Content-Type\", \"application/json\")","protocol"],
+  ["WebSocket网络","auth.c","esp_http_client_set_post_field","(client, body, len) 设置 POST 请求体","protocol"],
+  ["WebSocket网络","auth.c","esp_http_client_perform","(client) 执行 HTTP 请求","protocol"],
+  ["WebSocket网络","auth.c","esp_http_client_cleanup","(client) 清理 HTTP 资源","protocol"],
+
+  /* ── 音频编解码 ── */
+  ["音频编解码","bsp_codec.c","i2c_new_master_bus","(&i2c_bus_config, bus_handle) 创建I2C主机总线","bsp"],
+  ["音频编解码","bsp_codec.c","i2s_new_channel","(&chan_cfg, tx, rx) 同时创建TX/RX通道","bsp"],
+  ["音频编解码","bsp_codec.c","i2s_channel_init_std_mode","(handle, &std_cfg) 初始化标准Philips模式","bsp"],
+  ["音频编解码","bsp_codec.c","i2s_channel_enable","(handle) 启用 I2S 通道，开启 DMA","bsp"],
+  ["音频编解码","bsp_codec.c","esp_codec_dev_new","(&codec_config) 创建 ES8311 设备句柄","bsp"],
+  ["音频编解码","bsp_codec.c","esp_codec_dev_open","(dev, &sample_info) 16kHz/16bit/单声道","bsp"],
+  ["音频编解码","bsp_codec.c","esp_codec_dev_set_in_gain","(dev, 40) 麦克风增益 40（≈20dB）","bsp"],
+  ["音频编解码","bsp_codec.c","esp_codec_dev_set_out_vol","(dev, 60) 扬声器音量 60/100","bsp"],
+  ["音频编解码","bsp_codec.c","esp_codec_dev_read","(dev, buf, size, &bytes, 100ms) 读录音PCM","bsp"],
+  ["音频编解码","audio_processor.c","i2s_channel_write","(tx_handle, buf, size, &written, MAX_DELAY) I2S写扬声器","audio"],
+  ["音频编解码","audio_encoder.c","esp_audio_enc_get_frame_size","(enc, &in_sz, &out_sz) 查询OPUS帧大小","audio"],
+  ["音频编解码","audio_encoder.c","esp_audio_enc_process","(enc, &in_frame, &out_frame) PCM→OPUS 编码","audio"],
+  ["音频编解码","audio_decoder.c","esp_audio_dec_process","(dec, &in_frame, &out_frame) OPUS→PCM 解码","audio"],
+  ["音频编解码","audio_decoder.c","esp_audio_dec_process","(第二调用点，处理残留OPUS数据)","audio"],
+
+  /* ── WiFi ── */
+  ["WiFi","bsp_wifi.c","esp_netif_init","() 初始化 TCP/IP 协议栈","bsp"],
+  ["WiFi","bsp_wifi.c","esp_event_loop_create_default","() 创建默认事件循环","bsp"],
+  ["WiFi","bsp_wifi.c","esp_netif_create_default_wifi_sta","() 创建 STA 网络接口","bsp"],
+  ["WiFi","bsp_wifi.c","esp_event_handler_instance_register","(WIFI_PROV_EVENT) 注册BLE配网事件","bsp"],
+  ["WiFi","bsp_wifi.c","esp_event_handler_instance_register","(WIFI_EVENT) 注册 WiFi 事件","bsp"],
+  ["WiFi","bsp_wifi.c","esp_event_handler_instance_register","(IP_EVENT_STA_GOT_IP) 注册 IP 获取事件","bsp"],
+  ["WiFi","bsp_wifi.c","esp_wifi_init","(&cfg) 初始化 WiFi 驱动","bsp"],
+  ["WiFi","bsp_wifi.c","esp_wifi_get_mac","(WIFI_IF_STA, mac) 获取 MAC 地址","bsp"],
+  ["WiFi","bsp_wifi.c","esp_wifi_set_mode","(WIFI_MODE_STA) 设为 STA 模式","bsp"],
+  ["WiFi","bsp_wifi.c","esp_wifi_start","() 启动 WiFi","bsp"],
+  ["WiFi","bsp_wifi.c","esp_wifi_connect","() 发起连接","bsp"],
+  ["WiFi","bsp_wifi.c","esp_wifi_restore","() 清除 WiFi 凭证（长按重置）","bsp"],
+
+  /* ── 唤醒词AFE ── */
+  ["唤醒词AFE","custom_wake_word.c","esp_afe_handle_from_config","(afe_cfg) 获取AFE接口并创建实例","wake_word"],
+  ["唤醒词AFE","custom_wake_word.c","s_afe_iface->feed","(afe_data, pcm, chunk_size) 投喂麦克风PCM→AEC+NS","wake_word"],
+  ["唤醒词AFE","custom_wake_word.c","s_afe_iface->fetch","(afe_data, buf, &size) 取降噪后PCM","wake_word"],
+  ["唤醒词AFE","custom_wake_word.c","multinet_iface->create","(mn_name, 3000ms超时) 创建命令词模型","wake_word"],
+  ["唤醒词AFE","custom_wake_word.c","multinet_iface->detect","(model, pcm) 命令词检测","wake_word"],
+  ["唤醒词AFE","custom_wake_word.c","multinet_iface->get_results","(model) 获取检测结果","wake_word"],
+  ["唤醒词AFE","custom_wake_word.c","multinet_iface->set_det_threshold","(model, 0.6中/0.4英) 设检测阈值","wake_word"],
+  ["唤醒词AFE","custom_wake_word.c","multinet_iface->clean","(model) 清除历史状态重新检测","wake_word"],
+  ["唤醒词AFE","custom_wake_word.c","esp_mn_commands_alloc","(iface, model) 分配命令词槽位","wake_word"],
+
+  /* ── LCD显示 ── */
+  ["LCD显示","bsp_lcd.c","esp_lcd_new_panel_io_spi","(SPI2_HOST, &io_cfg, &lcd_io) 创建SPI LCD接口","bsp"],
+  ["LCD显示","bsp_lcd.c","esp_lcd_new_panel_st7789","(lcd_io, &panel_cfg, &lcd_panel) 初始化ST7789驱动","bsp"],
+  ["LCD显示","bsp_lcd.c","esp_lcd_panel_reset","(panel) 硬件复位显示屏","bsp"],
+  ["LCD显示","bsp_lcd.c","esp_lcd_panel_init","(panel) 初始化面板驱动","bsp"],
+  ["LCD显示","bsp_lcd.c","esp_lcd_panel_invert_color","(panel, true) 颜色反转（IPS屏需要）","bsp"],
+  ["LCD显示","bsp_lcd.c","esp_lcd_panel_disp_on_off","(panel, false) 关闭显示","bsp"],
+  ["LCD显示","bsp_lcd.c","esp_lcd_panel_disp_on_off","(panel, true) 开启显示","bsp"],
+
+  /* ── GPIO外设 ── */
+  ["GPIO外设","bsp_lcd.c","gpio_config","(&bk_gpio_config) 配置LCD背光GPIO（推挽输出）","bsp"],
+  ["GPIO外设","bsp_lcd.c","gpio_set_level","(BSP_LCD_BK_PIN, 0/1) 控制LCD背光","bsp"],
+  ["GPIO外设","bsp_wifi.c","gpio_config","(&io_conf) 配置GPIO0输入（按键）","bsp"],
+  ["GPIO外设","bsp_wifi.c","gpio_get_level","(CLEAR_WIFI_BUTTON_PIN) 读取按键状态","bsp"],
+  ["GPIO外设","bsp_touch.c","gpio_config","(&io_conf) 配置马达GPIO（推挽输出）","bsp"],
+  ["GPIO外设","bsp_touch.c","gpio_set_level","(BSP_MOTOR_VIB_PIN, 1) 马达通电","bsp"],
+  ["GPIO外设","bsp_touch.c","gpio_set_level","(BSP_MOTOR_VIB_PIN, 0) 马达断电","bsp"],
+  ["GPIO外设","interaction.c","gpio_set_level","(GPIO16, 1/0) 震动马达控制","ui"],
+
+  /* ── 内存管理 ── */
+  ["内存管理","object.h","heap_caps_malloc","(size, MALLOC_CAP_SPIRAM) 从SPIRAM分配","common"],
+  ["内存管理","audio_encoder.c","malloc_zeroed","(in_frame_size) 分配清零输入帧缓冲","audio"],
+  ["内存管理","audio_encoder.c","malloc_zeroed","(out_frame_size) 分配清零输出帧缓冲","audio"],
+  ["内存管理","audio_encoder.c","free","(buf) 释放临时缓冲区","audio"],
+];
+
+// ═══════════════════════════════════════════
+//  参数详情数据库  { 函数名: [{n,t,d}, …, {ret}] }
+//  每条: n=参数名, t=类型, d=说明
+//  最后一条 n="↩ 返回值" 表示返回值
+// ═══════════════════════════════════════════
+const PARAMS = {
+
+  /* ────── RTOS 任务 ────── */
+  "xTaskCreatePinnedToCoreWithCaps": [
+    {n:"pvTaskCode",    t:"TaskFunction_t",  d:"任务函数入口指针（void fn(void*)）"},
+    {n:"pcName",        t:"const char*",     d:"任务名称，仅用于调试，最长 configMAX_TASK_NAME_LEN 个字符"},
+    {n:"usStackDepth",  t:"uint32_t",        d:"任务栈大小（字节）。SPIRAM 栈可设置较大值，不消耗内部 SRAM"},
+    {n:"pvParameters",  t:"void*",           d:"传入任务函数的参数指针，可强转为任意类型"},
+    {n:"uxPriority",    t:"UBaseType_t",     d:"任务优先级，0 = 最低，configMAX_PRIORITIES-1 = 最高（本项目最高 22）"},
+    {n:"pxCreatedTask", t:"TaskHandle_t*",   d:"输出：任务句柄，传 NULL 则不保存，后续无法用 vTaskDelete 删除"},
+    {n:"xCoreID",       t:"BaseType_t",      d:"绑定 CPU 核：0 = PRO_CPU，1 = APP_CPU，tskNO_AFFINITY = 不绑定"},
+    {n:"uxMemoryCaps",  t:"UBaseType_t",     d:"内存能力标志：MALLOC_CAP_SPIRAM=从 PSRAM 分配，MALLOC_CAP_INTERNAL=内部 SRAM"},
+    {n:"↩ 返回值",      t:"BaseType_t",      d:"pdPASS=成功，errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY=内存不足"},
+  ],
+  "xTaskCreatePinnedToCore": [
+    {n:"pvTaskCode",    t:"TaskFunction_t",  d:"任务函数入口指针"},
+    {n:"pcName",        t:"const char*",     d:"任务名称（调试用）"},
+    {n:"usStackDepth",  t:"uint32_t",        d:"栈大小（字节），从内部 SRAM 分配"},
+    {n:"pvParameters",  t:"void*",           d:"传给任务的参数"},
+    {n:"uxPriority",    t:"UBaseType_t",     d:"优先级"},
+    {n:"pxCreatedTask", t:"TaskHandle_t*",   d:"输出：任务句柄"},
+    {n:"xCoreID",       t:"BaseType_t",      d:"绑定 CPU 核 0/1 / tskNO_AFFINITY"},
+    {n:"↩ 返回值",      t:"BaseType_t",      d:"pdPASS 成功"},
+  ],
+  "xTaskCreate": [
+    {n:"pvTaskCode",    t:"TaskFunction_t",  d:"任务函数"},
+    {n:"pcName",        t:"const char*",     d:"任务名"},
+    {n:"usStackDepth",  t:"uint32_t",        d:"栈大小（字）"},
+    {n:"pvParameters",  t:"void*",           d:"任务参数"},
+    {n:"uxPriority",    t:"UBaseType_t",     d:"优先级"},
+    {n:"pxCreatedTask", t:"TaskHandle_t*",   d:"输出句柄，NULL 忽略"},
+    {n:"↩ 返回值",      t:"BaseType_t",      d:"pdPASS 成功"},
+  ],
+  "vTaskDelay": [
+    {n:"xTicksToDelay", t:"TickType_t",      d:"延迟 Tick 数，用 pdMS_TO_TICKS(ms) 转换毫秒"},
+  ],
+  "xQueueCreate": [
+    {n:"uxQueueLength", t:"UBaseType_t",     d:"队列最大元素数"},
+    {n:"uxItemSize",    t:"UBaseType_t",     d:"每个元素大小（字节），用 sizeof() 计算"},
+    {n:"↩ 返回值",      t:"QueueHandle_t",   d:"队列句柄，NULL=内存不足"},
+  ],
+  "xQueueSend": [
+    {n:"xQueue",        t:"QueueHandle_t",   d:"目标队列句柄"},
+    {n:"pvItemToQueue", t:"const void*",     d:"要入队的元素指针（会被拷贝）"},
+    {n:"xTicksToWait",  t:"TickType_t",      d:"队列满时最长等待 Tick，0=不等，portMAX_DELAY=永久等"},
+    {n:"↩ 返回值",      t:"BaseType_t",      d:"pdTRUE 成功，errQUEUE_FULL 满了"},
+  ],
+  "xQueueReceive": [
+    {n:"xQueue",        t:"QueueHandle_t",   d:"源队列句柄"},
+    {n:"pvBuffer",      t:"void*",           d:"接收缓冲区，数据会被拷贝进来"},
+    {n:"xTicksToWait",  t:"TickType_t",      d:"队列空时最长等待 Tick，portMAX_DELAY=永久阻塞"},
+    {n:"↩ 返回值",      t:"BaseType_t",      d:"pdTRUE 成功，pdFALSE 超时"},
+  ],
+  "xEventGroupCreate": [
+    {n:"↩ 返回值",      t:"EventGroupHandle_t", d:"事件组句柄，NULL=内存不足"},
+  ],
+  "xEventGroupSetBits": [
+    {n:"xEventGroup",   t:"EventGroupHandle_t", d:"事件组句柄"},
+    {n:"uxBitsToSet",   t:"EventBits_t",     d:"要置 1 的位掩码，可同时置多位"},
+    {n:"↩ 返回值",      t:"EventBits_t",     d:"置位后的事件组值"},
+  ],
+  "xEventGroupClearBits": [
+    {n:"xEventGroup",   t:"EventGroupHandle_t", d:"事件组句柄"},
+    {n:"uxBitsToClear", t:"EventBits_t",     d:"要清 0 的位掩码"},
+    {n:"↩ 返回值",      t:"EventBits_t",     d:"清位前的事件组值"},
+  ],
+  "xEventGroupWaitBits": [
+    {n:"xEventGroup",   t:"EventGroupHandle_t", d:"事件组句柄"},
+    {n:"uxBitsToWaitFor",t:"EventBits_t",    d:"等待的位掩码"},
+    {n:"xClearOnExit",  t:"BaseType_t",      d:"pdTRUE=退出时自动清除等待位"},
+    {n:"xWaitForAllBits",t:"BaseType_t",     d:"pdTRUE=AND等所有位，pdFALSE=OR等任意位"},
+    {n:"xTicksToWait",  t:"TickType_t",      d:"最长等待 Tick"},
+    {n:"↩ 返回值",      t:"EventBits_t",     d:"满足条件时的事件组值（或超时时的当前值）"},
+  ],
+  "xSemaphoreCreateMutex": [
+    {n:"↩ 返回值",      t:"SemaphoreHandle_t", d:"互斥锁句柄，NULL=创建失败，用 xSemaphoreTake/Give 加解锁"},
+  ],
+  "xTimerCreate": [
+    {n:"pcTimerName",   t:"const char*",     d:"定时器名称（调试用）"},
+    {n:"xTimerPeriodInTicks",t:"TickType_t", d:"定时周期（Tick），用 pdMS_TO_TICKS 换算"},
+    {n:"uxAutoReload",  t:"UBaseType_t",     d:"pdTRUE=周期重复触发，pdFALSE=单次触发"},
+    {n:"pvTimerID",     t:"void*",           d:"定时器 ID，可在回调中通过 pvTimerGetTimerID 获取"},
+    {n:"pxCallbackFunction",t:"TimerCallbackFunction_t", d:"超时回调函数：void fn(TimerHandle_t)"},
+    {n:"↩ 返回值",      t:"TimerHandle_t",   d:"定时器句柄，NULL=创建失败"},
+  ],
+
+  /* ────── NVS 存储 ────── */
+  "nvs_flash_init": [
+    {n:"↩ 返回值",      t:"esp_err_t",       d:"ESP_OK 成功，ESP_ERR_NVS_NO_FREE_PAGES/VERSION_MISMATCH 需先擦除"},
+  ],
+  "nvs_flash_erase": [
+    {n:"↩ 返回值",      t:"esp_err_t",       d:"ESP_OK 成功，擦除后需重新调用 nvs_flash_init"},
+  ],
+  "nvs_open": [
+    {n:"name",          t:"const char*",     d:"命名空间名（≤15字节），相当于键值对的分组名"},
+    {n:"open_mode",     t:"nvs_open_mode_t", d:"NVS_READONLY=只读，NVS_READWRITE=读写"},
+    {n:"out_handle",    t:"nvs_handle_t*",   d:"输出：NVS 操作句柄"},
+    {n:"↩ 返回值",      t:"esp_err_t",       d:"ESP_OK 成功"},
+  ],
+  "nvs_get_str": [
+    {n:"handle",        t:"nvs_handle_t",    d:"nvs_open 返回的句柄"},
+    {n:"key",           t:"const char*",     d:"键名（≤15字节）"},
+    {n:"out_value",     t:"char*",           d:"接收字符串的缓冲区，NULL=仅查询长度"},
+    {n:"length",        t:"size_t*",         d:"输入缓冲区大小，输出实际字符串长度（含\\0）"},
+    {n:"↩ 返回值",      t:"esp_err_t",       d:"ESP_OK 成功，ESP_ERR_NVS_NOT_FOUND=键不存在"},
+  ],
+  "nvs_set_str": [
+    {n:"handle",        t:"nvs_handle_t",    d:"读写模式的 NVS 句柄"},
+    {n:"key",           t:"const char*",     d:"键名"},
+    {n:"value",         t:"const char*",     d:"要写入的字符串（\\0 结尾）"},
+    {n:"↩ 返回值",      t:"esp_err_t",       d:"ESP_OK 成功，写入后需调用 nvs_commit 才真正落盘"},
+  ],
+  "nvs_commit": [
+    {n:"handle",        t:"nvs_handle_t",    d:"NVS 句柄，将所有未提交的写操作刷新到 Flash"},
+    {n:"↩ 返回值",      t:"esp_err_t",       d:"ESP_OK 成功"},
+  ],
+  "nvs_close": [
+    {n:"handle",        t:"nvs_handle_t",    d:"要关闭的 NVS 句柄，释放资源"},
+  ],
+  "nvs_erase_key": [
+    {n:"handle",        t:"nvs_handle_t",    d:"读写模式的 NVS 句柄"},
+    {n:"key",           t:"const char*",     d:"要删除的键名"},
+    {n:"↩ 返回值",      t:"esp_err_t",       d:"ESP_OK 成功，ESP_ERR_NVS_NOT_FOUND=键不存在"},
+  ],
+
+  /* ────── 环形缓冲 ────── */
+  "xRingbufferCreateWithCaps": [
+    {n:"xBufferSize",   t:"size_t",          d:"缓冲区总字节数（含内部元数据开销）"},
+    {n:"xBufferType",   t:"RingbufferType_t", d:"RINGBUF_TYPE_BYTEBUF=字节流，NOSPLIT=完整帧不分割"},
+    {n:"uxMemoryCaps",  t:"UBaseType_t",     d:"内存标志，MALLOC_CAP_SPIRAM=从 PSRAM 分配"},
+    {n:"↩ 返回值",      t:"RingbufHandle_t", d:"缓冲区句柄，NULL=失败"},
+  ],
+  "xRingbufferSend": [
+    {n:"xRingbuffer",   t:"RingbufHandle_t", d:"目标缓冲区句柄"},
+    {n:"pvItem",        t:"const void*",     d:"要写入的数据指针"},
+    {n:"xItemSize",     t:"size_t",          d:"数据字节数"},
+    {n:"xTicksToWait",  t:"TickType_t",      d:"缓冲区满时等待 Tick，0=不等直接失败"},
+    {n:"↩ 返回值",      t:"BaseType_t",      d:"pdTRUE 成功，pdFALSE 缓冲区满"},
+  ],
+  "xRingbufferReceive": [
+    {n:"xRingbuffer",   t:"RingbufHandle_t", d:"源缓冲区句柄"},
+    {n:"pxItemSize",    t:"size_t*",         d:"输出：实际接收字节数"},
+    {n:"xTicksToWait",  t:"TickType_t",      d:"缓冲区空时等待 Tick"},
+    {n:"↩ 返回值",      t:"void*",           d:"指向数据的指针（零拷贝），用完需调 vRingbufferReturnItem"},
+  ],
+  "xRingbufferReceiveUpTo": [
+    {n:"xRingbuffer",   t:"RingbufHandle_t", d:"源缓冲区句柄"},
+    {n:"pxItemSize",    t:"size_t*",         d:"输出：实际读取字节数"},
+    {n:"xTicksToWait",  t:"TickType_t",      d:"等待超时 Tick"},
+    {n:"xMaxSize",      t:"size_t",          d:"最多读取字节上限，防止一次读取过多"},
+    {n:"↩ 返回值",      t:"void*",           d:"零拷贝数据指针，NULL=超时或空"},
+  ],
+  "vRingbufferReturnItem": [
+    {n:"xRingbuffer",   t:"RingbufHandle_t", d:"缓冲区句柄"},
+    {n:"pvItem",        t:"void*",           d:"xRingbufferReceive 返回的指针，归还后缓冲区空间才被释放"},
+  ],
+
+  /* ────── WebSocket / HTTP ────── */
+  "esp_websocket_client_init": [
+    {n:"config",        t:"const esp_websocket_client_config_t*", d:"配置结构体：uri/path/headers/cert/timeout 等"},
+    {n:"↩ 返回值",      t:"esp_websocket_client_handle_t",        d:"客户端句柄，NULL=失败"},
+  ],
+  "esp_websocket_register_events": [
+    {n:"client",        t:"esp_websocket_client_handle_t",        d:"WS 客户端句柄"},
+    {n:"event",         t:"esp_websocket_event_id_t",             d:"事件类型，WEBSOCKET_EVENT_ANY=所有事件"},
+    {n:"event_handler", t:"esp_event_handler_t",                  d:"回调函数：void fn(void*, esp_event_base_t, int32_t, void*)"},
+    {n:"event_handler_arg",t:"void*",                             d:"传给回调的用户数据"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "esp_websocket_client_start": [
+    {n:"client",        t:"esp_websocket_client_handle_t",        d:"WS 客户端句柄，发起 TCP 连接和 HTTP Upgrade"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "esp_websocket_client_stop": [
+    {n:"client",        t:"esp_websocket_client_handle_t",        d:"WS 客户端句柄，发送 Close 帧并断开连接"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "esp_websocket_client_is_connected": [
+    {n:"client",        t:"esp_websocket_client_handle_t",        d:"WS 客户端句柄"},
+    {n:"↩ 返回值",      t:"bool",                                 d:"true=已连接，false=断开或未连接"},
+  ],
+  "esp_websocket_client_send_text": [
+    {n:"client",        t:"esp_websocket_client_handle_t",        d:"WS 客户端句柄"},
+    {n:"data",          t:"const char*",                          d:"要发送的文本字符串"},
+    {n:"len",           t:"int",                                  d:"数据长度，-1=自动计算 strlen"},
+    {n:"timeout",       t:"TickType_t",                           d:"发送超时 Tick，本项目用 5000ms"},
+    {n:"↩ 返回值",      t:"int",                                  d:">=0 已发字节数，-1=失败"},
+  ],
+  "esp_websocket_client_send_bin": [
+    {n:"client",        t:"esp_websocket_client_handle_t",        d:"WS 客户端句柄"},
+    {n:"data",          t:"const char*",                          d:"二进制数据缓冲区指针"},
+    {n:"len",           t:"int",                                  d:"数据字节数"},
+    {n:"timeout",       t:"TickType_t",                           d:"发送超时 Tick，本项目 100ms（超时则丢帧保实时）"},
+    {n:"↩ 返回值",      t:"int",                                  d:">=0 已发字节数，-1=失败"},
+  ],
+  "esp_websocket_client_destroy": [
+    {n:"client",        t:"esp_websocket_client_handle_t",        d:"WS 客户端句柄，释放所有资源"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "esp_http_client_init": [
+    {n:"config",        t:"const esp_http_client_config_t*",      d:"配置：url/method/timeout/cert/event_handler 等"},
+    {n:"↩ 返回值",      t:"esp_http_client_handle_t",             d:"客户端句柄"},
+  ],
+  "esp_http_client_set_header": [
+    {n:"client",        t:"esp_http_client_handle_t",             d:"HTTP 客户端句柄"},
+    {n:"key",           t:"const char*",                          d:"请求头字段名，如 \"Content-Type\""},
+    {n:"value",         t:"const char*",                          d:"请求头字段值，如 \"application/json\""},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "esp_http_client_set_post_field": [
+    {n:"client",        t:"esp_http_client_handle_t",             d:"HTTP 客户端句柄"},
+    {n:"data",          t:"const char*",                          d:"POST 请求体数据指针"},
+    {n:"len",           t:"int",                                  d:"数据长度（字节）"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "esp_http_client_perform": [
+    {n:"client",        t:"esp_http_client_handle_t",             d:"HTTP 客户端句柄，执行完整请求-响应流程"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功，HTTP 错误码见 esp_http_client_get_status_code"},
+  ],
+  "esp_http_client_cleanup": [
+    {n:"client",        t:"esp_http_client_handle_t",             d:"HTTP 客户端句柄，关闭连接并释放内存"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+
+  /* ────── 音频编解码 ────── */
+  "i2c_new_master_bus": [
+    {n:"bus_config",    t:"const i2c_master_bus_config_t*",       d:"I2C 主机配置：端口号/SDA-SCL 引脚/上拉/时钟源"},
+    {n:"ret_bus_handle",t:"i2c_master_bus_handle_t*",             d:"输出：I2C 总线句柄"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "i2s_new_channel": [
+    {n:"chan_cfg",      t:"const i2s_chan_config_t*",             d:"通道配置：I2S 端口/角色/DMA 缓冲个数/大小"},
+    {n:"ret_tx_handle", t:"i2s_chan_handle_t*",                   d:"输出 TX 句柄，NULL 则不创建 TX"},
+    {n:"ret_rx_handle", t:"i2s_chan_handle_t*",                   d:"输出 RX 句柄，NULL 则不创建 RX"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "i2s_channel_init_std_mode": [
+    {n:"handle",        t:"i2s_chan_handle_t",                    d:"I2S 通道句柄"},
+    {n:"slot_cfg",      t:"const i2s_std_config_t*",             d:"标准模式配置：采样率/位宽/声道数/Philips格式"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "i2s_channel_enable": [
+    {n:"handle",        t:"i2s_chan_handle_t",                    d:"I2S 通道句柄，启用后 DMA 开始工作"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "i2s_channel_write": [
+    {n:"handle",        t:"i2s_chan_handle_t",                    d:"I2S TX 通道句柄"},
+    {n:"src",           t:"const void*",                         d:"PCM 数据缓冲区"},
+    {n:"size",          t:"size_t",                              d:"要写入的字节数"},
+    {n:"bytes_written", t:"size_t*",                             d:"输出：实际写入字节数"},
+    {n:"timeout_ms",    t:"uint32_t",                            d:"超时毫秒，portMAX_DELAY=永久等"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "esp_codec_dev_new": [
+    {n:"codec_cfg",     t:"const esp_codec_dev_cfg_t*",          d:"编解码器配置：dev_type/codec_if（I2C/SPI接口）/data_if（I2S接口）"},
+    {n:"↩ 返回值",      t:"esp_codec_dev_handle_t",              d:"设备句柄，NULL=失败"},
+  ],
+  "esp_codec_dev_open": [
+    {n:"codec_dev",     t:"esp_codec_dev_handle_t",              d:"编解码器设备句柄"},
+    {n:"fs",            t:"const esp_codec_dev_sample_info_t*",  d:"采样参数：sample_rate/bits_per_sample/channel"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功，本项目配置为 16000Hz/16bit/1ch"},
+  ],
+  "esp_codec_dev_set_in_gain": [
+    {n:"codec_dev",     t:"esp_codec_dev_handle_t",              d:"编解码器设备句柄"},
+    {n:"db_value",      t:"float",                               d:"麦克风输入增益（dB），本项目设 40（≈20dB实际增益）"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "esp_codec_dev_set_out_vol": [
+    {n:"codec_dev",     t:"esp_codec_dev_handle_t",              d:"编解码器设备句柄"},
+    {n:"volume",        t:"int",                                 d:"输出音量 0~100，本项目设 60"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "esp_codec_dev_read": [
+    {n:"codec_dev",     t:"esp_codec_dev_handle_t",              d:"编解码器设备句柄"},
+    {n:"data",          t:"void*",                               d:"接收 PCM 数据的缓冲区"},
+    {n:"len",           t:"int",                                 d:"期望读取字节数"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "esp_audio_enc_get_frame_size": [
+    {n:"encoder",       t:"esp_audio_enc_handle_t",              d:"OPUS 编码器句柄"},
+    {n:"in_frame_size", t:"int*",                                d:"输出：每帧 PCM 输入字节数（16kHz×20ms×2byte=640）"},
+    {n:"out_frame_size",t:"int*",                                d:"输出：每帧 OPUS 输出字节数（≈60 bytes@24kbps）"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "esp_audio_enc_process": [
+    {n:"encoder",       t:"esp_audio_enc_handle_t",              d:"OPUS 编码器句柄"},
+    {n:"in_frame",      t:"esp_audio_enc_in_frame_t*",           d:"输入帧：buffer 指针 + size + pts"},
+    {n:"out_frame",     t:"esp_audio_enc_out_frame_t*",          d:"输出帧：buffer 指针 + encoded_size"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功，PCM 已编码为 OPUS"},
+  ],
+  "esp_audio_dec_process": [
+    {n:"decoder",       t:"esp_audio_dec_handle_t",              d:"OPUS 解码器句柄"},
+    {n:"in_frame",      t:"esp_audio_dec_in_frame_t*",           d:"输入帧：OPUS 数据 buffer + size"},
+    {n:"out_frame",     t:"esp_audio_dec_out_frame_t*",          d:"输出帧：PCM buffer + decoded_size"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功，OPUS 已解码为 PCM"},
+  ],
+
+  /* ────── WiFi ────── */
+  "esp_netif_init": [
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功，初始化 TCP/IP 协议栈（lwIP）"},
+  ],
+  "esp_event_loop_create_default": [
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功，创建系统默认事件循环任务"},
+  ],
+  "esp_netif_create_default_wifi_sta": [
+    {n:"↩ 返回值",      t:"esp_netif_t*",                         d:"netif 句柄，NULL=失败"},
+  ],
+  "esp_event_handler_instance_register": [
+    {n:"event_base",    t:"esp_event_base_t",                    d:"事件基类，如 WIFI_EVENT / IP_EVENT / WIFI_PROV_EVENT"},
+    {n:"event_id",      t:"int32_t",                             d:"具体事件 ID，ESP_EVENT_ANY_ID=所有事件"},
+    {n:"event_handler", t:"esp_event_handler_t",                 d:"回调函数"},
+    {n:"event_handler_arg",t:"void*",                            d:"传给回调的用户数据"},
+    {n:"instance",      t:"esp_event_handler_instance_t*",       d:"输出：实例句柄，用于后续反注册"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "esp_wifi_init": [
+    {n:"config",        t:"const wifi_init_config_t*",           d:"WiFi 初始化配置，通常用 WIFI_INIT_CONFIG_DEFAULT() 宏"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "esp_wifi_get_mac": [
+    {n:"ifx",           t:"wifi_interface_t",                    d:"接口类型：WIFI_IF_STA=Station / WIFI_IF_AP=热点"},
+    {n:"mac",           t:"uint8_t[6]",                          d:"输出：6字节 MAC 地址"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "esp_wifi_set_mode": [
+    {n:"mode",          t:"wifi_mode_t",                         d:"WIFI_MODE_STA=站点，WIFI_MODE_AP=热点，WIFI_MODE_APSTA=双模"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "esp_wifi_start": [
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功，启动 WiFi 驱动，触发 WIFI_EVENT_STA_START"},
+  ],
+  "esp_wifi_connect": [
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功，使用 wifi_config_t 中配置的 SSID/密码发起连接"},
+  ],
+  "esp_wifi_restore": [
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功，清除 Flash 中保存的 WiFi 凭证"},
+  ],
+
+  /* ────── 唤醒词 AFE ────── */
+  "esp_afe_handle_from_config": [
+    {n:"afe_config",    t:"afe_config_t*",                       d:"AFE 配置：麦克风数/AEC参考通道/VAD启用/wakenet启用等"},
+    {n:"↩ 返回值",      t:"esp_afe_data_t*",                     d:"AFE 数据句柄，配合 afe_iface 使用"},
+  ],
+  "s_afe_iface->feed": [
+    {n:"afe_data",      t:"esp_afe_data_t*",                     d:"AFE 数据句柄"},
+    {n:"input",         t:"int16_t*",                            d:"PCM 数据：[mic0|mic1|…|ref0|ref1|…] 交织排列"},
+    {n:"↩ 返回值",      t:"int",                                  d:"成功喂入的帧数"},
+  ],
+  "s_afe_iface->fetch": [
+    {n:"afe_data",      t:"esp_afe_data_t*",                     d:"AFE 数据句柄"},
+    {n:"↩ 返回值",      t:"afe_fetch_result_t*",                 d:"含 data(降噪PCM) / vad_state / wakeup_state 的结构体"},
+  ],
+  "multinet_iface->create": [
+    {n:"model_name",    t:"const char*",                         d:"MultiNet 模型名称（来自 NVS 或默认值）"},
+    {n:"det_timeout",   t:"int32_t",                             d:"检测超时毫秒，超时后自动退出命令词等待"},
+    {n:"↩ 返回值",      t:"model_iface_data_t*",                 d:"MultiNet 模型数据句柄"},
+  ],
+  "multinet_iface->detect": [
+    {n:"model_data",    t:"model_iface_data_t*",                 d:"MultiNet 数据句柄"},
+    {n:"input",         t:"int16_t*",                            d:"一帧降噪后的单通道 PCM（AFE fetch 输出）"},
+    {n:"↩ 返回值",      t:"esp_mn_state_t",                      d:"ESP_MN_STATE_DETECTING/DETECTED/TIMEOUT"},
+  ],
+  "multinet_iface->get_results": [
+    {n:"model_data",    t:"model_iface_data_t*",                 d:"MultiNet 数据句柄"},
+    {n:"↩ 返回值",      t:"esp_mn_results_t*",                   d:"含 num/command_id/phrase_id/string 等检测结果"},
+  ],
+  "multinet_iface->set_det_threshold": [
+    {n:"model_data",    t:"model_iface_data_t*",                 d:"MultiNet 数据句柄"},
+    {n:"det_threshold", t:"float",                               d:"检测阈值 0.0~1.0，中文用 0.6，英文用 0.4（越高误报越少）"},
+    {n:"↩ 返回值",      t:"int",                                  d:"0 成功"},
+  ],
+  "multinet_iface->clean": [
+    {n:"model_data",    t:"model_iface_data_t*",                 d:"MultiNet 数据句柄，清除内部缓存帧，重新开始检测"},
+  ],
+  "esp_mn_commands_alloc": [
+    {n:"iface",         t:"const esp_mn_iface_t*",               d:"MultiNet 接口指针"},
+    {n:"model_data",    t:"model_iface_data_t*",                 d:"MultiNet 数据句柄"},
+    {n:"↩ 返回值",      t:"esp_mn_commands_t*",                  d:"命令词列表句柄，用于后续 add/update/remove"},
+  ],
+
+  /* ────── LCD 显示 ────── */
+  "esp_lcd_new_panel_io_spi": [
+    {n:"bus",           t:"esp_lcd_spi_bus_handle_t",            d:"SPI 总线句柄，本项目为 SPI2_HOST"},
+    {n:"io_config",     t:"const esp_lcd_panel_io_spi_config_t*",d:"IO 配置：CS引脚/DC引脚/时钟频率/SPI模式"},
+    {n:"ret_io",        t:"esp_lcd_panel_io_handle_t*",          d:"输出：LCD IO 句柄"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "esp_lcd_new_panel_st7789": [
+    {n:"io",            t:"esp_lcd_panel_io_handle_t",           d:"LCD IO 句柄"},
+    {n:"panel_dev_config",t:"const esp_lcd_panel_dev_config_t*", d:"面板配置：reset引脚/颜色位宽/vendor_config"},
+    {n:"ret_panel",     t:"esp_lcd_panel_handle_t*",             d:"输出：LCD 面板句柄"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "esp_lcd_panel_reset": [
+    {n:"panel",         t:"esp_lcd_panel_handle_t",              d:"LCD 面板句柄，拉低复位引脚并等待 ILI/ST7789 就绪"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "esp_lcd_panel_init": [
+    {n:"panel",         t:"esp_lcd_panel_handle_t",              d:"LCD 面板句柄，发送 ST7789 初始化命令序列"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "esp_lcd_panel_invert_color": [
+    {n:"panel",         t:"esp_lcd_panel_handle_t",              d:"LCD 面板句柄"},
+    {n:"invert_color_data",t:"bool",                             d:"true=颜色取反（IPS 屏需要开启），false=正常"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "esp_lcd_panel_disp_on_off": [
+    {n:"panel",         t:"esp_lcd_panel_handle_t",              d:"LCD 面板句柄"},
+    {n:"on_off",        t:"bool",                                d:"true=开启显示，false=关闭显示（省电）"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+
+  /* ────── GPIO ────── */
+  "gpio_config": [
+    {n:"pGPIOConfig",   t:"const gpio_config_t*",                d:"配置结构体：pin_bit_mask/mode/pull_up/pull_down/intr_type"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "gpio_set_level": [
+    {n:"gpio_num",      t:"gpio_num_t",                          d:"GPIO 编号，如 GPIO_NUM_16"},
+    {n:"level",         t:"uint32_t",                            d:"0=低电平，1=高电平"},
+    {n:"↩ 返回值",      t:"esp_err_t",                            d:"ESP_OK 成功"},
+  ],
+  "gpio_get_level": [
+    {n:"gpio_num",      t:"gpio_num_t",                          d:"GPIO 编号"},
+    {n:"↩ 返回值",      t:"int",                                  d:"0=低电平，1=高电平"},
+  ],
+
+  /* ────── 内存管理 ────── */
+  "heap_caps_malloc": [
+    {n:"size",          t:"size_t",                              d:"要分配的字节数"},
+    {n:"caps",          t:"uint32_t",                            d:"内存能力标志：MALLOC_CAP_SPIRAM=PSRAM，MALLOC_CAP_INTERNAL=内部SRAM，MALLOC_CAP_DMA=DMA可用"},
+    {n:"↩ 返回值",      t:"void*",                               d:"内存指针，NULL=分配失败"},
+  ],
+  "malloc_zeroed": [
+    {n:"size",          t:"size_t",                              d:"分配并清零的字节数（本项目自定义宏，底层调用 calloc）"},
+    {n:"↩ 返回值",      t:"void*",                               d:"已清零的内存指针"},
+  ],
+  "free": [
+    {n:"ptr",           t:"void*",                               d:"要释放的内存指针，NULL 安全（无操作）"},
+  ],
+};
+
+// ═══════════════════════════════════════════
+//  渲染饼图
+// ═══════════════════════════════════════════
+(function renderPie() {
+  const total = Object.values(CATEGORIES).reduce((a,b)=>a+b,0);
+  let startAngle = -Math.PI/2;
+  const g = document.getElementById('pie-slices');
+  const lg = document.getElementById('pie-legend');
+  const R = 90;
+
+  Object.entries(CATEGORIES).forEach(([cat, count]) => {
+    const angle = (count/total)*2*Math.PI;
+    const endAngle = startAngle + angle;
+    const x1 = R*Math.cos(startAngle), y1 = R*Math.sin(startAngle);
+    const x2 = R*Math.cos(endAngle),   y2 = R*Math.sin(endAngle);
+    const large = angle > Math.PI ? 1 : 0;
+    const color = CAT_COLORS[cat] || '#666';
+    const path = document.createElementNS('http://www.w3.org/2000/svg','path');
+    path.setAttribute('d',`M0,0 L${x1},${y1} A${R},${R},0,${large},1,${x2},${y2} Z`);
+    path.setAttribute('fill', color);
+    path.setAttribute('stroke','#0d1117');
+    path.setAttribute('stroke-width','2');
+    path.style.cursor='pointer';
+    path.addEventListener('mouseenter', function(){ this.setAttribute('opacity','0.8'); });
+    path.addEventListener('mouseleave', function(){ this.setAttribute('opacity','1'); });
+    const midAngle = startAngle + angle/2;
+    const lx = (R*0.65)*Math.cos(midAngle), ly = (R*0.65)*Math.sin(midAngle);
+    if(angle > 0.25) {
+      const txt = document.createElementNS('http://www.w3.org/2000/svg','text');
+      txt.setAttribute('x',lx); txt.setAttribute('y',ly);
+      txt.setAttribute('text-anchor','middle'); txt.setAttribute('dominant-baseline','middle');
+      txt.setAttribute('fill','#fff'); txt.setAttribute('font-size','11');
+      txt.setAttribute('font-weight','700'); txt.textContent = count;
+      g.appendChild(txt);
+    }
+    g.insertBefore(path, g.firstChild);
+    startAngle = endAngle;
+
+    // legend item
+    const li = document.createElement('div'); li.className='legend-item';
+    li.innerHTML = `<span class="legend-dot" style="background:${color}"></span><span>${cat} (${count})</span>`;
+    lg.appendChild(li);
+  });
+})();
+
+// ═══════════════════════════════════════════
+//  渲染条形图
+// ═══════════════════════════════════════════
+(function renderBar() {
+  const max = Math.max(...Object.values(CATEGORIES));
+  const bc = document.getElementById('bar-chart');
+  Object.entries(CATEGORIES).sort((a,b)=>b[1]-a[1]).forEach(([cat,count])=>{
+    const pct = Math.round(count/max*100);
+    const color = CAT_COLORS[cat]||'#666';
+    bc.innerHTML += `<div class="bar-row">
+      <div class="bar-label">${cat}</div>
+      <div class="bar-track">
+        <div class="bar-fill" style="width:${pct}%;background:${color}">${pct >= 20 ? count : ''}</div>
+      </div>
+      <div class="bar-count" style="color:${color}">${count}</div>
+    </div>`;
+  });
+})();
+
+// ═══════════════════════════════════════════
+//  渲染模块×类别矩阵
+// ═══════════════════════════════════════════
+(function renderMatrix() {
+  const MODULES = ["bsp","audio","protocol","session","wake_word","ui","common"];
+  const MODULE_LABELS = {bsp:"BSP硬件层",audio:"音频模块",protocol:"网络协议",session:"会话管理",wake_word:"唤醒词引擎",ui:"UI交互",common:"公共工具"};
+  const CATS = Object.keys(CATEGORIES);
+  const matrixData = {};
+  MODULES.forEach(m => { matrixData[m]={}; CATS.forEach(c=>matrixData[m][c]=0); });
+  APIS.forEach(([cat,,,, mod]) => { if(matrixData[mod]) matrixData[mod][cat]=(matrixData[mod][cat]||0)+1; });
+
+  const t = document.getElementById('matrix-table');
+  const head = `<thead><tr><th>模块↓ / 类别→</th>${CATS.map(c=>`<th style="color:${CAT_COLORS[c]||'#ccc'}">${c}</th>`).join('')}<th>合计</th></tr></thead>`;
+  let body='<tbody>';
+  MODULES.forEach(m=>{
+    const total = CATS.reduce((s,c)=>s+(matrixData[m][c]||0),0);
+    body+=`<tr><td class="row-label">${MODULE_LABELS[m]||m}</td>`;
+    CATS.forEach(c=>{
+      const v=matrixData[m][c]||0;
+      body+=v?`<td class="has">${v}</td>`:`<td class="no">·</td>`;
+    });
+    body+=`<td style="font-weight:700;color:#c9d1d9">${total}</td></tr>`;
+  });
+  body+='</tbody>';
+  t.innerHTML=head+body;
+})();
+
+// ═══════════════════════════════════════════
+//  渲染数据流图
+// ═══════════════════════════════════════════
+(function renderFlow() {
+  const nodes = [
+    {id:'mic',   x:40,  y:140, w:80, h:40, label:'麦克风\nES8311',     color:'#1f4e79'},
+    {id:'i2s',   x:160, y:140, w:80, h:40, label:'I2S RX\ni2s_channel_read', color:'#0e3553'},
+    {id:'afe',   x:290, y:100, w:100,h:40, label:'AFE 前端\nafe->feed/fetch', color:'#3a1a6e'},
+    {id:'mn',    x:290, y:180, w:100,h:40, label:'MultiNet\n->detect', color:'#3a1a6e'},
+    {id:'enc',   x:440, y:100, w:100,h:40, label:'OPUS 编码\nencode_process', color:'#1a3a1a'},
+    {id:'ws',    x:590, y:100, w:100,h:40, label:'WebSocket\nsend_bin', color:'#3a1a0e'},
+    {id:'cloud', x:740, y:100, w:90, h:40, label:'云端 AI\nLLM/TTS',    color:'#3a2200'},
+    {id:'wsrx',  x:590, y:200, w:100,h:40, label:'WebSocket\nrecv_bin',  color:'#3a1a0e'},
+    {id:'dec',   x:440, y:200, w:100,h:40, label:'OPUS 解码\ndec_process', color:'#1a3a1a'},
+    {id:'spk',   x:290, y:260, w:100,h:40, label:'I2S TX\ni2s_write',  color:'#0e3553'},
+  ];
+
+  const edges = [
+    {from:'mic',to:'i2s',label:'PCM 16kHz'},
+    {from:'i2s',to:'afe',label:'PCM帧'},
+    {from:'afe',to:'mn', label:'降噪PCM'},
+    {from:'afe',to:'enc',label:'PCM→编码'},
+    {from:'enc',to:'ws', label:'OPUS帧'},
+    {from:'ws', to:'cloud',label:'WS Binary'},
+    {from:'cloud',to:'wsrx',label:'TTS OPUS'},
+    {from:'wsrx',to:'dec',label:'OPUS'},
+    {from:'dec',to:'spk',label:'PCM'},
+  ];
+
+  const gn = document.getElementById('flow-nodes');
+  const ge = document.getElementById('flow-edges');
+
+  const cx = n => n.x + n.w/2;
+  const cy = n => n.y + n.h/2;
+  const nodeMap = {};
+  nodes.forEach(n => nodeMap[n.id]=n);
+
+  // 边
+  edges.forEach(e=>{
+    const s=nodeMap[e.from], t=nodeMap[e.to];
+    const line = document.createElementNS('http://www.w3.org/2000/svg','line');
+    line.setAttribute('x1', cx(s)); line.setAttribute('y1', cy(s));
+    line.setAttribute('x2', cx(t)); line.setAttribute('y2', cy(t));
+    line.setAttribute('stroke','#58a6ff'); line.setAttribute('stroke-width','1.5');
+    line.setAttribute('marker-end','url(#arr)');
+    const txt = document.createElementNS('http://www.w3.org/2000/svg','text');
+    txt.setAttribute('x',(cx(s)+cx(t))/2); txt.setAttribute('y',(cy(s)+cy(t))/2-6);
+    txt.setAttribute('text-anchor','middle'); txt.setAttribute('fill','#8b949e');
+    txt.setAttribute('font-size','10'); txt.textContent = e.label;
+    ge.appendChild(line); ge.appendChild(txt);
+  });
+
+  // 节点
+  nodes.forEach(n=>{
+    const rect = document.createElementNS('http://www.w3.org/2000/svg','rect');
+    rect.setAttribute('x',n.x); rect.setAttribute('y',n.y);
+    rect.setAttribute('width',n.w); rect.setAttribute('height',n.h);
+    rect.setAttribute('rx','6'); rect.setAttribute('fill',n.color);
+    rect.setAttribute('stroke','#30363d'); rect.setAttribute('stroke-width','1');
+    gn.appendChild(rect);
+    const lines = n.label.split('\n');
+    lines.forEach((ln,i)=>{
+      const txt = document.createElementNS('http://www.w3.org/2000/svg','text');
+      txt.setAttribute('x',cx(n)); txt.setAttribute('y', n.y + (i===0?14:26));
+      txt.setAttribute('text-anchor','middle'); txt.setAttribute('fill',i===0?'#c9d1d9':'#79c0ff');
+      txt.setAttribute('font-size',i===0?'11':'9');
+      if(i===0) txt.setAttribute('font-weight','600');
+      txt.textContent=ln; gn.appendChild(txt);
+    });
+  });
+})();
+
+// ═══════════════════════════════════════════
+//  渲染 API 表格（支持点击展开参数）
+// ═══════════════════════════════════════════
+const MOD_LABELS = {bsp:"BSP硬件层",audio:"音频模块",protocol:"网络协议",session:"会话管理",wake_word:"唤醒词引擎",ui:"UI交互",common:"公共工具"};
+
+function buildParamPanel(fn) {
+  const params = PARAMS[fn];
+  if (!params || params.length === 0) {
+    return `<div class="param-panel"><span class="no-params">该 API 无需参数或参数说明暂未收录</span></div>`;
+  }
+  const regular = params.filter(p => !p.n.startsWith('↩'));
+  const ret     = params.find(p => p.n.startsWith('↩'));
+  let rows = regular.map((p, i) =>
+    `<tr><td>${i+1}</td><td>${p.n}</td><td>${p.t}</td><td>${p.d}</td></tr>`
+  ).join('');
+  const retRow = ret
+    ? `<tr class="ret-row"><td>↩</td><td>${ret.n}</td><td>${ret.t}</td><td>${ret.d}</td></tr>`
+    : '';
+  return `<div class="param-panel">
+    <div class="param-title">参数说明 · 点击行再次折叠</div>
+    <table class="param-table">
+      <thead><tr><th>#</th><th>参数名</th><th>类型</th><th>说明</th></tr></thead>
+      <tbody>${rows}${retRow}</tbody>
+    </table>
+  </div>`;
+}
+
+function renderTable(filter='all', search='') {
+  const tbody = document.getElementById('api-tbody');
+  tbody.innerHTML='';
+  let count=0;
+  APIS.forEach(([cat, file, fn, desc, mod]) => {
+    if(filter!=='all' && cat!==filter) return;
+    const q = search.toLowerCase();
+    if(q && !fn.toLowerCase().includes(q) && !file.toLowerCase().includes(q) && !desc.toLowerCase().includes(q)) return;
+    count++;
+    const color = CAT_COLORS[cat]||'#666';
+    const hasParams = PARAMS[fn] && PARAMS[fn].length > 0;
+    const hint = hasParams
+      ? `<span style="color:#30363d;font-size:10px;margin-left:4px" title="点击展开参数说明">▶</span>`
+      : '';
+
+    // 主行
+    const tr = document.createElement('tr');
+    tr.className = 'api-main';
+    tr.innerHTML=`
+      <td><span class="tag" style="background:${color}22;color:${color};border:1px solid ${color}44">${cat}</span></td>
+      <td style="color:#8b949e;font-size:11px">${file}</td>
+      <td style="font-family:'Consolas',monospace;color:#79c0ff">${fn}${hint}</td>
+      <td style="color:var(--muted);font-size:11px">${desc}</td>
+      <td><span class="tag" style="background:#21262d;color:#8b949e">${MOD_LABELS[mod]||mod}</span></td>`;
+
+    // 展开行
+    const expandTr = document.createElement('tr');
+    expandTr.className = 'param-row hidden';
+    expandTr.innerHTML = `<td colspan="5">${buildParamPanel(fn)}</td>`;
+
+    tr.addEventListener('click', () => {
+      const open = !expandTr.classList.contains('hidden');
+      expandTr.classList.toggle('hidden', open);
+      tr.classList.toggle('expanded', !open);
+      // 更新指示箭头
+      const arrow = tr.querySelector('span[title]');
+      if (arrow) arrow.textContent = open ? '▶' : '▼';
+      if (arrow) arrow.style.color = open ? '#30363d' : 'var(--accent)';
+    });
+
+    tbody.appendChild(tr);
+    tbody.appendChild(expandTr);
+  });
+  document.getElementById('visible-count').textContent=count;
+}
+renderTable();
+
+// 筛选按钮
+document.querySelectorAll('.filter-btn').forEach(btn=>{
+  btn.addEventListener('click', function(){
+    document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));
+    this.classList.add('active');
+    renderTable(this.dataset.cat, document.getElementById('search-input').value);
+  });
+});
+document.getElementById('search-input').addEventListener('input', function(){
+  const active = document.querySelector('.filter-btn.active');
+  renderTable(active?active.dataset.cat:'all', this.value);
+});
+</script>
+</body>
+</html>
