@@ -1,167 +1,327 @@
 /**
- * @file bsp_interaction.c
- * @brief 情绪矩阵与动作解析引擎
+ * @file interaction.c
+ * @brief 情绪矩阵与动作解析引擎（非阻塞 worker 架构）
+ *
+ * 架构说明：
+ *   - bsp_interaction_play() 仅入队，立即返回，不阻塞调用方（session/UI 任务）。
+ *   - 内部 interaction_worker_task 串行消费队列，依次执行：
+ *       屏幕动画 → 音效 → 震动马达 → 三轴舵机动作序列 → 舵机归中
+ *   - 所有舵机调用经 bsp_servo_move_smooth()，内部持 per-channel mutex，线程安全。
+ *
+ * 角度约定：中心点 = 90°
+ *   头部：左+ 右−  (左转30° → angle=120, 右转30° → angle=60)
+ *   手臂：前+ 后−  (前摆20° → angle=110, 后摆20° → angle=70)
  */
 
 #include "interaction.h"
+#include "bsp/servo_manager.h"    // SERVO_SPEED_* 常量
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_heap_caps.h"
 
 static const char *TAG = "INTERACTION";
 
+// ─── Worker task 配置 ────────────────────────────────────────────────────────
+#define INTERACTION_QUEUE_LEN  4    ///< 最多缓存 4 个待执行情绪（超出时丢弃新请求）
+#define INTERACTION_TASK_STACK 4096 ///< worker 栈大小（含 vTaskDelay 调用链）
+#define INTERACTION_TASK_PRIO  5    ///< 优先级与 session 相当，略低于音频（7）
+
+static QueueHandle_t s_ia_queue  = NULL; ///< 情绪 ID 队列
+static TaskHandle_t  s_ia_worker = NULL; ///< worker 任务句柄
+static bool          s_ia_inited = false;
+
 // ==========================================
-// 1. 数据结构定义 (严格对齐你的 Excel 表头)
+// 1. 数据结构：严格对齐情绪矩阵表头
 // ==========================================
+
 /**
- * @brief 单轴舵机动作参数（情绪矩阵中每个舵机轴的动作描述）
+ * @brief 单轴舵机动作参数
  *
- * 一个动作步骤描述"在此情绪下，该轴舵机如何运动"：
- *   - 先运动到 angle_1（前半段，如 左转/前摆）
- *   - 再运动到 angle_2（后半段，如 右转/后摆；单向动作填 90 即归中）
- *   - 以上两步组成一次循环，共执行 count 次
+ * 描述一个情绪下某轴舵机的完整动作：
+ *   angle_1 → angle_2 为一次循环，共执行 count 次，最后自动归中。
  *
- * 角度说明：中心点为 90°。
- *   头部：左+ 右-（左转 30° → angle=120，右转 30° → angle=60）
- *   手臂：前+ 后-（前摆 20° → angle=110，后摆 15° → angle=75）
+ * 角度说明：中心 = 90°。
+ *   head:  左+(大) 右-(小)  | L/R_arm: 前+(大) 后-(小)
  */
 typedef struct
 {
-    float angle_1;  ///< 动作前半段目标角度（度），如左转或前摆的目标位置
-    float angle_2;  ///< 动作后半段目标角度（度），如右转或后摆；单向动作填 90（归中）
-    uint32_t speed; ///< 运动速度延时（step_ms，对应 SERVO_SPEED_xxx 宏，值越大越慢）
-    uint8_t count;  ///< 该轴在此情绪下的循环执行次数（0 表示不动）
+    float    angle_1; ///< 动作前半段目标角度（度）
+    float    angle_2; ///< 动作后半段目标角度（度）；单向动作填 90.0f（归中）
+    uint32_t speed;   ///< step_ms，对应 SERVO_SPEED_xxx（值越大越慢）
+    uint8_t  count;   ///< 循环次数（0 = 该轴不参与本情绪动作）
 } ActionStep_t;
 
 /**
- * @brief 情绪矩阵行（情绪 ID → 全套硬件动作映射表的一行）
- *
- * g_emotion_matrix[] 数组中每个元素对应一种情绪，
- * bsp_interaction_play() 按 emotion_id 查表后，依次执行各字段定义的动作。
+ * @brief 情绪矩阵行：情绪 ID → 全套硬件动作映射
  */
 typedef struct
 {
-    robot_emotion_t emotion_id; ///< 情绪枚举 ID，作为查表键（对应 robot_emotion_t）
-    const char *screen_anim;    ///< 屏幕动画标识字符串（传给 UI 层的动画名称，预留接口）
-    uint8_t motor_mode;         ///< 震动马达模式（0:无振动, 1:轻1次50ms, 2:短促2次, 3:连续, 4:长震1次）
-    const char *audio_file;     ///< 音效文件名（传给音频层播放，预留接口）
-    ActionStep_t head;          ///< 头部舵机（CH_HEAD）动作参数
-    ActionStep_t left_arm;      ///< 左臂舵机（CH_L_ARM）动作参数
-    ActionStep_t right_arm;     ///< 右臂舵机（CH_R_ARM）动作参数
+    robot_emotion_t emotion_id; ///< 情绪枚举 ID（查表键）
+    const char     *screen_anim; ///< 屏幕动画标识（传给 UI 层，预留）
+    uint8_t         motor_mode;  ///< 震动马达模式 (0=无 1=轻1次 2=短促2次 3=连续 4=长1次)
+    const char     *audio_file;  ///< 音效文件名（传给音频层，预留）
+    ActionStep_t    head;        ///< 头部舵机（CH_HEAD）
+    ActionStep_t    left_arm;    ///< 左臂舵机（CH_L_ARM）
+    ActionStep_t    right_arm;   ///< 右臂舵机（CH_R_ARM）
 } InteractionMatrix_t;
 
 // ==========================================
-// 2. 情绪动作矩阵表 (你的 Excel 数据都在这里)
-// ⚠️ 角度换算说明：中心点为 90度。
-// 头部：左+ 右- (如 左30度=120, 右30度=60)
-// 手臂：前+ 后- (如 前20度=110, 后15度=75)
+// 2. 情绪动作矩阵表（14 种全覆盖）
+//
+// 角度速查：
+//   左/前 45° → 135°  |  右/后 45° → 45°
+//   头部软限位: [45, 135]   手臂软限位: [10, 160]
 // ==========================================
-const InteractionMatrix_t g_emotion_matrix[] = {
-    // 【第 1 行】开心
+static const InteractionMatrix_t g_emotion_matrix[] = {
+
+    // ── 0: 开心 ──────────────────────────────────────────────────────────────
+    // 快速左右摇头3次 + 双臂前后摆2次 + 2次短促震动
     {
-        .emotion_id = EMO_HAPPY,
+        .emotion_id  = EMO_HAPPY,
         .screen_anim = "anim_happy_stars",
-        .motor_mode = 2,
-        .audio_file = "laugh_short.mp3",
-        // 头部：左30 -> 右30 (120, 60)，快速，执行 3 次
-        .head = {120.0f, 60.0f, SERVO_SPEED_FAST, 3},
-        // 左臂：前20 -> 后15 (110, 75)，中速，执行 2 次
-        .left_arm = {110.0f, 75.0f, SERVO_SPEED_MID, 2},
-        // 右臂：前15 -> 后20 (105, 70)，中速，执行 2 次
-        .right_arm = {105.0f, 70.0f, SERVO_SPEED_MID, 2}},
+        .motor_mode  = 2,
+        .audio_file  = "laugh_short.mp3",
+        .head      = {120.0f, 60.0f, SERVO_SPEED_FAST, 3},   // 左30→右30，快速×3
+        .left_arm  = {110.0f, 70.0f, SERVO_SPEED_MID,  2},   // 前20→后20，中速×2
+        .right_arm = {110.0f, 70.0f, SERVO_SPEED_MID,  2},
+    },
 
-    // 【第 2 行】好奇
+    // ── 1: 好奇 ──────────────────────────────────────────────────────────────
+    // 缓慢左右侧头2次 + 双臂前举1次 + 1次轻震动
     {
-        .emotion_id = EMO_CURIOUS,
+        .emotion_id  = EMO_CURIOUS,
         .screen_anim = "anim_curious_q",
-        .motor_mode = 1,
-        .audio_file = "doubt.mp3",
-        // 头部：左25 -> 右25 (115, 65)，缓慢，执行 2 次
-        .head = {115.0f, 65.0f, SERVO_SPEED_SLOW, 2},
-        // 左臂：前30 (120)，缓慢，执行 1 次
-        .left_arm = {120.0f, 90.0f, SERVO_SPEED_SLOW, 1},
-        // 右臂：前30 (120)，缓慢，执行 1 次
-        .right_arm = {120.0f, 90.0f, SERVO_SPEED_SLOW, 1}},
+        .motor_mode  = 1,
+        .audio_file  = "doubt.mp3",
+        .head      = {115.0f, 65.0f, SERVO_SPEED_SLOW, 2},   // 左25→右25，慢×2
+        .left_arm  = {120.0f, 90.0f, SERVO_SPEED_SLOW, 1},   // 前30→归中，慢×1
+        .right_arm = {120.0f, 90.0f, SERVO_SPEED_SLOW, 1},
+    },
 
-    // 【第 3 行】傲娇
+    // ── 2: 傲娇 ──────────────────────────────────────────────────────────────
+    // 头部轻偏左1次（不回来，等归中）+ 双臂快速后收1次 + 无震动
     {
-        .emotion_id = EMO_TSUNDERE,
+        .emotion_id  = EMO_TSUNDERE,
         .screen_anim = "anim_tsundere",
-        .motor_mode = 0,
-        .audio_file = "hmph.mp3",
-        // 头部：左15 (105)，极慢，执行 1 次
-        .head = {105.0f, 90.0f, 50, 1}, // 50 是自定义极慢速
-        // 左臂：后30 (60)，快速，执行 1 次
-        .left_arm = {60.0f, 90.0f, SERVO_SPEED_FAST, 1},
-        // 右臂：后30 (60)，快速，执行 1 次
-        .right_arm = {60.0f, 90.0f, SERVO_SPEED_FAST, 1}},
+        .motor_mode  = 0,
+        .audio_file  = "hmph.mp3",
+        .head      = {105.0f, 90.0f, SERVO_SPEED_VERY_SLOW, 1}, // 左15→归中，极慢×1
+        .left_arm  = {60.0f,  90.0f, SERVO_SPEED_FAST,      1}, // 后30→归中，快×1
+        .right_arm = {60.0f,  90.0f, SERVO_SPEED_FAST,      1},
+    },
 
-    // 【第 4 行】怕痒
+    // ── 3: 怕痒 ──────────────────────────────────────────────────────────────
+    // 极速抖头5次 + 双臂快速前后摆3次 + 连续震动
     {
-        .emotion_id = EMO_TICKLISH,
+        .emotion_id  = EMO_TICKLISH,
         .screen_anim = "anim_ticklish",
-        .motor_mode = 3,
-        .audio_file = "ticklish.mp3",
-        // 头部：左15 -> 右15 (105, 75)，极快速，执行 5 次
-        .head = {105.0f, 75.0f, 2, 5}, // 2 是极快
-        // 左臂：前25 -> 后25 (115, 65)，快速，执行 3 次
-        .left_arm = {115.0f, 65.0f, SERVO_SPEED_FAST, 3},
-        // 右臂：前25 -> 后25 (115, 65)，快速，执行 3 次
-        .right_arm = {115.0f, 65.0f, SERVO_SPEED_FAST, 3}}
+        .motor_mode  = 3,
+        .audio_file  = "ticklish.mp3",
+        .head      = {105.0f, 75.0f, SERVO_SPEED_VERY_FAST, 5}, // 左15→右15，极快×5
+        .left_arm  = {115.0f, 65.0f, SERVO_SPEED_FAST,      3}, // 前25→后25，快×3
+        .right_arm = {115.0f, 65.0f, SERVO_SPEED_FAST,      3},
+    },
 
-    // ... 你可以对照你的 Excel，把剩下的几十个表情全按照这个格式粘进来
+    // ── 4: 犯困 ──────────────────────────────────────────────────────────────
+    // 极慢大幅侧头1次 + 双臂缓缓下垂1次 + 无震动
+    {
+        .emotion_id  = EMO_SLEEPY,
+        .screen_anim = "anim_sleepy",
+        .motor_mode  = 0,
+        .audio_file  = "yawn.mp3",
+        .head      = {115.0f, 65.0f, SERVO_SPEED_VERY_SLOW, 1}, // 左25→右25，极慢×1
+        .left_arm  = {70.0f,  90.0f, SERVO_SPEED_VERY_SLOW, 1}, // 后20（下垂）→归中
+        .right_arm = {70.0f,  90.0f, SERVO_SPEED_VERY_SLOW, 1},
+    },
+
+    // ── 5: 委屈 ──────────────────────────────────────────────────────────────
+    // 头部缓慢轻偏1次 + 双臂小幅后收（内缩）1次 + 无震动
+    {
+        .emotion_id  = EMO_GRIEVED,
+        .screen_anim = "anim_grieved",
+        .motor_mode  = 0,
+        .audio_file  = "sob.mp3",
+        .head      = {100.0f, 90.0f, SERVO_SPEED_SLOW, 1}, // 左10→归中，慢×1
+        .left_arm  = {65.0f,  90.0f, SERVO_SPEED_SLOW, 1}, // 后25→归中，慢×1
+        .right_arm = {65.0f,  90.0f, SERVO_SPEED_SLOW, 1},
+    },
+
+    // ── 6: 舒服 ──────────────────────────────────────────────────────────────
+    // 慢速轻摇头2次 + 双臂微微展开1次 + 1次轻震动
+    {
+        .emotion_id  = EMO_COMFORTABLE,
+        .screen_anim = "anim_comfortable",
+        .motor_mode  = 1,
+        .audio_file  = "sigh_happy.mp3",
+        .head      = {105.0f, 75.0f, SERVO_SPEED_SLOW, 2}, // 左15→右15，慢×2
+        .left_arm  = {100.0f, 90.0f, SERVO_SPEED_SLOW, 1}, // 前10→归中，慢×1
+        .right_arm = {100.0f, 90.0f, SERVO_SPEED_SLOW, 1},
+    },
+
+    // ── 7: 撒娇 ──────────────────────────────────────────────────────────────
+    // 头部中速倾斜往返2次 + 双臂中速上举2次 + 2次短促震动
+    {
+        .emotion_id  = EMO_ACT_CUTE,
+        .screen_anim = "anim_act_cute",
+        .motor_mode  = 2,
+        .audio_file  = "cute.mp3",
+        .head      = {110.0f, 90.0f, SERVO_SPEED_MID, 2}, // 左20→归中，中速×2
+        .left_arm  = {120.0f, 90.0f, SERVO_SPEED_MID, 2}, // 前30→归中，中速×2
+        .right_arm = {120.0f, 90.0f, SERVO_SPEED_MID, 2},
+    },
+
+    // ── 8: 生气 ──────────────────────────────────────────────────────────────
+    // 快速大幅摇头3次 + 双臂用力前摆2次 + 2次短促震动
+    {
+        .emotion_id  = EMO_ANGRY,
+        .screen_anim = "anim_angry",
+        .motor_mode  = 2,
+        .audio_file  = "angry.mp3",
+        .head      = {120.0f, 60.0f, SERVO_SPEED_FAST, 3}, // 左30→右30，快×3
+        .left_arm  = {125.0f, 70.0f, SERVO_SPEED_FAST, 2}, // 前35→后20，快×2
+        .right_arm = {125.0f, 70.0f, SERVO_SPEED_FAST, 2},
+    },
+
+    // ── 9: 害羞 ──────────────────────────────────────────────────────────────
+    // 头部缓缓轻低垂1次 + 双臂小幅前举（遮脸感）1次 + 1次轻震动
+    {
+        .emotion_id  = EMO_SHY,
+        .screen_anim = "anim_shy",
+        .motor_mode  = 1,
+        .audio_file  = "shy.mp3",
+        .head      = {80.0f,  90.0f, SERVO_SPEED_SLOW, 1}, // 右10→归中，慢×1
+        .left_arm  = {105.0f, 90.0f, SERVO_SPEED_SLOW, 1}, // 前15→归中，慢×1
+        .right_arm = {105.0f, 90.0f, SERVO_SPEED_SLOW, 1},
+    },
+
+    // ── 10: 惊喜 ─────────────────────────────────────────────────────────────
+    // 头部快速左右摆1次 + 双臂快速上扬1次 + 1次轻震动
+    {
+        .emotion_id  = EMO_SURPRISED,
+        .screen_anim = "anim_surprised",
+        .motor_mode  = 1,
+        .audio_file  = "surprise.mp3",
+        .head      = {115.0f, 65.0f, SERVO_SPEED_FAST, 1}, // 左25→右25，快×1
+        .left_arm  = {125.0f, 90.0f, SERVO_SPEED_FAST, 1}, // 前35→归中，快×1
+        .right_arm = {125.0f, 90.0f, SERVO_SPEED_FAST, 1},
+    },
+
+    // ── 11: 慵懒 ─────────────────────────────────────────────────────────────
+    // 极慢小幅侧头1次 + 双臂极慢微垂1次 + 无震动
+    {
+        .emotion_id  = EMO_SLUGGISH,
+        .screen_anim = "anim_sluggish",
+        .motor_mode  = 0,
+        .audio_file  = "lazy.mp3",
+        .head      = {100.0f, 80.0f, SERVO_SPEED_VERY_SLOW, 1}, // 左10→右10，极慢×1
+        .left_arm  = {75.0f,  90.0f, SERVO_SPEED_VERY_SLOW, 1}, // 后15→归中，极慢×1
+        .right_arm = {75.0f,  90.0f, SERVO_SPEED_VERY_SLOW, 1},
+    },
+
+    // ── 12: 治愈 ─────────────────────────────────────────────────────────────
+    // 缓慢温柔摇头2次 + 双臂轻柔微展2次 + 1次轻震动
+    {
+        .emotion_id  = EMO_HEALING,
+        .screen_anim = "anim_healing",
+        .motor_mode  = 1,
+        .audio_file  = "healing.mp3",
+        .head      = {105.0f, 75.0f, SERVO_SPEED_SLOW, 2}, // 左15→右15，慢×2
+        .left_arm  = {100.0f, 90.0f, SERVO_SPEED_SLOW, 2}, // 前10→归中，慢×2
+        .right_arm = {100.0f, 90.0f, SERVO_SPEED_SLOW, 2},
+    },
+
+    // ── 13: 兴奋 ─────────────────────────────────────────────────────────────
+    // 快速大幅摇头4次 + 双臂大幅前后摆3次 + 2次短促震动
+    {
+        .emotion_id  = EMO_EXCITED,
+        .screen_anim = "anim_excited",
+        .motor_mode  = 2,
+        .audio_file  = "excited.mp3",
+        .head      = {120.0f, 60.0f, SERVO_SPEED_FAST, 4}, // 左30→右30，快×4
+        .left_arm  = {125.0f, 60.0f, SERVO_SPEED_FAST, 3}, // 前35→后30，快×3
+        .right_arm = {125.0f, 60.0f, SERVO_SPEED_FAST, 3},
+    },
 };
 
 // ==========================================
-// 3. 私有：马达震动控制 (这里接入你的 GPIO 16)
+// 3. 震动马达控制（私有）
+//    使用 BSP_MOTOR_VIB_PIN 宏，不硬编码 GPIO 号
 // ==========================================
 
 /**
- * @brief 按指定模式触发震动马达脉冲（私有函数）
+ * @brief 按模式触发震动马达脉冲
  *
- * 通过直接操作 GPIO16 产生指定节奏的震动脉冲序列。
- * 震动模式与 InteractionMatrix_t.motor_mode 字段对应：
- *   0 = 无震动（直接返回）
- *   1 = 轻微 1 次（50ms 高电平）
- *   2 = 短促 2 次（50ms 高 → 50ms 低 → 50ms 高）
- *
- * @param mode 震动模式（0~4，目前实现了 0/1/2）
- * @return void
- *
- * @note 调用者：bsp_interaction_play()（步骤 4，执行舵机前先触发震动）
- * @note 使用 vTaskDelay 阻塞，不适合在中断上下文调用
+ * @param mode  0=无  1=轻1次50ms  2=短促2次  3=连续3次  4=长震1次200ms
  */
 static void trigger_vibration_motor(uint8_t mode)
 {
-    // BSP_MOTOR_VIB_PIN 需要在 bsp_board.h 中定义为 16
     if (mode == 0)
         return;
 
-    // 简单示例，实际可根据 mode 设计不同长短的脉冲
     if (mode == 1)
-    { // 轻微1次
-        gpio_set_level(16, 1);
+    {
+        // 轻微 1 次（50ms）
+        gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
         vTaskDelay(pdMS_TO_TICKS(50));
-        gpio_set_level(16, 0);
+        gpio_set_level(BSP_MOTOR_VIB_PIN, 0);
     }
     else if (mode == 2)
-    { // 短促2次
-        gpio_set_level(16, 1);
-        vTaskDelay(pdMS_TO_TICKS(50));
-        gpio_set_level(16, 0);
-        vTaskDelay(pdMS_TO_TICKS(50));
-        gpio_set_level(16, 1);
-        vTaskDelay(pdMS_TO_TICKS(50));
-        gpio_set_level(16, 0);
+    {
+        // 短促 2 次（50ms × 2，间隔 50ms）
+        for (int i = 0; i < 2; i++)
+        {
+            gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            gpio_set_level(BSP_MOTOR_VIB_PIN, 0);
+            if (i < 1)
+                vTaskDelay(pdMS_TO_TICKS(50)); // 两次之间间隔
+        }
+    }
+    else if (mode == 3)
+    {
+        // 连续 3 次（30ms × 3，间隔 30ms）
+        for (int i = 0; i < 3; i++)
+        {
+            gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
+            vTaskDelay(pdMS_TO_TICKS(30));
+            gpio_set_level(BSP_MOTOR_VIB_PIN, 0);
+            if (i < 2)
+                vTaskDelay(pdMS_TO_TICKS(30));
+        }
+    }
+    else if (mode == 4)
+    {
+        // 长震 1 次（200ms）
+        gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        gpio_set_level(BSP_MOTOR_VIB_PIN, 0);
     }
 }
 
 // ==========================================
-// 4. 核心解析引擎：同步多轴运动与外部硬件
+// 4. 私有：同步执行单个情绪动作（在 worker 任务中调用）
+//    调用方必须在 FreeRTOS 任务上下文，不可在中断中使用
 // ==========================================
-void bsp_interaction_play(robot_emotion_t target_emotion)
+
+/**
+ * @brief 阻塞执行指定情绪的完整动作序列（worker 内部调用）
+ *
+ * 执行顺序：
+ *   1. 查表
+ *   2. 触发屏幕动画（预留日志占位）
+ *   3. 触发音频播放（预留日志占位）
+ *   4. 触发震动马达
+ *   5. 三轴舵机同步动作（angle_1 → angle_2，循环 count 次）
+ *   6. 全轴归中至待机姿态（90°）
+ */
+static void _interaction_play_blocking(robot_emotion_t target_emotion)
 {
     const InteractionMatrix_t *cmd = NULL;
-    int table_size = sizeof(g_emotion_matrix) / sizeof(g_emotion_matrix[0]);
+    int table_size = (int)(sizeof(g_emotion_matrix) / sizeof(g_emotion_matrix[0]));
 
-    // 1. 查表寻找对应情绪
+    // ── 1. 查表 ───────────────────────────────────────────────────────────────
     for (int i = 0; i < table_size; i++)
     {
         if (g_emotion_matrix[i].emotion_id == target_emotion)
@@ -173,55 +333,142 @@ void bsp_interaction_play(robot_emotion_t target_emotion)
 
     if (cmd == NULL)
     {
-        ESP_LOGE(TAG, "未找到情绪 ID: %d", target_emotion);
+        ESP_LOGE(TAG, "未在矩阵中找到情绪 ID: %d，请在 g_emotion_matrix 中补充！", (int)target_emotion);
         return;
     }
 
-    ESP_LOGI(TAG, ">>> 开始执行情绪动作: %d <<<", target_emotion);
+    ESP_LOGI(TAG, ">>> 开始执行情绪动作: %d (%s) <<<", (int)target_emotion, cmd->screen_anim);
 
-    // 2. 触发屏幕 UI (发消息给 LVGL 任务)
-    // 伪代码: ui_manager_play_anim(cmd->screen_anim);
-    ESP_LOGI(TAG, "-> 播放屏幕动画: %s", cmd->screen_anim);
+    // ── 2. 屏幕动画（预留：发消息给 LVGL 任务）──────────────────────────────
+    // TODO: ui_manager_play_anim(cmd->screen_anim);
+    ESP_LOGI(TAG, "-> [预留] 屏幕动画: %s", cmd->screen_anim);
 
-    // 3. 触发音频播放 (发消息给 ES8311 任务)
-    // 伪代码: audio_player_play_file(cmd->audio_file);
-    ESP_LOGI(TAG, "-> 播放音效: %s", cmd->audio_file);
+    // ── 3. 音频播放（预留：发消息给音频播放任务）────────────────────────────
+    // TODO: audio_player_play_file(cmd->audio_file);
+    ESP_LOGI(TAG, "-> [预留] 音效文件: %s", cmd->audio_file);
 
-    // 4. 触发马达震动
+    // ── 4. 震动马达 ──────────────────────────────────────────────────────────
     trigger_vibration_motor(cmd->motor_mode);
 
-    // 5. 舵机同步解析引擎
-    // 找出三个舵机中，执行次数最多的一个，作为外层大循环
+    // ── 5. 舵机三轴动作序列 ─────────────────────────────────────────────────
+    // 以三轴中循环次数最多的为外层循环次数，保证全轴都完整执行
     uint8_t max_loop = cmd->head.count;
-    if (cmd->left_arm.count > max_loop)
-        max_loop = cmd->left_arm.count;
-    if (cmd->right_arm.count > max_loop)
-        max_loop = cmd->right_arm.count;
+    if (cmd->left_arm.count  > max_loop) max_loop = cmd->left_arm.count;
+    if (cmd->right_arm.count > max_loop) max_loop = cmd->right_arm.count;
 
     for (uint8_t loop = 0; loop < max_loop; loop++)
     {
-
-        // 动作前半段 (如 左转 / 前摆)
+        // 前半段（如左转/前摆）
         if (loop < cmd->head.count)
-            bsp_servo_move_smooth(CH_HEAD, cmd->head.angle_1, cmd->head.speed);
+            bsp_servo_move_smooth(CH_HEAD,  cmd->head.angle_1,      cmd->head.speed);
         if (loop < cmd->left_arm.count)
-            bsp_servo_move_smooth(CH_L_ARM, cmd->left_arm.angle_1, cmd->left_arm.speed);
+            bsp_servo_move_smooth(CH_L_ARM, cmd->left_arm.angle_1,  cmd->left_arm.speed);
         if (loop < cmd->right_arm.count)
             bsp_servo_move_smooth(CH_R_ARM, cmd->right_arm.angle_1, cmd->right_arm.speed);
 
-        // 动作后半段 (如 右转 / 后摆)
+        // 后半段（如右转/后摆）
         if (loop < cmd->head.count)
-            bsp_servo_move_smooth(CH_HEAD, cmd->head.angle_2, cmd->head.speed);
+            bsp_servo_move_smooth(CH_HEAD,  cmd->head.angle_2,      cmd->head.speed);
         if (loop < cmd->left_arm.count)
-            bsp_servo_move_smooth(CH_L_ARM, cmd->left_arm.angle_2, cmd->left_arm.speed);
+            bsp_servo_move_smooth(CH_L_ARM, cmd->left_arm.angle_2,  cmd->left_arm.speed);
         if (loop < cmd->right_arm.count)
             bsp_servo_move_smooth(CH_R_ARM, cmd->right_arm.angle_2, cmd->right_arm.speed);
     }
 
-    // 6. 动作执行完毕，所有舵机平滑归中，恢复待机姿态
-    bsp_servo_move_smooth(CH_HEAD, 90.0f, SERVO_SPEED_MID);
+    // ── 6. 全轴归中（恢复待机姿态）──────────────────────────────────────────
+    bsp_servo_move_smooth(CH_HEAD,  90.0f, SERVO_SPEED_MID);
     bsp_servo_move_smooth(CH_L_ARM, 90.0f, SERVO_SPEED_MID);
     bsp_servo_move_smooth(CH_R_ARM, 90.0f, SERVO_SPEED_MID);
 
-    ESP_LOGI(TAG, ">>> 情绪动作执行完毕 <<<");
+    ESP_LOGI(TAG, ">>> 情绪动作执行完毕: %d <<<", (int)target_emotion);
+}
+
+// ==========================================
+// 5. Worker 任务：串行消费情绪队列
+// ==========================================
+
+/**
+ * @brief interaction worker 主循环
+ *
+ * 永久阻塞等待队列，每次取出一个 robot_emotion_t 并执行完整动作序列。
+ * 串行执行保证动作不重叠，无需外部加锁。
+ */
+static void interaction_worker_task(void *arg)
+{
+    robot_emotion_t emo;
+    for (;;)
+    {
+        // 无限等待，收到情绪请求后执行（阻塞期间不占 CPU）
+        if (xQueueReceive(s_ia_queue, &emo, portMAX_DELAY) == pdTRUE)
+        {
+            _interaction_play_blocking(emo);
+        }
+    }
+}
+
+// ==========================================
+// 6. 公开 API
+// ==========================================
+
+/**
+ * @brief 初始化 interaction_manager（创建队列 + worker 任务）
+ *
+ * 必须在 bsp_board_servo_init() 之后、首次调用 bsp_interaction_play() 之前调用。
+ */
+esp_err_t interaction_manager_init(void)
+{
+    if (s_ia_inited)
+        return ESP_OK;
+
+    // ── 创建情绪请求队列 ──────────────────────────────────────────────────────
+    s_ia_queue = xQueueCreate(INTERACTION_QUEUE_LEN, sizeof(robot_emotion_t));
+    if (s_ia_queue == NULL)
+    {
+        ESP_LOGE(TAG, "创建 interaction 队列失败，内存不足!");
+        return ESP_ERR_NO_MEM;
+    }
+
+    // ── 创建 worker 任务（栈分配到 SPIRAM，节省内部 SRAM）────────────────────
+    BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(
+        interaction_worker_task,
+        "ia_worker",
+        INTERACTION_TASK_STACK,
+        NULL,
+        INTERACTION_TASK_PRIO,
+        &s_ia_worker,
+        tskNO_AFFINITY,            // 不绑定 CPU 核心，调度器自由分配
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); // 栈分配在 SPIRAM
+
+    if (ret != pdPASS)
+    {
+        vQueueDelete(s_ia_queue);
+        s_ia_queue = NULL;
+        ESP_LOGE(TAG, "创建 interaction worker 任务失败，内存不足!");
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_ia_inited = true;
+    ESP_LOGI(TAG, "interaction_manager 初始化完成（队列深度=%d）", INTERACTION_QUEUE_LEN);
+    return ESP_OK;
+}
+
+/**
+ * @brief 非阻塞触发情绪动作（将 emotion_id 入队后立即返回）
+ *
+ * 线程安全，可从任意任务调用。
+ * 若队列已满（INTERACTION_QUEUE_LEN），新请求被丢弃并打印警告。
+ */
+void bsp_interaction_play(robot_emotion_t target_emotion)
+{
+    if (!s_ia_inited || s_ia_queue == NULL)
+    {
+        ESP_LOGE(TAG, "interaction_manager 未初始化，调用 interaction_manager_init() 后再使用!");
+        return;
+    }
+
+    // 非阻塞入队（timeout=0），队满则丢弃
+    if (xQueueSend(s_ia_queue, &target_emotion, 0) != pdTRUE)
+    {
+        ESP_LOGW(TAG, "interaction 队列已满，丢弃情绪 %d", (int)target_emotion);
+    }
 }

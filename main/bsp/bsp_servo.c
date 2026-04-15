@@ -4,7 +4,7 @@
  *
  * 本模块管理头部、左臂、右臂三路 PWM 舵机：
  *   - 使用 ESP32-S3 LEDC（LED 控制器）输出 50Hz PWM 信号驱动舵机
- *   - 内置软限位保护（_clamp_safe_angle），防止超出物理极限角度
+ *   - 内置软限位保护（clamp_safe_angle），防止超出物理极限角度
  *   - 提供平滑插值运动（bsp_servo_move_smooth），避免上电抽搐
  *
  * 依赖：
@@ -16,8 +16,23 @@
 #include "bsp_board.h"
 #include "iot_servo.h"
 #include <math.h>
+#include "freertos/semphr.h" // 互斥锁，保证多任务调用线程安全
 #include "bsp/bsp_config.h"
+// 注意：robot_emotion_t 唯一定义在 interaction.h，此处不重复定义。
+// 注意：不 include servo_manager.h，避免与上层形成循环依赖。
+
 static const char *TAG = "BSP_SERVO";
+
+/**
+ * 每通道独立互斥锁（CH_HEAD=0 / CH_L_ARM=1 / CH_R_ARM=2）
+ *
+ * 设计目标：
+ *   - 同一通道同一时刻只允许一个任务驱动，防止 LEDC 写入竞争。
+ *   - 不同通道之间互不阻塞，头部与手臂可在不同任务中并发运动。
+ *   - interaction worker 和 servo_manager worker 都经此锁，天然线程安全。
+ *   - 在 bsp_board_servo_init() 内创建，bsp_servo_move_smooth() 内加/解锁。
+ */
+static SemaphoreHandle_t s_ch_mutex[3] = {NULL, NULL, NULL};
 
 // ==========================================
 // 1. 情绪/动作指令枚举 (对应你 Excel 表格的第一列)
@@ -25,36 +40,10 @@ static const char *TAG = "BSP_SERVO";
 //       bsp_servo.c 内部仅用于舵机动作映射，保持两处同步。
 // ==========================================
 
-/**
- * @brief 机器人情绪/动作枚举
- *
- * 每个枚举值对应一套完整的情绪表现（舵机姿态 + 屏幕动画 + 音效 + 震动）。
- * 与 interaction.c 中的 InteractionMatrix_t 表格一一对应，
- * 调用 bsp_interaction_play(emotion_id) 触发完整表现。
- */
-typedef enum
-{
-    EMO_HAPPY = 0,   ///< 开心：快速摇头 + 双臂前摆
-    EMO_CURIOUS,     ///< 好奇：缓慢侧头 + 双臂前举
-    EMO_TSUNDERE,    ///< 傲娇：头部轻偏 + 双臂后收
-    EMO_TICKLISH,    ///< 怕痒：极速抖头 + 双臂快速前后摆
-    EMO_SLEEPY,      ///< 犯困：缓慢点头 + 双臂下垂
-    EMO_GRIEVED,     ///< 委屈：头部低垂 + 双臂内收
-    EMO_COMFORTABLE, ///< 舒服：慢速摇头 + 双臂微展
-    EMO_ACT_CUTE,    ///< 撒娇：头部倾斜 + 双臂上举
-    EMO_ANGRY,       ///< 生气：快速摇头 + 双臂用力前摆
-    EMO_SHY,         ///< 害羞：头部低垂 + 双臂遮脸
-    EMO_SURPRISED,   ///< 惊喜：头部快速抬起 + 双臂上扬
-    EMO_SLUGGISH,    ///< 慵懒：极慢摇头 + 双臂低垂
-    EMO_HEALING,     ///< 治愈：慢速点头 + 双臂微展
-    EMO_EXCITED      ///< 兴奋：快速大幅摇头 + 双臂大幅前后摆
-    // ... 在这里继续添加你表格里剩下的情绪
-} robot_emotion_t;
-
 // 强保护机制：物理边界软限位 (Soft Limits)
 // ⚠️ 组装好外壳后，请务必根据实际情况修改这几个极限值！
-// 超出范围时 _clamp_safe_angle 会自动修正并打印警告日志。
-#define HEAD_MIN_ANGLE  45.0f  ///< 头部向左最大极限角度（度），防止颈部过度旋转损坏舵机
+// 超出范围时 clamp_safe_angle 会自动修正并打印警告日志。
+#define HEAD_MIN_ANGLE 45.0f   ///< 头部向左最大极限角度（度），防止颈部过度旋转损坏舵机
 #define HEAD_MAX_ANGLE 135.0f  ///< 头部向右最大极限角度（度）
 #define L_ARM_MIN_ANGLE 10.0f  ///< 左臂向后最大极限角度（度），防止手臂撞到机身
 #define L_ARM_MAX_ANGLE 160.0f ///< 左臂向前最大极限角度（度），防止撞头
@@ -78,7 +67,7 @@ typedef enum
  * @note 调用者：bsp_servo_move_smooth()（内部自动调用，外部无需直接使用）
  * @note 对于未知通道，强制返回 90.0f（安全中点），并不会 panic
  */
-static float _clamp_safe_angle(uint8_t channel, float target_angle)
+static float clamp_safe_angle(uint8_t channel, float target_angle)
 {
     float safe_angle = target_angle;
     switch (channel)
@@ -144,22 +133,39 @@ void bsp_board_servo_init(bsp_board_t *bsp_board)
 
     ESP_LOGI(TAG, "正在初始化躯体舵机模块...");
 
+    // ── 步骤 0：创建每通道互斥锁（必须在 bsp_servo_move_smooth 首次调用前就绪）──
+    // 即使后续硬件 init 失败，锁也已创建；因 servo_initialized=false，
+    // bsp_servo_move_smooth 会在加锁前提前返回，不影响正确性。
+    for (int i = 0; i < 3; i++)
+    {
+        if (s_ch_mutex[i] == NULL)
+        {
+            s_ch_mutex[i] = xSemaphoreCreateMutex();
+            if (s_ch_mutex[i] == NULL)
+            {
+                ESP_LOGE(TAG, "通道 %d 互斥锁创建失败，内存不足!", i);
+                bsp_board->servo_initialized = false;
+                return;
+            }
+        }
+    }
+
     // ── 步骤 1：配置 LEDC PWM 舵机参数 ─────────────────────────────────────
     servo_config_t servo_cfg = {
-        .max_angle    = 180,              // 物理最大行程 180°
-        .min_width_us = 500,              // 0° 对应脉宽 500μs（标准舵机规格）
-        .max_width_us = 2500,             // 180° 对应脉宽 2500μs
-        .freq         = 50,               // PWM 驱动频率 50Hz（标准模拟舵机要求）
-        .timer_number = LEDC_TIMER_0,     // 使用 LEDC 定时器 0（4 个可选，避免与 LED/蜂鸣器冲突）
+        .max_angle = 180,             // 物理最大行程 180°
+        .min_width_us = 500,          // 0° 对应脉宽 500μs（标准舵机规格）
+        .max_width_us = 2400,         // 180° 对应脉宽 2400μs
+        .freq = 50,                   // PWM 驱动频率 50Hz（标准模拟舵机要求）
+        .timer_number = LEDC_TIMER_0, // 使用 LEDC 定时器 0（4 个可选，避免与 LED/蜂鸣器冲突）
         .channels = {
             .servo_pin = {
-                BSP_SERVO_HEAD_PIN,       // GPIO38：头部舵机
-                BSP_SERVO_L_ARM_PIN,      // GPIO47：左臂舵机
-                BSP_SERVO_R_ARM_PIN,      // GPIO21：右臂舵机
+                BSP_SERVO_HEAD_PIN,  // GPIO38：头部舵机
+                BSP_SERVO_L_ARM_PIN, // GPIO47：左臂舵机
+                BSP_SERVO_R_ARM_PIN, // GPIO21：右臂舵机
             },
             .ch = {LEDC_CHANNEL_0, LEDC_CHANNEL_1, LEDC_CHANNEL_2}, // 三路独立 LEDC 通道
         },
-        .channel_number = 3,              // 启用 3 路通道（头 + 左臂 + 右臂）
+        .channel_number = 3, // 启用 3 路通道（头 + 左臂 + 右臂）
     };
 
     // ── 步骤 2：初始化硬件驱动（ESP32-S3 使用 LOW_SPEED_MODE）──────────────
@@ -174,7 +180,7 @@ void bsp_board_servo_init(bsp_board_t *bsp_board)
 
         // ── 步骤 4：上电缓慢归中（防止舵机从随机位置快速跳到目标位置产生抽搐）──
         // SERVO_SPEED_MID = 15ms/度，从任意位置到 90° 最长约 1.35 秒
-        bsp_servo_move_smooth(CH_HEAD,  90.0f, SERVO_SPEED_MID); // 头部归中
+        bsp_servo_move_smooth(CH_HEAD, 90.0f, SERVO_SPEED_MID);  // 头部归中
         bsp_servo_move_smooth(CH_L_ARM, 90.0f, SERVO_SPEED_MID); // 左臂归中
         bsp_servo_move_smooth(CH_R_ARM, 90.0f, SERVO_SPEED_MID); // 右臂归中
 
@@ -201,7 +207,7 @@ void bsp_board_servo_init(bsp_board_t *bsp_board)
  *
  * 内部步骤：
  *   1. 检查 servo_initialized 标志，未初始化拒绝执行
- *   2. 通过 _clamp_safe_angle() 将目标角度限制在软限位范围内
+ *   2. 通过 clamp_safe_angle() 将目标角度限制在软限位范围内
  *   3. 读取当前角度（iot_servo_read_angle），计算差值
  *   4. 差值 < 1.0° 则跳过（消除抖动死区）
  *   5. step_ms == 0 时直接写入（瞬间模式）
@@ -215,23 +221,34 @@ void bsp_board_servo_init(bsp_board_t *bsp_board)
  *                 SERVO_SPEED_FAST(5) / MID(15) / SLOW(30) = 推荐值
  * @return void（未就绪或读取失败时打印日志并提前返回）
  *
- * @note 调用者：bsp_board_servo_init()（归中）、bsp_interaction_play()（情绪动作）
+ * @note 调用者：bsp_board_servo_init()（归中）、interaction worker（情绪动作）、servo_manager worker
  * @note 此函数内部调用 vTaskDelay，必须在 FreeRTOS 任务上下文中调用，不可在中断中使用
- * @note 线程安全：当前未加锁，若多个任务并发调用同一通道可能产生竞争，建议上层串行化
+ * @note 线程安全：内部持 s_ch_mutex[channel] 互斥锁，同通道串行，不同通道并发安全
  */
 void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms)
 {
     bsp_board_t *board = bsp_board_get_instance();
 
-    // ── 前置检查：舵机必须已初始化 ───────────────────────────────────────────
+    // ── 前置检查 1：舵机必须已初始化 ─────────────────────────────────────────
     if (board == NULL || !board->servo_initialized)
     {
         ESP_LOGE(TAG, "舵机未就绪，拒绝执行动作指令!");
         return;
     }
 
+    // ── 前置检查 2：通道编号合法且互斥锁已就绪 ──────────────────────────────
+    if (channel >= 3 || s_ch_mutex[channel] == NULL)
+    {
+        ESP_LOGE(TAG, "无效通道 %d 或互斥锁未初始化!", channel);
+        return;
+    }
+
+    // ── 加锁：独占该通道直到本次运动完成 ─────────────────────────────────────
+    // portMAX_DELAY：永久等待，保证请求不丢失（worker task 串行化保证不会长时间持锁）
+    xSemaphoreTake(s_ch_mutex[channel], portMAX_DELAY);
+
     // ── 步骤 1：软限位裁剪（防止超出物理范围损坏机械结构）──────────────────
-    float safe_target = _clamp_safe_angle(channel, target);
+    float safe_target = clamp_safe_angle(channel, target);
 
     // ── 步骤 2：读取当前实际角度（iot_servo_read_angle 返回 LEDC 寄存器推算值）──
     float current = 0.0f;
@@ -239,19 +256,22 @@ void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms)
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "读取通道 %d 角度失败!", channel);
+        xSemaphoreGive(s_ch_mutex[channel]); // 务必在所有提前返回处解锁
         return;
     }
 
     // ── 步骤 3：抖动死区过滤（差值 < 1° 不运动，消除因浮点精度产生的微抖）──
     if (fabs(safe_target - current) < 1.0f)
     {
-        return; // 已经在目标位置，无需运动
+        xSemaphoreGive(s_ch_mutex[channel]); // 已在目标位置，解锁后返回
+        return;
     }
 
     // ── 步骤 4：瞬间模式（step_ms == 0，直接写入目标，无平滑过渡）──────────
     if (step_ms == 0)
     {
         iot_servo_write_angle(LEDC_LOW_SPEED_MODE, channel, safe_target);
+        xSemaphoreGive(s_ch_mutex[channel]);
         return;
     }
 
@@ -269,4 +289,7 @@ void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms)
 
     // ── 步骤 6：兜底对齐（确保最终精准停在目标位置，消除循环步进的浮点累积误差）──
     iot_servo_write_angle(LEDC_LOW_SPEED_MODE, channel, safe_target);
+
+    // ── 解锁：本次运动完成，释放通道 ─────────────────────────────────────────
+    xSemaphoreGive(s_ch_mutex[channel]);
 }

@@ -67,15 +67,18 @@
 #define BSP_SERVO_HEAD_PIN 38  ///< 头部舵机 PWM 引脚
 #define BSP_SERVO_L_ARM_PIN 47 ///< 左臂舵机 PWM 引脚
 // 舵机逻辑通道映射 (供上层调用)
-#define CH_HEAD  0 ///< 头部舵机逻辑通道编号（对应 LEDC_CHANNEL_0，引脚 GPIO38）
+#define CH_HEAD 0  ///< 头部舵机逻辑通道编号（对应 LEDC_CHANNEL_0，引脚 GPIO38）
 #define CH_L_ARM 1 ///< 左臂舵机逻辑通道编号（对应 LEDC_CHANNEL_1，引脚 GPIO47）
 #define CH_R_ARM 2 ///< 右臂舵机逻辑通道编号（对应 LEDC_CHANNEL_2，引脚 GPIO21）
 
-// 舵机推荐的速度档位 (step_ms 延时，数值越大运动越慢)
-#define SERVO_SPEED_INSTANT 0  ///< 瞬间到位（无平滑过渡，危险，上电归中禁止使用）
-#define SERVO_SPEED_FAST    5  ///< 快速（约 5ms/度，适合挥手、点头等活泼动作）
-#define SERVO_SPEED_MID     15 ///< 中速（约 15ms/度，适合大多数情绪动作）
-#define SERVO_SPEED_SLOW    30 ///< 慢速（约 30ms/度，适合慵懒、委屈等缓慢动作）
-
 // 设备状态标志位 (添加舵机的 BIT)
 #define BOARD_STATUS_SERVO_READY (1 << 3) ///< 舵机已初始化就绪（向 board_status 事件组置位）
+
+// ─── 6. 舵机速度宏（step_ms：每度等待毫秒数，值越大运动越慢）───────────────────
+// 统一在此定义，供 bsp_servo.c 和 servo_manager.h 共同引用，避免重复定义
+#define SERVO_SPEED_INSTANT    0U  ///< 瞬间到位（无平滑，上电归中禁止使用）
+#define SERVO_SPEED_VERY_FAST  2U  ///< 极快（2ms/度，适合快速抖动动作）
+#define SERVO_SPEED_FAST       5U  ///< 快速（5ms/度，适合挥手、点头等活泼动作）
+#define SERVO_SPEED_MID       15U  ///< 中速（15ms/度，适合大多数情绪动作）
+#define SERVO_SPEED_SLOW      30U  ///< 慢速（30ms/度，适合慵懒、委屈等缓慢动作）
+#define SERVO_SPEED_VERY_SLOW 50U  ///< 极慢（50ms/度，适合细腻的情感表达）

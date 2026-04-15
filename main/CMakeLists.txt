@@ -6,6 +6,7 @@ idf_component_register(SRCS
 "bsp/bsp_lcd.c"
 "bsp/bsp_touch.c"
 "bsp/bsp_servo.c"
+"bsp/servo_manager.c"
 "wake_word/custom_wake_word.c"
 "protocol/mqtt_protocol.c"
 "protocol/websocket_client.c"
