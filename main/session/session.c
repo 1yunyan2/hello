@@ -517,11 +517,11 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
             if (delay_ms > 60000)
                 delay_ms = 60000; // 上限 60 秒
             ESP_LOGW(TAG, "第 %d 次重连，%d 秒后执行...", s_reconnect_attempts, delay_ms / 1000);
-            // 延迟在重连任务内部执行，避免阻塞事件回调
-            xTaskCreatePinnedToCore(session_reconnect_task, "ws_reconn",
-                                    6144, (void *)(intptr_t)delay_ms, 3,
-                                    (TaskHandle_t *)&s_reconnect_handle,
-                                    1);
+            // 延迟在重连任务内部执行，避免阻塞事件回调（栈分配在 SPIRAM）
+            xTaskCreatePinnedToCoreWithCaps(session_reconnect_task, "ws_reconn",
+                                            6144, (void *)(intptr_t)delay_ms, 3,
+                                            (TaskHandle_t *)&s_reconnect_handle,
+                                            1, MALLOC_CAP_SPIRAM);
         }
         break;
 

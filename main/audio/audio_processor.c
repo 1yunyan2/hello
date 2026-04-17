@@ -313,7 +313,11 @@ size_t audio_processor_read(audio_processor_t *audio_processor, void *buffer, si
  */
 void audio_processor_write_pcm(audio_processor_t *audio_processor, void *buffer, size_t size)
 {
-    if (xRingbufferSend(audio_processor->enc_input, buffer, size, pdMS_TO_TICKS(50)) != pdTRUE)
+    // 超时从 50ms 降至 10ms：
+    // 旧 50ms 会在 enc_input 满时阻塞 afe_fetch_task 整整一帧半，
+    // 导致 AFE FEED ringbuffer 溢出（fetch 跟不上 feed 速率）。
+    // 丢几帧上行 PCM 只影响 ASR 质量，远好于卡死整条 AFE 链路。
+    if (xRingbufferSend(audio_processor->enc_input, buffer, size, pdMS_TO_TICKS(10)) != pdTRUE)
     {
         ESP_LOGW(TAG, "enc_input 满，丢弃 PCM 帧 (%d bytes)", (int)size);
     }

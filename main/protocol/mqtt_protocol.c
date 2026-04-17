@@ -15,6 +15,7 @@
  *   async_update_wakeword_task → wake_word_update()（唤醒词引擎）
  */
 #include "mqtt_protocol.h"
+#include "esp_heap_caps.h"
 
 static const char *MQTT_TAG = "MQTT"; ///< 日志 TAG
 
@@ -289,8 +290,14 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         strncpy(params->pinyin, pinyin_item->valuestring, sizeof(params->pinyin) - 1);
                         params->pinyin[sizeof(params->pinyin) - 1] = '\0';
 
-                        BaseType_t ret = xTaskCreate(async_update_wakeword_task, "async_ww_update",
-                                                     4096, params, 4, NULL);
+                        // ★ 必须使用内部 SRAM 栈！
+                        // 此任务调用 wake_word_update → nvs_write_str → SPI Flash 写操作。
+                        // ESP32-S3 flash 操作期间临时禁用 Data Cache，SPIRAM 通过同一 Cache 访问，
+                        // 若任务栈在 SPIRAM，cache_utils.c 内部断言失败 → panic 重启。
+                        // 使用 MALLOC_CAP_INTERNAL 确保栈始终可访问。
+                        BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(async_update_wakeword_task, "async_ww_update",
+                                                     4096, params, 4, NULL,
+                                                     tskNO_AFFINITY, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
                         if (ret != pdPASS)
                         {
                             ESP_LOGE(MQTT_TAG, "内存不足，无法创建唤醒词更新任务！");
@@ -332,7 +339,9 @@ void protocol_mqtt_start(void)
     esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     esp_mqtt_client_start(s_mqtt_client);
     ESP_LOGI(MQTT_TAG, "MQTT 客户端正在启动...");
-    xTaskCreate(heartbeat_task, "heartbeat_task", 4096, NULL, 4, NULL);
+    /* 心跳任务栈分配在 SPIRAM，节省内部 SRAM */
+    xTaskCreatePinnedToCoreWithCaps(heartbeat_task, "heartbeat_task", 4096, NULL, 4, NULL,
+                                    tskNO_AFFINITY, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 };
 
 /**
