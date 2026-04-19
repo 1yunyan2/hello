@@ -122,8 +122,8 @@ static TickType_t s_wait_silence_start = 0;
 // 静音容忍：连续 ≤1 帧 SILENCE 不清零 speech_count，防止 VAD 单帧抖动吃掉首字
 // 第 2 帧静音才真清零（≈ 64ms 静音 = 真停顿）
 #define VAD_SILENCE_TOLERANCE_FRAMES 1
-static int s_vad_speech_count = 0;     // 连续 VAD_SPEECH 帧计数
-static int s_vad_silence_streak = 0;   // 当前连续 VAD_SILENCE 帧计数（用于 1 帧容忍判定）
+static int s_vad_speech_count = 0;   // 连续 VAD_SPEECH 帧计数
+static int s_vad_silence_streak = 0; // 当前连续 VAD_SILENCE 帧计数（用于 1 帧容忍判定）
 // WebSocket服务器URI地址
 static char s_ws_uri[128] = DEFAULT_WS_URI;
 // deviceToken（App绑定时下发的长期凭证）
@@ -363,14 +363,21 @@ static void on_enhanced_pcm(const int16_t *data, size_t samples)
         {
             uint32_t wait_ms = (xTaskGetTickCount() - s_wait_silence_start) * portTICK_PERIOD_MS;
 
+            // 1. 强制物理静音期：前 400ms 内，不管 VAD 说啥，强制认为还在响
+            // 喇叭物理震动的余波最危险
+            if (wait_ms < 400)
+            {
+                s_vad_silence_count = 0;
+                return; // 丢弃音频
+            }
+
             if (vad == VAD_SILENCE)
             {
                 s_vad_silence_count++;
-                // 连续 15 帧静音 (约 480ms)，确认喇叭彻底闭嘴,8~10 帧（约 250~320ms）
-                if (s_vad_silence_count > 8)
+                // 2. 将连续静音帧数提高到 15 帧（约 480ms），确保空气中真的没有余音了
+                if (s_vad_silence_count > 15)
                 {
                     s_waiting_for_silence = false;
-                    // 修复类型报错：将 uint32_t 强转为 int
                     ESP_LOGI(TAG, ">>> 扬声器排空完毕 (耗时 %d ms)，开启监听 <<<", (int)wait_ms);
                     s_vad_ready_tick = xTaskGetTickCount();
                 }
