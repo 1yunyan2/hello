@@ -51,7 +51,7 @@
 // 整体会话超时时间：30秒，超过此时间无活动则关闭会话
 #define SESSION_TIMEOUT_MS 30000
 // 说话结束静音检测时间：500ms，用于判断用户是否说完话
-#define EOS_SILENCE_MS 500
+#define EOS_SILENCE_MS 800
 // Token主动刷新时间：110分钟（accessToken过期时间为2小时，提前10分钟刷新）
 #define TOKEN_REFRESH_MS (110 * 60 * 1000)
 // OPUS音频帧发送缓冲区大小
@@ -115,11 +115,15 @@ static TickType_t s_wait_silence_start = 0;
 // static bool s_waiting_for_silence = false; // 是否正在等待喇叭排空
 // static int s_vad_silence_count = 0;        // 连续静音帧计数器
 // VAD 连续帧防抖：连续确认帧数 & 当前计数
-// AFE fetch 约 32ms/帧，6 帧 ≈ 192ms 持续语音才确认为"真实人声"
+// AFE fetch 约 32ms/帧，3 帧 ≈ 96ms 持续语音才确认为"真实人声"
 // 防止环境音/短促噪声单帧触发 s_speech_detected，导致误报给服务器
-// （原 8 帧≈256ms 过严，吞掉用户短语首字；6 帧兼顾较吵环境抗误触与响应速度）
-#define VAD_SPEECH_CONFIRM_FRAMES 8
-static int s_vad_speech_count = 0; // 连续 VAD_SPEECH 帧计数
+// 演化：8 帧(256ms 吞首字) → 6 帧(192ms 仍丢"和"/"今"擦音字) → 3 帧(96ms 配合 1 帧静音容忍)
+#define VAD_SPEECH_CONFIRM_FRAMES 3
+// 静音容忍：连续 ≤1 帧 SILENCE 不清零 speech_count，防止 VAD 单帧抖动吃掉首字
+// 第 2 帧静音才真清零（≈ 64ms 静音 = 真停顿）
+#define VAD_SILENCE_TOLERANCE_FRAMES 1
+static int s_vad_speech_count = 0;     // 连续 VAD_SPEECH 帧计数
+static int s_vad_silence_streak = 0;   // 当前连续 VAD_SILENCE 帧计数（用于 1 帧容忍判定）
 // WebSocket服务器URI地址
 static char s_ws_uri[128] = DEFAULT_WS_URI;
 // deviceToken（App绑定时下发的长期凭证）
@@ -414,8 +418,9 @@ static void on_enhanced_pcm(const int16_t *data, size_t samples)
         bool is_active_audio = false;
         if (vad == VAD_SPEECH)
         {
-            is_active_audio = true; // 只要有声音，先存下来再说！(这就是保住“今天”这俩字的关键)
+            is_active_audio = true; // 只要有声音，先存下来再说！(这就是保住"今天"这俩字的关键)
             s_vad_speech_count++;
+            s_vad_silence_streak = 0; // 收到语音帧，清零静音连击计数
 
             // 使用动态阈值 current_threshold 来判断
             if (!s_speech_detected && s_vad_speech_count >= current_threshold)
@@ -439,10 +444,26 @@ static void on_enhanced_pcm(const int16_t *data, size_t samples)
         }
         else // VAD_SILENCE (静音)
         {
-            s_vad_speech_count = 0; // 只要中间断开了一帧（杂音通常不连续），立刻清零
+            // ★ 关键：单帧静音容忍机制（防 VAD 抖动吃首字）
+            //   旧逻辑：只要中间断开 1 帧 silence 就立刻清零 speech_count → 累积一半夭折
+            //   现逻辑：连续 ≤1 帧 silence 时不清零（≈ 32ms 抖动），第 2 帧才真清零（≈ 64ms 真停顿）
+            //   同时把这 1~2 帧静音的 PCM 也录进去（is_active_audio = true），
+            //   防止凑帧期间出现"语音 - 静音 - 语音"被切成两半
+            s_vad_silence_streak++;
+            if (s_vad_silence_streak > VAD_SILENCE_TOLERANCE_FRAMES)
+            {
+                // 超出容忍帧数，确认是真停顿，重置 speech_count
+                s_vad_speech_count = 0;
+            }
+            else if (!s_speech_detected && s_vad_speech_count > 0)
+            {
+                // 容忍期内未确认状态：把这帧静音算作"准语音"录入，避免凑帧出现断点
+                is_active_audio = true;
+            }
+
             if (s_speech_detected)
             {
-                is_active_audio = true; // 已经被确认为句子了，说话时的短暂呼吸/停顿也要录，保持句子连贯
+                is_active_audio = true; // 已确认为句子，呼吸/停顿也要录，保持句子连贯
                 if (s_eos_timer && xTimerIsTimerActive(s_eos_timer) == pdFALSE)
                 {
                     xTimerStart(s_eos_timer, 0);
@@ -720,6 +741,7 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
             s_is_continuous_turn = true;
             s_reset_frame_counter = true;
             s_vad_speech_count = 0;
+            s_vad_silence_streak = 0; // 多轮模式：进入下一轮前清零静音连击，避免容忍机制残留
             s_vad_ready_tick = xTaskGetTickCount();
             xEventGroupClearBits(s_session_eg, SESSION_SERVER_READY_BIT);
             xTimerReset(s_session_timer, 0);
@@ -801,8 +823,10 @@ static void ws_sender_task(void *arg)
                 sent_frames++;
                 if (sent_frames % 50 == 1) // 每 50 帧（约 3 秒）打印一次
                     ESP_LOGI(TAG, "OPUS 发送中: frame#%d size=%d", sent_frames, (int)len);
-                // vTaskDelay(1);
-                vTaskDelay(pdMS_TO_TICKS(2)); // 轻微延迟，给其他任务喘息机会，防止 CPU0 过热导致频繁降频影响性能
+                // 让步 1 tick（≈ 1ms）即可：encoder_task 已经在每帧编码后让 2ms，
+                // 这里再让 2ms 会拖慢发送（50 帧累计 100ms），且发送频率本就 ≤ 50fps，
+                // CPU0 压力主要在 encoder 而非 sender，1 tick 足够给 IDLE0 喂狗。
+                vTaskDelay(1);
             }
             // 💡 如果没进上面的 if，说明此时处于静音等待期（或刚报完错）。
             // 读出来的音频数据会直接被静默丢弃，绝对不会发给服务器惹祸。
@@ -913,6 +937,7 @@ static void session_close(void)
     s_speech_detected = false;    // 重置语音检测状态
     s_is_continuous_turn = false; // 关闭会话后不再认为是连续对话，下一次唤醒即新会话
     s_vad_speech_count = 0;       // 重置 VAD 相关状态，确保下次唤醒后从干净状态开始
+    s_vad_silence_streak = 0;     // 同步清零静音连击计数（防容忍机制残留状态污染下一轮）
     s_waiting_for_silence = false;
     s_vad_silence_count = 0;
     // s_waiting_for_silence = false;

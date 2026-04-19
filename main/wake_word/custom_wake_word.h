@@ -31,6 +31,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include "esp_err.h"
 #include <stdio.h>
 #include <string.h>
@@ -104,6 +105,30 @@ void wake_word_load_from_nvs(char *dest, size_t max_len);
  * @param wake_word_pinyin   命令词，中文用拼音 "yun yan"，英文用单词 "hello echo"
  */
 esp_err_t wake_word_update(const char *wake_word_display, const char *wake_word_pinyin);
+
+/**
+ * @brief 判断当前生效的唤醒词与传入的一组是否完全一致
+ *
+ * 用于 MQTT 上线后收到 retained 消息时快速判断服务器下发的唤醒词
+ * 是否与当前已生效的配置相同。相同则调用方可直接跳过 wake_word_update()，
+ * 避免不必要的 FST 重建 + Flash 写入 + AFE reset（AGC/NS 自适应状态清零）。
+ *
+ * 比较规则：
+ *   - display 按原样字符串比较（UTF-8）
+ *   - pinyin 按 wake_word_update 的大小写处理后比较：
+ *       * 中文（display 含汉字）：原样比较
+ *       * 英文：传入值自动转大写后再与 current_wake_word 比较
+ *
+ * @param display 显示文字（如 "你好小熊" / "Hello Echo"）
+ * @param pinyin  命令词（中文拼音 / 英文单词）
+ * @return true   两者与当前生效值完全相同，调用方应跳过更新
+ * @return false  引擎未初始化或任一字段不同，调用方应执行更新
+ *
+ * @note 只读访问，不加锁；current_* 由 wake_word_update 持锁串行写入，
+ *       短暂读到旧值最多导致一次多余更新，不会崩溃。
+ * @note 调用者：mqtt_protocol.c → mqtt_event_handler（MQTT_EVENT_DATA）
+ */
+bool wake_word_is_same(const char *display, const char *pinyin);
 
 /**
  * @brief 获取 MultiNet 每次 detect() 所需的采样点数量（通常为 512）

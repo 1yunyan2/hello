@@ -37,8 +37,14 @@
 #define AUDIO_PROCESSOR_TASK_CORE_ID 0             // 固定到 CPU 核心 0
 
 // ─── 环形缓冲区大小配置（单位：字节）────────────────────────────────────────
-#define ENC_INPUT_BUF_SIZE 30720  // 编码器输入（原始 PCM）：~640ms @16kHz 单声道
-#define ENC_OUTPUT_BUF_SIZE 12288 // 编码器输出（OPUS 帧）：增大以容纳 Hello 握手期间积压的帧
+// 编码器输入（原始 PCM）：131072 B ≈ 4.1s @ 16kHz 16-bit 单声道
+// 历史值 81920 B（~2.56s）在 SILK 编码偶发耗时 + CPU0 拥堵时仍会被打满，
+// 导致 audio_processor_write_pcm 丢帧（即"尾部音频丢失"），扩到 4s 给 encoder 更多追赶时间。
+#define ENC_INPUT_BUF_SIZE 131072
+// 编码器输出（OPUS 帧）：32KB ≈ 500+ 帧（每帧约 60 字节）
+// 历史 12288（~200 帧）在 SILK NSQ 尖峰 + ws_sender 网络抖动时仍会打满丢帧，
+// 扩到 32KB 吸收 CPU0 拥堵时的编码追赶脉冲，同时保留 Hello 握手期的积压余量。
+#define ENC_OUTPUT_BUF_SIZE 32768
 #define DEC_INPUT_BUF_SIZE 16384  //! 原为5120 解码器输入（OPUS 帧）：云端下发的音频缓冲,
 #define DEC_OUTPUT_BUF_SIZE 40960 // 解码器输出（PCM 播放）：~1.28s 缓冲，保证播放流畅
 // AEC 参考缓冲区：play_task 写入 I2S 时同步推送一份副本，audio_feed_task 读取后
@@ -346,7 +352,7 @@ void audio_processor_write_pcm(audio_processor_t *audio_processor, void *buffer,
     // 旧 50ms 会在 enc_input 满时阻塞 afe_fetch_task 整整一帧半，
     // 导致 AFE FEED ringbuffer 溢出（fetch 跟不上 feed 速率）。
     // 丢几帧上行 PCM 只影响 ASR 质量，远好于卡死整条 AFE 链路。
-    if (xRingbufferSend(audio_processor->enc_input, buffer, size, pdMS_TO_TICKS(10)) != pdTRUE)
+    if (xRingbufferSend(audio_processor->enc_input, buffer, size, 0) != pdTRUE)
     {
         ESP_LOGW(TAG, "enc_input 满，丢弃 PCM 帧 (%d bytes)", (int)size);
     }

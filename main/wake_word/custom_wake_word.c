@@ -298,7 +298,7 @@ static esp_err_t load_model_for_lang(const char *lang)
     // 设置语言差异阈值：
     //   中文(cn)：0.2（实测正常音量"你好小熊" prob 集中在 0.25-0.37，阈值 0.3 漏检多，降到 0.2 扩大召回）
     //   英文(en)：0.4（BPE 路径长，prob 天然偏低，0.4 才能正常触发）
-    float threshold = (strcmp(lang, ESP_MN_ENGLISH) == 0) ? 0.4f : 0.23f;
+    float threshold = (strcmp(lang, ESP_MN_ENGLISH) == 0) ? 0.4f : 0.12f;
     multinet_iface->set_det_threshold(multinet_model_data, threshold);
 
     ESP_LOGW(TAG, "已加载语言模型: %s", mn_name);
@@ -587,6 +587,62 @@ esp_err_t wake_word_init(wake_word_detected_cb_t cb)
     return ESP_OK;
 }
 
+// ─── 公开 API：唤醒词是否与当前一致（用于 MQTT 跳过无意义更新）──────────
+
+/**
+ * @brief 判断传入的显示词/命令词与当前生效的唤醒词是否完全相同
+ *
+ * 实现要点：
+ *   - display 原样字符串比较
+ *   - pinyin：中文原样比较；英文临时转大写后再比较（与 wake_word_update 对齐）
+ *   - 引擎未初始化（current_wake_word 为空）直接返回 false，强制走更新流程
+ *
+ * @param display 新的显示词（非 NULL）
+ * @param pinyin  新的命令词（非 NULL）
+ * @return true   完全一致，调用方应跳过 wake_word_update
+ * @return false  任一字段不同或输入非法
+ *
+ * @note 调用者：mqtt_protocol.c（MQTT 上线 retained 消息处理）
+ */
+bool wake_word_is_same(const char *display, const char *pinyin)
+{
+    // 非法入参直接返回 false，交由更新路径的校验逻辑处理
+    if (display == NULL || pinyin == NULL)
+        return false;
+    // 引擎未初始化（尚未读取过 NVS），无法比较，直接返回 false 让 update 走完整流程
+    if (current_disp_word[0] == '\0' || current_wake_word[0] == '\0')
+        return false;
+
+    // 显示词必须完全相同
+    if (strcmp(display, current_disp_word) != 0)
+        return false;
+
+    // 根据语言决定命令词的比较方式：
+    //   中文：原样比较（current_wake_word 存的就是小写拼音）
+    //   英文：wake_word_update 会把新词转大写存入 current_wake_word，
+    //         因此这里也把传入的 pinyin 临时转大写再比较，避免大小写差异导致误判"不同"
+    bool new_is_cn = is_chinese_text(display);
+    if (new_is_cn)
+    {
+        return strcmp(pinyin, current_wake_word) == 0;
+    }
+    else
+    {
+        // 英文走大写比较（逐字符大写比对，无需额外分配缓冲区）
+        const unsigned char *a = (const unsigned char *)pinyin;
+        const unsigned char *b = (const unsigned char *)current_wake_word;
+        while (*a && *b)
+        {
+            if (toupper(*a) != *b)
+                return false;
+            a++;
+            b++;
+        }
+        // 两字符串必须同时到达末尾，否则长度不一致
+        return (*a == '\0' && *b == '\0');
+    }
+}
+
 // ─── 公开 API：运行时更新唤醒词 ─────────────────────────────────────────
 
 /**
@@ -686,6 +742,22 @@ esp_err_t wake_word_update(const char *wake_word_display, const char *wake_word_
     nvs_write_str(NVS_KEY_WAKEWORD, current_wake_word);
     nvs_write_str(NVS_KEY_DISP_WORD, current_disp_word);
 
+    // 🟢 关键：在恢复运行前，彻底重置底层状态，防止旧数据导致死锁或误触发
+    if (s_afe_iface && s_afe_data)
+    {
+        s_afe_iface->reset_buffer(s_afe_data); // 重置 AFE 内部 Ringbuffer
+    }
+
+    // 🟢 关键：清空中间 PCM 队列中残留的旧数据
+    if (s_mn_pcm_buf != NULL)
+    {
+        size_t sz;
+        void *item;
+        while ((item = xRingbufferReceive(s_mn_pcm_buf, &sz, 0)) != NULL)
+        {
+            vRingbufferReturnItem(s_mn_pcm_buf, item);
+        }
+    }
     // NVS 写完成后再恢复运行并释放锁，确保 multinet_detect_task 重新运行时 flash 已空闲
     is_running = true;
     input_buffer_len = 0;

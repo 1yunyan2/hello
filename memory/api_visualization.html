@@ -117,15 +117,15 @@
 <body>
 <div class="container">
   <h1>Echo2 项目 API 调用可视化</h1>
-  <p class="subtitle">扫描日期：2026-04-14 · 覆盖文件：31 个 · API 调用总量：129+</p>
+  <p class="subtitle">扫描日期：2026-04-15 · 覆盖文件：33 个 · API 调用总量：155+</p>
 
   <!-- ──────────────── 统计卡片 ──────────────── -->
   <div class="stat-grid">
-    <div class="stat-card"><div class="num" style="color:#58a6ff">31</div><div class="label">扫描源文件</div></div>
-    <div class="stat-card"><div class="num" style="color:#3fb950">129+</div><div class="label">API 调用总量</div></div>
+    <div class="stat-card"><div class="num" style="color:#58a6ff">33</div><div class="label">扫描源文件</div></div>
+    <div class="stat-card"><div class="num" style="color:#3fb950">155+</div><div class="label">API 调用总量</div></div>
     <div class="stat-card"><div class="num" style="color:#d29922">10</div><div class="label">API 类别</div></div>
-    <div class="stat-card"><div class="num" style="color:#f85149">26</div><div class="label">RTOS 任务/同步 API</div></div>
-    <div class="stat-card"><div class="num" style="color:#bc8cff">23</div><div class="label">NVS 存储 API</div></div>
+    <div class="stat-card"><div class="num" style="color:#f85149">41</div><div class="label">RTOS 任务/同步 API</div></div>
+    <div class="stat-card"><div class="num" style="color:#bc8cff">28</div><div class="label">NVS 存储 API</div></div>
     <div class="stat-card"><div class="num" style="color:#39d353">5</div><div class="label">环形缓冲类型</div></div>
   </div>
 
@@ -221,8 +221,8 @@ const CAT_COLORS = {
 };
 
 const CATEGORIES = {
-  "RTOS":        26,
-  "NVS存储":     23,
+  "RTOS":        41,
+  "NVS存储":     28,
   "环形缓冲":    13,
   "WebSocket网络":13,
   "音频编解码":  14,
@@ -230,7 +230,7 @@ const CATEGORIES = {
   "唤醒词AFE":   9,
   "LCD显示":     7,
   "GPIO外设":    8,
-  "内存管理":    4,
+  "内存管理":    8,
 };
 
 const APIS = [
@@ -240,11 +240,26 @@ const APIS = [
   ["RTOS","session.c","xTaskCreatePinnedToCoreWithCaps","(\"ws_sender\", 4096, …, MALLOC_CAP_SPIRAM)  WS 发送任务","session"],
   ["RTOS","audio_encoder.c","xTaskCreatePinnedToCoreWithCaps","(\"encoder_task\", 32768, …, MALLOC_CAP_SPIRAM)  OPUS 编码任务（32KB栈）","audio"],
   ["RTOS","audio_decoder.c","xTaskCreatePinnedToCoreWithCaps","(\"decoder_task\", 32768, …, MALLOC_CAP_SPIRAM)  OPUS 解码任务","audio"],
-  ["RTOS","audio_processor.c","xTaskCreatePinnedToCore","(\"play_task\", …)  音频播放任务","audio"],
-  ["RTOS","custom_wake_word.c","xTaskCreatePinnedToCoreWithCaps","(\"afe_fetch\", 8192, priority=22, …)  AFE 消费任务（最高优先级）","wake_word"],
-  ["RTOS","bsp_wifi.c","xTaskCreatePinnedToCore","(\"btn_task\", 4096, …)  按钮监控任务","bsp"],
-  ["RTOS","mqtt_protocol.c","xTaskCreate","(\"heartbeat_task\", 4096, …)  MQTT 心跳任务","protocol"],
-  ["RTOS","mqtt_protocol.c","xTaskCreate","(\"async_ww_update\", 4096, …)  异步唤醒词更新任务","protocol"],
+  ["RTOS","audio_processor.c","xTaskCreatePinnedToCoreWithCaps","(\"play_task\", 4096, CPU0, MALLOC_CAP_SPIRAM)  音频播放任务","audio"],
+  ["RTOS","bsp_codec.c","xTaskCreatePinnedToCoreWithCaps","(\"audio_feed\", 8192, CPU1, MALLOC_CAP_SPIRAM)  麦克风采集任务 ✅04-15迁移","bsp"],
+  ["RTOS","custom_wake_word.c","xTaskCreatePinnedToCoreWithCaps","(\"afe_fetch\", 4096, CPU1, MALLOC_CAP_SPIRAM)  AFE消费任务 ✅04-15迁移","wake_word"],
+  ["RTOS","bsp_wifi.c","xTaskCreatePinnedToCore","(\"btn_task\", 4096, …)  WiFi/按钮监控任务（保留内部SRAM）","bsp"],
+  ["RTOS","mqtt_protocol.c","xTaskCreatePinnedToCoreWithCaps","(\"heartbeat_task\", 4096, SPIRAM)  MQTT心跳任务 ✅04-15迁移","protocol"],
+  ["RTOS","mqtt_protocol.c","xTaskCreatePinnedToCoreWithCaps","(\"async_ww_update\", 4096, SPIRAM)  异步唤醒词更新任务 ✅04-15迁移","protocol"],
+  ["RTOS","servo_manager.c","xTaskCreatePinnedToCoreWithCaps","(\"servo_mgr\", 4096, tskNO_AFFINITY, MALLOC_CAP_SPIRAM)  舵机worker任务","bsp"],
+  ["RTOS","interaction.c","xTaskCreatePinnedToCoreWithCaps","(\"ia_worker\", 4096, tskNO_AFFINITY, MALLOC_CAP_SPIRAM)  情绪动作worker","ui"],
+  ["RTOS","reminder.c","xTaskCreatePinnedToCoreWithCaps","(\"reminder_task\", 8192, tskNO_AFFINITY, MALLOC_CAP_SPIRAM)  提醒系统任务","ui"],
+  ["RTOS","servo_manager.c","xQueueCreate","(SERVO_MGR_QUEUE_LEN, sizeof(internal_req_t)) 舵机动作队列","bsp"],
+  ["RTOS","servo_manager.c","xQueueSend","(s_queue, &item, 0) 非阻塞投递动作指令","bsp"],
+  ["RTOS","servo_manager.c","xQueueReceive","(s_queue, &item, portMAX_DELAY) worker串行消费动作","bsp"],
+  ["RTOS","interaction.c","xQueueCreate","(INTERACTION_QUEUE_LEN, sizeof(robot_emotion_t)) 情绪请求队列","ui"],
+  ["RTOS","interaction.c","xQueueSend","(s_ia_queue, &emo, 0) 非阻塞入队情绪","ui"],
+  ["RTOS","interaction.c","xQueueReceive","(s_ia_queue, &emo, portMAX_DELAY) 串行消费情绪事件","ui"],
+  ["RTOS","reminder.c","xQueueCreate","(evt_queue) 提醒事件队列（7种事件类型）","ui"],
+  ["RTOS","reminder.c","xSemaphoreCreateMutex","() 共享数据保护锁（闹钟/日历/倒计时列表）","ui"],
+  ["RTOS","bsp_servo.c","xSemaphoreCreateMutex","() per-channel mutex × 3（CH_HEAD/CH_L_ARM/CH_R_ARM）","bsp"],
+  ["RTOS","bsp_servo.c","xSemaphoreTake","(s_ch_mutex[ch], portMAX_DELAY) 加锁舵机通道","bsp"],
+  ["RTOS","bsp_servo.c","xSemaphoreGive","(s_ch_mutex[ch]) 释放舵机通道","bsp"],
   ["RTOS","session.c","vTaskDelay","(pdMS_TO_TICKS(20)) 短暂让步 CPU","session"],
   ["RTOS","bsp_wifi.c","vTaskDelay","(pdMS_TO_TICKS(30000)) WiFi失败后延迟30s重启","bsp"],
   ["RTOS","bsp_touch.c","vTaskDelay","(pdMS_TO_TICKS(20/50/100)) 触摸/马达时序控制","bsp"],
@@ -378,10 +393,23 @@ const APIS = [
   ["GPIO外设","interaction.c","gpio_set_level","(GPIO16, 1/0) 震动马达控制","ui"],
 
   /* ── 内存管理 ── */
-  ["内存管理","object.h","heap_caps_malloc","(size, MALLOC_CAP_SPIRAM) 从SPIRAM分配","common"],
+  ["内存管理","object.h","heap_caps_malloc","(size, MALLOC_CAP_SPIRAM) 从SPIRAM分配（malloc_zeroed 内部调用）","common"],
   ["内存管理","audio_encoder.c","malloc_zeroed","(in_frame_size) 分配清零输入帧缓冲","audio"],
   ["内存管理","audio_encoder.c","malloc_zeroed","(out_frame_size) 分配清零输出帧缓冲","audio"],
   ["内存管理","audio_encoder.c","free","(buf) 释放临时缓冲区","audio"],
+  ["内存管理","bsp_codec.c","heap_caps_malloc","(chunk_size*2, MALLOC_CAP_SPIRAM) 采集缓冲区 ✅04-15","bsp"],
+  ["内存管理","custom_wake_word.c","heap_caps_malloc","(AEC_MAX*2, MALLOC_CAP_SPIRAM) s_aec_ref 参考信号缓冲 ✅04-15","wake_word"],
+  ["内存管理","custom_wake_word.c","heap_caps_malloc","(AEC_MAX*4, MALLOC_CAP_SPIRAM) s_aec_interleaved MR交织缓冲 ✅04-15","wake_word"],
+  ["内存管理","custom_wake_word.c","heap_caps_malloc","(AUDIO_BUFFER_MAX*2, MALLOC_CAP_SPIRAM) input_buffer MultiNet积累缓冲 ✅04-15","wake_word"],
+
+  /* ── NVS存储（servo_manager 校准参数）── */
+  ["NVS存储","servo_manager.c","nvs_open","(NVS_NAMESPACE, NVS_READWRITE, &h) 写入舵机校准参数","bsp"],
+  ["NVS存储","servo_manager.c","nvs_set_u32","(h, key_min, min_us) 保存最小脉宽 μs","bsp"],
+  ["NVS存储","servo_manager.c","nvs_set_u32","(h, key_max, max_us) 保存最大脉宽 μs","bsp"],
+  ["NVS存储","servo_manager.c","nvs_commit","(h) 提交校准写入","bsp"],
+  ["NVS存储","servo_manager.c","nvs_close","(h) 关闭 NVS 句柄","bsp"],
+  ["NVS存储","servo_manager.c","nvs_open","(NVS_NAMESPACE, NVS_READONLY, &h) 读取舵机校准参数","bsp"],
+  ["NVS存储","servo_manager.c","nvs_get_u32","(h, key_min/key_max) 读取脉宽校准值","bsp"],
 ];
 
 // ═══════════════════════════════════════════

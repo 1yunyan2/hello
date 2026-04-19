@@ -20,14 +20,14 @@
 static const char *MQTT_TAG = "MQTT"; ///< 日志 TAG
 
 // ─── MQTT 凭证（运行时从 NVS 加载，回退到编译期默认值）────────────────────
-#define MQTT_DEFAULT_URI  "mqtt://122.224.191.2:1883" ///< 默认 Broker 地址（测试环境）
-#define MQTT_DEFAULT_USER "xtc"                        ///< 默认 MQTT 用户名
-#define MQTT_DEFAULT_PASS "Xtc@12345"                  ///< 默认 MQTT 密码
+#define MQTT_DEFAULT_URI "mqtt://122.224.191.2:1883" ///< 默认 Broker 地址（测试环境）
+#define MQTT_DEFAULT_USER "xtc"                      ///< 默认 MQTT 用户名
+#define MQTT_DEFAULT_PASS "Xtc@12345"                ///< 默认 MQTT 密码
 
 // 运行时凭证缓冲区（由 mqtt_credentials_load 从 NVS 填充，否则保持默认值）
-static char s_mqtt_uri[128]  = MQTT_DEFAULT_URI;
-static char s_mqtt_user[64]  = MQTT_DEFAULT_USER;
-static char s_mqtt_pass[64]  = MQTT_DEFAULT_PASS;
+static char s_mqtt_uri[128] = MQTT_DEFAULT_URI;
+static char s_mqtt_user[64] = MQTT_DEFAULT_USER;
+static char s_mqtt_pass[64] = MQTT_DEFAULT_PASS;
 
 /**
  * @brief 从 NVS "mqtt_creds" 命名空间加载 MQTT 凭证
@@ -279,6 +279,20 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 if (cJSON_IsString(pinyin_item) && pinyin_item->valuestring != NULL &&
                     cJSON_IsString(display_item) && display_item->valuestring != NULL)
                 {
+                    // ★ 启动时服务端常下发 retained 消息，内容往往与当前 NVS 完全相同。
+                    //   若无差异直接跳过，可避免 wake_word_update 带来的副作用：
+                    //     - FST 重建 ~300ms
+                    //     - NVS 写 Flash ~50-100ms
+                    //     - AFE reset_buffer 把 AGC/NS 的自适应状态清零（冷启动首次唤醒变迟钝的主因）
+                    //   收益：上电即可用，首次唤醒不再踩"更新窗口 + AGC 冷启动"双重坑。
+                    if (wake_word_is_same(display_item->valuestring, pinyin_item->valuestring))
+                    {
+                        ESP_LOGI(MQTT_TAG, "唤醒词无变化 (wakeWord=%s)，跳过更新以保留 AFE 自适应状态",
+                                 display_item->valuestring);
+                        cJSON_Delete(root);
+                        break;
+                    }
+
                     ESP_LOGW(MQTT_TAG, "准备更新唤醒词: wakeWord=%s pinyin=%s",
                              display_item->valuestring, pinyin_item->valuestring);
 
@@ -296,8 +310,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         // 若任务栈在 SPIRAM，cache_utils.c 内部断言失败 → panic 重启。
                         // 使用 MALLOC_CAP_INTERNAL 确保栈始终可访问。
                         BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(async_update_wakeword_task, "async_ww_update",
-                                                     4096, params, 4, NULL,
-                                                     tskNO_AFFINITY, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                                                         4096, params, 4, NULL,
+                                                                         tskNO_AFFINITY, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
                         if (ret != pdPASS)
                         {
                             ESP_LOGE(MQTT_TAG, "内存不足，无法创建唤醒词更新任务！");
