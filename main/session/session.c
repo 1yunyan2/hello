@@ -48,8 +48,8 @@
 #define DEFAULT_WS_URI "ws://192.168.1.100:8080/audio"
 // NVS存储命名空间，用于存储网络配置
 #define NVS_NAMESPACE_NET "net_config"
-// 整体会话超时时间：60秒，超过此时间无活动则关闭会话
-#define SESSION_TIMEOUT_MS 60000
+// 整体会话超时时间：30秒，超过此时间无活动则关闭会话
+#define SESSION_TIMEOUT_MS 30000
 // 说话结束静音检测时间：500ms，用于判断用户是否说完话
 #define EOS_SILENCE_MS 500
 // Token主动刷新时间：110分钟（accessToken过期时间为2小时，提前10分钟刷新）
@@ -105,16 +105,20 @@ static volatile bool s_stop_sent = false;
 static bool s_is_continuous_turn = false;
 // 服务器就绪时刻（用于VAD延迟启动基准）
 static TickType_t s_vad_ready_tick = 0;
+// static TickType_t s_tts_stop_tick = 0;
+static bool s_waiting_for_silence = false;
+static int s_vad_silence_count = 0;
+static TickType_t s_wait_silence_start = 0;
 // 唤醒词尾音消退期：1500ms，避免唤醒词尾音被误判为用户语音
 // 实测唤醒词尾音 + 硬件排空延迟约 1.2s，保护期需覆盖此窗口
-#define VAD_GRACE_MS 1500
+#define VAD_GRACE_MS 1000
 // static bool s_waiting_for_silence = false; // 是否正在等待喇叭排空
 // static int s_vad_silence_count = 0;        // 连续静音帧计数器
 // VAD 连续帧防抖：连续确认帧数 & 当前计数
 // AFE fetch 约 32ms/帧，6 帧 ≈ 192ms 持续语音才确认为"真实人声"
 // 防止环境音/短促噪声单帧触发 s_speech_detected，导致误报给服务器
 // （原 8 帧≈256ms 过严，吞掉用户短语首字；6 帧兼顾较吵环境抗误触与响应速度）
-#define VAD_SPEECH_CONFIRM_FRAMES 6
+#define VAD_SPEECH_CONFIRM_FRAMES 8
 static int s_vad_speech_count = 0; // 连续 VAD_SPEECH 帧计数
 // WebSocket服务器URI地址
 static char s_ws_uri[128] = DEFAULT_WS_URI;
@@ -199,6 +203,12 @@ static void session_event_task(void *arg)
                 ESP_LOGI(TAG, "检测到说话结束（VAD 静音 %dms），通知服务器", EOS_SILENCE_MS);
                 if (s_protocol && protocol_is_connected(s_protocol))
                 {
+                    int wait_count = 0;
+                    while (!(xEventGroupGetBits(s_session_eg) & SESSION_SERVER_READY_BIT) && wait_count < 10)
+                    {
+                        vTaskDelay(pdMS_TO_TICKS(50)); // 50ms 间隔，总上限 2.5s，减少 stop_listening 发出延迟
+                        wait_count++;
+                    }
                     // 在这里执行耗时的 WebSocket 发送操作，绝对不会导致定时器栈溢出！
                     protocol_send_stop_listening(s_protocol);
                 }
@@ -333,29 +343,8 @@ static void on_enhanced_pcm(const int16_t *data, size_t samples)
 
     // ── VAD 检测（仅在服务器就绪 + 消退期后启用）──────────────────
     // 条件：服务器已就绪、消退期已过、stop 尚未发送
-    vad_state_t vad = wake_word_get_vad_state();
+    // vad_state_t vad = wake_word_get_vad_state();
 
-    // // ★ 阶段 1：排空等待期（等喇叭闭嘴）
-    // if (s_waiting_for_silence)
-    // {
-    //     if (vad == VAD_SILENCE)
-    //     {
-    //         s_vad_silence_count++;
-    //         // AFE每帧约32ms，连续 15 帧静音(约480ms)，说明喇叭彻底播完了！
-    //         if (s_vad_silence_count > 15)
-    //         {
-    //             s_waiting_for_silence = false;
-    //             ESP_LOGI(TAG, ">>> 扬声器排空完毕，正式开始监听用户语音 <<<");
-    //         }
-    //     }
-    //     else
-    //     {
-    //         // 如果还有声音（喇叭还在播），静音计数器清零，继续等
-    //         s_vad_silence_count = 0;
-    //     }
-    //     // 在排空期内，直接返回，绝对不允许触发人声！
-    //     return;
-    // }
     // ── 防抖：连续 N 帧 VAD_SPEECH 才确认为真实人声 ──────────
     // AFE 约 32ms/帧，VAD_SPEECH_CONFIRM_FRAMES=5 → 需要 160ms 持续语音
     // 环境音/短促噪声通常只触发 1~2 帧，不足 N 帧则直接忽略
@@ -363,15 +352,66 @@ static void on_enhanced_pcm(const int16_t *data, size_t samples)
 
     if (!s_stop_sent)
     {
-        // 【关键】：把保护期设为 1500ms。
-        // 因为你的日志显示，TTS_STOP 之后，解码器排空和喇叭物理播放还需要约 1.4 秒才能播完。
+        vad_state_t vad = wake_word_get_vad_state();
+
+        // 🟢 阶段 1：扬声器动态排空期 (等待物理播放彻底结束)
+        if (s_waiting_for_silence)
+        {
+            uint32_t wait_ms = (xTaskGetTickCount() - s_wait_silence_start) * portTICK_PERIOD_MS;
+
+            if (vad == VAD_SILENCE)
+            {
+                s_vad_silence_count++;
+                // 连续 15 帧静音 (约 480ms)，确认喇叭彻底闭嘴,8~10 帧（约 250~320ms）
+                if (s_vad_silence_count > 8)
+                {
+                    s_waiting_for_silence = false;
+                    // 修复类型报错：将 uint32_t 强转为 int
+                    ESP_LOGI(TAG, ">>> 扬声器排空完毕 (耗时 %d ms)，开启监听 <<<", (int)wait_ms);
+                    s_vad_ready_tick = xTaskGetTickCount();
+                }
+            }
+            else
+            {
+                s_vad_silence_count = 0; // 只要有声音，就重置静音计数器继续死等
+            }
+
+            // 防卡死兜底：如果等了 8 秒喇叭还没播完（或者环境太吵），强行切入监听
+            if (wait_ms > 8000)
+            {
+                s_waiting_for_silence = false;
+                ESP_LOGW(TAG, ">>> 排空等待超时 (8s)，强制开启监听 <<<");
+                s_vad_ready_tick = xTaskGetTickCount();
+            }
+            return; // ⚠️ 排空期间，丢弃所有音频数据，绝对不触发人声判定！
+        }
+        // ==========================================
+        // 🟢 新增防御：软件噪音门限 (Noise Gate)
+        // 专门对付下雨、风扇、空调等持续型环境白噪音
+        // ==========================================
+        uint32_t sum_amp = 0;
+        for (size_t i = 0; i < samples; i++)
+        {
+            int16_t val = data[i];
+            sum_amp += (val < 0 ? -val : val); // 取绝对值
+        }
+        uint32_t avg_amp = sum_amp / samples; // 算出当前帧的平均振幅音量
+
+        // 如果底层 VAD 误判为有声音，但实际音量非常小（背景白噪音）
+        // 我们强行推翻底层的判定，将其压制为静音！
+        // 💡 这里的 200 是阈值。如果雨下得大依然误触发，可以改成 250 或 300。
+        // 代价是：阈值越高，你离它太远小声说话时，它可能也会听不见。
+        if (vad == VAD_SPEECH && avg_amp < 150)
+        {
+            vad = VAD_SILENCE;
+        }
+        // 🟢 阶段 2：正常监听用户讲话 (确保此处没有重复定义 in_grace_period)
         bool in_grace_period = (s_vad_ready_tick != 0) &&
                                ((xTaskGetTickCount() - s_vad_ready_tick) < pdMS_TO_TICKS(VAD_GRACE_MS));
 
-        // 保护期内拔高阈值到 14 帧（约 450ms）：唤醒尾音/电流杂音绝不可能持续这么久。
-        // 保护期后恢复 VAD_SPEECH_CONFIRM_FRAMES（6 帧≈192ms），正常人声轻松触发。
         int current_threshold = in_grace_period ? 14 : VAD_SPEECH_CONFIRM_FRAMES;
-        bool is_active_audio = false; // ★ 新增标记：是否应该录入缓冲区
+
+        bool is_active_audio = false;
         if (vad == VAD_SPEECH)
         {
             is_active_audio = true; // 只要有声音，先存下来再说！(这就是保住“今天”这俩字的关键)
@@ -525,8 +565,12 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
         // // ★ 核心修复：不再依赖写死的消退时间，改为动态检测静音
         // s_waiting_for_silence = true;
         // s_vad_silence_count = 0;
+        s_waiting_for_silence = true;
+        s_vad_silence_count = 0;
+        s_wait_silence_start = xTaskGetTickCount();
         s_vad_speech_count = 0;
-        s_vad_ready_tick = xTaskGetTickCount();
+        s_vad_ready_tick = 0; // ★ 关键修复：重置服务器就绪时刻，确保 VAD 保护期正确计算
+        // s_vad_ready_tick = xTaskGetTickCount();
 
         xTimerReset(s_session_timer, 0);
         xEventGroupClearBits(s_session_eg, SESSION_SERVER_READY_BIT);
@@ -607,29 +651,27 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
                 xQueueSend(s_session_evt_queue, &evt, 0);
             }
         }
+
+        // 闲置待机状态，才允许发起正常的重连
+        if (s_reconnect_handle != NULL)
+        {
+            ESP_LOGW(TAG, "重连任务已在运行中，跳过");
+        }
+        else if (s_reconnect_attempts >= RECONNECT_MAX_ATTEMPTS)
+        {
+            ESP_LOGE(TAG, "已连续重连 %d 次均失败，停止重连。", s_reconnect_attempts);
+        }
         else
         {
-            // 闲置待机状态，才允许发起正常的重连
-            if (s_reconnect_handle != NULL)
-            {
-                ESP_LOGW(TAG, "重连任务已在运行中，跳过");
-            }
-            else if (s_reconnect_attempts >= RECONNECT_MAX_ATTEMPTS)
-            {
-                ESP_LOGE(TAG, "已连续重连 %d 次均失败，停止重连。", s_reconnect_attempts);
-            }
-            else
-            {
-                s_reconnect_attempts++;
-                int delay_ms = 5000 * (1 << (s_reconnect_attempts - 1));
-                if (delay_ms > 60000)
-                    delay_ms = 60000;
-                ESP_LOGW(TAG, "第 %d 次重连，%d 秒后执行...", s_reconnect_attempts, delay_ms / 1000);
-                xTaskCreatePinnedToCoreWithCaps(session_reconnect_task, "ws_reconn",
-                                                6144, (void *)(intptr_t)delay_ms, 3,
-                                                (TaskHandle_t *)&s_reconnect_handle,
-                                                1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-            }
+            s_reconnect_attempts++;
+            int delay_ms = 5000 * (1 << (s_reconnect_attempts - 1));
+            if (delay_ms > 60000)
+                delay_ms = 60000;
+            ESP_LOGW(TAG, "第 %d 次重连，%d 秒后执行...", s_reconnect_attempts, delay_ms / 1000);
+            xTaskCreatePinnedToCoreWithCaps(session_reconnect_task, "ws_reconn",
+                                            6144, (void *)(intptr_t)delay_ms, 3,
+                                            (TaskHandle_t *)&s_reconnect_handle,
+                                            1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         }
         break;
     } // ★ 对应开头的大括号
@@ -759,6 +801,8 @@ static void ws_sender_task(void *arg)
                 sent_frames++;
                 if (sent_frames % 50 == 1) // 每 50 帧（约 3 秒）打印一次
                     ESP_LOGI(TAG, "OPUS 发送中: frame#%d size=%d", sent_frames, (int)len);
+                // vTaskDelay(1);
+                vTaskDelay(pdMS_TO_TICKS(2)); // 轻微延迟，给其他任务喘息机会，防止 CPU0 过热导致频繁降频影响性能
             }
             // 💡 如果没进上面的 if，说明此时处于静音等待期（或刚报完错）。
             // 读出来的音频数据会直接被静默丢弃，绝对不会发给服务器惹祸。
@@ -869,6 +913,8 @@ static void session_close(void)
     s_speech_detected = false;    // 重置语音检测状态
     s_is_continuous_turn = false; // 关闭会话后不再认为是连续对话，下一次唤醒即新会话
     s_vad_speech_count = 0;       // 重置 VAD 相关状态，确保下次唤醒后从干净状态开始
+    s_waiting_for_silence = false;
+    s_vad_silence_count = 0;
     // s_waiting_for_silence = false;
     // s_vad_silence_count = 0;
     // 先停止 PCM Hook，防止新数据继续写入已停止的编码器
@@ -952,7 +998,7 @@ void session_init(const char *ws_uri)
             nvs_get_str(h, "ws_uri", s_ws_uri, &sz);
         }
         size_t token_sz = sizeof(s_ws_token);
-        nvs_get_str(h, "ws_token", s_ws_token, &token_sz); // 修复：使用正确的键名"ws_token"
+        nvs_get_str(h, "ws_token", s_ws_token, &token_sz);
         nvs_close(h);
     }
     if (ws_uri != NULL)

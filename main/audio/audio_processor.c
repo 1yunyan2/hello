@@ -37,8 +37,8 @@
 #define AUDIO_PROCESSOR_TASK_CORE_ID 0             // 固定到 CPU 核心 0
 
 // ─── 环形缓冲区大小配置（单位：字节）────────────────────────────────────────
-#define ENC_INPUT_BUF_SIZE 20480  // 编码器输入（原始 PCM）：~640ms @16kHz 单声道
-#define ENC_OUTPUT_BUF_SIZE 8192  // 编码器输出（OPUS 帧）：增大以容纳 Hello 握手期间积压的帧
+#define ENC_INPUT_BUF_SIZE 30720  // 编码器输入（原始 PCM）：~640ms @16kHz 单声道
+#define ENC_OUTPUT_BUF_SIZE 12288 // 编码器输出（OPUS 帧）：增大以容纳 Hello 握手期间积压的帧
 #define DEC_INPUT_BUF_SIZE 16384  //! 原为5120 解码器输入（OPUS 帧）：云端下发的音频缓冲,
 #define DEC_OUTPUT_BUF_SIZE 40960 // 解码器输出（PCM 播放）：~1.28s 缓冲，保证播放流畅
 // AEC 参考缓冲区：play_task 写入 I2S 时同步推送一份副本，audio_feed_task 读取后
@@ -84,46 +84,71 @@ static void audio_processor_play_task(void *arg)
     audio_processor_t *audio_processor = (audio_processor_t *)arg;
     bsp_board_t *board = bsp_board_get_instance();
 
-    /* 防御性检查：BSP 实例与 i2s_tx_handle 必须就绪，否则直接退出 */
     if (board == NULL || board->i2s_tx_handle == NULL)
     {
-        ESP_LOGE(TAG, "play_task abort: board=%p i2s_tx_handle=%p",
-                 board, board ? board->i2s_tx_handle : NULL);
         audio_processor->play_task_handle = NULL;
         vTaskDelete(NULL);
         return;
     }
 
-    // ★ 新增：分配一个 1024 字节的全 0 数组，充当“白开水”（静音包）
-    // 设为 static，避免每次循环在栈上重复分配
     static const uint8_t silence_buf[1024] = {0};
+
+    // 🟢 智能预缓冲状态机变量
+    bool prebuffering = true;
+    TickType_t buffer_start_tick = xTaskGetTickCount();
 
     while (audio_processor->is_running)
     {
+        // 🟢 阶段 1：预缓冲蓄水期
+        if (prebuffering)
+        {
+            size_t bytes_waiting = 0;
+            // 查询当前解码器输出了多少 PCM 数据准备播放
+            vRingbufferGetInfo(audio_processor->dec_output, NULL, NULL, NULL, NULL, &bytes_waiting);
+
+            // 计算从开始蓄水到现在过了多久
+            uint32_t wait_ms = (xTaskGetTickCount() - buffer_start_tick) * portTICK_PERIOD_MS;
+
+            // 🚀 核心调优区：智能开闸条件
+            // 攒够 16384 字节（约 0.5 秒） OR 已经干等了 600ms（防大模型说短句导致死锁）
+            if (bytes_waiting >= 16384 || wait_ms >= 600)
+            {
+                prebuffering = false; // 开闸放水！
+                if (bytes_waiting > 0)
+                {
+                    ESP_LOGI(TAG, "TTS 预缓冲完成 (数据:%d B, 耗时:%d ms)，开始流畅播放", bytes_waiting, (int)wait_ms);
+                }
+            }
+            else
+            {
+                // 还没攒够水，继续喂入静音包，维持 I2S 时钟稳定，并让喇叭"等一等"
+                size_t silence_written = 0;
+                i2s_channel_write(board->i2s_tx_handle, silence_buf, sizeof(silence_buf), &silence_written, pdMS_TO_TICKS(20));
+                continue;
+            }
+        }
+
+        // 🟢 阶段 2：正常流式连贯播放
         size_t size_read = 0;
-        // 把等待时间缩短到 20ms，一旦没数据，迅速切去喂静音包，防止 DMA 饿死
-        void *buf = xRingbufferReceiveUpTo(audio_processor->dec_output, &size_read,
-                                           pdMS_TO_TICKS(20), 2048);
+        void *buf = xRingbufferReceiveUpTo(audio_processor->dec_output, &size_read, pdMS_TO_TICKS(20), 2048);
+
         if (buf)
         {
-            // 【有 TTS 数据】：正常写入，必须用 portMAX_DELAY 保证一滴不漏！
             size_t bytes_written = 0;
             i2s_channel_write(board->i2s_tx_handle, buf, size_read, &bytes_written, portMAX_DELAY);
-
-            /* 向 AEC 参考缓冲推送副本，让回声消除知道喇叭正在出声 */
             xRingbufferSend(audio_processor->aec_ref_buf, buf, size_read, 0);
             vRingbufferReturnItem(audio_processor->dec_output, buf);
         }
         else
         {
-            // ★ 核心修复（防 DMA 停滞）：
-            // 【没有 TTS 数据】：喂入全 0 的静默包！
-            // 因为用了 portMAX_DELAY，写入 1024 字节在 16kHz 下大约会挂起任务 32ms，
-            // 完美充当了延时，既不占用 CPU，又保住了 I2S 时钟的连续性。
+            // 🟢 阶段 3：缓冲欠载（网络太卡，播放速度追上了云端下载速度）
+            // ⚠️ 极其关键：必须立刻重新进入预缓冲状态！否则会出现鬼畜的"一帧一卡"电音！
+            prebuffering = true;
+            buffer_start_tick = xTaskGetTickCount(); // 重置计时器，重新开始蓄水
+
+            // 喂入静音包，平滑过渡
             size_t silence_written = 0;
             i2s_channel_write(board->i2s_tx_handle, silence_buf, sizeof(silence_buf), &silence_written, portMAX_DELAY);
-
-            // 注意：静音包【不要】推送给 AEC 参考缓冲，否则会浪费 AFE 的算力
         }
     }
 

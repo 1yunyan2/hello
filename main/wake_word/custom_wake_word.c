@@ -296,9 +296,9 @@ static esp_err_t load_model_for_lang(const char *lang)
     }
 
     // 设置语言差异阈值：
-    //   中文(cn)：0.6（prob 分布高，低于 0.6 误触率极高，环境音也能过）
+    //   中文(cn)：0.2（实测正常音量"你好小熊" prob 集中在 0.25-0.37，阈值 0.3 漏检多，降到 0.2 扩大召回）
     //   英文(en)：0.4（BPE 路径长，prob 天然偏低，0.4 才能正常触发）
-    float threshold = (strcmp(lang, ESP_MN_ENGLISH) == 0) ? 0.4f : 0.3f;
+    float threshold = (strcmp(lang, ESP_MN_ENGLISH) == 0) ? 0.4f : 0.23f;
     multinet_iface->set_det_threshold(multinet_model_data, threshold);
 
     ESP_LOGW(TAG, "已加载语言模型: %s", mn_name);
@@ -453,9 +453,12 @@ esp_err_t wake_word_init(wake_word_detected_cb_t cb)
     afe_cfg->se_init = false;                  // 单麦无需 BSS/MASE 多麦阵列处理
     afe_cfg->ns_init = true;                   // ★ 开启 NS 噪声抑制（核心功能）
     afe_cfg->afe_ns_mode = AFE_NS_MODE_WEBRTC; // WebRTC NS 模式，兼顾降噪效果和语音质量
-    // afe_cfg->agc_init = true;                  // 开启 AGC 自动增益控制（增强小声输入），但不让它过度放大底噪
-    afe_cfg->agc_init = false; // AGC 暂不开启，避免增益导致底噪放大
-    // afe_cfg->agc_mode = AFE_AGC_MODE_WAKENET;                 // 专为唤醒词设计的 AGC 模式，限制增益变化，避免过度放大底噪
+    // ★ 开启 AGC（自动增益控制）：AFE_AGC_MODE_WAKENET 专为唤醒词优化。
+    // 问题根因：WebRTC NS 会同时抑制噪声和安静的语音，导致 MultiNet 置信度极低（必须大喊才识别）。
+    // WAKENET AGC 在 NS 输出后自适应补偿增益：放大安静人声，同时限制底噪放大幅度。
+    // 效果：普通音量说"你好小熊"的置信度提升，阈值 0.3 可覆盖更多正常发音。
+    afe_cfg->agc_init = true;
+    afe_cfg->agc_mode = AFE_AGC_MODE_WAKENET;
     afe_cfg->vad_init = true;                                 //! ★ 开启 VAD 语音活动检测（核心功能）
     afe_cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM; // 尽量用 PSRAM 省内部 SRAM
     afe_cfg->vad_mode = VAD_MODE_1;                           // VAD 模式 1：适合唤醒词场景，快速响应，适度误触；
@@ -674,17 +677,20 @@ esp_err_t wake_word_update(const char *wake_word_display, const char *wake_word_
     // 清除模型内部的音频历史状态，从干净状态开始检测
     multinet_iface->clean(multinet_model_data);
 
-    // 恢复运行并释放锁（在 NVS 写之前释放，避免持锁期间 flash 操作导致 detect_task 超时 200ms）
+    // ★ NVS 写在锁内（is_running=false）、释放锁之前执行。
+    // 原因：flash 写操作会临时禁用 Data Cache，若此时 multinet_detect_task（SPIRAM栈）
+    // 正在运行，SPIRAM 不可访问 → cache_utils.c assert 崩溃重启。
+    // 将 NVS 写提前到锁内，multinet_detect_task 因等锁而阻塞，不访问 SPIRAM，安全。
+    // ★ 调用者 async_update_wakeword_task 必须使用内部 SRAM 栈（MALLOC_CAP_INTERNAL），
+    //   否则 flash 操作禁用 Data Cache 时本任务自身栈也不可访问 → 崩溃。
+    nvs_write_str(NVS_KEY_WAKEWORD, current_wake_word);
+    nvs_write_str(NVS_KEY_DISP_WORD, current_disp_word);
+
+    // NVS 写完成后再恢复运行并释放锁，确保 multinet_detect_task 重新运行时 flash 已空闲
     is_running = true;
     input_buffer_len = 0;
     xSemaphoreGive(buffer_mutex);
 
-    // NVS 写在锁外执行：flash 写操作耗时 10-100ms，持锁写会让 multinet_detect_task 每次
-    // 等待 200ms 超时，造成 input_buffer 过度积累。锁外写只影响 NVS 持久化时序，无功能影响。
-    // ★ 调用者 async_update_wakeword_task 必须使用内部 SRAM 栈（MALLOC_CAP_INTERNAL），
-    //   否则 flash 操作禁用 Data Cache 时 SPIRAM 栈不可访问 → cache_utils.c assert 崩溃。
-    nvs_write_str(NVS_KEY_WAKEWORD, current_wake_word);
-    nvs_write_str(NVS_KEY_DISP_WORD, current_disp_word);
     ESP_LOGW(TAG, "唤醒词更新成功！display=%s command=%s",
              current_disp_word, current_wake_word);
 

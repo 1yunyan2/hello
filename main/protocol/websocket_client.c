@@ -278,24 +278,67 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
         PRINT_MEM_INFO(TAG, "握手后");
         break;
 
-    // ── WebSocket数据接收事件处理 ────────────────────────────────────────────
-    /**
-     * @brief WebSocket数据接收事件处理
-     *
-     * 说明：处理接收到的数据事件，区分Binary Frame（音频数据）和Text Frame（JSON控制消息），
-     *       对Text Frame进行JSON解析并根据type字段路由到对应的处理器。
-     * API：cJSON_ParseWithLength, cJSON_GetObjectItem, strcmp, cJSON_Delete
-     * 数据：根据消息类型调用不同的处理器函数
-     */
+        // ── WebSocket数据接收事件处理 ────────────────────────────────────────────
+        /**
+         * @brief WebSocket数据接收事件处理
+         *
+         * 说明：处理接收到的数据事件，区分Binary Frame（音频数据）和Text Frame（JSON控制消息），
+         *       对Text Frame进行JSON解析并根据type字段路由到对应的处理器。
+         * API：cJSON_ParseWithLength, cJSON_GetObjectItem, strcmp, cJSON_Delete
+         * 数据：根据消息类型调用不同的处理器函数
+         */
     case WEBSOCKET_EVENT_DATA:
-        /* opcode 0x02 = Binary Frame → 云端下发的 OPUS 音频帧 */
+        /* opcode 0x02 = Binary Frame -> 云端下发的 OPUS 音频帧 */
         if (data->op_code == 0x02)
         {
-            binary_data_t bin = {.ptr = (void *)data->data_ptr, .size = data->data_len};
-            protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_AUDIO, &bin);
+            // 必须使用 8192 的大缓存，绝对不能用 2048！
+            static uint8_t s_audio_rx_buf[8192];
+            static int s_audio_rx_offset = 0;
+
+            // 1. 新帧开始信号：强制复位（治愈上一帧可能遗留的断包错位）
+            if (data->payload_offset == 0)
+            {
+                s_audio_rx_offset = 0;
+            }
+
+            // 2. 溢出保护：防爆内存
+            if (s_audio_rx_offset + data->data_len > (int)sizeof(s_audio_rx_buf))
+            {
+                ESP_LOGW(TAG, "音频帧分片异常或过大(payload_len=%d)，丢弃...", data->payload_len);
+                s_audio_rx_offset = 0;
+                return;
+            }
+
+            // 3. 收集碎片，拼接数据
+            memcpy(s_audio_rx_buf + s_audio_rx_offset, data->data_ptr, data->data_len);
+            s_audio_rx_offset += data->data_len;
+
+            // 4. 收齐整帧后，一次性投递给解码器
+            if (s_audio_rx_offset >= data->payload_len && data->payload_len > 0)
+            {
+                // 再次过滤：极其微小的包（<15字节）通常是网络残留垃圾，直接扔掉防爆音
+                if (data->payload_len > 15)
+                {
+                    binary_data_t bin = {.ptr = s_audio_rx_buf, .size = (size_t)data->payload_len};
+                    protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_AUDIO, &bin);
+                }
+                // 投递完立刻清零，准备迎接下一帧
+                s_audio_rx_offset = 0;
+            }
             return;
         }
-
+        // /* opcode 0x02 = Binary Frame -> 云端下发的 OPUS 音频帧 */
+        //! 因为云端发送的是opus碎片化包，所以我们必须自己在客户端做拼接重组，才能得到完整的opus帧送给解码器。
+        // if (data->op_code == 0x02)
+        // {
+        //     // 🚀 极致优化：零拷贝直传，消灭 memcpy 带来的底层任务阻塞
+        //     if (data->data_len > 0)
+        //     {
+        //         binary_data_t bin = {.ptr = (void *)data->data_ptr, .size = (size_t)data->data_len};
+        //         protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_AUDIO, &bin);
+        //     }
+        //     return;
+        // }
         /* opcode 0x01 = Text Frame → JSON 控制消息 */
         if (data->op_code == 0x01)
         {
@@ -401,7 +444,7 @@ protocol_t *protocol_create(const char *url, const char *token)
         // 也让客户端能及时感知服务端/网络断开并触发重连（修复 transport_poll_write returned 0）
         .ping_interval_sec = 20,    // 20s 发一次 ping，维持 NAT 连接活跃
         .pingpong_timeout_sec = 10, // ping 后 10s 未收到 pong 则判定断开
-        .buffer_size = 8192, //! 增加了缓存，防止接收数据过大 默认接收缓冲区大小是 1024 字节
+        .buffer_size = 8192,        //! 增加了缓存，防止接收数据过大 默认接收缓冲区大小是 1024 字节
     };
 
     /* 初始化底层 WebSocket 客户端并注册事件回调 */
@@ -564,7 +607,7 @@ void protocol_send_audio_data(protocol_t *protocol, binary_data_t *data)
         // 同时远短于会话 60s 超时，不会让 sender 长期阻塞。
         // （原 100ms 过激进，网络稍拥就触发 transport_poll_write returned 0）
         int ret = esp_websocket_client_send_bin(protocol->websocket_client, data->ptr, data->size,
-                                                pdMS_TO_TICKS(300));
+                                                pdMS_TO_TICKS(1000));
         if (ret < 0)
         {
             // 发送失败通常由网络拥堵或底层缓冲区暂满引起；

@@ -313,16 +313,18 @@ void audio_init(bsp_board_t *bsp_board)
     };
     ESP_ERROR_CHECK(esp_codec_dev_open(bsp_board->codec_dev, &sample_info));
 
-    // ── 步骤 3：设置麦克风增益（40 ≈ 20dB，适合近讲场景）───────────────────
-    // 增益过小：语音信号弱，VAD 和 ASR 识别率下降
+    // ── 步骤 3：设置麦克风增益（ADC PGA 增益，0~100，>50 饱和失真）──────────
+    // 增益过小：语音信号弱，VAD 和 MultiNet 识别率下降（必须大声才能触发）
     // 增益过大>50：产生饱和失真，同样影响识别率
+    // 43→46：配合 AFE AGC(WAKENET) 使用，硬件增益提升语音底线幅度，
+    //        AGC 再做软件自适应补偿，无需大喊即可达到模型所需置信度
     esp_codec_dev_set_in_gain(bsp_board->codec_dev, 48);
 
     // ── 步骤 4：设置扬声器音量（0~100，60 为适中音量）──────────────────────
     // 音量过大可能导致 ES8311 内部 DAC 饱和，产生爆音
     esp_codec_dev_set_out_vol(bsp_board->codec_dev, 60);
 
-    ESP_LOGI(TAG, "ES8311 初始化完成（增益=45, 音量=60）");
+    ESP_LOGI(TAG, "ES8311 初始化完成（增益=46, 音量=60）");
 
     // ── 步骤 5：创建麦克风采集任务 ────────────────────────────────────────────
     // 任务立即开始从 I2S DMA 读取 PCM 数据并投喂给 AFE/MultiNet
