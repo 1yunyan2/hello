@@ -263,3 +263,42 @@ void bsp_board_servo_init(bsp_board_t *bsp_board);
  * @param step_ms   步进延时，数值越大动作越慢 (推荐使用 SERVO_SPEED_xxx 宏)
  */
 void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms);
+
+// ─── 7. 触摸事件与接口 (整合自 bsp_touch.h) ───────────────────────────────
+
+/**
+ * @brief 触摸事件类型枚举（对应物理铜箔位置）
+ */
+typedef enum
+{
+    TOUCH_EVENT_NONE = 0,
+    // 单位置触摸
+    TOUCH_EVENT_SHORT_HEAD,    // 头部短按
+    TOUCH_EVENT_SHORT_ABDOMEN, // 腹部短按
+    TOUCH_EVENT_SHORT_BACK,    // 背部短按
+    TOUCH_EVENT_LONG_HEAD,     // 头部长按
+    TOUCH_EVENT_LONG_ABDOMEN,  // 腹部长按
+    TOUCH_EVENT_LONG_BACK,     // 背部长按
+    // 双位置组合触摸（对应你的表格）
+    TOUCH_EVENT_COMBO_HEAD_ABDOMEN, // 头部+腹部同时按
+    TOUCH_EVENT_COMBO_HEAD_BACK,    // 头部+背部同时按
+    TOUCH_EVENT_COMBO_ABDOMEN_BACK  // 腹部+背部同时按
+} touch_event_t;
+
+/**
+ * @brief 初始化触摸传感器和震动马达（touch_scan_task 内部自动调用）
+ */
+void bsp_touch_init(void);
+
+/**
+ * @brief 非阻塞读取一个触摸事件
+ * @param out_event 输出事件类型
+ * @return true=取到事件, false=队列为空
+ */
+bool bsp_touch_get_event(touch_event_t *out_event);
+
+/**
+ * @brief 震动马达单次 30ms 短脉冲（BSP 级触觉反馈）
+ * 上层情绪震动模式由 interaction.c 独立管理，两者不冲突。
+ */
+void bsp_motor_pulse(void);
