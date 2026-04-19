@@ -30,21 +30,20 @@
  */
 typedef enum
 {
-    EMO_HAPPY = 0,   ///< 0: 开心（基础）
-    EMO_CURIOUS,     ///< 1: 好奇（基础）
-    EMO_TSUNDERE,    ///< 2: 傲娇（基础）
-    EMO_TICKLISH,    ///< 3: 怕痒（基础）
-    EMO_SLEEPY,      ///< 4: 犯困（基础）
-    EMO_GRIEVED,     ///< 5: 委屈（基础）
-    EMO_COMFORTABLE, ///< 6: 舒服（基础）
-    EMO_ACT_CUTE,    ///< 7: 撒娇（基础）
-    EMO_ANGRY,       ///< 8: 生气（基础）
-    EMO_SHY,         ///< 9: 害羞（基础）
-    EMO_SURPRISED,   ///< 10: 惊喜（基础）
-    EMO_SLUGGISH,    ///< 11: 慵懒（通用）
-    EMO_HEALING,     ///< 12: 治愈（基础）
-    EMO_EXCITED,     ///< 13: 兴奋（基础）
-    // ========== 以下为图片中新增的细分动作情绪 ==========
+    EMO_HAPPY = 0,        ///< 0: 开心（基础）
+    EMO_CURIOUS,          ///< 1: 好奇（基础）
+    EMO_TSUNDERE,         ///< 2: 傲娇（基础）
+    EMO_TICKLISH,         ///< 3: 怕痒（基础）
+    EMO_SLEEPY,           ///< 4: 犯困（基础）
+    EMO_GRIEVED,          ///< 5: 委屈（基础）
+    EMO_COMFORTABLE,      ///< 6: 舒服（基础）
+    EMO_ACT_CUTE,         ///< 7: 撒娇（基础）
+    EMO_ANGRY,            ///< 8: 生气（基础）
+    EMO_SHY,              ///< 9: 害羞（基础）
+    EMO_SURPRISED,        ///< 10: 惊喜（基础）
+    EMO_SLUGGISH,         ///< 11: 慵懒（通用）
+    EMO_HEALING,          ///< 12: 治愈（基础）
+    EMO_EXCITED,          ///< 13: 兴奋（基础）
     EMO_SHY_RUB,          ///< 14: 害羞蹭蹭（害羞进阶，头部左右轻蹭）
     EMO_COMFORTABLE_ROLL, ///< 15: 舒服到打滚（舒服进阶，头部大幅左右摇摆）
     EMO_TSUNDERE_PET,     ///< 16: 傲娇求摸（傲娇进阶，头部微抬+手臂轻抬）
@@ -55,7 +54,7 @@ typedef enum
 /**
  * @brief 初始化 interaction_manager（创建 worker 任务 + 动作队列）
  *
- * 必须在 bsp_board_servo_init() 之后调用，在首次调用 bsp_interaction_play() 之前完成。
+ * 必须在 bsp_board_servo_init() 之后调用，在首次调用 ui_interaction_play() 之前完成。
  *
  * @return ESP_OK 成功，ESP_ERR_NO_MEM 内存不足
  *
@@ -76,4 +75,4 @@ esp_err_t interaction_manager_init(void);
  * @note 此函数现为非阻塞：入队后立即返回，不阻塞调用任务
  * @note 若队列已满（连续触发超过 INTERACTION_QUEUE_LEN），新情绪将被丢弃并打印警告
  */
-void bsp_interaction_play(robot_emotion_t target_emotion);
+void ui_interaction_play(robot_emotion_t target_emotion);
