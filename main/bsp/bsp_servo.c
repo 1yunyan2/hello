@@ -17,7 +17,7 @@
 #include "iot_servo.h"
 #include <math.h>
 #include "freertos/semphr.h" // 互斥锁，保证多任务调用线程安全
-#include "bsp/bsp_config.h"
+#include "bsp_config.h"
 // 注意：robot_emotion_t 唯一定义在 interaction.h，此处不重复定义。
 // 注意：不 include servo_manager.h，避免与上层形成循环依赖。
 

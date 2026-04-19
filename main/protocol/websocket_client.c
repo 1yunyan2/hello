@@ -291,54 +291,43 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
         /* opcode 0x02 = Binary Frame -> 云端下发的 OPUS 音频帧 */
         if (data->op_code == 0x02)
         {
-            // 必须使用 8192 的大缓存，绝对不能用 2048！
             static uint8_t s_audio_rx_buf[8192];
             static int s_audio_rx_offset = 0;
 
-            // 1. 新帧开始信号：强制复位（治愈上一帧可能遗留的断包错位）
+            // 🟢 救命装甲 1：新帧强制复位！
+            // WebSocket 协议规定，如果是一帧的开头，payload_offset 必定为 0。
+            // 无论上一次重组进行到哪里（有没有卡死），只要收到新帧开头，立刻清零重来！
             if (data->payload_offset == 0)
             {
                 s_audio_rx_offset = 0;
             }
 
-            // 2. 溢出保护：防爆内存
+            // 🟢 救命装甲 2：溢出保护，防止内存踩踏
             if (s_audio_rx_offset + data->data_len > (int)sizeof(s_audio_rx_buf))
             {
-                ESP_LOGW(TAG, "音频帧分片异常或过大(payload_len=%d)，丢弃...", data->payload_len);
+                ESP_LOGW(TAG, "音频帧分片异常或过大(len=%d)，丢弃防爆内存", data->payload_len);
                 s_audio_rx_offset = 0;
                 return;
             }
 
-            // 3. 收集碎片，拼接数据
             memcpy(s_audio_rx_buf + s_audio_rx_offset, data->data_ptr, data->data_len);
             s_audio_rx_offset += data->data_len;
 
-            // 4. 收齐整帧后，一次性投递给解码器
+            // 拼齐了一整帧
             if (s_audio_rx_offset >= data->payload_len && data->payload_len > 0)
             {
-                // 再次过滤：极其微小的包（<15字节）通常是网络残留垃圾，直接扔掉防爆音
+                // 🟢 救命装甲 3：微小碎片过滤（丢弃网络残留垃圾，防 error:-4）
                 if (data->payload_len > 15)
                 {
                     binary_data_t bin = {.ptr = s_audio_rx_buf, .size = (size_t)data->payload_len};
                     protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_AUDIO, &bin);
                 }
-                // 投递完立刻清零，准备迎接下一帧
+
+                // 送完后，立刻清零，准备迎接下一帧
                 s_audio_rx_offset = 0;
             }
             return;
         }
-        // /* opcode 0x02 = Binary Frame -> 云端下发的 OPUS 音频帧 */
-        //! 因为云端发送的是opus碎片化包，所以我们必须自己在客户端做拼接重组，才能得到完整的opus帧送给解码器。
-        // if (data->op_code == 0x02)
-        // {
-        //     // 🚀 极致优化：零拷贝直传，消灭 memcpy 带来的底层任务阻塞
-        //     if (data->data_len > 0)
-        //     {
-        //         binary_data_t bin = {.ptr = (void *)data->data_ptr, .size = (size_t)data->data_len};
-        //         protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_AUDIO, &bin);
-        //     }
-        //     return;
-        // }
         /* opcode 0x01 = Text Frame → JSON 控制消息 */
         if (data->op_code == 0x01)
         {

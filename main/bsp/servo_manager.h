@@ -14,7 +14,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
-#include "bsp_config.h"  // SERVO_SPEED_* 宏的唯一定义来源（避免与 bsp_servo.c 重复）
+#include "bsp_config.h" // SERVO_SPEED_* 宏的唯一定义来源（避免与 bsp_servo.c 重复）
 
 // 幅度等级（对应具体角度偏差）
 typedef enum
@@ -23,14 +23,15 @@ typedef enum
     SERVO_AMPLITUDE_15 = 15,
     SERVO_AMPLITUDE_20 = 20,
     SERVO_AMPLITUDE_30 = 30,
+    // 后续可增加幅度等级
 } servo_amplitude_t;
 
 // 方向（语义���HEAD、ARM 统一使用 same sign：LEFT/FRONT = +，RIGHT/BACK = -）
 typedef enum
 {
-    SERVO_DIR_NEUTRAL = 0,
-    SERVO_DIR_LEFT = 1,   // head: left (+), arm: front (+)
-    SERVO_DIR_RIGHT = -1, // head: right (-), arm: back (-)
+    SERVO_DIR_NEUTRAL = 0, // 中立
+    SERVO_DIR_LEFT = 1,    // head: left (+), arm: front (+)
+    SERVO_DIR_RIGHT = -1,  // head: right (-), arm: back (-)
 } servo_direction_t;
 
 // 速度档位类型：直接使用 uint32_t，具体数值复用 bsp_config.h 的 SERVO_SPEED_* 宏

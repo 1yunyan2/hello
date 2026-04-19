@@ -28,6 +28,7 @@
 - [每日总结 2026-04-09](daily/2026-04-09.md) — VAD延迟启动+AFE WebRTC VAD+OPUS参数调优+session事件队列
 - [每日总结 2026-04-10](daily/2026-04-10.md) — 禁用VBR+协议修复+LCD BSP集成+大规模文档补全
 - [每日总结 2026-04-11](daily/2026-04-11.md) — LCD业务层+触摸/舵机模块+端到端链路联调
+- [每日总结 2026-04-15](daily/2026-04-15.md) — servo_manager新模块+interaction非阻塞架构+内部SRAM峰值优化53KB
 - [每日总结 2026-04-14](daily/2026-04-14.md) — session方案A/B切换+定时器栈溢出修复+servo/touch/reminder新模块
 - [总结自动流程](feedback_summary_flow.md) — 说"总结"自动记忆+提交+坑点记录，无需询问
 - [总结文档放置规范](feedback_summary_placement.md) — 总结放 memory/ 目录，更新时保留旧版本并注释相似点

@@ -28,8 +28,8 @@ void bsp_board_lcd_init(bsp_board_t *bsp_board)
     // 背光引脚（GPIO48）控制 LCD 背光 LED，高电平开启背光
     // 初始化时先关闭背光（level=0），避免屏幕在初始化过程中显示乱码
     gpio_config_t bk_gpio_config = {
-        .mode         = GPIO_MODE_OUTPUT,                // 推挽输出模式
-        .pin_bit_mask = 1ULL << BSP_LCD_BK_PIN,         // 仅配置背光引脚（GPIO48）
+        .mode = GPIO_MODE_OUTPUT,               // 推挽输出模式
+        .pin_bit_mask = 1ULL << BSP_LCD_BK_PIN, // 仅配置背光引脚（GPIO48）
     };
     ESP_ERROR_CHECK(gpio_config(&bk_gpio_config));
 
@@ -37,11 +37,11 @@ void bsp_board_lcd_init(bsp_board_t *bsp_board)
     // SPI2_HOST（HSPI）：ESP32-S3 第二个 SPI 控制器，支持 DMA 加速传输
     // max_transfer_sz 设为整屏大小，保证一次 flush_fb 不会截断
     spi_bus_config_t buscfg = {
-        .sclk_io_num  = BSP_LCD_SCLK_PIN, // 时钟线（GPIO12），最高 80MHz
-        .mosi_io_num  = BSP_LCD_MOSI_PIN, // 数据线（GPIO11），主发从收，LCD 单向写
-        .miso_io_num  = -1,               // 无 MISO（ST7789 不支持读回，只写）
-        .quadwp_io_num = -1,              // 不使用四线 SPI（QSPI）
-        .quadhd_io_num = -1,              // 不使用四线 SPI
+        .sclk_io_num = BSP_LCD_SCLK_PIN, // 时钟线（GPIO12），最高 80MHz
+        .mosi_io_num = BSP_LCD_MOSI_PIN, // 数据线（GPIO11），主发从收，LCD 单向写
+        .miso_io_num = -1,               // 无 MISO（ST7789 不支持读回，只写）
+        .quadwp_io_num = -1,             // 不使用四线 SPI（QSPI）
+        .quadhd_io_num = -1,             // 不使用四线 SPI
         // 最大 DMA 传输字节数 = 整屏像素数 × 每像素字节数 + 余量
         // 240×320×2 = 153600 字节 ≈ 150KB，确保整帧刷新不溢出
         .max_transfer_sz = BSP_LCD_WIDTH * BSP_LCD_HEIGHT * 2 + 8,
@@ -52,23 +52,23 @@ void bsp_board_lcd_init(bsp_board_t *bsp_board)
     // ── 步骤 3：创建 SPI LCD 通信接口 ────────────────────────────────────────
     // 此接口封装了 SPI 事务的时序细节，上层只需调用 esp_lcd_panel_* API
     esp_lcd_panel_io_spi_config_t io_config = {
-        .dc_gpio_num       = BSP_LCD_DC_PIN,    // DC 引脚（GPIO13）：高=数据，低=命令
-        .cs_gpio_num       = BSP_LCD_CS_PIN,    // CS 引脚（GPIO10）：低电平选中 LCD
-        .pclk_hz           = 80 * 1000 * 1000, // SPI 时钟 80MHz（保证动画流畅）
-        .lcd_cmd_bits      = 8,                 // 命令字段位宽（ST7789 固定 8-bit）
-        .lcd_param_bits    = 8,                 // 参数字段位宽（ST7789 固定 8-bit）
-        .spi_mode          = 0,                 // SPI 模式 0（CPOL=0，CPHA=0）
-        .trans_queue_depth = 10,                // 事务队列深度（最多 10 个异步事务排队）
+        .dc_gpio_num = BSP_LCD_DC_PIN, // DC 引脚（GPIO13）：高=数据，低=命令
+        .cs_gpio_num = BSP_LCD_CS_PIN, // CS 引脚（GPIO10）：低电平选中 LCD
+        .pclk_hz = 80 * 1000 * 1000,   // SPI 时钟 80MHz（保证动画流畅）
+        .lcd_cmd_bits = 8,             // 命令字段位宽（ST7789 固定 8-bit）
+        .lcd_param_bits = 8,           // 参数字段位宽（ST7789 固定 8-bit）
+        .spi_mode = 0,                 // SPI 模式 0（CPOL=0，CPHA=0）
+        .trans_queue_depth = 10,       // 事务队列深度（最多 10 个异步事务排队）
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(
         (esp_lcd_spi_bus_handle_t)SPI2_HOST, &io_config, &bsp_board->lcd_io));
 
     // ── 步骤 4：初始化 ST7789 LCD 面板驱动 ───────────────────────────────────
     esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num    = BSP_LCD_RST_PIN,              // 复位引脚（GPIO14），低电平复位
-        .rgb_ele_order     = LCD_RGB_ELEMENT_ORDER_RGB,    // RGB 像素排列顺序（R高位，B低位）
-        .bits_per_pixel    = 16,                           // 每像素 16-bit（RGB565 格式）
-        .data_endian       = LCD_RGB_DATA_ENDIAN_LITTLE,   // 小端字节序（ESP32 原生字节序）
+        .reset_gpio_num = BSP_LCD_RST_PIN,          // 复位引脚（GPIO14），低电平复位
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB, // RGB 像素排列顺序（R高位，B低位）
+        .bits_per_pixel = 16,                       // 每像素 16-bit（RGB565 格式）
+        .data_endian = LCD_RGB_DATA_ENDIAN_LITTLE,  // 小端字节序（ESP32 原生字节序）
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(
         bsp_board->lcd_io, &panel_config, &bsp_board->lcd_panel));
@@ -113,10 +113,11 @@ void bsp_board_lcd_on(bsp_board_t *bsp_board)
     // 先启用 ST7789 显示输出（DISPON 命令），再点亮背光
     // 顺序：控制器输出 → 背光点亮，避免背光亮时显示未就绪的画面
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(bsp_board->lcd_panel, true)); // 启用显示
-    ESP_ERROR_CHECK(gpio_set_level(BSP_LCD_BK_PIN, 1));                      // 点亮背光
+    ESP_ERROR_CHECK(gpio_set_level(BSP_LCD_BK_PIN, 1));                     // 点亮背光
 }
 
 /**
+ *
  * @brief 关闭 LCD 背光和显示
  *
  * 先关闭背光 LED，再关闭显示控制器，省电效果最佳。
@@ -130,6 +131,6 @@ void bsp_board_lcd_on(bsp_board_t *bsp_board)
 void bsp_board_lcd_off(bsp_board_t *bsp_board)
 {
     // 先关背光（用户立即看不到画面），再关显示控制器
-    ESP_ERROR_CHECK(gpio_set_level(BSP_LCD_BK_PIN, 0));                       // 关闭背光
-    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(bsp_board->lcd_panel, false));  // 关闭显示
+    ESP_ERROR_CHECK(gpio_set_level(BSP_LCD_BK_PIN, 0));                      // 关闭背光
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(bsp_board->lcd_panel, false)); // 关闭显示
 }
