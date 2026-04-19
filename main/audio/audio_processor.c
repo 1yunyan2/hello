@@ -94,43 +94,48 @@ static void audio_processor_play_task(void *arg)
         return;
     }
 
+    // ★ 新增：分配一个 1024 字节的全 0 数组，充当“白开水”（静音包）
+    // 设为 static，避免每次循环在栈上重复分配
+    static const uint8_t silence_buf[1024] = {0};
+
     while (audio_processor->is_running)
     {
         size_t size_read = 0;
-        /* 使用 100ms 超时，确保能及时响应 is_running 置 false */
+        // 把等待时间缩短到 20ms，一旦没数据，迅速切去喂静音包，防止 DMA 饿死
         void *buf = xRingbufferReceiveUpTo(audio_processor->dec_output, &size_read,
-                                           pdMS_TO_TICKS(100), 2048);
+                                           pdMS_TO_TICKS(20), 2048);
         if (buf)
         {
-            /* 直接写 I2S TX 通道，完全绕过 codec_dev mutex。
-             * 修复原因：codec_dev(IN_OUT) 的 read/write 共享同一把 mutex；
-             *   旧方案 esp_codec_dev_write 持锁 ~64ms，CPU1 的 audio_feed_task
-             *   调用 esp_codec_dev_read 时长期等锁 → AFE FEED ringbuffer 溢出
-             *   → MultiNet 拿不到音频 → 唤醒词无法检测 → TTS 期间无法打断。
-             * I2S TX 和 RX 是独立 DMA 通道，硬件层无冲突，可以完全并发。 */
+            // 【有 TTS 数据】：正常写入，必须用 portMAX_DELAY 保证一滴不漏！
             size_t bytes_written = 0;
-            i2s_channel_write(board->i2s_tx_handle, buf, size_read,
-                              &bytes_written, portMAX_DELAY);
-            /* 向 AEC 参考缓冲推送一份副本（0 超时：丢满则弃，不阻塞播放） */
+            i2s_channel_write(board->i2s_tx_handle, buf, size_read, &bytes_written, portMAX_DELAY);
+
+            /* 向 AEC 参考缓冲推送副本，让回声消除知道喇叭正在出声 */
             xRingbufferSend(audio_processor->aec_ref_buf, buf, size_read, 0);
             vRingbufferReturnItem(audio_processor->dec_output, buf);
         }
+        else
+        {
+            // ★ 核心修复（防 DMA 停滞）：
+            // 【没有 TTS 数据】：喂入全 0 的静默包！
+            // 因为用了 portMAX_DELAY，写入 1024 字节在 16kHz 下大约会挂起任务 32ms，
+            // 完美充当了延时，既不占用 CPU，又保住了 I2S 时钟的连续性。
+            size_t silence_written = 0;
+            i2s_channel_write(board->i2s_tx_handle, silence_buf, sizeof(silence_buf), &silence_written, portMAX_DELAY);
+
+            // 注意：静音包【不要】推送给 AEC 参考缓冲，否则会浪费 AFE 的算力
+        }
     }
 
-    /* ── 排水阶段：is_running 变 false 后 dec_output 里可能仍有已解码PCM。
-     * 原因：audio_decoder 把最后几帧写入 dec_output 后 drain_done=true，
-     *       audio_processor_stop 立即置 is_running=false，play_task 在
-     *       while 条件检查时退出，跳过了 dec_output 中剩余的 PCM 数据，
-     *       导致 TTS 末尾几个字被截断（通常 ~5 字，约 1~2 帧）。
-     * 修复：继续把 dec_output 剩余数据全部播完，200ms 超时（队列空即退出）。 */
+    /* ── 排水阶段：确保 is_running 被置 false 后，最后一个字完整播完 ── */
     {
         size_t drain_size = 0;
         void *drain_buf = NULL;
         while ((drain_buf = xRingbufferReceiveUpTo(audio_processor->dec_output,
                                                    &drain_size, pdMS_TO_TICKS(200), 2048)) != NULL)
         {
-            size_t written = 0;
-            i2s_channel_write(board->i2s_tx_handle, drain_buf, drain_size, &written, portMAX_DELAY);
+            size_t drain_written = 0;
+            i2s_channel_write(board->i2s_tx_handle, drain_buf, drain_size, &drain_written, portMAX_DELAY);
             xRingbufferSend(audio_processor->aec_ref_buf, drain_buf, drain_size, 0);
             vRingbufferReturnItem(audio_processor->dec_output, drain_buf);
         }
@@ -139,7 +144,6 @@ static void audio_processor_play_task(void *arg)
     audio_processor->play_task_handle = NULL;
     vTaskDelete(NULL);
 }
-
 // ─── 公开 API：生命周期管理 ────────────────────────────────────────────────
 
 /**

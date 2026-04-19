@@ -3,6 +3,7 @@
 #include "driver/i2s_std.h"
 #include "driver/i2c_master.h"
 #include "wake_word/custom_wake_word.h"
+#include "esp_heap_caps.h"
 
 static const char *TAG = "BSP_CODEC";
 
@@ -239,7 +240,8 @@ void audio_feed_task(void *arg)
     // // 【修改点 2】按新计算的大小分配内存
     // int16_t *buffer = malloc(alloc_size);
     // 大小 = 采样点数 × 每点字节数（16-bit = 2 字节）
-    int16_t *buffer = malloc(chunk_size * sizeof(int16_t));
+    /* 从 SPIRAM 分配采集缓冲区，避免占用宝贵的内部 SRAM */
+    int16_t *buffer = heap_caps_malloc(chunk_size * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (buffer == NULL)
     {
         ESP_LOGE(TAG, "audio_feed_task: 内存不足，无法分配 %d 字节采集缓冲区",
@@ -313,24 +315,26 @@ void audio_init(bsp_board_t *bsp_board)
 
     // ── 步骤 3：设置麦克风增益（40 ≈ 20dB，适合近讲场景）───────────────────
     // 增益过小：语音信号弱，VAD 和 ASR 识别率下降
-    // 增益过大：产生饱和失真，同样影响识别率
-    esp_codec_dev_set_in_gain(bsp_board->codec_dev, 40);
+    // 增益过大>50：产生饱和失真，同样影响识别率
+    esp_codec_dev_set_in_gain(bsp_board->codec_dev, 48);
 
     // ── 步骤 4：设置扬声器音量（0~100，60 为适中音量）──────────────────────
     // 音量过大可能导致 ES8311 内部 DAC 饱和，产生爆音
     esp_codec_dev_set_out_vol(bsp_board->codec_dev, 60);
 
-    ESP_LOGI(TAG, "ES8311 初始化完成（增益=40, 音量=60）");
+    ESP_LOGI(TAG, "ES8311 初始化完成（增益=45, 音量=60）");
 
     // ── 步骤 5：创建麦克风采集任务 ────────────────────────────────────────────
     // 任务立即开始从 I2S DMA 读取 PCM 数据并投喂给 AFE/MultiNet
     // 必须在 codec_dev 完全打开后才能创建，否则 read() 会失败
-    xTaskCreatePinnedToCore(
-        audio_feed_task, // 任务函数
-        "audio_feed",    // 任务名称（用于 FreeRTOS 调试工具显示）
-        8192,            // 栈大小（8KB：含 DMA 缓冲区指针和局部变量）
-        bsp_board,       // 传入 bsp_board 指针（任务需要 codec_dev 读取音频）
-        5,               // 优先级（与编解码任务对称，保证实时性）
-        NULL,            // 不需要保存任务句柄（任务永远运行，无需管理）
-        1);              // 固定到 CPU 核心 1（WiFi 协议栈默认用 CPU0，避免竞争）
+    /* 任务栈分配到 SPIRAM，节省内部 SRAM（audio_feed 无实时 ISR 调用，PSRAM cache 足够快） */
+    xTaskCreatePinnedToCoreWithCaps(
+        audio_feed_task,                      // 任务函数
+        "audio_feed",                         // 任务名称（用于 FreeRTOS 调试工具显示）
+        8192,                                 // 栈大小（8KB：含 DMA 缓冲区指针和局部变量）
+        bsp_board,                            // 传入 bsp_board 指针（任务需要 codec_dev 读取音频）
+        5,                                    // 优先级（与编解码任务对称，保证实时性）
+        NULL,                                 // 不需要保存任务句柄（任务永远运行，无需管理）
+        1,                                    // 固定到 CPU 核心 1（WiFi 协议栈默认用 CPU0，避免竞争）
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); // 栈分配在 SPIRAM
 }

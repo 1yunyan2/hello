@@ -96,7 +96,8 @@ static void protocol_hello_handler(protocol_t *protocol, cJSON *root)
     cJSON *session_id = cJSON_GetObjectItem(root, "session_id");
     if (cJSON_IsString(session_id))
     {
-        protocol->session_id = strdup(session_id->valuestring);
+        protocol->session_id = strdup // 含义：复制字符串并返回新指针，此处保存服务端分配的 session_id
+            (session_id->valuestring);
     }
 
     /* 通知上层：Hello 握手完成 */
@@ -380,12 +381,14 @@ protocol_t *protocol_create(const char *url, const char *token)
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     char mac_str[18];
-    snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    snprintf // 含义：将格式化的数据写入字符串中，此处将MAC地址格式化为常见的冒号分隔形式
+        (mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
     /* 构造自定义 HTTP 头（WebSocket 握手时携带） */
     char *headers = NULL;
-    asprintf(&headers, "Device-Id: %s\r\nClient-Id: %s\r\nAuthorization: Bearer %s\r\nProtocol-Version: 1\r\n",
-             mac_str, mac_str, token ? token : "");
+    asprintf // 含义：将参数列表中的内容格式化成字符串，并返回该字符串的指针。
+        (&headers, "Device-Id: %s\r\nClient-Id: %s\r\nAuthorization: Bearer %s\r\nProtocol-Version: 1\r\n",
+         mac_str, mac_str, token ? token : "");
 
     /* 配置 WebSocket 客户端参数 */
     esp_websocket_client_config_t websocket_cfg = {
@@ -394,12 +397,16 @@ protocol_t *protocol_create(const char *url, const char *token)
         // .crt_bundle_attach = esp_crt_bundle_attach, // HTTPS 根证书校验（wss:// 需要）
         .network_timeout_ms = 5000,     // 网络超时 5 秒
         .disable_auto_reconnect = true, // 禁用自动重连，由 session 层控制退避策略
-        // .ping_interval_sec = 30,                    // Ping 间隔 30 秒
+        // 启用 Ping 保活：防止 NAT/路由 idle 断链产生"幽灵连接"，
+        // 也让客户端能及时感知服务端/网络断开并触发重连（修复 transport_poll_write returned 0）
+        .ping_interval_sec = 20,    // 20s 发一次 ping，维持 NAT 连接活跃
+        .pingpong_timeout_sec = 10, // ping 后 10s 未收到 pong 则判定断开
         .buffer_size = 8192, //! 增加了缓存，防止接收数据过大 默认接收缓冲区大小是 1024 字节
     };
 
     /* 初始化底层 WebSocket 客户端并注册事件回调 */
     protocol->websocket_client = esp_websocket_client_init(&websocket_cfg);
+    // 注册事件回调，监听所有 WebSocket 事件（WEBSOCKET_EVENT_ANY），传递协议实例指针作为参数
     esp_websocket_register_events(protocol->websocket_client, WEBSOCKET_EVENT_ANY, protocol_websocket_event_handler, protocol);
 
     free(headers); // headers 已被底层拷贝，可安全释放
@@ -553,9 +560,17 @@ void protocol_send_audio_data(protocol_t *protocol, binary_data_t *data)
 {
     if (esp_websocket_client_is_connected(protocol->websocket_client))
     {
-        // 实时音频场景：100ms 发不出去则丢弃（一帧 OPUS 60ms，阻塞就过时了）
-        // 避免 sender 任务长时间阻塞导致 enc_output 积压溢出
-        esp_websocket_client_send_bin(protocol->websocket_client, data->ptr, data->size, pdMS_TO_TICKS(100));
+        // 实时音频发送：300ms 超时给 TCP 窗口抖动留出恢复时间，
+        // 同时远短于会话 60s 超时，不会让 sender 长期阻塞。
+        // （原 100ms 过激进，网络稍拥就触发 transport_poll_write returned 0）
+        int ret = esp_websocket_client_send_bin(protocol->websocket_client, data->ptr, data->size,
+                                                pdMS_TO_TICKS(300));
+        if (ret < 0)
+        {
+            // 发送失败通常由网络拥堵或底层缓冲区暂满引起；
+            // 不在此强制断连，保活 ping 或接收端事件会触发重连逻辑
+            ESP_LOGW(TAG, "WS 音频发送失败 (size=%d, ret=%d)，网络拥堵", data->size, ret);
+        }
     }
 }
 
