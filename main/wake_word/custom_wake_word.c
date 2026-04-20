@@ -27,15 +27,15 @@ static const char *TAG = "BSP_WakeWord";
 static void afe_fetch_task(void *arg);
 
 // ─── 常量定义 ────────────────────────────────────────────────────────────
-#define WAKE_COMMAND_ID 1                    // 唤醒词在命令词表中的固定 ID（唯一一条命令）
-#define NVS_NAMESPACE "sys_config"           // NVS 命名空间（与其他模块共享）
-#define NVS_KEY_WAKEWORD "wakeword"          // NVS Key：命令词（拼音或英文）
-#define NVS_KEY_DISP_WORD "ww_disp"          // NVS Key：显示文字（用于下次启动判断语言）
-#define DEFAULT_DISP_CN "你好伙伴"           // 出厂默认中文显示词
-#define DEFAULT_WAKEWORD_CN "ni hao huo ban" // 出厂默认中文命令词（拼音）
-#define DEFAULT_DISP_EN "Hello Echo"         // 出厂默认英文显示词
-#define DEFAULT_WAKEWORD_EN "HELLO ECHO"     // 出厂默认英文命令词（mn6_en 词表全大写）
-#define AUDIO_BUFFER_MAX 8192                // MultiNet 音频积累缓冲区最大采样点数
+#define WAKE_COMMAND_ID 1                // 唤醒词在命令词表中的固定 ID（唯一一条命令）
+#define NVS_NAMESPACE "sys_config"       // NVS 命名空间（与其他模块共享）
+#define NVS_KEY_WAKEWORD "wakeword"      // NVS Key：命令词（拼音或英文）
+#define NVS_KEY_DISP_WORD "ww_disp"      // NVS Key：显示文字（用于下次启动判断语言）
+#define DEFAULT_DISP_CN "你好"           // 出厂默认中文显示词
+#define DEFAULT_WAKEWORD_CN "ni hao "    // 出厂默认中文命令词（拼音）
+#define DEFAULT_DISP_EN "Hello Echo"     // 出厂默认英文显示词
+#define DEFAULT_WAKEWORD_EN "HELLO ECHO" // 出厂默认英文命令词（mn6_en 词表全大写）
+#define AUDIO_BUFFER_MAX 8192            // MultiNet 音频积累缓冲区最大采样点数
 // AEC 交织缓冲区大小：最大 feed chunksize（每通道）* 2 通道
 // 通常 chunksize = 512，因此此处取保守上限 1024 * 2 = 2048 个 int16_t
 #define AEC_MAX_FEED_SAMPLES 1024 // 每通道最大采样点数
@@ -296,9 +296,10 @@ static esp_err_t load_model_for_lang(const char *lang)
     }
 
     // 设置语言差异阈值：
-    //   中文(cn)：0.2（实测正常音量"你好小熊" prob 集中在 0.25-0.37，阈值 0.3 漏检多，降到 0.2 扩大召回）
+    //   中文(cn)：0.18（正常音量 prob 集中 0.25~0.37，0.18 保留召回余量；
+    //             原 0.12 过松，TTS 残留经 AEC 后的 prob≈0.22 会误触发自激）
     //   英文(en)：0.4（BPE 路径长，prob 天然偏低，0.4 才能正常触发）
-    float threshold = (strcmp(lang, ESP_MN_ENGLISH) == 0) ? 0.4f : 0.12f;
+    float threshold = (strcmp(lang, ESP_MN_ENGLISH) == 0) ? 0.4f : 0.18f;
     multinet_iface->set_det_threshold(multinet_model_data, threshold);
 
     ESP_LOGW(TAG, "已加载语言模型: %s", mn_name);
@@ -427,7 +428,7 @@ esp_err_t wake_word_init(wake_word_detected_cb_t cb)
 
     // 从 NVS 读取上次保存的显示词，用于推断上次使用的语言
     nvs_read_str(NVS_KEY_DISP_WORD, current_disp_word,
-                 sizeof(current_disp_word), DEFAULT_DISP_EN);
+                 sizeof(current_disp_word), DEFAULT_DISP_CN);
 
     // 根据显示词语言选择并加载对应 MultiNet6 模型
     const char *lang = is_chinese_text(current_disp_word) ? ESP_MN_CHINESE : ESP_MN_ENGLISH;
@@ -458,7 +459,7 @@ esp_err_t wake_word_init(wake_word_detected_cb_t cb)
     // WAKENET AGC 在 NS 输出后自适应补偿增益：放大安静人声，同时限制底噪放大幅度。
     // 效果：普通音量说"你好小熊"的置信度提升，阈值 0.3 可覆盖更多正常发音。
     afe_cfg->agc_init = true;
-    afe_cfg->agc_mode = AFE_AGC_MODE_WAKENET;
+    afe_cfg->agc_mode = AFE_AGC_MODE_WAKENET;                 // WAKENET AGC 模式，专为唤醒词场景设计，配合 WebRTC NS 使用
     afe_cfg->vad_init = true;                                 //! ★ 开启 VAD 语音活动检测（核心功能）
     afe_cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM; // 尽量用 PSRAM 省内部 SRAM
     afe_cfg->vad_mode = VAD_MODE_1;                           // VAD 模式 1：适合唤醒词场景，快速响应，适度误触；
@@ -1041,6 +1042,12 @@ void wake_word_stop(void)
  *
  * @note 调用者：session.c → session_close()（会话关闭后恢复监听）
  */
+void wake_word_set_det_threshold(float threshold)
+{
+    if (multinet_iface && multinet_model_data)
+        multinet_iface->set_det_threshold(multinet_model_data, threshold);
+}
+
 void wake_word_start(void)
 {
     // 持锁后清空残留缓冲区，避免旧数据触发误识别，然后允许 feed 继续
@@ -1049,6 +1056,9 @@ void wake_word_start(void)
     // 重置 AFE 内部 ringbuf，丢弃积压的旧音频数据
     if (s_afe_iface && s_afe_data)
         s_afe_iface->reset_buffer(s_afe_data); // 重要！重置 AFE 内部状态，确保旧数据不干扰新检测
+    // 确保恢复正常阈值（防止 TTS 被打断或异常关闭后阈值卡在 0.55）
+    if (multinet_iface && multinet_model_data)
+        multinet_iface->set_det_threshold(multinet_model_data, 0.18f);
     is_running = true;
     xSemaphoreGive(buffer_mutex);
 

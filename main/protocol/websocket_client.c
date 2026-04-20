@@ -427,12 +427,17 @@ protocol_t *protocol_create(const char *url, const char *token)
         .uri = url,
         .headers = headers,
         // .crt_bundle_attach = esp_crt_bundle_attach, // HTTPS 根证书校验（wss:// 需要）
-        .network_timeout_ms = 5000,     // 网络超时 5 秒
+        .network_timeout_ms = 3000,     // 网络超时 3 秒（缩短让连接失败更快触发重试）
         .disable_auto_reconnect = true, // 禁用自动重连，由 session 层控制退避策略
-        // 启用 Ping 保活：防止 NAT/路由 idle 断链产生"幽灵连接"，
-        // 也让客户端能及时感知服务端/网络断开并触发重连（修复 transport_poll_write returned 0）
-        .ping_interval_sec = 20,    // 20s 发一次 ping，维持 NAT 连接活跃
-        .pingpong_timeout_sec = 10, // ping 后 10s 未收到 pong 则判定断开
+        // ★ Ping 保活说明：
+        // 设备端 ping 要求服务端必须回 pong（RFC 6455）。
+        // 若服务端未实现 pong 响应，pingpong_timeout_sec 到期后 ESP-IDF 会主动断开，
+        // 表现为 "transport_poll_write returned 0, errno=Success"（不是真网络断）。
+        //
+        // 当前策略：关闭设备端主动 ping（服务端有自己的心跳机制）。
+        // 若需要开启，必须先确认服务端已实现 pong 响应，再取消下面两行注释。
+        // .ping_interval_sec = 20,
+        // .pingpong_timeout_sec = 10,
         .buffer_size = 8192,        //! 增加了缓存，防止接收数据过大 默认接收缓冲区大小是 1024 字节
     };
 
@@ -615,7 +620,8 @@ void protocol_send_audio_data(protocol_t *protocol, binary_data_t *data)
  */
 void protocol_send_abort_speaking(protocol_t *protocol)
 {
-    protocol_send_text(protocol, "{\"reason\":\"wake_word_detected\",\"session_id\":\"%s\",\"type\":\"abort\"}", protocol->session_id ? protocol->session_id : "");
+    // protocol_send_text(protocol, "{\"reason\":\"wake_word_detected\",\"session_id\":\"%s\",\"type\":\"abort\"}", protocol->session_id ? protocol->session_id : "");
+    protocol_send_text(protocol, "{\"type\":\"stop\"}");
 }
 
 /**

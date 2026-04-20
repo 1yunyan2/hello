@@ -192,6 +192,16 @@ void wake_word_stop(void);
  */
 void wake_word_start(void);
 
+/**
+ * @brief 动态调整 MultiNet 检测概率阈值
+ *
+ * TTS 播放期间建议设为 0.55f（防 AGC 放大 AEC 残留误触发）；
+ * TTS 结束后恢复为 0.18f（正常唤醒灵敏度）。
+ *
+ * @param threshold 概率阈值（0.0~1.0），越高越难触发
+ */
+void wake_word_set_det_threshold(float threshold);
+
 // ─── VAD / 增强 PCM 接口 ────────────────────────────────────────────────
 
 /**

@@ -51,7 +51,7 @@
 // 整体会话超时时间：30秒，超过此时间无活动则关闭会话
 #define SESSION_TIMEOUT_MS 30000
 // 说话结束静音检测时间：500ms，用于判断用户是否说完话
-#define EOS_SILENCE_MS 800
+#define EOS_SILENCE_MS 400
 // Token主动刷新时间：110分钟（accessToken过期时间为2小时，提前10分钟刷新）
 #define TOKEN_REFRESH_MS (110 * 60 * 1000)
 // OPUS音频帧发送缓冲区大小
@@ -138,8 +138,8 @@ static volatile TaskHandle_t s_reconnect_handle = NULL;
 static int s_reconnect_attempts = 0;
 // 最大重连次数，超过后停止重连
 #define RECONNECT_MAX_ATTEMPTS 5
-// 基础退避延迟时间：5秒
-#define RECONNECT_BASE_DELAY_MS 500
+// 基础退避延迟时间：2秒（原定义500ms但从未使用，实际代码写死5000ms，此处统一修正）
+#define RECONNECT_BASE_DELAY_MS 2000
 // 唤醒词操作互斥锁，防止多线程操作冲突
 static SemaphoreHandle_t s_wake_word_mutex = NULL;
 // 当前触发的唤醒词字符串
@@ -375,7 +375,7 @@ static void on_enhanced_pcm(const int16_t *data, size_t samples)
             {
                 s_vad_silence_count++;
                 // 2. 将连续静音帧数提高到 15 帧（约 480ms），确保空气中真的没有余音了
-                if (s_vad_silence_count > 15)
+                if (s_vad_silence_count > 8)
                 {
                     s_waiting_for_silence = false;
                     ESP_LOGI(TAG, ">>> 扬声器排空完毕 (耗时 %d ms)，开启监听 <<<", (int)wait_ms);
@@ -388,39 +388,71 @@ static void on_enhanced_pcm(const int16_t *data, size_t samples)
             }
 
             // 防卡死兜底：如果等了 8 秒喇叭还没播完（或者环境太吵），强行切入监听
-            if (wait_ms > 8000)
+            if (wait_ms > 1500)
             {
                 s_waiting_for_silence = false;
-                ESP_LOGW(TAG, ">>> 排空等待超时 (8s)，强制开启监听 <<<");
+                ESP_LOGW(TAG, ">>> 排空等待超时 (1.5s)，强制开启监听 <<<");
                 s_vad_ready_tick = xTaskGetTickCount();
             }
             return; // ⚠️ 排空期间，丢弃所有音频数据，绝对不触发人声判定！
         }
         // ==========================================
-        // 🟢 新增防御：软件噪音门限 (Noise Gate)
-        // 专门对付下雨、风扇、空调等持续型环境白噪音
+        // 🟢 软件噪音门限 (Noise Gate) + 脉冲噪声过滤
+        // 专门对付下雨、风扇、空调等持续型环境白噪音 + 键盘敲击、脚步等脉冲噪声
         // ==========================================
         uint32_t sum_amp = 0;
+        uint32_t peak_amp = 0;
         for (size_t i = 0; i < samples; i++)
         {
             int16_t val = data[i];
-            sum_amp += (val < 0 ? -val : val); // 取绝对值
+            uint32_t abs_val = (val < 0 ? -val : val); // 取绝对值
+            sum_amp += abs_val;
+            if (abs_val > peak_amp)
+                peak_amp = abs_val; // 记录本帧峰值
         }
         uint32_t avg_amp = sum_amp / samples; // 算出当前帧的平均振幅音量
 
-        // 如果底层 VAD 误判为有声音，但实际音量非常小（背景白噪音）
-        // 我们强行推翻底层的判定，将其压制为静音！
-        // 💡 这里的 200 是阈值。如果雨下得大依然误触发，可以改成 250 或 300。
-        // 代价是：阈值越高，你离它太远小声说话时，它可能也会听不见。
-        if (vad == VAD_SPEECH && avg_amp < 150)
+        // ★ 分两级噪声门（不反弹旧坑 #5"背景噪音误触发"）：
+        //   未确认人声（s_speech_detected=false）：严格 150，防止白噪音误触发 speech_detected
+        //   已确认人声（=true）：宽松 50，允许尾音低振幅字（"的/吗/啦/啊"）通过，
+        //                        避免触发 EOS 过早 stop 截断尾端词
+        uint32_t gate_threshold = s_speech_detected ? 50 : 150;
+        if (vad == VAD_SPEECH && avg_amp < gate_threshold)
         {
             vad = VAD_SILENCE;
+        }
+
+        // ★ 脉冲噪声过滤（键盘敲击、脚步、桌面震动）：
+        //   脉冲声特征：瞬时高峰 + 快速回落，peak/avg 比值极大（通常 >15）
+        //   人声特征：能量分布相对均匀，peak/avg 一般在 3~6
+        //   只在未确认人声时启用，避免误杀已录句子中的辅音爆破
+        //   avg_amp > 30 避免除零和超低噪底误判
+        if (vad == VAD_SPEECH && !s_speech_detected && avg_amp > 30 &&
+            (peak_amp / avg_amp) > 8)
+        {
+            vad = VAD_SILENCE;
+        }
+
+        // ★ 尾端字保护（核心修复）：已确认人声后，若 AFE 判 SILENCE 但振幅仍够高，强制上调为 SPEECH
+        //   根因：AFE VAD 对低能量拖音（"的/吗/啦/啊"/长元音衰减段）过于敏感，
+        //         会在字还没说完时就判 SILENCE → EOS 定时器启动 → 600ms 后 stop，尾字被服务端截断
+        //   条件三重：
+        //     1. s_speech_detected=true（只在句子中生效，不影响未确认阶段的噪声防护）
+        //     2. vad==VAD_SILENCE（AFE 判静音，与降级逻辑互斥）
+        //     3. avg_amp > 200（明显高于环境底噪 50~100，真的有人声能量）
+        //   效果：每当还有能量时，EOS 定时器就被 stop 重置；真正静音 600ms 后才触发结束
+        if (s_speech_detected && vad == VAD_SILENCE && avg_amp > 200)
+        {
+            vad = VAD_SPEECH;
         }
         // 🟢 阶段 2：正常监听用户讲话 (确保此处没有重复定义 in_grace_period)
         bool in_grace_period = (s_vad_ready_tick != 0) &&
                                ((xTaskGetTickCount() - s_vad_ready_tick) < pdMS_TO_TICKS(VAD_GRACE_MS));
 
-        int current_threshold = in_grace_period ? 14 : VAD_SPEECH_CONFIRM_FRAMES;
+        // 保护期内阈值：14 → 10 帧（320ms），兼顾唤醒词尾音过滤与短首字召回
+        // 实测唤醒词尾音经 AEC+物理衰减后，连续 VAD_SPEECH 帧通常 ≤ 7 帧，
+        // 10 帧仍可过滤尾音，同时让"和/今/你"等短音节（3~5 帧）配合容忍机制累积成功
+        int current_threshold = in_grace_period ? 10 : VAD_SPEECH_CONFIRM_FRAMES;
 
         bool is_active_audio = false;
         if (vad == VAD_SPEECH)
@@ -563,6 +595,9 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
         xTimerStop(s_eos_timer, 0);
         xTimerReset(s_session_timer, 0);
         // 重启唤醒词引擎，TTS 期间可以检测打断唤醒词
+        // ★ 切高阈值：AGC 会放大 AEC 残留，普通阈值 0.18 在 TTS 开始 1~2s 内极易误触
+        //   实测 TTS 残留经 AGC 后 prob 可达 0.40，故设 0.55 要求更强置信才触发打断
+        wake_word_set_det_threshold(0.55f);
         wake_word_start();
         break;
 
@@ -602,6 +637,8 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
 
         xTimerReset(s_session_timer, 0);
         xEventGroupClearBits(s_session_eg, SESSION_SERVER_READY_BIT);
+        // TTS 播放结束，恢复正常检测阈值（多轮监听需要较低阈值感知用户说话）
+        wake_word_set_det_threshold(0.18f);
         wake_word_stop();
 #else /* ❌ 方案 A：单轮对话（已禁用，仅保留作参考） */
         ESP_LOGI(TAG, "[TTS] TTS 播放结束，单轮模式关闭会话");
@@ -692,7 +729,7 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
         else
         {
             s_reconnect_attempts++;
-            int delay_ms = 5000 * (1 << (s_reconnect_attempts - 1));
+            int delay_ms = RECONNECT_BASE_DELAY_MS * (1 << (s_reconnect_attempts - 1));
             if (delay_ms > 60000)
                 delay_ms = 60000;
             ESP_LOGW(TAG, "第 %d 次重连，%d 秒后执行...", s_reconnect_attempts, delay_ms / 1000);
@@ -787,14 +824,29 @@ static void ws_sender_task(void *arg)
 
     ESP_LOGI(TAG, "发送任务启动，等待服务器就绪...");
 
-    // 1. 开局等待阶段：等待服务器 started 响应，不排空 enc_output
+    // 1. 开局等待阶段：等待服务器 started 响应，最多等待 8s
     //    enc_output（8KB ≈ 2.7s OPUS）足以缓冲 hello/started RTT 期间的帧，
     //    服务器就绪后阶段2直接发送，唤醒词后立即说话的语音不再丢失。
-    while (!(xEventGroupGetBits(s_session_eg) & SESSION_SERVER_READY_BIT))
+    //    超时兜底：8s 未收到 started（网络不稳或服务端无响应），主动关闭避免任务挂死到30s超时
     {
-        if (s_state != SESSION_LISTENING && s_state != SESSION_PLAYING)
-            goto exit;                 // 会话已关闭，直接退出
-        vTaskDelay(pdMS_TO_TICKS(20)); // 等待，不消耗 enc_output
+        int wait_count = 0;
+        const int max_wait = 8000 / 20; // 8s / 20ms per tick
+        while (!(xEventGroupGetBits(s_session_eg) & SESSION_SERVER_READY_BIT))
+        {
+            if (s_state != SESSION_LISTENING && s_state != SESSION_PLAYING)
+                goto exit;
+            if (++wait_count > max_wait)
+            {
+                ESP_LOGW(TAG, "等待服务器 started 超时（8s），主动关闭会话");
+                if (s_session_evt_queue != NULL)
+                {
+                    session_evt_t evt = SESSION_EVT_CLOSE;
+                    xQueueSend(s_session_evt_queue, &evt, 0);
+                }
+                goto exit;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
     }
 
     ESP_LOGI(TAG, "服务器已就绪，发送任务运行中");

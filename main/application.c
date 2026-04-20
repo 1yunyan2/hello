@@ -165,6 +165,9 @@ void application_init(void)
     /* ── 步骤 2: NVS Flash ─────────────────────────────────────────────────── */
     bsp_board_nvs_init(bsp_board);
     PRINT_INTERNAL_HEAP;
+    /* ── 步骤 5: WiFi（阻塞直至获取 IP 或彻底失败后重启）─────────────────── */
+    bsp_board_wifi_main(bsp_board);
+    PRINT_INTERNAL_HEAP;
 
     /* ── 步骤 3: 音频硬件 + 采集任务 ──────────────────────────────────────── */
     audio_init(bsp_board);
@@ -173,10 +176,6 @@ void application_init(void)
     /* ── 步骤 4: 唤醒词引擎 ────────────────────────────────────────────────── */
     wake_word_init(wake_word_callback);
     wake_word_start(); /* BUG-024 修复：显式启动，不依赖隐式启动 */
-    PRINT_INTERNAL_HEAP;
-
-    /* ── 步骤 5: WiFi（阻塞直至获取 IP 或彻底失败后重启）─────────────────── */
-    bsp_board_wifi_main(bsp_board);
     PRINT_INTERNAL_HEAP;
 
     /* ── 步骤 6: MQTT 客户端 ───────────────────────────────────────────────── */
@@ -195,6 +194,9 @@ void application_init(void)
     }
     PRINT_INTERNAL_HEAP;
 
+    bsp_board_lcd_init(bsp_board); // LCD 初始化（当前未自动置位 LCD_BIT，后续可根据需求调整）
+    PRINT_INTERNAL_HEAP;
+    bsp_board_lcd_on(bsp_board);
     /* ── 步骤 10: 情绪交互管理器（情绪矩阵 + worker task，栈在 SPIRAM）────── */
     ret = interaction_manager_init();
     if (ret != ESP_OK)
@@ -234,11 +236,11 @@ void application_init(void)
         ESP_LOGE(TAG, "touch_dispatch_task 创建失败");
     }
     PRINT_INTERNAL_HEAP;
+    ESP_LOGI(TAG, "触摸链路: 铜箔 → touch_scan → queue → touch_dispatch → interaction_worker → 舵机/震动/表情/音效");
 
     /* ── 步骤 7: 会话模块（WebSocket 预连接）─────────────────────────────── */
     session_init("ws://122.224.191.2:4888/ws/voice");
     PRINT_INTERNAL_HEAP;
 
     ESP_LOGI(TAG, "application_init 完成，系统就绪");
-    ESP_LOGI(TAG, "触摸链路: 铜箔 → touch_scan → queue → touch_dispatch → interaction_worker → 舵机/震动/表情/音效");
 }
