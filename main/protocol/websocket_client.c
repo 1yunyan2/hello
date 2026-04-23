@@ -343,13 +343,13 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
             cJSON *type = cJSON_GetObjectItem(root, "type");
             if (cJSON_IsString(type))
             {
-                if (strcmp(type->valuestring, "started") == 0)
+                if (strcmp(type->valuestring, "started") == 0) // 当收到服务端的 start 响应时，type 字段是 "started"
                     protocol_hello_handler(protocol, root);
-                else if (strcmp(type->valuestring, "llm") == 0)
+                else if (strcmp(type->valuestring, "llm") == 0) // 假设服务端发情感状态的 type 字段是 "llm"
                     protocol_llm_handler(protocol, root);
                 // else if (strcmp(type->valuestring, "stt") == 0)
                 //     protocol_stt_handler(protocol, root);
-                else if (strcmp(type->valuestring, "tts") == 0)
+                else if (strcmp(type->valuestring, "tts") == 0) // 假设服务端发 TTS 状态的 type 字段是 "tts"
                     protocol_tts_handler(protocol, root);
                 //  兼容你服务端的 tts_start
                 else if (strcmp(type->valuestring, "tts_start") == 0)
@@ -438,7 +438,7 @@ protocol_t *protocol_create(const char *url, const char *token)
         // 若需要开启，必须先确认服务端已实现 pong 响应，再取消下面两行注释。
         // .ping_interval_sec = 20,
         // .pingpong_timeout_sec = 10,
-        .buffer_size = 8192,        //! 增加了缓存，防止接收数据过大 默认接收缓冲区大小是 1024 字节
+        .buffer_size = 8192, //! 增加了缓存，防止接收数据过大 默认接收缓冲区大小是 1024 字节
     };
 
     /* 初始化底层 WebSocket 客户端并注册事件回调 */
@@ -621,7 +621,7 @@ void protocol_send_audio_data(protocol_t *protocol, binary_data_t *data)
 void protocol_send_abort_speaking(protocol_t *protocol)
 {
     // protocol_send_text(protocol, "{\"reason\":\"wake_word_detected\",\"session_id\":\"%s\",\"type\":\"abort\"}", protocol->session_id ? protocol->session_id : "");
-    protocol_send_text(protocol, "{\"type\":\"stop\"}");
+    protocol_send_text(protocol, "{\"type\":\"cancel\"}");
 }
 
 /**

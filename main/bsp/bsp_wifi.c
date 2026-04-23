@@ -241,7 +241,10 @@ static esp_err_t custom_prov_data_handler(uint32_t session_id,
     ESP_LOGI(TAG, "Token 已永久写入 NVS！");
 
     // ── 步骤 5：Token 保存成功后，主动停止配网广播 ────────────────────────────
-    // 让框架触发 WIFI_PROV_END 事件，解除 bsp_board_wifi_main() 中的阻塞等待
+    // wifi_prov_mgr_disable_auto_stop(3000) 保证本函数返回（App 收到 {status:OK} 响应）
+    // 之后 3000ms 才真正断开 BLE，避免原先"App 显示配网失败"的竞态问题。
+    // 不调此函数 → PROV_DONE_BIT 永远不置位 → bsp_board_wifi_main 阻塞 120s 后强制重启，
+    // session_init / audio_init 等后续所有初始化永远不执行（偶发"写 NVS 成功后卡死"根因）。
     wifi_prov_mgr_stop_provisioning();
 
     // ── 步骤 6：释放资源 ───────────────────────────────────────────────────────

@@ -114,7 +114,7 @@ bool protocol_is_connected(protocol_t *protocol);
 void protocol_send_hello(protocol_t *protocol);
 
 /**
- * @brief 发送打断 TTS 指令
+ * @brief 发送打断/结束会话 TTS 指令
  * @param[in] protocol 实例句柄
  * @return 无
  * @note 调用者：session.c -> session_on_wake_word()

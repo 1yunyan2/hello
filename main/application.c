@@ -65,7 +65,60 @@ static const struct
 #define TOUCH_EMOTION_MAP_SIZE (sizeof(s_touch_emotion_map) / sizeof(s_touch_emotion_map[0]))
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 2. 唤醒词回调
+// 2. 唤醒提示音
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── 唤醒提示音 ───────────────────────────────────────────────────────────
+// 880Hz 方波，持续 300ms，通过 ES8311 DAC 输出到扬声器
+// 方波生成无需浮点运算，在 ESP32-S3 上 CPU 占用极低
+static void play_wake_tone(void)
+{
+    bsp_board_t *board = bsp_board_get_instance();
+    // Codec 设备必须已初始化（audio_init 完成后才调用此函数，正常不会为 NULL）
+    if (!board || !board->codec_dev)
+        return;
+
+    // 音调参数
+    const int sample_rate = 16000;  // 16kHz采样率
+    const int freq_hz = 880;        // 880Hz = 音乐 A5，清脆易辨
+    const int duration_ms = 300;    // 持续 300ms，简短提示
+    const int16_t amplitude = 8000; // 幅度（0~32767，8000 约为 24% 满幅，适中音量）
+
+    // 计算方波半周期采样点数：half_period = 采样率 / 频率 / 2
+    // 880Hz → 半周期 = 16000 / 880 / 2 ≈ 9 个采样点
+    const int half_period = sample_rate / freq_hz / 2;
+    const int total_samples = sample_rate * duration_ms / 1000; // = 4800 个采样点
+
+// 使用栈上小缓冲区分块写入，避免 heap 分配大块内存
+#define TONE_CHUNK 256
+    int16_t buf[TONE_CHUNK];
+    int written = 0; // 已生成的采样点计数
+    int phase = 0;   // 方波相位计数（0~2×half_period 循环）
+
+    while (written < total_samples)
+    {
+        // 本次写入的采样点数（最后一块可能不满 TONE_CHUNK）
+        int n = total_samples - written;
+        if (n > TONE_CHUNK)
+            n = TONE_CHUNK;
+
+        // 生成方波：前半周期为正幅度，后半周期为负幅度
+        for (int i = 0; i < n; i++)
+        {
+            buf[i] = (phase < half_period) ? amplitude : -amplitude;
+            // 相位推进并循环归零
+            if (++phase >= half_period * 2)
+                phase = 0;
+        }
+
+        // 将 PCM 数据写入 Codec TX 通道（阻塞直到 DMA 接收完本块数据）
+        esp_codec_dev_write(board->codec_dev, buf, n * sizeof(int16_t));
+        written += n;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 3. 唤醒词回调
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
@@ -76,11 +129,15 @@ static const struct
 static void wake_word_callback(const char *wake_word_display)
 {
     ESP_LOGW("WAKE_UP", "唤醒词触发: [%s]", wake_word_display);
+
+    // 播放 880Hz 提示音给用户听觉反馈
+    play_wake_tone();
+
     session_on_wake_word(wake_word_display);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 3. 触摸任务（BSP 扫描 + 应用层 dispatch）
+// 4. 触摸任务（BSP 扫描 + 应用层 dispatch）
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
@@ -133,7 +190,7 @@ static void touch_dispatch_task(void *arg)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 4. 应用主初始化序列
+// 5. 应用主初始化序列
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
@@ -182,64 +239,64 @@ void application_init(void)
     protocol_mqtt_start();
     PRINT_INTERNAL_HEAP;
 
-    /* ── 步骤 8: 舵机硬件初始化（LEDC/PWM）──────────────────────────────── */
-    bsp_board_servo_init(bsp_board);
-    PRINT_INTERNAL_HEAP;
+    // /* ── 步骤 8: 舵机硬件初始化（LEDC/PWM）──────────────────────────────── */
+    // bsp_board_servo_init(bsp_board);
+    // PRINT_INTERNAL_HEAP;
 
-    /* ── 步骤 9: 舵机管理器（队列 + worker task，栈在 SPIRAM）─────────────── */
-    esp_err_t ret = servo_manager_init();
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "servo_manager_init 失败: %s", esp_err_to_name(ret));
-    }
-    PRINT_INTERNAL_HEAP;
+    // /* ── 步骤 9: 舵机管理器（队列 + worker task，栈在 SPIRAM）─────────────── */
+    // esp_err_t ret = servo_manager_init();
+    // if (ret != ESP_OK)
+    // {
+    //     ESP_LOGE(TAG, "servo_manager_init 失败: %s", esp_err_to_name(ret));
+    // }
+    // PRINT_INTERNAL_HEAP;
 
-    bsp_board_lcd_init(bsp_board); // LCD 初始化（当前未自动置位 LCD_BIT，后续可根据需求调整）
-    PRINT_INTERNAL_HEAP;
-    bsp_board_lcd_on(bsp_board);
-    /* ── 步骤 10: 情绪交互管理器（情绪矩阵 + worker task，栈在 SPIRAM）────── */
-    ret = interaction_manager_init();
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "interaction_manager_init 失败: %s", esp_err_to_name(ret));
-    }
-    PRINT_INTERNAL_HEAP;
+    // bsp_board_lcd_init(bsp_board); // LCD 初始化（当前未自动置位 LCD_BIT，后续可根据需求调整）
+    // PRINT_INTERNAL_HEAP;
+    // bsp_board_lcd_on(bsp_board);
+    // /* ── 步骤 10: 情绪交互管理器（情绪矩阵 + worker task，栈在 SPIRAM）────── */
+    // ret = interaction_manager_init();
+    // if (ret != ESP_OK)
+    // {
+    //     ESP_LOGE(TAG, "interaction_manager_init 失败: %s", esp_err_to_name(ret));
+    // }
+    // PRINT_INTERNAL_HEAP;
 
-    /* ── 步骤 11: 触摸扫描任务（BSP 层，仅入队，不含 UI 逻辑）─────────────── */
-    BaseType_t task_ret = xTaskCreatePinnedToCoreWithCaps(
-        touch_scan_wrapper, /* 包装函数（解决类型兼容） */
-        "touch_scan",       /* 任务名 */
-        4096,               /* 栈大小（SPIRAM） */
-        bsp_board,          /* 参数：bsp 实例 */
-        4,                  /* 优先级：低于音频(7)和 session(5)，略低于 interaction(5) */
-        NULL,
-        tskNO_AFFINITY,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (task_ret != pdPASS)
-    {
-        ESP_LOGE(TAG, "touch_scan_task 创建失败");
-    }
-    PRINT_INTERNAL_HEAP;
+    // /* ── 步骤 11: 触摸扫描任务（BSP 层，仅入队，不含 UI 逻辑）─────────────── */
+    // BaseType_t task_ret = xTaskCreatePinnedToCoreWithCaps(
+    //     touch_scan_wrapper, /* 包装函数（解决类型兼容） */
+    //     "touch_scan",       /* 任务名 */
+    //     4096,               /* 栈大小（SPIRAM） */
+    //     bsp_board,          /* 参数：bsp 实例 */
+    //     4,                  /* 优先级：低于音频(7)和 session(5)，略低于 interaction(5) */
+    //     NULL,
+    //     tskNO_AFFINITY,
+    //     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    // if (task_ret != pdPASS)
+    // {
+    //     ESP_LOGE(TAG, "touch_scan_task 创建失败");
+    // }
+    // PRINT_INTERNAL_HEAP;
 
-    /* ── 步骤 12: 触摸事件分发任务（application 层策略，映射触摸→情绪）───── */
-    task_ret = xTaskCreatePinnedToCoreWithCaps(
-        touch_dispatch_task,
-        "touch_dispatch",
-        2048, /* 栈小（只做查表+入队，无深调用链） */
-        NULL,
-        4, /* 与 touch_scan 同优先级 */
-        NULL,
-        tskNO_AFFINITY,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (task_ret != pdPASS)
-    {
-        ESP_LOGE(TAG, "touch_dispatch_task 创建失败");
-    }
-    PRINT_INTERNAL_HEAP;
-    ESP_LOGI(TAG, "触摸链路: 铜箔 → touch_scan → queue → touch_dispatch → interaction_worker → 舵机/震动/表情/音效");
+    // /* ── 步骤 12: 触摸事件分发任务（application 层策略，映射触摸→情绪）───── */
+    // task_ret = xTaskCreatePinnedToCoreWithCaps(
+    //     touch_dispatch_task,
+    //     "touch_dispatch",
+    //     2048, /* 栈小（只做查表+入队，无深调用链） */
+    //     NULL,
+    //     4, /* 与 touch_scan 同优先级 */
+    //     NULL,
+    //     tskNO_AFFINITY,
+    //     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    // if (task_ret != pdPASS)
+    // {
+    //     ESP_LOGE(TAG, "touch_dispatch_task 创建失败");
+    // }
+    // PRINT_INTERNAL_HEAP;
+    // ESP_LOGI(TAG, "触摸链路: 铜箔 → touch_scan → queue → touch_dispatch → interaction_worker → 舵机/震动/表情/音效");
 
     /* ── 步骤 7: 会话模块（WebSocket 预连接）─────────────────────────────── */
-    session_init("ws://122.224.191.2:4888/ws/voice");
+    session_init("ws://122.224.191.2:4888/ws/omni");
     PRINT_INTERNAL_HEAP;
 
     ESP_LOGI(TAG, "application_init 完成，系统就绪");

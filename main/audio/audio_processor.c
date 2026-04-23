@@ -248,6 +248,16 @@ audio_processor_t *audio_processor_create(void)
  */
 void audio_processor_destroy(audio_processor_t *audio_processor)
 {
+    // play_task 超时仍未退出：强制终止，确保所有内存被释放，不留内存泄漏。
+    // audio_processor_stop 已等待 2s；到此仍未退出属于 I2S 硬件异常，
+    // 强制删除虽然会丢失末尾音频，但总好过每次会话 ~272KB PSRAM 永久泄漏。
+    if (audio_processor->play_task_handle != NULL)
+    {
+        ESP_LOGW("AUDIO_PROC", "play_task 超时未退出，强制终止以释放内存");
+        vTaskDelete(audio_processor->play_task_handle);
+        audio_processor->play_task_handle = NULL;
+    }
+
     vRingbufferDelete(audio_processor->enc_input);
     vRingbufferDelete(audio_processor->enc_output);
     vRingbufferDelete(audio_processor->dec_input);
@@ -258,6 +268,7 @@ void audio_processor_destroy(audio_processor_t *audio_processor)
     audio_decoder_destroy(audio_processor->decoder);
 
     free(audio_processor);
+    PRINT_MEM_INFO(TAG, "音频处理器销毁后（ringbuf+编解码器均已释放）");
 }
 
 // ─── 公开 API：启停控制 ────────────────────────────────────────────────────
@@ -278,6 +289,7 @@ void audio_processor_start(audio_processor_t *audio_processor)
                                     AUDIO_PROCESSOR_TASK_PRIORITY,
                                     &audio_processor->play_task_handle,
                                     AUDIO_PROCESSOR_TASK_CORE_ID, MALLOC_CAP_SPIRAM);
+    PRINT_MEM_INFO(TAG, "音频处理器启动后（编解码+播放任务均已创建）");
 }
 
 /**
@@ -372,16 +384,18 @@ void audio_processor_write(audio_processor_t *audio_processor, void *buffer, siz
     if (audio_processor == NULL || audio_processor->dec_input == NULL)
         return;
 
-    // ✅ 核心修复：绝对不能丢帧！大模型语速快，扬声器播得慢。
-    // 用 while 循环等待扬声器消化缓冲，保证十几秒的语音一字不漏！
-    while (audio_processor->is_running)
+    // 不能用 portMAX_DELAY：WS 事件回调如果永久阻塞，STT/TTS_STOP 等控制帧全部收不到。
+    // 最多重试 30 次（共 3 秒）：3 秒内扬声器仍无法消化则放弃本帧并告警，
+    // 避免会话死锁，代价是极端 I2S 卡顿时轻微音频丢失。
+    int retry = 0;
+    while (audio_processor->is_running && retry < 30)
     {
         if (xRingbufferSend(audio_processor->dec_input, buffer, size, pdMS_TO_TICKS(100)) == pdTRUE)
-        {
-            break; // 写入成功，跳出循环接下一帧
-        }
-        // 如果 100ms 还没写进去，不会丢弃，而是继续下一轮 while 等待
+            break;
+        retry++;
     }
+    if (retry >= 30)
+        ESP_LOGW("AUDIO_PROC", "dec_input 持续满载 3s，丢弃 %d 字节 TTS 帧", (int)size);
 }
 /**
  * @brief 清空解码器输入和输出缓冲区

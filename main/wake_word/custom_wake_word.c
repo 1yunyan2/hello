@@ -446,7 +446,22 @@ esp_err_t wake_word_init(wake_word_detected_cb_t cb)
         buffer_mutex = NULL;
         return ESP_FAIL;
     }
-
+    /***
+     *
+     *
+     *
+     *
+     *
+     *
+     *
+     *
+     *
+     *
+     *
+     *
+     *
+     *
+     */
     // 精确控制各子模块开关
     afe_cfg->wakenet_init = false;             // 不用 WakeNet，MultiNet 做唤醒词
     afe_cfg->aec_init = true;                  // ★ 开启 AEC 回声消除（需要 "MR" 格式参考信号）
@@ -886,8 +901,12 @@ static void multinet_detect_task(void *arg)
 
         TickType_t wait_time = (input_buffer_len >= (size_t)mn_chunksize) ? 0 : pdMS_TO_TICKS(100);
 
+        // 根本原因修复：s_mn_pcm_buf 是 BYTEBUF 类型，xRingbufferReceive 会把积压的所有数据
+        // 一次性返回。当 detect 任务落后时，一次返回可超过 AUDIO_BUFFER_MAX，触发 overflow。
+        // 改用 ReceiveUpTo 限制每次最多读 mn_chunksize 个采样，确保 input_buffer 不被撑爆。
+        size_t max_recv = ((size_t)mn_chunksize > 0) ? (size_t)mn_chunksize * sizeof(int16_t) : 1024;
         size_t recv_size = 0;
-        void *item = xRingbufferReceive(s_mn_pcm_buf, &recv_size, wait_time);
+        void *item = xRingbufferReceiveUpTo(s_mn_pcm_buf, &recv_size, wait_time, max_recv);
 
         if (item != NULL)
         {
