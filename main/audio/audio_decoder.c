@@ -46,8 +46,9 @@ struct audio_decoder
     int sample_rate; ///< 采样率（Hz），用于计算 PCM 输出缓冲区大小
     int channels;    ///< 声道数
 
-    bool is_running;          ///< 任务运行标志：false 时解码主循环退出
-    volatile bool drain_done; ///< 排水完成标志：主循环退出后排完 dec_input 剩余帧后置 true
+    bool is_running;                   ///< 任务运行标志：false 时解码主循环退出
+    volatile bool drain_done;          ///< 排水完成标志：主循环退出后排完 dec_input 剩余帧后置 true
+    volatile TaskHandle_t task_handle; ///< 任务句柄，用于超时强制终止和确认退出
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -198,8 +199,9 @@ void audio_decoder_task(void *arg)
     // 通知 audio_decoder_stop() 排水完成，可以停止 play_task
     audio_decoder->drain_done = true;
 
-    // ── 任务退出：释放 PCM 输出缓冲区，自删除 ────────────────────────────────
+    // ── 任务退出：释放 PCM 输出缓冲区，清空句柄，自删除 ──────────────────────
     free(out_buffer);
+    audio_decoder->task_handle = NULL; // 通知 stop() 任务已安全退出
     vTaskDelete(NULL);
 }
 
@@ -306,14 +308,14 @@ void audio_decoder_start(audio_decoder_t *audio_decoder)
 
     // ── 创建解码任务（栈分配在 SPIRAM）───────────────────────────────────────
     xTaskCreatePinnedToCoreWithCaps(
-        audio_decoder_task,            // 任务函数
-        "decoder_task",                // 任务名称
-        AUDIO_DECODER_TASK_STACK_SIZE, // 栈大小：32KB
-        audio_decoder,                 // 任务参数：解码器实例指针
-        AUDIO_DECODER_TASK_PRIORITY,   // 优先级：5
-        NULL,                          // 不保存任务句柄
-        AUDIO_DECODER_TASK_CORE_ID,    // 绑定核心：CPU0
-        MALLOC_CAP_SPIRAM);            // 栈内存来源：外部 SPIRAM
+        audio_decoder_task,                          // 任务函数
+        "decoder_task",                              // 任务名称
+        AUDIO_DECODER_TASK_STACK_SIZE,               // 栈大小：32KB
+        audio_decoder,                               // 任务参数：解码器实例指针
+        AUDIO_DECODER_TASK_PRIORITY,                 // 优先级：5
+        (TaskHandle_t *)&audio_decoder->task_handle, // 保存句柄，用于超时强制终止
+        AUDIO_DECODER_TASK_CORE_ID,                  // 绑定核心：CPU0
+        MALLOC_CAP_SPIRAM);                          // 栈内存来源：外部 SPIRAM
 }
 
 /**
@@ -325,11 +327,11 @@ void audio_decoder_start(audio_decoder_t *audio_decoder)
  */
 void audio_decoder_stop(audio_decoder_t *audio_decoder)
 {
-    // 清除运行标志：主循环在当前 portMAX_DELAY 完成后检测到 is_running=false 退出
+    // 清除运行标志：主循环在当前 xRingbufferReceive 超时后检测到 is_running=false 退出
     audio_decoder->is_running = false;
 
     // 等待排水完成（最多 30 秒）：
-    //   解码器退出主循环后会进入排水阶段，把 dec_input 剩余帧全部写入 dec_output，
+    //   解码器退出主循环后进入排水阶段，把 dec_input 剩余帧全部写入 dec_output，
     //   drain_done 置 true 后才返回，play_task 随后播完所有积压的 PCM。
     // 若用户打断（audio_processor_flush_output 已清空 dec_input），排水立即完成。
     for (int i = 0; i < 300 && !audio_decoder->drain_done; i++)
@@ -337,4 +339,16 @@ void audio_decoder_stop(audio_decoder_t *audio_decoder)
 
     if (!audio_decoder->drain_done)
         ESP_LOGW(TAG, "解码器排水超时（30s），可能丢失末尾音频");
+
+    // 等待任务完全退出（drain_done=true 后任务还需 free+vTaskDelete，约几毫秒）
+    for (int i = 0; i < 10 && audio_decoder->task_handle != NULL; i++)
+        vTaskDelay(pdMS_TO_TICKS(20));
+
+    // 超时仍未退出：强制终止，防止 SPIRAM 栈永久泄漏（32KB per session）
+    if (audio_decoder->task_handle != NULL)
+    {
+        ESP_LOGW(TAG, "解码任务超时未退出，强制终止以释放 SPIRAM 栈");
+        vTaskDelete(audio_decoder->task_handle);
+        audio_decoder->task_handle = NULL;
+    }
 }

@@ -331,42 +331,110 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
         /* opcode 0x01 = Text Frame → JSON 控制消息 */
         if (data->op_code == 0x01)
         {
-            ESP_LOGI(TAG, "收到文本帧: %.*s", data->data_len, data->data_ptr);
-            cJSON *root = cJSON_ParseWithLength(data->data_ptr, data->data_len);
-            if (!root)
+            // 🟢 实现文本消息重组逻辑，处理分片的JSON消息
+            static char *s_text_rx_buf = NULL;
+            static int s_text_rx_offset = 0;
+            static int s_text_rx_total_len = 0;
+
+            // 如果是新消息的开始（payload_offset == 0），重置缓冲区
+            if (data->payload_offset == 0)
             {
-                ESP_LOGW(TAG, "JSON 解析失败");
+                // 释放之前的缓冲区（如果有）
+                if (s_text_rx_buf)
+                {
+                    free(s_text_rx_buf);
+                    s_text_rx_buf = NULL;
+                }
+                s_text_rx_offset = 0;
+                s_text_rx_total_len = data->payload_len;
+
+                // 分配足够的缓冲区来存储完整的消息
+                if (s_text_rx_total_len > 0)
+                {
+                    s_text_rx_buf = (char *)malloc(s_text_rx_total_len + 1); // +1 for null terminator
+                    if (!s_text_rx_buf)
+                    {
+                        ESP_LOGE(TAG, "内存分配失败，无法处理文本消息 (len=%d)", s_text_rx_total_len);
+                        return;
+                    }
+                }
+            }
+
+            // 检查缓冲区是否已分配且不会溢出
+            if (s_text_rx_buf && s_text_rx_offset + data->data_len <= s_text_rx_total_len)
+            {
+                memcpy(s_text_rx_buf + s_text_rx_offset, data->data_ptr, data->data_len);
+                s_text_rx_offset += data->data_len;
+            }
+            else
+            {
+                ESP_LOGW(TAG, "文本消息分片异常或缓冲区不足，丢弃消息");
+                if (s_text_rx_buf)
+                {
+                    free(s_text_rx_buf);
+                    s_text_rx_buf = NULL;
+                }
+                s_text_rx_offset = 0;
+                s_text_rx_total_len = 0;
                 return;
             }
 
-            /* 根据 type 字段路由到对应的消息处理器 */
-            cJSON *type = cJSON_GetObjectItem(root, "type");
-            if (cJSON_IsString(type))
+            // 如果收到了完整的消息
+            if (s_text_rx_offset >= s_text_rx_total_len && s_text_rx_total_len > 0)
             {
-                if (strcmp(type->valuestring, "started") == 0) // 当收到服务端的 start 响应时，type 字段是 "started"
-                    protocol_hello_handler(protocol, root);
-                else if (strcmp(type->valuestring, "llm") == 0) // 假设服务端发情感状态的 type 字段是 "llm"
-                    protocol_llm_handler(protocol, root);
-                // else if (strcmp(type->valuestring, "stt") == 0)
-                //     protocol_stt_handler(protocol, root);
-                else if (strcmp(type->valuestring, "tts") == 0) // 假设服务端发 TTS 状态的 type 字段是 "tts"
-                    protocol_tts_handler(protocol, root);
-                //  兼容你服务端的 tts_start
-                else if (strcmp(type->valuestring, "tts_start") == 0)
-                    protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_TTS_START, NULL);
-                //  兼容你服务端的 tts_end，这会触发上面我们刚写的方案A关机！
-                else if (strcmp(type->valuestring, "tts_end") == 0)
-                    protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_TTS_STOP, NULL);
-                else if (strcmp(type->valuestring, "iot") == 0)
-                    protocol_iot_handler(protocol, root);
-                else if (strcmp(type->valuestring, "error") == 0)
-                    protocol_error_handler(protocol, root);
-                else if (strcmp(type->valuestring, "complete") == 0)
-                    protocol_complete_handler(protocol, root);
-                else if (strcmp(type->valuestring, "transcript") == 0)
-                    protocol_stt_handler(protocol, root); // 假设你的 stt_handler 是处理文字结果的
+                // 添加null终止符以便打印和解析
+                s_text_rx_buf[s_text_rx_offset] = '\0';
+
+                ESP_LOGI(TAG, "收到文本帧: %s", s_text_rx_buf);
+                cJSON *root = cJSON_Parse(s_text_rx_buf);
+                if (!root)
+                {
+                    ESP_LOGW(TAG, "JSON 解析失败");
+                }
+                else
+                {
+                    /* 根据 type 字段路由到对应的消息处理器 */
+                    cJSON *type = cJSON_GetObjectItem(root, "type");
+                    if (cJSON_IsString(type))
+                    {
+                        if (strcmp(type->valuestring, "started") == 0) // 当收到服务端的 start 响应时，type 字段是 "started"
+                            protocol_hello_handler(protocol, root);
+                        else if (strcmp(type->valuestring, "llm") == 0) // 假设服务端发情感状态的 type 字段是 "llm"
+                            protocol_llm_handler(protocol, root);
+                        // else if (strcmp(type->valuestring, "stt") == 0)
+                        //     protocol_stt_handler(protocol, root);
+                        else if (strcmp(type->valuestring, "tts") == 0) // 假设服务端发 TTS 状态的 type 字段是 "tts"
+                            protocol_tts_handler(protocol, root);
+                        //  兼容你服务端的 tts_start
+                        else if (strcmp(type->valuestring, "tts_start") == 0)
+                            protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_TTS_START, NULL);
+                        //  兼容你服务端的 tts_end，这会触发上面我们刚写的方案A关机！
+                        else if (strcmp(type->valuestring, "tts_end") == 0)
+                            protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_TTS_STOP, NULL);
+                        else if (strcmp(type->valuestring, "iot") == 0)
+                            protocol_iot_handler(protocol, root);
+                        else if (strcmp(type->valuestring, "error") == 0)
+                            protocol_error_handler(protocol, root);
+                        else if (strcmp(type->valuestring, "complete") == 0)
+                            protocol_complete_handler(protocol, root);
+                        else if (strcmp(type->valuestring, "transcript") == 0)
+                            protocol_stt_handler(protocol, root); // 假设你的 stt_handler 是处理文字结果的
+                    }
+                    cJSON_Delete(root);
+                }
+
+                // 清理缓冲区，准备接收下一条消息
+                free(s_text_rx_buf);
+                s_text_rx_buf = NULL;
+                s_text_rx_offset = 0;
+                s_text_rx_total_len = 0;
             }
-            cJSON_Delete(root);
+            else
+            {
+                // 还未收到完整消息，只打印当前分片用于调试
+                ESP_LOGI(TAG, "收到文本帧分片: %.*s", data->data_len, data->data_ptr);
+            }
+            return;
         }
         break;
 

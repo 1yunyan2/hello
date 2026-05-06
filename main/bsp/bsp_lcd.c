@@ -95,6 +95,7 @@ void bsp_board_lcd_init(bsp_board_t *bsp_board)
     // ── 步骤 9：关闭显示（等待上层主动调用 bsp_board_lcd_on() 开启）────────
     // 初始化完成但不立即显示，让上层决定何时打开（可以先准备好画面再开背光）
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(bsp_board->lcd_panel, false));
+    xEventGroupSetBits(bsp_board->board_status, LCD_BIT); // 置位 LCD_BIT，通知其他模块 LCD 已就绪
 }
 
 /**

@@ -27,10 +27,11 @@
  */
 struct audio_encoder
 {
-    RingbufHandle_t input_buffer;  ///< 输入缓冲区：接收来自 AFE 降噪后的 PCM 数据
-    RingbufHandle_t output_buffer; ///< 输出缓冲区：存放编码完成的 OPUS 帧
-    esp_audio_enc_handle_t enc;    ///< OPUS 编码器句柄（esp_audio_codec 框架管理）
-    bool is_running;               ///< 任务运行标志：false 时编码循环退出，任务自删除
+    RingbufHandle_t input_buffer;      ///< 输入缓冲区：接收来自 AFE 降噪后的 PCM 数据
+    RingbufHandle_t output_buffer;     ///< 输出缓冲区：存放编码完成的 OPUS 帧
+    esp_audio_enc_handle_t enc;        ///< OPUS 编码器句柄（esp_audio_codec 框架管理）
+    bool is_running;                   ///< 任务运行标志：false 时编码循环退出，任务自删除
+    volatile TaskHandle_t task_handle; ///< 任务句柄，用于超时强制终止和确认退出
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -168,9 +169,10 @@ void audio_encoder_task(void *arg)
         taskYIELD(); // 主动让步，防止偶发编码耗时拉满 CPU0 饿死同核任务
     }
 
-    // ── 任务退出：释放帧缓冲区，自删除 ──────────────────────────────────────
+    // ── 任务退出：释放帧缓冲区，清空句柄，自删除 ─────────────────────────────
     free(in_frame.buffer);
     free(out_frame.buffer);
+    audio_encoder->task_handle = NULL; // 通知 stop() 任务已安全退出
     vTaskDelete(NULL);
 }
 
@@ -286,17 +288,20 @@ void audio_encoder_start(audio_encoder_t *audio_encoder)
 
     // ── 创建编码任务（栈分配在 SPIRAM，节省内部 SRAM）───────────────────────
     BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(
-        audio_encoder_task,            // 任务函数
-        "encoder_task",                // 任务名称
-        AUDIO_ENCODER_TASK_STACK_SIZE, // 栈大小：32KB
-        audio_encoder,                 // 任务参数：编码器实例指针
-        AUDIO_ENCODER_TASK_PRIORITY,   // 优先级：5
-        NULL,                          // 不保存任务句柄（任务由 is_running 控制退出）
-        AUDIO_ENCODER_TASK_CORE_ID,    // 绑定核心：CPU0
-        MALLOC_CAP_SPIRAM);            // 栈内存来源：外部 SPIRAM
+        audio_encoder_task,                          // 任务函数
+        "encoder_task",                              // 任务名称
+        AUDIO_ENCODER_TASK_STACK_SIZE,               // 栈大小：32KB
+        audio_encoder,                               // 任务参数：编码器实例指针
+        AUDIO_ENCODER_TASK_PRIORITY,                 // 优先级：5
+        (TaskHandle_t *)&audio_encoder->task_handle, // 保存句柄，用于超时强制终止
+        AUDIO_ENCODER_TASK_CORE_ID,                  // 绑定核心：CPU0
+        MALLOC_CAP_SPIRAM);                          // 栈内存来源：外部 SPIRAM
 
     if (ret != pdPASS)
+    {
         ESP_LOGE(TAG, "编码任务创建失败（内存不足或参数错误）");
+        audio_encoder->task_handle = NULL;
+    }
 }
 
 /**
@@ -312,7 +317,15 @@ void audio_encoder_stop(audio_encoder_t *audio_encoder)
     // 清除运行标志：任务在下次 xRingbufferReceiveUpTo 超时（100ms）后检测到并退出
     audio_encoder->is_running = false;
 
-    // 等待 200ms：确保任务完成当前帧的处理并安全退出
-    // （100ms 读超时 + 50ms 编码耗时 + 50ms 余量）
-    vTaskDelay(pdMS_TO_TICKS(200));
+    // 等待任务自然退出（最多 400ms：100ms 读超时 + 编码耗时 + 余量）
+    for (int i = 0; i < 20 && audio_encoder->task_handle != NULL; i++)
+        vTaskDelay(pdMS_TO_TICKS(20));
+
+    // 超时仍未退出：强制终止，防止 SPIRAM 栈永久泄漏（32KB per session）
+    if (audio_encoder->task_handle != NULL)
+    {
+        ESP_LOGW(TAG, "编码任务超时未退出，强制终止以释放 SPIRAM 栈");
+        vTaskDelete(audio_encoder->task_handle);
+        audio_encoder->task_handle = NULL;
+    }
 }

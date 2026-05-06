@@ -268,6 +268,10 @@ void audio_processor_destroy(audio_processor_t *audio_processor)
     audio_decoder_destroy(audio_processor->decoder);
 
     free(audio_processor);
+    // 给 CPU0 的 IDLE 任务留出 100ms 时间，让其释放已 vTaskDelete 但尚未清理的
+    // SPIRAM 任务栈（encoder 32KB + decoder 32KB + play 4KB），
+    // 确保内存快照反映真实的 PSRAM 剩余量，而非快照时序偏差导致的虚假"泄漏"。
+    vTaskDelay(pdMS_TO_TICKS(100));
     PRINT_MEM_INFO(TAG, "音频处理器销毁后（ringbuf+编解码器均已释放）");
 }
 
