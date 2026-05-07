@@ -8,7 +8,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
-
+extern void apppp_main(void);
 /**
  * @brief ESP-IDF 程序入口
  * 系统启动后由 FreeRTOS 主任务调用，所有业务逻辑在 application_init() 中展开
@@ -24,8 +24,8 @@ void app_main(void)
         ESP_LOGE("BOOT", "PSRAM异常(仅%u字节可用)，自动重启以完成初始化", (unsigned)psram_free);
         esp_restart();
     }
-
     application_init();
+    // apppp_main();
     while (1)
     {
         vTaskDelay(pdMS_TO_TICKS(1000));

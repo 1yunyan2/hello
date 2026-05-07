@@ -208,22 +208,8 @@ void audio_init(bsp_board_t *bsp_board);
  */
 void audio_feed_task(void *arg);
 
-// ─── 公开 API：LCD 显示控制 ───────────────────────────────────────────────────
+// ─── 公开 API：音频初始化 ─────────────────────────────────────────────────────
 
-/**
- * @brief 初始化 LCD 显示屏（SPI 总线 + ST7789 驱动）
- *
- * 内部步骤：
- *   1. 配置背光 GPIO（初始关闭）
- *   2. 初始化 SPI2 总线（80MHz，DMA 自动）
- *   3. 创建 SPI LCD 通信接口（DC/CS/80MHz）
- *   4. 初始化 ST7789 面板驱动（240×320，RGB565，颜色反转）
- *   5. 复位并初始化面板（关闭显示，等待上层主动开启）
- *
- * @param bsp_board BSP 实例指针，lcd_io/lcd_panel 字段由此函数填充
- *
- * @note 调用者：application.c（当前注释掉，LCD 功能预留）
- */
 void bsp_board_lcd_init(bsp_board_t *bsp_board);
 
 /**
@@ -248,7 +234,6 @@ void bsp_board_lcd_on(bsp_board_t *bsp_board);
  */
 void bsp_board_lcd_off(bsp_board_t *bsp_board);
 
-void touch_scan_task(bsp_board_t *pvParameters);
 // ========== 3. 在 API 声明区添加 ==========
 /**
  * @brief 初始化躯体三轴舵机
@@ -264,6 +249,15 @@ void bsp_board_servo_init(bsp_board_t *bsp_board);
  */
 void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms);
 
+/**
+ * @brief 三轴舵机同时平滑运动到各自目标（并行插值，不割裂）
+ * @param head_target  头部目标角度
+ * @param larm_target  左臂目标角度
+ * @param rarm_target  右臂目标角度
+ * @param step_ms      最长轴每步延时，对应 SERVO_SPEED_xxx
+ */
+void bsp_servo_move_all_parallel(float head_target, float larm_target, float rarm_target, uint32_t step_ms);
+
 // ─── 7. 触摸事件与接口 (整合自 bsp_touch.h) ───────────────────────────────
 
 /**
@@ -272,33 +266,48 @@ void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms);
 typedef enum
 {
     TOUCH_EVENT_NONE = 0,
-    // 单位置触摸
+    // 单位置触摸（仅短按 1s，按住释放后才触发；参与组合时不触发）
     TOUCH_EVENT_SHORT_HEAD,    // 头部短按
     TOUCH_EVENT_SHORT_ABDOMEN, // 腹部短按
     TOUCH_EVENT_SHORT_BACK,    // 背部短按
-    TOUCH_EVENT_LONG_HEAD,     // 头部长按
-    TOUCH_EVENT_LONG_ABDOMEN,  // 腹部长按
-    TOUCH_EVENT_LONG_BACK,     // 背部长按
-    // 双位置组合触摸（对应你的表格）
+    // 双位置组合触摸
     TOUCH_EVENT_COMBO_HEAD_ABDOMEN, // 头部+腹部同时按
     TOUCH_EVENT_COMBO_HEAD_BACK,    // 头部+背部同时按
-    TOUCH_EVENT_COMBO_ABDOMEN_BACK  // 腹部+背部同时按
+    TOUCH_EVENT_COMBO_ABDOMEN_BACK, // 腹部+背部同时按
+    // 翻页控制触摸（按住释放后触发：≥1s 翻页，≥3s 进入功能菜单）
+    TOUCH_EVENT_SHORT_PREV_PAGE, // 前一页：短按
+    TOUCH_EVENT_SHORT_NEXT_PAGE, // 后一页：短按
+    TOUCH_EVENT_LONG_PREV_PAGE,  // 前一页：长按 → 进入功能菜单
+    TOUCH_EVENT_LONG_NEXT_PAGE   // 后一页：长按 → 进入功能菜单
 } touch_event_t;
 
 /**
- * @brief 初始化触摸传感器和震动马达（touch_scan_task 内部自动调用）
+ * @brief 触摸扫描任务入口（由 app_main 创建）
+ * @param pvParameters BSP 实例指针（可选）
  */
-void bsp_touch_init(void);
+void touch_scan_task(void *pvParameters);
 
 /**
- * @brief 非阻塞读取一个触摸事件
- * @param out_event 输出事件类型
- * @return true=取到事件, false=队列为空
+ * @brief 非阻塞获取触摸事件（立即返回）
+ * @param out_event 输出触摸事件
+ * @return true 有事件，false 无事件
  */
 bool bsp_touch_get_event(touch_event_t *out_event);
 
 /**
- * @brief 震动马达单次 30ms 短脉冲（BSP 级触觉反馈）
- * 上层情绪震动模式由 interaction.c 独立管理，两者不冲突。
+ * @brief 震动马达单次脉冲（触觉反馈）
+ */
+void bsp_motor_pulse(void);
+
+/**
+ * @brief 初始化触摸控制器和震动马达（内部调用，无需手动执行）
+ * @note 由 touch_scan_task() 内部自动调用
+ */
+void bsp_touch_init(void);
+
+/**
+ * @brief 扫描触摸控制器（内部调用，无需手动执行）
+ * @note 由 touch_scan_task() 循环调用
+ * @note 扫描结果将写入 bsp_touch_get_event() 的输出参数
  */
 void bsp_motor_pulse(void);

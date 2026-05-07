@@ -6,3 +6,6 @@ cmake_minimum_required(VERSION 3.16)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(Echo)
+spiffs_create_partition_image(assets gif FLASH_IN_PROJECT)
+# 替换掉原来的 spiffs 指令
+# fatfs_create_spiflash_image(storage gif FLASH_IN_PROJECT)

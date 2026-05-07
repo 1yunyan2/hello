@@ -18,5 +18,10 @@ idf_component_register(SRCS
 "protocol/auth.c"
 "ui/interaction.c"
 "ui/reminder.c"
+"ui/ui_port.c"
+"ui/flash.c"
+"ui/games.c"
+"ui/font_cn_16.c"
+"test_wifi_time.c"
 INCLUDE_DIRS "."
 )

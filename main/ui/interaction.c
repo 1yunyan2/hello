@@ -19,13 +19,16 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
+#include "driver/i2s_std.h"
 #include "esp_heap_caps.h"
+#include "bsp/bsp_board.h"
+#include "ui/ui_port.h"
 
 static const char *TAG = "INTERACTION";
 
 // ─── Worker task 配置 ────────────────────────────────────────────────────────
 #define INTERACTION_QUEUE_LEN 8     ///< 最多缓存 4 个待执行情绪（超出时丢弃新请求）
-#define INTERACTION_TASK_STACK 4096 ///< worker 栈大小（含 vTaskDelay 调用链）
+#define INTERACTION_TASK_STACK 8192 ///< worker 栈大小（含音频/舵机调用链）
 #define INTERACTION_TASK_PRIO 5     ///< 优先级与 session 相当，略低于音频（7）
 
 static QueueHandle_t s_ia_queue = NULL; ///< 情绪 ID 队列
@@ -316,6 +319,51 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     }};
 
 // ==========================================
+// 3a. 方波 beep（I2S 占位音效，真实音频接入后删除）
+// ==========================================
+
+// 880Hz 方波，半周期采样数（16kHz 采样率：16000/880/2 ≈ 9）
+#define BEEP_HALF 9
+#define BEEP_FULL (BEEP_HALF * 2)
+
+/**
+ * @brief 通过 I2S TX 输出 300ms 880Hz 方波（立体声 16-bit PCM，16kHz）
+ */
+static void play_square_wave_beep(void)
+{
+    bsp_board_t *board = bsp_board_get_instance();
+    if (board == NULL || board->i2s_tx_handle == NULL)
+        return;
+
+    static const int16_t AMP = 0x1800; // ~37.5% 满幅
+    int16_t one_period[BEEP_FULL * 2]; // 一个完整周期，L+R 各 int16_t
+    for (int i = 0; i < BEEP_FULL; i++)
+    {
+        int16_t v = (i < BEEP_HALF) ? AMP : -AMP;
+        one_period[i * 2] = v;
+        one_period[i * 2 + 1] = v;
+    }
+
+    // 300ms × 16000 frames/s = 4800 frames
+    int total_frames = 16000 * 300 / 1000;
+    size_t bytes_written;
+    int sent = 0;
+    while (sent < total_frames)
+    {
+        int chunk = BEEP_FULL;
+        if (sent + chunk > total_frames)
+            chunk = total_frames - sent;
+        i2s_channel_write(board->i2s_tx_handle,
+                          one_period,
+                          chunk * 2 * sizeof(int16_t),
+                          &bytes_written,
+                          pdMS_TO_TICKS(200));
+        sent += chunk;
+    }
+    ESP_LOGI(TAG, "🔊 方波 beep 播放完毕");
+}
+
+// ==========================================
 // 3. 震动马达控制（私有）
 //    使用 BSP_MOTOR_VIB_PIN 宏，不硬编码 GPIO 号
 // ==========================================
@@ -409,13 +457,12 @@ static void interaction_play_blocking(robot_emotion_t target_emotion)
 
     ESP_LOGI(TAG, ">>> 开始执行情绪动画: %d (%s) <<<", (int)target_emotion, cmd->screen_anim);
 
-    // ── 2. 屏幕动画（预留：发消息给 LVGL 任务）──────────────────────────────
-    // TODO: ui_manager_play_anim(cmd->screen_anim);
-    ESP_LOGI(TAG, "-> [预留] 屏幕动画: %s", cmd->screen_anim);
-
-    // ── 3. 音频播放（预留：发消息给音频播放任务）────────────────────────────
+    // ── 3. 音频播放（方波占位，真实文件接入后替换）──────────────────────────
+    // 注：lv_gif_set_src 会访问 SPIFFS（SPI flash），ia_worker 栈在 SPIRAM，
+    //     禁用 cache 时 SPIRAM 不可访问，因此不能在此任务中调用屏幕动画。
     // TODO: audio_player_play_file(cmd->audio_file);
-    ESP_LOGI(TAG, "-> [预留] 音效文件: %s", cmd->audio_file);
+    ESP_LOGI(TAG, "🔊 音效槽: %s（当前使用方波占位）", cmd->audio_file);
+    play_square_wave_beep(); // 播放方波占位音频
 
     // ── 4. 震动马达 ──────────────────────────────────────────────────────────
     trigger_vibration_motor(cmd->motor_mode);
@@ -430,27 +477,23 @@ static void interaction_play_blocking(robot_emotion_t target_emotion)
 
     for (uint8_t loop = 0; loop < max_loop; loop++)
     {
-        // 前半段（如左转/前摆）
-        if (loop < cmd->head.count)
-            bsp_servo_move_smooth(CH_HEAD, cmd->head.angle_1, cmd->head.speed);
-        if (loop < cmd->left_arm.count)
-            bsp_servo_move_smooth(CH_L_ARM, cmd->left_arm.angle_1, cmd->left_arm.speed);
-        if (loop < cmd->right_arm.count)
-            bsp_servo_move_smooth(CH_R_ARM, cmd->right_arm.angle_1, cmd->right_arm.speed);
+        // 前半段：三轴同时运动到 angle_1（未参与的轴保持 90°）
+        bsp_servo_move_all_parallel(
+            (loop < cmd->head.count) ? cmd->head.angle_1 : 90.0f,
+            (loop < cmd->left_arm.count) ? cmd->left_arm.angle_1 : 90.0f,
+            (loop < cmd->right_arm.count) ? cmd->right_arm.angle_1 : 90.0f,
+            cmd->head.speed);
 
-        // 后半段（如右转/后摆）
-        if (loop < cmd->head.count)
-            bsp_servo_move_smooth(CH_HEAD, cmd->head.angle_2, cmd->head.speed);
-        if (loop < cmd->left_arm.count)
-            bsp_servo_move_smooth(CH_L_ARM, cmd->left_arm.angle_2, cmd->left_arm.speed);
-        if (loop < cmd->right_arm.count)
-            bsp_servo_move_smooth(CH_R_ARM, cmd->right_arm.angle_2, cmd->right_arm.speed);
+        // 后半段：三轴同时运动到 angle_2
+        bsp_servo_move_all_parallel(
+            (loop < cmd->head.count) ? cmd->head.angle_2 : 90.0f,
+            (loop < cmd->left_arm.count) ? cmd->left_arm.angle_2 : 90.0f,
+            (loop < cmd->right_arm.count) ? cmd->right_arm.angle_2 : 90.0f,
+            cmd->head.speed);
     }
 
-    // ── 6. 全轴归中（恢复待机姿态）──────────────────────────────────────────
-    bsp_servo_move_smooth(CH_HEAD, 90.0f, SERVO_SPEED_MID);
-    bsp_servo_move_smooth(CH_L_ARM, 90.0f, SERVO_SPEED_MID);
-    bsp_servo_move_smooth(CH_R_ARM, 90.0f, SERVO_SPEED_MID);
+    // ── 6. 全轴同时归中（恢复待机姿态）──────────────────────────────────────
+    bsp_servo_move_all_parallel(90.0f, 90.0f, 90.0f, SERVO_SPEED_MID);
 
     ESP_LOGI(TAG, ">>> 情绪动作执行完毕: %d <<<", (int)target_emotion);
 }

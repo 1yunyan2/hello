@@ -13,11 +13,11 @@
  *   - bsp_config.h（引脚与通道宏定义）
  */
 
-#include "bsp_board.h"
+#include "bsp/bsp_board.h"
 #include "iot_servo.h"
 #include <math.h>
 #include "freertos/semphr.h" // 互斥锁，保证多任务调用线程安全
-#include "bsp_config.h"
+#include "bsp/bsp_config.h"
 // 注意：robot_emotion_t 唯一定义在 interaction.h，此处不重复定义。
 // 注意：不 include servo_manager.h，避免与上层形成循环依赖。
 
@@ -292,4 +292,73 @@ void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms)
 
     // ── 解锁：本次运动完成，释放通道 ─────────────────────────────────────────
     xSemaphoreGive(s_ch_mutex[channel]);
+}
+
+// ==========================================
+// API: 三轴同时平滑运动（真正并行）
+// ==========================================
+
+/**
+ * @brief 三轴舵机同时运动到各自目标角度（线性插值并行）
+ *
+ * 以三轴中行程最大的轴为步数基准，所有轴在相同时间内同步到达目标，
+ * 避免串行调用导致的"头先动完、臂才开始"的割裂感。
+ *
+ * @param head_target  头部目标角度（度）
+ * @param larm_target  左臂目标角度（度）
+ * @param rarm_target  右臂目标角度（度）
+ * @param step_ms      最长轴每步延时（毫秒），对应 SERVO_SPEED_xxx
+ */
+void bsp_servo_move_all_parallel(float head_target, float larm_target, float rarm_target, uint32_t step_ms)
+{
+    bsp_board_t *board = bsp_board_get_instance();
+    if (board == NULL || !board->servo_initialized)
+        return;
+
+    for (int i = 0; i < 3; i++)
+    {
+        if (s_ch_mutex[i] == NULL)
+            return;
+        xSemaphoreTake(s_ch_mutex[i], portMAX_DELAY);
+    }
+
+    float h_safe = clamp_safe_angle(CH_HEAD, head_target);
+    float l_safe = clamp_safe_angle(CH_L_ARM, larm_target);
+    float r_safe = clamp_safe_angle(CH_R_ARM, rarm_target);
+
+    float h_cur = 0.0f, l_cur = 0.0f, r_cur = 0.0f;
+    iot_servo_read_angle(LEDC_LOW_SPEED_MODE, CH_HEAD, &h_cur);
+    iot_servo_read_angle(LEDC_LOW_SPEED_MODE, CH_L_ARM, &l_cur);
+    iot_servo_read_angle(LEDC_LOW_SPEED_MODE, CH_R_ARM, &r_cur);
+
+    // 以三轴中行程最大的为总步数，保证同时到达
+    int max_steps = (int)fmaxf(fmaxf(fabsf(h_safe - h_cur), fabsf(l_safe - l_cur)), fabsf(r_safe - r_cur));
+
+    if (max_steps < 1 || step_ms == 0)
+    {
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_HEAD, h_safe);
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_L_ARM, l_safe);
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_R_ARM, r_safe);
+        for (int i = 0; i < 3; i++)
+            xSemaphoreGive(s_ch_mutex[i]);
+        return;
+    }
+
+    // 线性插值：每步同时写三轴，t 从 1/max_steps 到 1
+    for (int step = 1; step <= max_steps; step++)
+    {
+        float t = (float)step / (float)max_steps;
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_HEAD, h_cur + t * (h_safe - h_cur));
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_L_ARM, l_cur + t * (l_safe - l_cur));
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_R_ARM, r_cur + t * (r_safe - r_cur));
+        vTaskDelay(pdMS_TO_TICKS(step_ms));
+    }
+
+    // 兜底：精准落在目标位置
+    iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_HEAD, h_safe);
+    iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_L_ARM, l_safe);
+    iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_R_ARM, r_safe);
+
+    for (int i = 0; i < 3; i++)
+        xSemaphoreGive(s_ch_mutex[i]);
 }

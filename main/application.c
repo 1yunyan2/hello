@@ -18,51 +18,18 @@
 #include "session/session.h"
 #include "audio/audio_processor.h"
 #include "bsp/servo_manager.h"
-#include "ui/interaction.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-
+#include "ui/ui_port.h"
+#include "ui/interaction.h"
+#include "ui/reminder.h"
 #define TAG "Application"
 
 /** @brief 打印当前内部 SRAM 剩余空间（追踪初始化内存消耗） */
 #define PRINT_INTERNAL_HEAP \
     ESP_LOGI(TAG, "[heap] internal free: %lu B", esp_get_free_internal_heap_size())
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// 1. 触摸事件 → 情绪映射表（application 层策略，可随时调整）
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * @brief 触摸事件到情绪 ID 的映射表
- *
- * 映射关系集中在 application 层，优点：
- *   - BSP 层（bsp_touch.c）不依赖任何 UI 模块，保持纯硬件抽象
- *   - 调整触摸→情绪对应关系时只改这张表，无需改底层驱动
- *   - 未来游戏模式可切换到另一张表（game_touch_map），无需修改 BSP
- */
-static const struct
-{
-    touch_event_t event;
-    robot_emotion_t emotion;
-} s_touch_emotion_map[] = {
-    /* 单点短按 — 基础情绪 */
-    {TOUCH_EVENT_SHORT_HEAD, EMO_HAPPY},          ///< 头部轻触 → 开心
-    {TOUCH_EVENT_SHORT_ABDOMEN, EMO_COMFORTABLE}, ///< 腹部轻触 → 舒服
-    {TOUCH_EVENT_SHORT_BACK, EMO_TICKLISH},       ///< 背部轻触 → 怕痒
-
-    /* 单点长按 — 进阶情绪 */
-    {TOUCH_EVENT_LONG_HEAD, EMO_ACT_CUTE},   ///< 头部长按 → 撒娇
-    {TOUCH_EVENT_LONG_ABDOMEN, EMO_HEALING}, ///< 腹部长按 → 治愈
-    {TOUCH_EVENT_LONG_BACK, EMO_SURPRISED},  ///< 背部长按 → 惊喜
-
-    /* 双点组合 — 特殊情绪 */
-    {TOUCH_EVENT_COMBO_HEAD_ABDOMEN, EMO_SHY_RUB},          ///< 头+腹 → 害羞蹭蹭
-    {TOUCH_EVENT_COMBO_HEAD_BACK, EMO_EXCITED},             ///< 头+背 → 兴奋
-    {TOUCH_EVENT_COMBO_ABDOMEN_BACK, EMO_COMFORTABLE_ROLL}, ///< 腹+背 → 舒服到打滚
-};
-#define TOUCH_EMOTION_MAP_SIZE (sizeof(s_touch_emotion_map) / sizeof(s_touch_emotion_map[0]))
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 2. 唤醒提示音
@@ -136,59 +103,7 @@ static void wake_word_callback(const char *wake_word_display)
     session_on_wake_word(wake_word_display);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 4. 触摸任务（BSP 扫描 + 应用层 dispatch）
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * @brief touch_scan_task 的 FreeRTOS 兼容包装
- *
- * touch_scan_task 签名为 void(bsp_board_t*)，不符合 TaskFunction_t(void*)，
- * 此包装解决类型问题，同时保留 bsp_board 参数传递。
- */
-static void touch_scan_wrapper(void *arg)
-{
-    touch_scan_task((bsp_board_t *)arg);
-}
-
-/**
- * @brief 触摸事件分发任务（application 层）
- *
- * 每 10ms 轮询一次触摸事件队列，将事件查表映射为情绪 ID，
- * 调用 ui_interaction_play() 触发完整情绪表现（舵机+震动+音效+表情）。
- *
- * 为何在 application 层而不在 bsp_touch.c：
- *   - 保持 BSP 层与 UI 层解耦
- *   - 映射策略（哪个触摸→哪个情绪）是产品决策，属于 app 层职责
- *   - 未来切换游戏模式时，只需替换分发逻辑，无需改 BSP
- *
- * @param arg 未使用
- */
-static void touch_dispatch_task(void *arg)
-{
-    ESP_LOGI(TAG, "触摸事件分发任务启动");
-    touch_event_t event;
-
-    while (1)
-    {
-        if (bsp_touch_get_event(&event))
-        {
-            /* 查映射表，找到对应情绪后触发 */
-            for (int i = 0; i < (int)TOUCH_EMOTION_MAP_SIZE; i++)
-            {
-                if (s_touch_emotion_map[i].event == event)
-                {
-                    ESP_LOGI(TAG, "触摸事件 %d → 情绪 %d", (int)event,
-                             (int)s_touch_emotion_map[i].emotion);
-                    ui_interaction_play(s_touch_emotion_map[i].emotion);
-                    break;
-                }
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
-
+//
 // ═══════════════════════════════════════════════════════════════════════════════
 // 5. 应用主初始化序列
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -225,6 +140,9 @@ void application_init(void)
     /* ── 步骤 5: WiFi（阻塞直至获取 IP 或彻底失败后重启）─────────────────── */
     bsp_board_wifi_main(bsp_board);
     PRINT_INTERNAL_HEAP;
+    // 提醒系统初始化（含 MOCK_TIME 模式下的系统时间设置）
+    reminder_init(NULL); // NULL = 暂无 TTS 回调，后续接入 session 层时替换
+    PRINT_INTERNAL_HEAP;
 
     /* ── 步骤 3: 音频硬件 + 采集任务 ──────────────────────────────────────── */
     audio_init(bsp_board);
@@ -240,63 +158,55 @@ void application_init(void)
     PRINT_INTERNAL_HEAP;
 
     // /* ── 步骤 8: 舵机硬件初始化（LEDC/PWM）──────────────────────────────── */
-    // bsp_board_servo_init(bsp_board);
-    // PRINT_INTERNAL_HEAP;
+    bsp_board_servo_init(bsp_board);
+    PRINT_INTERNAL_HEAP;
 
     // /* ── 步骤 9: 舵机管理器（队列 + worker task，栈在 SPIRAM）─────────────── */
-    // esp_err_t ret = servo_manager_init();
-    // if (ret != ESP_OK)
-    // {
-    //     ESP_LOGE(TAG, "servo_manager_init 失败: %s", esp_err_to_name(ret));
-    // }
-    // PRINT_INTERNAL_HEAP;
+    esp_err_t ret = servo_manager_init();
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "servo_manager_init 失败: %s", esp_err_to_name(ret));
+    }
+    PRINT_INTERNAL_HEAP;
 
-    // bsp_board_lcd_init(bsp_board); // LCD 初始化（当前未自动置位 LCD_BIT，后续可根据需求调整）
-    // PRINT_INTERNAL_HEAP;
-    // bsp_board_lcd_on(bsp_board);
-    // /* ── 步骤 10: 情绪交互管理器（情绪矩阵 + worker task，栈在 SPIRAM）────── */
-    // ret = interaction_manager_init();
-    // if (ret != ESP_OK)
-    // {
-    //     ESP_LOGE(TAG, "interaction_manager_init 失败: %s", esp_err_to_name(ret));
-    // }
-    // PRINT_INTERNAL_HEAP;
+    bsp_board_lcd_init(bsp_board); // LCD 初始化（当前未自动置位 LCD_BIT，后续可根据需求调整）
+    PRINT_INTERNAL_HEAP;
+    ui_init();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    PRINT_INTERNAL_HEAP;
+    bsp_board_lcd_on(bsp_board);
+    /* ── 步骤 10: 情绪交互管理器（情绪矩阵 + worker task，栈在 SPIRAM）────── */
+    ret = interaction_manager_init();
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "interaction_manager_init 失败: %s", esp_err_to_name(ret));
+    }
+    PRINT_INTERNAL_HEAP;
+    // 6. 创建触摸扫描任务（栈分配在PSRAM，节省内部SRAM）
+    ret = xTaskCreatePinnedToCoreWithCaps(
+        touch_scan_task,
+        "touch_scan",
+        8192,
+        NULL,
+        4, // 优先级略低于舵机和音频
+        NULL,
+        tskNO_AFFINITY,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
-    // /* ── 步骤 11: 触摸扫描任务（BSP 层，仅入队，不含 UI 逻辑）─────────────── */
-    // BaseType_t task_ret = xTaskCreatePinnedToCoreWithCaps(
-    //     touch_scan_wrapper, /* 包装函数（解决类型兼容） */
-    //     "touch_scan",       /* 任务名 */
-    //     4096,               /* 栈大小（SPIRAM） */
-    //     bsp_board,          /* 参数：bsp 实例 */
-    //     4,                  /* 优先级：低于音频(7)和 session(5)，略低于 interaction(5) */
-    //     NULL,
-    //     tskNO_AFFINITY,
-    //     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    // if (task_ret != pdPASS)
-    // {
-    //     ESP_LOGE(TAG, "touch_scan_task 创建失败");
-    // }
-    // PRINT_INTERNAL_HEAP;
-
-    // /* ── 步骤 12: 触摸事件分发任务（application 层策略，映射触摸→情绪）───── */
-    // task_ret = xTaskCreatePinnedToCoreWithCaps(
-    //     touch_dispatch_task,
-    //     "touch_dispatch",
-    //     2048, /* 栈小（只做查表+入队，无深调用链） */
-    //     NULL,
-    //     4, /* 与 touch_scan 同优先级 */
-    //     NULL,
-    //     tskNO_AFFINITY,
-    //     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    // if (task_ret != pdPASS)
-    // {
-    //     ESP_LOGE(TAG, "touch_dispatch_task 创建失败");
-    // }
-    // PRINT_INTERNAL_HEAP;
-    // ESP_LOGI(TAG, "触摸链路: 铜箔 → touch_scan → queue → touch_dispatch → interaction_worker → 舵机/震动/表情/音效");
+    if (ret != pdPASS)
+    {
+        ESP_LOGE(TAG, "创建触摸扫描任务失败！");
+    }
+    else
+    {
+        ESP_LOGI(TAG, "触摸扫描任务创建完成");
+    }
 
     /* ── 步骤 7: 会话模块（WebSocket 预连接）─────────────────────────────── */
+
     session_init("ws://122.224.191.2:4888/ws/omni");
+    // session_init(" ws://122.224.191.2:4888/ws/voice");
+
     PRINT_INTERNAL_HEAP;
 
     ESP_LOGI(TAG, "application_init 完成，系统就绪");
