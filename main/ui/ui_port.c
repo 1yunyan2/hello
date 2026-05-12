@@ -28,6 +28,7 @@
 #include <string.h>
 #include <limits.h>
 #include <stdio.h>
+#include "driver/adc.h"
 
 /* ── 外部自定义中文字体声明 ── */
 LV_FONT_DECLARE(font_cn_16);
@@ -1711,5 +1712,70 @@ void ui_dispatch_touch_event(touch_event_t event)
     }
 }
 
-void ui_update_wifi(int rssi) {}
-void ui_update_battery(int soc) {}
+void ui_update_wifi(int rssi)
+{
+    // lv_obj_t *screen = lv_screen_active();
+    // lv_obj_t *status_bar = lv_obj_get_child(screen, 0);
+    // lv_obj_t *wifi_label = lv_obj_get_child(status_bar, 0);
+
+    // char *wifi_str = FONT_AWESOME_WIFI_SLASH;
+    // if (rssi < 0 && rssi >= -50)
+    // {
+    //     wifi_str = FONT_AWESOME_WIFI;
+    // }
+    // else if (rssi < -50 && rssi >= -70)
+    // {
+    //     wifi_str = FONT_AWESOME_WIFI_FAIR;
+    // }
+    // else if (rssi < -70)
+    // {
+    //     wifi_str = FONT_AWESOME_WIFI_WEAK;
+    // }
+
+    // if (lvgl_port_lock(1000))
+    // {
+    //     lv_label_set_text(wifi_label, wifi_str);
+    //     lvgl_port_unlock();
+    // }
+}
+void ui_update_battery(int soc)
+{
+
+    //     static const char *battery_str[] = {
+    //         FONT_AWESOME_BATTERY_EMPTY,          // 0-25
+    //         FONT_AWESOME_BATTERY_QUARTER,        // 25-50/
+    //         FONT_AWESOME_BATTERY_HALF,           // 50-75
+    //         FONT_AWESOME_BATTERY_THREE_QUARTERS, // 75-100
+    //         FONT_AWESOME_BATTERY_FULL,           // 100
+    //         FONT_AWESOME_BATTERY_FULL,           // 100
+    //     };
+    //     lv_obj_t *screen = lv_screen_active();
+    //     lv_obj_t *status_bar = lv_obj_get_child(screen, 0);
+    //     lv_obj_t *battery_label = lv_obj_get_child(status_bar, 1);
+
+    //     if (soc < 0)
+    //         soc = 0;
+    //     else if (soc > 100)
+    //         soc = 100;
+
+    //     if (lvgl_port_lock(1000))
+    //     {
+    //         lv_label_set_text(battery_label, battery_str[soc / 20]);
+    //         lvgl_port_unlock();
+    //     }
+
+    // #define BATT_ADC_CHANNEL ADC1_CHANNEL_0
+    //     adc1_config_width(ADC_WIDTH_BIT_12);
+    //     adc1_config_channel_atten(BATT_ADC_CHANNEL, ADC_ATTEN_DB_11);
+
+    //     int adc_raw = adc1_get_raw(BATT_ADC_CHANNEL);
+
+    //     // TODO: 根据实际硬件（分压比、参考电压）替换下列线性映射公式
+    //     int percent = (adc_raw - 2000) * 100 / (4000 - 2000);
+    //     if (percent > 100)
+    //         percent = 100;
+    //     if (percent < 0)
+    //         percent = 0;
+
+    //     return percent;
+}

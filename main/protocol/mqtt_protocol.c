@@ -207,12 +207,12 @@ static void heartbeat_task(void *arg)
         {
             cJSON *root = cJSON_CreateObject();
             cJSON_AddStringToObject(root, "deviceId", device_id);
-            cJSON_AddNumberToObject(root, "battery", get_battery_level());
+            // cJSON_AddNumberToObject(root, "battery", get_battery_level());
 
-            if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
-                cJSON_AddNumberToObject(root, "wifi_signal", ap_info.rssi);
-            else
-                cJSON_AddNumberToObject(root, "wifi_signal", -100);
+            // if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
+            //     cJSON_AddNumberToObject(root, "wifi_signal", ap_info.rssi);
+            // else
+            //     cJSON_AddNumberToObject(root, "wifi_signal", -100);
 
             char *json_str = cJSON_PrintUnformatted(root);
             if (json_str != NULL)

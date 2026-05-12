@@ -35,6 +35,7 @@
 #include <sys/time.h>
 #include "esp_crt_bundle.h"
 #include "weather.h"
+#include "esp_heap_caps.h"
 static const char *TAG = "REMINDER";
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -891,7 +892,9 @@ esp_err_t reminder_init(reminder_trigger_cb_t cb)
         return ESP_FAIL;
     }
     {
-        BaseType_t r = xTaskCreate(nvs_save_task, "nvs_save", 4096, NULL, 1, NULL);
+        BaseType_t r = xTaskCreateWithCaps(nvs_save_task, "nvs_save",
+                                           3072, NULL, 1, NULL,
+                                           MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (r != pdPASS)
         {
             ESP_LOGE(TAG, "NVS 保存任务创建失败");
