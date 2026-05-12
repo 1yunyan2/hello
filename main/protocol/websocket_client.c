@@ -5,7 +5,7 @@
  * 本模块实现了设备与云端大模型之间的完整 WebSocket 通信协议：
  *
  * 上行（设备→云端）：
- *   - Hello 握手：协商音频参数，建立会话
+ *   - start 握手：协商音频参数，建立会话
  *   - 唤醒词通知：告知服务端触发的唤醒词
  *   - 监听控制：start / stop / detect
  *   - 音频帧：OPUS 编码的麦克风数据（Binary Frame）
@@ -13,7 +13,7 @@
  *   - IoT 消息：设备能力和状态上报
  *
  * 下行（云端→设备）：
- *   - Hello 响应：返回 session_id
+ *   - start 响应：返回 session_id
  *   - STT 结果：语音识别文本
  *   - LLM 状态：大模型情感标签
  *   - TTS 控制：start / stop / sentence_start
@@ -67,7 +67,7 @@ ESP_EVENT_DEFINE_BASE(PROTOCOL_EVENT);
 struct protocol
 {
     esp_websocket_client_handle_t websocket_client; ///< 底层 WebSocket 客户端句柄
-    char *session_id;                               ///< 服务端分配的会话 ID（Hello 响应中获取）
+    char *session_id;                               ///< 服务端分配的会话 ID（start 响应中获取）
     esp_event_handler_t callback;                   ///< 上层注册的事件回调函数
     void *handler_args;                             ///< 回调函数的用户自定义参数
 };
@@ -85,7 +85,7 @@ static int s_text_rx_total_len = 0;
 // 每个 handler 负责解析一种 type 的 JSON 消息，提取数据后通过回调通知上层
 
 /**
- * @brief 处理服务端 Hello 响应
+ * @brief 处理服务端 start 响应
  * 提取 session_id 并保存，通知上层握手完成
  *
  * @param protocol 协议实例指针
@@ -93,7 +93,7 @@ static int s_text_rx_total_len = 0;
  *
  * 调用者：protocol_websocket_event_handler中的WEBSOCKET_EVENT_DATA事件处理
  */
-static void protocol_hello_handler(protocol_t *protocol, cJSON *root)
+static void protocol_start_handler(protocol_t *protocol, cJSON *root)
 {
     /* 释放旧的 session_id（重连场景） */
     if (protocol->session_id)
@@ -110,8 +110,8 @@ static void protocol_hello_handler(protocol_t *protocol, cJSON *root)
             (session_id->valuestring);
     }
 
-    /* 通知上层：Hello 握手完成 */
-    protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_HELLO, NULL);
+    /* 通知上层：start 握手完成 */
+    protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_start, NULL);
 }
 
 /**
@@ -174,7 +174,7 @@ static void protocol_tts_handler(protocol_t *protocol, cJSON *root)
     }
     else if (strcmp(state->valuestring, "stop") == 0)
     {
-        protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_TTS_STOP, NULL);
+        protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_TTS_END, NULL);
     }
     else if (strcmp(state->valuestring, "sentence_start") == 0)
     {
@@ -409,7 +409,7 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
                     if (cJSON_IsString(type))
                     {
                         if (strcmp(type->valuestring, "started") == 0) // 当收到服务端的 start 响应时，type 字段是 "started"
-                            protocol_hello_handler(protocol, root);
+                            protocol_start_handler(protocol, root);
                         else if (strcmp(type->valuestring, "llm") == 0) // 假设服务端发情感状态的 type 字段是 "llm"
                             protocol_llm_handler(protocol, root);
                         // else if (strcmp(type->valuestring, "stt") == 0)
@@ -421,7 +421,7 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
                             protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_TTS_START, NULL);
                         //  兼容你服务端的 tts_end，
                         else if (strcmp(type->valuestring, "tts_end") == 0)
-                            protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_TTS_STOP, NULL);
+                            protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_TTS_END, NULL);
                         else if (strcmp(type->valuestring, "iot") == 0)
                             protocol_iot_handler(protocol, root);
                         else if (strcmp(type->valuestring, "error") == 0)
@@ -460,7 +460,8 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
     case WEBSOCKET_EVENT_DISCONNECTED:
     case WEBSOCKET_EVENT_FINISH:
         // 清理文本消息缓冲区，防止断连时正在重组的 JSON 消息泄漏
-        if (s_text_rx_buf) {
+        if (s_text_rx_buf)
+        {
             free(s_text_rx_buf);
             s_text_rx_buf = NULL;
         }
@@ -494,7 +495,8 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
 protocol_t *protocol_create(const char *url, const char *token)
 {
     protocol_t *protocol = (protocol_t *)calloc(1, sizeof(protocol_t));
-    if (protocol == NULL) {
+    if (protocol == NULL)
+    {
         ESP_LOGE(TAG, "protocol calloc 失败，内存不足");
         return NULL;
     }
@@ -625,14 +627,14 @@ bool protocol_is_connected(protocol_t *protocol)
 // ─── 公开 API：消息发送 ────────────────────────────────────────────────────
 
 /**
- * @brief 发送 Hello 握手消息
+ * @brief 发送 start 握手消息
  * 协商音频参数：单声道 / OPUS 编码 / 60ms 帧时长 / 16kHz 采样率
  *
  * @param protocol 协议实例指针
  *
  * 调用者：session_on_wake_word、PROTOCOL_EVENT_CONNECTED事件处理
  */
-void protocol_send_hello(protocol_t *protocol)
+void protocol_send_start(protocol_t *protocol)
 {
     ESP_LOGI(TAG, "发送 Start 握手消息...");
 

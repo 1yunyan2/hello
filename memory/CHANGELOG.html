@@ -470,8 +470,11 @@
           <div class="diff-note">
             <strong>症状 A</strong>：多轮第二句卡 9~10 秒后云端报 <code>buffer too small, or have no audio</code>。<br>
             <strong>症状 B</strong>：风扇环境下"几点了"被录 26 秒，enc_output 撑爆持续丢帧。<br>
-            <strong>根因 A</strong>：<code>PROTOCOL_EVENT_COMPLETE</code> 在多轮分支清掉 SERVER_READY_BIT，但多轮模式没有新 Hello/Started 来重新置位 → ws_sender_task 卡在 L890 continue 循环 → enc_output 撑爆 + 上行无数据。<br>
-            <strong>根因 B</strong>：尾端字保护逻辑 <code>if (s_speech_detected && vad==SILENCE && avg_amp&gt;100) vad=SPEECH</code> 被风扇噪声（avg_amp 稳定 &gt;100）持续命中 → EOS 定时器永远启动不起来 → 无限录音。<br>
+            <strong>根因 A</strong>：<code>PROTOCOL_EVENT_COMPLETE</code> 在多轮分支清掉 SERVER_READY_BIT，但多轮模式没有新 start/Started
+            来重新置位 → ws_sender_task 卡在 L890 continue 循环 → enc_output 撑爆 + 上行无数据。<br>
+            <strong>根因 B</strong>：尾端字保护逻辑
+            <code>if (s_speech_detected && vad==SILENCE && avg_amp&gt;100) vad=SPEECH</code> 被风扇噪声（avg_amp 稳定
+            &gt;100）持续命中 → EOS 定时器永远启动不起来 → 无限录音。<br>
             <strong>详见</strong>：<a href="bugs/BUG-014.md">bugs/BUG-014.md</a>
           </div>
 
@@ -485,26 +488,26 @@
                 <div class="diff-col-header before">修改前（清掉就再没人 Set 回来）</div>
                 <div class="diff-lines">
                   <div class="diff-line ctx">case PROTOCOL_EVENT_COMPLETE:</div>
-                  <div class="diff-line ctx">  if (s_state == LISTENING) {</div>
-                  <div class="diff-line ctx">    s_vad_ready_tick = now;</div>
-                  <div class="diff-line del">    xEventGroupClearBits(</div>
-                  <div class="diff-line del">      s_session_eg,</div>
-                  <div class="diff-line del">      SERVER_READY_BIT);</div>
-                  <div class="diff-line ctx">    xTimerReset(...);</div>
-                  <div class="diff-line ctx">  }</div>
+                  <div class="diff-line ctx"> if (s_state == LISTENING) {</div>
+                  <div class="diff-line ctx"> s_vad_ready_tick = now;</div>
+                  <div class="diff-line del"> xEventGroupClearBits(</div>
+                  <div class="diff-line del"> s_session_eg,</div>
+                  <div class="diff-line del"> SERVER_READY_BIT);</div>
+                  <div class="diff-line ctx"> xTimerReset(...);</div>
+                  <div class="diff-line ctx"> }</div>
                 </div>
               </div>
               <div class="diff-col after">
                 <div class="diff-col-header after">修改后（维持 TTS_STOP 已 set 的 READY）</div>
                 <div class="diff-lines">
                   <div class="diff-line ctx">case PROTOCOL_EVENT_COMPLETE:</div>
-                  <div class="diff-line ctx">  if (s_state == LISTENING) {</div>
-                  <div class="diff-line ctx">    s_vad_ready_tick = now;</div>
-                  <div class="diff-line add">    xEventGroupSetBits(</div>
-                  <div class="diff-line add">      s_session_eg,</div>
-                  <div class="diff-line add">      SERVER_READY_BIT);</div>
-                  <div class="diff-line ctx">    xTimerReset(...);</div>
-                  <div class="diff-line ctx">  }</div>
+                  <div class="diff-line ctx"> if (s_state == LISTENING) {</div>
+                  <div class="diff-line ctx"> s_vad_ready_tick = now;</div>
+                  <div class="diff-line add"> xEventGroupSetBits(</div>
+                  <div class="diff-line add"> s_session_eg,</div>
+                  <div class="diff-line add"> SERVER_READY_BIT);</div>
+                  <div class="diff-line ctx"> xTimerReset(...);</div>
+                  <div class="diff-line ctx"> }</div>
                 </div>
               </div>
             </div>
@@ -520,9 +523,9 @@
                 <div class="diff-col-header before">修改前（无熔断，噪声永远救场）</div>
                 <div class="diff-lines">
                   <div class="diff-line ctx">if (s_speech_detected</div>
-                  <div class="diff-line ctx">    && vad == VAD_SILENCE</div>
-                  <div class="diff-line del">    && avg_amp > 100) {</div>
-                  <div class="diff-line del">  vad = VAD_SPEECH;</div>
+                  <div class="diff-line ctx"> && vad == VAD_SILENCE</div>
+                  <div class="diff-line del"> && avg_amp > 100) {</div>
+                  <div class="diff-line del"> vad = VAD_SPEECH;</div>
                   <div class="diff-line del">}</div>
                 </div>
               </div>
@@ -530,1407 +533,1417 @@
                 <div class="diff-col-header after">修改后（800ms 静音窗口外放手）</div>
                 <div class="diff-lines">
                   <div class="diff-line ctx">if (s_speech_detected</div>
-                  <div class="diff-line ctx">    && vad == VAD_SILENCE</div>
-                  <div class="diff-line add">    && avg_amp > 100) {</div>
-                  <div class="diff-line add">  if (s_first_silence_tick == 0)</div>
-                  <div class="diff-line add">    s_first_silence_tick = now;</div>
-                  <div class="diff-line add">  if (now - tick < 800ms)</div>
-                  <div class="diff-line add">    vad = VAD_SPEECH;</div>
-                  <div class="diff-line add">  // 否则放手交回 AFE VAD</div>
-                  <div class="diff-line add">} else if (vad == VAD_SPEECH) {</div>
-                  <div class="diff-line add">  s_first_silence_tick = 0;</div>
-                  <div class="diff-line add">}</div>
+                  <div class="diff-line ctx"> && vad == VAD_SILENCE</div>
+                  <div class="diff-line add"> && avg_amp > 100) {</div>
+                  <div class="diff-line add"> if (s_first_silence_tick == 0)</div>
+                  <div class="diff-line add"> s_first_silence_tick = now;</div>
+                  <div class="diff-line add"> if (now - tick < 800ms)</div>
+                      <div class="diff-line add"> vad = VAD_SPEECH;</div>
+                      <div class="diff-line add"> // 否则放手交回 AFE VAD</div>
+                      <div class="diff-line add">} else if (vad == VAD_SPEECH) {</div>
+                      <div class="diff-line add"> s_first_silence_tick = 0;</div>
+                      <div class="diff-line add">}</div>
+                  </div>
                 </div>
               </div>
             </div>
-          </div>
 
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/session/session.c — 单句最大时长硬切（方案 B 兜底）</span>
-              <div class="diff-stat"><span class="diff-add">+18</span><span class="diff-del">-0</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前（无硬切）</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">// is_active_audio 写入 PCM</div>
-                  <div class="diff-line ctx">// 全靠 EOS 定时器收尾</div>
+            <div class="file-diff">
+              <div class="file-header">
+                <span class="file-path">main/session/session.c — 单句最大时长硬切（方案 B 兜底）</span>
+                <div class="diff-stat"><span class="diff-add">+18</span><span class="diff-del">-0</span></div>
+              </div>
+              <div class="diff-split">
+                <div class="diff-col before">
+                  <div class="diff-col-header before">修改前（无硬切）</div>
+                  <div class="diff-lines">
+                    <div class="diff-line ctx">// is_active_audio 写入 PCM</div>
+                    <div class="diff-line ctx">// 全靠 EOS 定时器收尾</div>
+                  </div>
+                </div>
+                <div class="diff-col after">
+                  <div class="diff-col-header after">修改后（speech_detected 后 8s 强制 EOS）</div>
+                  <div class="diff-lines">
+                    <div class="diff-line add">if (s_speech_detected</div>
+                    <div class="diff-line add"> && !s_stop_sent</div>
+                    <div class="diff-line add"> && now - s_speech_start_tick</div>
+                    <div class="diff-line add"> > 8000ms) {</div>
+                    <div class="diff-line add"> s_stop_sent = true;</div>
+                    <div class="diff-line add"> xTimerStop(s_eos_timer, 0);</div>
+                    <div class="diff-line add"> xQueueSend(s_session_evt_queue,</div>
+                    <div class="diff-line add"> &SESSION_EVT_VAD_STOP, 0);</div>
+                    <div class="diff-line add">}</div>
+                  </div>
                 </div>
               </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后（speech_detected 后 8s 强制 EOS）</div>
-                <div class="diff-lines">
-                  <div class="diff-line add">if (s_speech_detected</div>
-                  <div class="diff-line add">    && !s_stop_sent</div>
-                  <div class="diff-line add">    && now - s_speech_start_tick</div>
-                  <div class="diff-line add">         > 8000ms) {</div>
-                  <div class="diff-line add">  s_stop_sent = true;</div>
-                  <div class="diff-line add">  xTimerStop(s_eos_timer, 0);</div>
-                  <div class="diff-line add">  xQueueSend(s_session_evt_queue,</div>
-                  <div class="diff-line add">    &SESSION_EVT_VAD_STOP, 0);</div>
-                  <div class="diff-line add">}</div>
-                </div>
-              </div>
             </div>
-          </div>
 
-          <div class="diff-note">
-            <strong>新增静态变量</strong>：<code>s_first_silence_tick</code>（方案 A 静音窗口起点）、<code>s_speech_start_tick</code>（方案 B 单句起点）。<br>
-            <strong>状态机同步</strong>：TTS_START / TTS_STOP / COMPLETE / session_close / wake_word（打断/新会话/error）7 处入口同步清零，防止上一轮残留 tick 在新轮误触发硬切。<br>
-            <strong>验证</strong>：编译通过，Echo.bin 0x1ddb30 字节（38% 余量）；待实测多轮 + 风扇噪声场景。
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- ========== 2026-05-11 ========== -->
-    <div class="day-section">
-      <div class="day-header">
-        <div class="day-date">2026-05-11</div>
-        <div class="day-summary">BUG-013 修复：长 TTS 残留被识别为下一轮用户输入（排空三重锁 + 解码器水位检查）</div>
-        <div class="day-line"></div>
-      </div>
-
-      <!-- BUG-013（未提交） -->
-      <div class="commit" id="bug013-0511">
-        <div class="commit-header" onclick="toggle('bug013-0511')">
-          <div class="dot-red"></div>
-          <div class="commit-info">
-            <div class="commit-title">fix(session): 长 TTS 残留被误识别为下一轮提问 — 排空三重锁 + 5s 兜底</div>
-            <div class="commit-meta">
-              <span class="time-badge">2026-05-11（未提交）</span>
-              <span class="tag tag-fix">BUG-013</span>
-              <span class="tag tag-fix">回声防护</span>
+            <div class="diff-note">
+              <strong>新增静态变量</strong>：<code>s_first_silence_tick</code>（方案 A 静音窗口起点）、<code>s_speech_start_tick</code>（方案
+              B 单句起点）。<br>
+              <strong>状态机同步</strong>：TTS_START / TTS_STOP / COMPLETE / session_close / wake_word（打断/新会话/error）7
+              处入口同步清零，防止上一轮残留 tick 在新轮误触发硬切。<br>
+              <strong>验证</strong>：编译通过，Echo.bin 0x1ddb30 字节（38% 余量）；待实测多轮 + 风扇噪声场景。
             </div>
-          </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="diff-note">
-            <strong>症状</strong>：TTS 播放<strong>长句</strong>（≥3s）时，残留音频被麦克风采集后当作下一轮用户提问上传。<br>
-            <strong>根因</strong>：TTS_STOP 是服务端逻辑事件，本地下游 dec_input(16KB) + dec_output(40KB) + I2S DMA 仍有 1~3s 未播完；旧版 1500ms 兜底超时强制开监听后喇叭仍在响。<br>
-            <strong>详见</strong>：<a href="bugs/BUG-013.md">bugs/BUG-013.md</a>
-          </div>
-
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/audio/audio_processor.h</span>
-              <div class="diff-stat"><span class="diff-add">+20</span><span class="diff-del">-0</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">// 仅暴露 read/write/flush/read_ref_pcm</div>
-                  <div class="diff-line ctx">// 无下游水位查询接口</div>
-                </div>
-              </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后（新增接口）</div>
-                <div class="diff-lines">
-                  <div class="diff-line add">size_t audio_processor_get_pending_bytes(</div>
-                  <div class="diff-line add">    audio_processor_t *audio_processor);</div>
-                  <div class="diff-line ctx">// 返回 dec_input + dec_output 当前积压字节数</div>
-                  <div class="diff-line ctx">// 0 表示下游链路完全排空</div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/audio/audio_processor.c</span>
-              <div class="diff-stat"><span class="diff-add">+18</span><span class="diff-del">-0</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">（无对应实现）</div>
-                </div>
-              </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后</div>
-                <div class="diff-lines">
-                  <div class="diff-line add">size_t audio_processor_get_pending_bytes(</div>
-                  <div class="diff-line add">    audio_processor_t *p) {</div>
-                  <div class="diff-line add">  if (p == NULL) return 0;</div>
-                  <div class="diff-line add">  size_t in = 0, out = 0;</div>
-                  <div class="diff-line add">  if (p->dec_input)</div>
-                  <div class="diff-line add">    vRingbufferGetInfo(p->dec_input,</div>
-                  <div class="diff-line add">      NULL,NULL,NULL,NULL,&in);</div>
-                  <div class="diff-line add">  if (p->dec_output)</div>
-                  <div class="diff-line add">    vRingbufferGetInfo(p->dec_output,</div>
-                  <div class="diff-line add">      NULL,NULL,NULL,NULL,&out);</div>
-                  <div class="diff-line add">  return in + out;</div>
-                  <div class="diff-line add">}</div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/session/session.c</span>
-              <div class="diff-stat"><span class="diff-add">+18</span><span class="diff-del">-9</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前（双重锁 + 1.5s 兜底）</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">if (s_waiting_for_silence) {</div>
-                  <div class="diff-line ctx">  uint32_t wait_ms = ...;</div>
-                  <div class="diff-line ctx">  if (wait_ms < 400) return;</div>
-                  <div class="diff-line ctx">  if (vad == VAD_SILENCE) {</div>
-                  <div class="diff-line ctx">    s_vad_silence_count++;</div>
-                  <div class="diff-line del">    if (s_vad_silence_count > 8) {</div>
-                  <div class="diff-line del">      // 进入监听</div>
-                  <div class="diff-line del">    }</div>
-                  <div class="diff-line ctx">  } else s_vad_silence_count = 0;</div>
-                  <div class="diff-line del">  if (wait_ms > 1500) {</div>
-                  <div class="diff-line del">    // 强制开监听</div>
-                  <div class="diff-line del">  }</div>
-                  <div class="diff-line ctx">  return;</div>
-                  <div class="diff-line ctx">}</div>
-                </div>
-              </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后（三重锁 + 5s 兜底）</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">if (s_waiting_for_silence) {</div>
-                  <div class="diff-line ctx">  uint32_t wait_ms = ...;</div>
-                  <div class="diff-line ctx">  if (wait_ms < 400) return;</div>
-                  <div class="diff-line add">  size_t pending_bytes =</div>
-                  <div class="diff-line add">    audio_processor_get_pending_bytes(</div>
-                  <div class="diff-line add">      s_processor);</div>
-                  <div class="diff-line ctx">  if (vad == VAD_SILENCE) {</div>
-                  <div class="diff-line ctx">    s_vad_silence_count++;</div>
-                  <div class="diff-line add">    if (s_vad_silence_count > 8</div>
-                  <div class="diff-line add">        && pending_bytes == 0) {</div>
-                  <div class="diff-line add">      // 三重锁 OK，进入监听</div>
-                  <div class="diff-line add">    }</div>
-                  <div class="diff-line ctx">  } else s_vad_silence_count = 0;</div>
-                  <div class="diff-line add">  if (wait_ms > 5000) {</div>
-                  <div class="diff-line add">    // 强制开监听（5s 兜底）</div>
-                  <div class="diff-line add">  }</div>
-                  <div class="diff-line ctx">  return;</div>
-                  <div class="diff-line ctx">}</div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="diff-note">
-            <strong>排空三重锁</strong>：物理静音 ≥ 400ms · 解码链路 pending == 0 · 连续 8 帧 VAD_SILENCE，三者同时成立才放行。<br>
-            <strong>兜底超时</strong>：1500ms → 5000ms（覆盖 dec_input 16KB + dec_output 40KB 极端长句深度）。<br>
-            <strong>验证</strong>：编译通过，Echo.bin 0x290330 字节（15% 余量）；待实测长句对话场景。
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- ========== 2026-04-15 ========== -->
-    <div class="day-section">
-      <div class="day-header">
-        <div class="day-date">2026-04-15</div>
-        <div class="day-summary">内部 SRAM 峰值优化（22KB→75KB+）· servo/interaction 非阻塞架构 · servo_manager 新模块</div>
-        <div class="day-line"></div>
-        <a href="daily/2026-04-15.md" class="file-link">📄 日报</a>
-      </div>
-
-      <!-- 内存优化（未提交，待提交） -->
-      <div class="commit" id="mem-opt-0415">
-        <div class="commit-header" onclick="toggle('mem-opt-0415')">
-          <div class="dot-green"></div>
-          <div class="commit-info">
-            <div class="commit-title">perf(memory): 内部SRAM峰值优化 — 7任务栈+3静态buffer迁移至SPIRAM，节省约53KB</div>
-            <div class="commit-meta">
-              <span class="time-badge">2026-04-15</span>
-              <span class="tag tag-feat">内存优化</span>
-              <span class="tag tag-feat">SPIRAM</span>
-            </div>
-          </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/bsp/bsp_codec.c</span>
-              <div class="diff-stat"><span class="diff-add">+8</span><span class="diff-del">-4</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前</div>
-                <div class="diff-lines">
-                  <div class="diff-line del">int16_t *buffer = malloc(chunk_size * sizeof(int16_t));</div>
-                  <div class="diff-line ctx">// ...</div>
-                  <div class="diff-line del">xTaskCreatePinnedToCore(</div>
-                  <div class="diff-line del"> audio_feed_task, "audio_feed", 8192,</div>
-                  <div class="diff-line del"> bsp_board, 5, NULL, 1);</div>
-                </div>
-              </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后</div>
-                <div class="diff-lines">
-                  <div class="diff-line add">int16_t *buffer = heap_caps_malloc(</div>
-                  <div class="diff-line add"> chunk_size * sizeof(int16_t), MALLOC_CAP_SPIRAM);</div>
-                  <div class="diff-line ctx">// ...</div>
-                  <div class="diff-line add">xTaskCreatePinnedToCoreWithCaps(</div>
-                  <div class="diff-line add"> audio_feed_task, "audio_feed", 8192,</div>
-                  <div class="diff-line add"> bsp_board, 5, NULL, 1,</div>
-                  <div class="diff-line add"> MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);</div>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/wake_word/custom_wake_word.c</span>
-              <div class="diff-stat"><span class="diff-add">+20</span><span class="diff-del">-5</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前（BSS 静态数组，内部 SRAM）</div>
-                <div class="diff-lines">
-                  <div class="diff-line del">static int16_t s_aec_ref[1024]; // 2KB BSS</div>
-                  <div class="diff-line del">static int16_t s_aec_interleaved[2048]; // 4KB BSS</div>
-                  <div class="diff-line del">static int16_t input_buffer[2048]; // 4KB BSS</div>
-                  <div class="diff-line ctx">// ...</div>
-                  <div class="diff-line del">xTaskCreatePinnedToCore(afe_fetch_task, "afe_fetch", 4096, ...);</div>
-                </div>
-              </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后（动态 SPIRAM 分配）</div>
-                <div class="diff-lines">
-                  <div class="diff-line add">static int16_t *s_aec_ref = NULL; // 指针</div>
-                  <div class="diff-line add">static int16_t *s_aec_interleaved = NULL;// 指针</div>
-                  <div class="diff-line add">static int16_t *input_buffer = NULL; // 指针</div>
-                  <div class="diff-line ctx">// wake_word_init() 中分配：</div>
-                  <div class="diff-line add">s_aec_ref = heap_caps_malloc(1024*2, MALLOC_CAP_SPIRAM);</div>
-                  <div class="diff-line add">s_aec_interleaved = heap_caps_malloc(2048*2, MALLOC_CAP_SPIRAM);</div>
-                  <div class="diff-line add">input_buffer = heap_caps_malloc(2048*2, MALLOC_CAP_SPIRAM);</div>
-                  <div class="diff-line ctx">// ...</div>
-                  <div class="diff-line add">xTaskCreatePinnedToCoreWithCaps(afe_fetch_task, "afe_fetch", 4096,</div>
-                  <div class="diff-line add"> NULL, 5, NULL, 1, MALLOC_CAP_SPIRAM);</div>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div class="diff-note">
-            <strong>峰值内部 SRAM 22KB → 75KB+（+53KB）</strong>
-            <br>迁移清单：audio_feed(8KB) + afe_fetch(4KB) + reminder(8KB) + interaction_worker(4KB) + heartbeat(4KB) +
-            async_ww_update(4KB) + servo_worker(4KB) + ws_reconn(6KB) = 42KB 任务栈，+ 10KB 静态
-            buffer（s_aec_ref/s_aec_interleaved/input_buffer）+ 1KB 采集 buffer。
-            <br><br><strong>安全论证：</strong>ESP32-S3 PSRAM 通过 MMU cache 访问，task stack 放 PSRAM 对非 ISR 任务完全兼容。I2S DMA
-            内部维护自己的 DMA ring buffer，用户 buffer 只是 CPU memcpy 目标，放 PSRAM 安全。NVS 写入会短暂挂起 CPU1（毫秒级音频帧丢失），不影响正确性。
-            <br><br>已保留 WiFi task 在内部 SRAM（原 SPIRAM 版被注释，疑有特殊需求）。
           </div>
         </div>
       </div>
 
-      <!-- servo_manager 新模块 -->
-      <div class="commit" id="servo-mgr-0415">
-        <div class="commit-header" onclick="toggle('servo-mgr-0415')">
-          <div class="dot-blue"></div>
-          <div class="commit-info">
-            <div class="commit-title">feat(servo): 新增servo_manager高层管理器 + interaction非阻塞架构重构</div>
-            <div class="commit-meta">
-              <span class="time-badge">2026-04-15</span>
-              <span class="tag tag-feat">新增模块</span>
-              <span class="tag tag-feat">非阻塞</span>
-            </div>
-          </div>
-          <span class="chevron">▶</span>
+      <!-- ========== 2026-05-11 ========== -->
+      <div class="day-section">
+        <div class="day-header">
+          <div class="day-date">2026-05-11</div>
+          <div class="day-summary">BUG-013 修复：长 TTS 残留被识别为下一轮用户输入（排空三重锁 + 解码器水位检查）</div>
+          <div class="day-line"></div>
         </div>
-        <div class="commit-body">
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/bsp/servo_manager.c（新增）</span>
-              <div class="diff-stat"><span class="diff-add">+258</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">（无此文件）</div>
-                </div>
-              </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后</div>
-                <div class="diff-lines">
-                  <div class="diff-line add">servo_manager_init() // 创建队列 + worker task(4KB SPIRAM)</div>
-                  <div class="diff-line add">servo_manager_submit_angle() // 非阻塞下发角度指令</div>
-                  <div class="diff-line add">servo_manager_submit_preset() // 按预设动作索引触发</div>
-                  <div class="diff-line add">// servo_amplitude_t / servo_direction_t 枚举</div>
-                  <div class="diff-line add">// SERVO_SPEED_* 全部从 bsp_config.h 统一引用</div>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/ui/interaction.c（重构）</span>
-              <div class="diff-stat"><span class="diff-add">+350</span><span class="diff-del">-100</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前（同步阻塞）</div>
-                <div class="diff-lines">
-                  <div class="diff-line del">// ui_interaction_play() 直接同步执行舵机动作</div>
-                  <div class="diff-line del">// 阻塞调用方（session/UI）数百毫秒</div>
-                </div>
-              </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后（非阻塞 worker）</div>
-                <div class="diff-lines">
-                  <div class="diff-line add">interaction_manager_init() // 创建队列 + worker task</div>
-                  <div class="diff-line add">ui_interaction_play(emo) // 仅入队，立即返回</div>
-                  <div class="diff-line add">// interaction_worker_task 串行消费队列</div>
-                  <div class="diff-line add">// 屏幕动画→音效→震动→三轴舵机→归中</div>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/bsp/bsp_servo.c（重构）</span>
-              <div class="diff-stat"><span class="diff-add">+40</span><span class="diff-del">-50</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前</div>
-                <div class="diff-lines">
-                  <div class="diff-line del">// 无 mutex，多任务并发调用 bsp_servo_move_smooth 不安全</div>
-                  <div class="diff-line del">// max_width_us = 2500</div>
-                  <div class="diff-line del">typedef enum { EMO_HAPPY, ... } robot_emotion_t; // 重复定义</div>
-                </div>
-              </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后</div>
-                <div class="diff-lines">
-                  <div class="diff-line add">static SemaphoreHandle_t s_ch_mutex[3]; // per-channel mutex</div>
-                  <div class="diff-line add">// max_width_us = 2400（更准确匹配实物）</div>
-                  <div class="diff-line add">// robot_emotion_t 移至 interaction.h，此处删除</div>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div class="diff-note">
-            <strong>bsp_config.h</strong> 新增 <code>SERVO_SPEED_VERY_FAST 2U</code> 和
-            <code>SERVO_SPEED_VERY_SLOW 50U</code>，速度宏统一在此定义，bsp_servo.c 和 servo_manager.h 共同引用，消除重复定义。
-            <br><br><strong>reminder.c</strong> 同步重构（+114行）：事件队列架构，poll_timer_callback 仅投递事件，reminder_task 串行处理 7 种事件类型。
-          </div>
-          <div class="file-links">
-            <a href="daily/2026-04-15.md" class="file-link">📄 日报详情</a>
-          </div>
-        </div>
-      </div>
 
-    </div>
-    <!-- ========== END 2026-04-15 ========== -->
+        <!-- BUG-013（未提交） -->
+        <div class="commit" id="bug013-0511">
+          <div class="commit-header" onclick="toggle('bug013-0511')">
+            <div class="dot-red"></div>
+            <div class="commit-info">
+              <div class="commit-title">fix(session): 长 TTS 残留被误识别为下一轮提问 — 排空三重锁 + 5s 兜底</div>
+              <div class="commit-meta">
+                <span class="time-badge">2026-05-11（未提交）</span>
+                <span class="tag tag-fix">BUG-013</span>
+                <span class="tag tag-fix">回声防护</span>
+              </div>
+            </div>
+            <span class="chevron">▶</span>
+          </div>
+          <div class="commit-body">
+            <div class="diff-note">
+              <strong>症状</strong>：TTS 播放<strong>长句</strong>（≥3s）时，残留音频被麦克风采集后当作下一轮用户提问上传。<br>
+              <strong>根因</strong>：TTS_STOP 是服务端逻辑事件，本地下游 dec_input(16KB) + dec_output(40KB) + I2S DMA 仍有 1~3s 未播完；旧版
+              1500ms 兜底超时强制开监听后喇叭仍在响。<br>
+              <strong>详见</strong>：<a href="bugs/BUG-013.md">bugs/BUG-013.md</a>
+            </div>
 
-    <!-- ========== 2026-04-14 ========== -->
-    <div class="day-section">
-      <div class="day-header">
-        <div class="day-date">2026-04-14</div>
-        <div class="day-summary">session 方案A/B切换 · 定时器栈溢出修复 · servo/touch/reminder 新模块骨架</div>
-        <div class="day-line"></div>
-        <a href="daily/2026-04-14.md" class="file-link">📄 日报</a>
-      </div>
-      <div class="commit" id="2eea04d">
-        <div class="commit-header" onclick="toggle('2eea04d')">
-          <div class="dot-blue"></div>
-          <div class="commit-info">
-            <div class="commit-title">feat(wake_word): 移除bsp前缀并优化音频处理接口</div>
-            <div class="commit-meta">
-              <a class="hash" href="#2eea04d">2eea04d</a>
-              <span class="tag tag-feat">接口重构</span>
-            </div>
-          </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="diff-note">
-            自定义唤醒词模块去掉 <code>bsp_</code> 前缀，优化音频处理接口命名。对应 2026-04-14 日报的最后一次提交。
-          </div>
-          <div class="file-links">
-            <a href="daily/2026-04-14.md" class="file-link">📄 日报详情</a>
-          </div>
-        </div>
-      </div>
-      <div class="commit" id="c2df9e1">
-        <div class="commit-header" onclick="toggle('c2df9e1')">
-          <div class="dot-blue"></div>
-          <div class="commit-info">
-            <div class="commit-title">feat(session): 会话模式A/B预留+定时器栈溢出修复+新增servo/touch/reminder模块</div>
-            <div class="commit-meta">
-              <a class="hash" href="#c2df9e1">c2df9e1</a>
-              <span class="tag tag-fix">BUG-008</span>
-              <span class="tag tag-feat">新模块</span>
-            </div>
-          </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="diff-note">
-            <strong>BUG-008 修复：</strong>软件定时器栈溢出。定时器回调中直接执行 <code>session_close()</code> →
-            <code>protocol_disconnect()</code> 等网络操作，导致定时器任务栈溢出。修复：所有定时器回调改为只往事件队列投递消息，由独立的
-            <code>session_event_task</code>（8KB 栈）处理耗时操作。
-            <br><br>同时新增 <strong>servo/touch/reminder</strong> 三个模块骨架（CMakeLists.txt 添加注册，头文件/接口定义完成）。
-          </div>
-          <div class="file-links">
-            <a href="daily/2026-04-14.md" class="file-link">📄 日报详情</a>
-            <a href="bugs/BUG-008.md" class="file-link">🐛 BUG-008</a>
-          </div>
-        </div>
-      </div>
-    </div>
-    <!-- ========== END 2026-04-14 ========== -->
-
-    <!-- ========== 2026-04-11 ========== -->
-    <div class="day-section">
-      <div class="day-header">
-        <div class="day-date">2026-04-11</div>
-        <div class="day-summary">唤醒词API命名空间重构 · LCD业务层开发 · 触摸/舵机模块加入构建</div>
-        <div class="day-line"></div>
-        <a href="daily/2026-04-11.md" class="file-link">📄 日报</a>
-      </div>
-
-      <!-- 3fe7c5b -->
-      <div class="commit" id="3fe7c5b">
-        <div class="commit-header" onclick="toggle('3fe7c5b')">
-          <div class="dot-red"></div>
-          <div class="commit-info">
-            <div class="commit-title">BREAKING CHANGE: 唤醒词引擎API重构，统一使用wake_word_*命名空间替代bsp_wake_word_*</div>
-            <div class="commit-meta">
-              <a class="hash" href="#3fe7c5b">3fe7c5b</a>
-              <span class="time-badge">16:01</span>
-              <span class="tag tag-fix">BREAKING</span>
-              <span class="tag tag-feat">接口重构</span>
-            </div>
-          </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/wake_word/custom_wake_word.h / .c</span>
-              <div class="diff-stat"><span class="diff-add">+N</span><span class="diff-del">-N</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前（bsp_wake_word_* 前缀）</div>
-                <div class="diff-lines">
-                  <div class="diff-line del">bsp_wake_word_init(cb)</div>
-                  <div class="diff-line del">bsp_wake_word_set_vad_cb(cb)</div>
-                  <div class="diff-line del">bsp_wake_word_set_enhanced_pcm_hook(hook)</div>
-                  <div class="diff-line del">bsp_wake_word_set_aec_ref_cb(cb)</div>
-                  <div class="diff-line del">bsp_wake_word_update(disp, pinyin)</div>
+            <div class="file-diff">
+              <div class="file-header">
+                <span class="file-path">main/audio/audio_processor.h</span>
+                <div class="diff-stat"><span class="diff-add">+20</span><span class="diff-del">-0</span></div>
+              </div>
+              <div class="diff-split">
+                <div class="diff-col before">
+                  <div class="diff-col-header before">修改前</div>
+                  <div class="diff-lines">
+                    <div class="diff-line ctx">// 仅暴露 read/write/flush/read_ref_pcm</div>
+                    <div class="diff-line ctx">// 无下游水位查询接口</div>
+                  </div>
+                </div>
+                <div class="diff-col after">
+                  <div class="diff-col-header after">修改后（新增接口）</div>
+                  <div class="diff-lines">
+                    <div class="diff-line add">size_t audio_processor_get_pending_bytes(</div>
+                    <div class="diff-line add"> audio_processor_t *audio_processor);</div>
+                    <div class="diff-line ctx">// 返回 dec_input + dec_output 当前积压字节数</div>
+                    <div class="diff-line ctx">// 0 表示下游链路完全排空</div>
+                  </div>
                 </div>
               </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后（wake_word_* 命名空间）</div>
-                <div class="diff-lines">
-                  <div class="diff-line add">wake_word_init(cb)</div>
-                  <div class="diff-line add">wake_word_set_vad_cb(cb)</div>
-                  <div class="diff-line add">wake_word_set_enhanced_pcm_hook(hook)</div>
-                  <div class="diff-line add">wake_word_set_aec_ref_cb(cb)</div>
-                  <div class="diff-line add">wake_word_update(disp, pinyin)</div>
+            </div>
+
+            <div class="file-diff">
+              <div class="file-header">
+                <span class="file-path">main/audio/audio_processor.c</span>
+                <div class="diff-stat"><span class="diff-add">+18</span><span class="diff-del">-0</span></div>
+              </div>
+              <div class="diff-split">
+                <div class="diff-col before">
+                  <div class="diff-col-header before">修改前</div>
+                  <div class="diff-lines">
+                    <div class="diff-line ctx">（无对应实现）</div>
+                  </div>
+                </div>
+                <div class="diff-col after">
+                  <div class="diff-col-header after">修改后</div>
+                  <div class="diff-lines">
+                    <div class="diff-line add">size_t audio_processor_get_pending_bytes(</div>
+                    <div class="diff-line add"> audio_processor_t *p) {</div>
+                    <div class="diff-line add"> if (p == NULL) return 0;</div>
+                    <div class="diff-line add"> size_t in = 0, out = 0;</div>
+                    <div class="diff-line add"> if (p->dec_input)</div>
+                    <div class="diff-line add"> vRingbufferGetInfo(p->dec_input,</div>
+                    <div class="diff-line add"> NULL,NULL,NULL,NULL,&in);</div>
+                    <div class="diff-line add"> if (p->dec_output)</div>
+                    <div class="diff-line add"> vRingbufferGetInfo(p->dec_output,</div>
+                    <div class="diff-line add"> NULL,NULL,NULL,NULL,&out);</div>
+                    <div class="diff-line add"> return in + out;</div>
+                    <div class="diff-line add">}</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="file-diff">
+              <div class="file-header">
+                <span class="file-path">main/session/session.c</span>
+                <div class="diff-stat"><span class="diff-add">+18</span><span class="diff-del">-9</span></div>
+              </div>
+              <div class="diff-split">
+                <div class="diff-col before">
+                  <div class="diff-col-header before">修改前（双重锁 + 1.5s 兜底）</div>
+                  <div class="diff-lines">
+                    <div class="diff-line ctx">if (s_waiting_for_silence) {</div>
+                    <div class="diff-line ctx"> uint32_t wait_ms = ...;</div>
+                    <div class="diff-line ctx"> if (wait_ms < 400) return;</div>
+                        <div class="diff-line ctx"> if (vad == VAD_SILENCE) {</div>
+                        <div class="diff-line ctx"> s_vad_silence_count++;</div>
+                        <div class="diff-line del"> if (s_vad_silence_count > 8) {</div>
+                        <div class="diff-line del"> // 进入监听</div>
+                        <div class="diff-line del"> }</div>
+                        <div class="diff-line ctx"> } else s_vad_silence_count = 0;</div>
+                        <div class="diff-line del"> if (wait_ms > 1500) {</div>
+                        <div class="diff-line del"> // 强制开监听</div>
+                        <div class="diff-line del"> }</div>
+                        <div class="diff-line ctx"> return;</div>
+                        <div class="diff-line ctx">}</div>
+                    </div>
+                  </div>
+                  <div class="diff-col after">
+                    <div class="diff-col-header after">修改后（三重锁 + 5s 兜底）</div>
+                    <div class="diff-lines">
+                      <div class="diff-line ctx">if (s_waiting_for_silence) {</div>
+                      <div class="diff-line ctx"> uint32_t wait_ms = ...;</div>
+                      <div class="diff-line ctx"> if (wait_ms < 400) return;</div>
+                          <div class="diff-line add"> size_t pending_bytes =</div>
+                          <div class="diff-line add"> audio_processor_get_pending_bytes(</div>
+                          <div class="diff-line add"> s_processor);</div>
+                          <div class="diff-line ctx"> if (vad == VAD_SILENCE) {</div>
+                          <div class="diff-line ctx"> s_vad_silence_count++;</div>
+                          <div class="diff-line add"> if (s_vad_silence_count > 8</div>
+                          <div class="diff-line add"> && pending_bytes == 0) {</div>
+                          <div class="diff-line add"> // 三重锁 OK，进入监听</div>
+                          <div class="diff-line add"> }</div>
+                          <div class="diff-line ctx"> } else s_vad_silence_count = 0;</div>
+                          <div class="diff-line add"> if (wait_ms > 5000) {</div>
+                          <div class="diff-line add"> // 强制开监听（5s 兜底）</div>
+                          <div class="diff-line add"> }</div>
+                          <div class="diff-line ctx"> return;</div>
+                          <div class="diff-line ctx">}</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="diff-note">
+                  <strong>排空三重锁</strong>：物理静音 ≥ 400ms · 解码链路 pending == 0 · 连续 8 帧 VAD_SILENCE，三者同时成立才放行。<br>
+                  <strong>兜底超时</strong>：1500ms → 5000ms（覆盖 dec_input 16KB + dec_output 40KB 极端长句深度）。<br>
+                  <strong>验证</strong>：编译通过，Echo.bin 0x290330 字节（15% 余量）；待实测长句对话场景。
                 </div>
               </div>
             </div>
           </div>
-          <div class="diff-note">
-            去掉 <code>bsp_</code> 前缀，统一使用 <code>wake_word_*</code> 命名，与模块功能更匹配（唤醒词是应用层概念，非单纯 BSP 硬件层）。
-            <br>本次 BREAKING CHANGE 为后续 session.c 调用方全部更新命名空间。
-          </div>
-          <div class="file-links">
-            <a href="daily/2026-04-11.md" class="file-link">📄 日报详情</a>
-          </div>
-        </div>
-      </div>
 
-    </div>
-    <!-- ========== END 2026-04-11 ========== -->
+          <!-- ========== 2026-04-15 ========== -->
+          <div class="day-section">
+            <div class="day-header">
+              <div class="day-date">2026-04-15</div>
+              <div class="day-summary">内部 SRAM 峰值优化（22KB→75KB+）· servo/interaction 非阻塞架构 · servo_manager 新模块</div>
+              <div class="day-line"></div>
+              <a href="daily/2026-04-15.md" class="file-link">📄 日报</a>
+            </div>
 
-    <!-- ========== 2026-04-10 ========== -->
-    <div class="day-section">
-      <div class="day-header">
-        <div class="day-date">2026-04-10</div>
-        <div class="day-summary">禁用VBR · 协议修复 · LCD接入构建 · 大规模文档补全</div>
-        <div class="day-line"></div>
-        <a href="daily/2026-04-10.md" class="file-link">📄 日报</a>
-      </div>
+            <!-- 内存优化（未提交，待提交） -->
+            <div class="commit" id="mem-opt-0415">
+              <div class="commit-header" onclick="toggle('mem-opt-0415')">
+                <div class="dot-green"></div>
+                <div class="commit-info">
+                  <div class="commit-title">perf(memory): 内部SRAM峰值优化 — 7任务栈+3静态buffer迁移至SPIRAM，节省约53KB</div>
+                  <div class="commit-meta">
+                    <span class="time-badge">2026-04-15</span>
+                    <span class="tag tag-feat">内存优化</span>
+                    <span class="tag tag-feat">SPIRAM</span>
+                  </div>
+                </div>
+                <span class="chevron">▶</span>
+              </div>
+              <div class="commit-body">
+                <div class="file-diff">
+                  <div class="file-header">
+                    <span class="file-path">main/bsp/bsp_codec.c</span>
+                    <div class="diff-stat"><span class="diff-add">+8</span><span class="diff-del">-4</span></div>
+                  </div>
+                  <div class="diff-split">
+                    <div class="diff-col before">
+                      <div class="diff-col-header before">修改前</div>
+                      <div class="diff-lines">
+                        <div class="diff-line del">int16_t *buffer = malloc(chunk_size * sizeof(int16_t));</div>
+                        <div class="diff-line ctx">// ...</div>
+                        <div class="diff-line del">xTaskCreatePinnedToCore(</div>
+                        <div class="diff-line del"> audio_feed_task, "audio_feed", 8192,</div>
+                        <div class="diff-line del"> bsp_board, 5, NULL, 1);</div>
+                      </div>
+                    </div>
+                    <div class="diff-col after">
+                      <div class="diff-col-header after">修改后</div>
+                      <div class="diff-lines">
+                        <div class="diff-line add">int16_t *buffer = heap_caps_malloc(</div>
+                        <div class="diff-line add"> chunk_size * sizeof(int16_t), MALLOC_CAP_SPIRAM);</div>
+                        <div class="diff-line ctx">// ...</div>
+                        <div class="diff-line add">xTaskCreatePinnedToCoreWithCaps(</div>
+                        <div class="diff-line add"> audio_feed_task, "audio_feed", 8192,</div>
+                        <div class="diff-line add"> bsp_board, 5, NULL, 1,</div>
+                        <div class="diff-line add"> MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="file-diff">
+                  <div class="file-header">
+                    <span class="file-path">main/wake_word/custom_wake_word.c</span>
+                    <div class="diff-stat"><span class="diff-add">+20</span><span class="diff-del">-5</span></div>
+                  </div>
+                  <div class="diff-split">
+                    <div class="diff-col before">
+                      <div class="diff-col-header before">修改前（BSS 静态数组，内部 SRAM）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line del">static int16_t s_aec_ref[1024]; // 2KB BSS</div>
+                        <div class="diff-line del">static int16_t s_aec_interleaved[2048]; // 4KB BSS</div>
+                        <div class="diff-line del">static int16_t input_buffer[2048]; // 4KB BSS</div>
+                        <div class="diff-line ctx">// ...</div>
+                        <div class="diff-line del">xTaskCreatePinnedToCore(afe_fetch_task, "afe_fetch", 4096, ...);
+                        </div>
+                      </div>
+                    </div>
+                    <div class="diff-col after">
+                      <div class="diff-col-header after">修改后（动态 SPIRAM 分配）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line add">static int16_t *s_aec_ref = NULL; // 指针</div>
+                        <div class="diff-line add">static int16_t *s_aec_interleaved = NULL;// 指针</div>
+                        <div class="diff-line add">static int16_t *input_buffer = NULL; // 指针</div>
+                        <div class="diff-line ctx">// wake_word_init() 中分配：</div>
+                        <div class="diff-line add">s_aec_ref = heap_caps_malloc(1024*2, MALLOC_CAP_SPIRAM);</div>
+                        <div class="diff-line add">s_aec_interleaved = heap_caps_malloc(2048*2, MALLOC_CAP_SPIRAM);
+                        </div>
+                        <div class="diff-line add">input_buffer = heap_caps_malloc(2048*2, MALLOC_CAP_SPIRAM);</div>
+                        <div class="diff-line ctx">// ...</div>
+                        <div class="diff-line add">xTaskCreatePinnedToCoreWithCaps(afe_fetch_task, "afe_fetch", 4096,
+                        </div>
+                        <div class="diff-line add"> NULL, 5, NULL, 1, MALLOC_CAP_SPIRAM);</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="diff-note">
+                  <strong>峰值内部 SRAM 22KB → 75KB+（+53KB）</strong>
+                  <br>迁移清单：audio_feed(8KB) + afe_fetch(4KB) + reminder(8KB) + interaction_worker(4KB) + heartbeat(4KB) +
+                  async_ww_update(4KB) + servo_worker(4KB) + ws_reconn(6KB) = 42KB 任务栈，+ 10KB 静态
+                  buffer（s_aec_ref/s_aec_interleaved/input_buffer）+ 1KB 采集 buffer。
+                  <br><br><strong>安全论证：</strong>ESP32-S3 PSRAM 通过 MMU cache 访问，task stack 放 PSRAM 对非 ISR 任务完全兼容。I2S DMA
+                  内部维护自己的 DMA ring buffer，用户 buffer 只是 CPU memcpy 目标，放 PSRAM 安全。NVS 写入会短暂挂起 CPU1（毫秒级音频帧丢失），不影响正确性。
+                  <br><br>已保留 WiFi task 在内部 SRAM（原 SPIRAM 版被注释，疑有特殊需求）。
+                </div>
+              </div>
+            </div>
 
-      <!-- a884816 -->
-      <div class="commit" id="a884816">
-        <div class="commit-header" onclick="toggle('a884816')">
-          <div class="dot-blue"></div>
-          <div class="commit-info">
-            <div class="commit-title">feat(audio): 添加LCD BSP支持并完善音频解码器文档</div>
-            <div class="commit-meta">
-              <a class="hash" href="#a884816">a884816</a>
-              <span class="time-badge">10:31</span>
-              <span class="tag tag-feat">新增</span>
-              <span class="tag tag-feat">LCD</span>
-              <span class="tag tag-feat">文档补全</span>
-            </div>
-          </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/CMakeLists.txt</span>
-              <div class="diff-stat"><span class="diff-add">+1</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">set(SOURCES</div>
-                  <div class="diff-line ctx"> "bsp/bsp_codec.c"</div>
-                  <div class="diff-line ctx"> "bsp/bsp_wifi.c"</div>
-                  <div class="diff-line del"> # bsp_lcd.c 未加入</div>
-                  <div class="diff-line ctx">)</div>
+            <!-- servo_manager 新模块 -->
+            <div class="commit" id="servo-mgr-0415">
+              <div class="commit-header" onclick="toggle('servo-mgr-0415')">
+                <div class="dot-blue"></div>
+                <div class="commit-info">
+                  <div class="commit-title">feat(servo): 新增servo_manager高层管理器 + interaction非阻塞架构重构</div>
+                  <div class="commit-meta">
+                    <span class="time-badge">2026-04-15</span>
+                    <span class="tag tag-feat">新增模块</span>
+                    <span class="tag tag-feat">非阻塞</span>
+                  </div>
+                </div>
+                <span class="chevron">▶</span>
+              </div>
+              <div class="commit-body">
+                <div class="file-diff">
+                  <div class="file-header">
+                    <span class="file-path">main/bsp/servo_manager.c（新增）</span>
+                    <div class="diff-stat"><span class="diff-add">+258</span></div>
+                  </div>
+                  <div class="diff-split">
+                    <div class="diff-col before">
+                      <div class="diff-col-header before">修改前</div>
+                      <div class="diff-lines">
+                        <div class="diff-line ctx">（无此文件）</div>
+                      </div>
+                    </div>
+                    <div class="diff-col after">
+                      <div class="diff-col-header after">修改后</div>
+                      <div class="diff-lines">
+                        <div class="diff-line add">servo_manager_init() // 创建队列 + worker task(4KB SPIRAM)</div>
+                        <div class="diff-line add">servo_manager_submit_angle() // 非阻塞下发角度指令</div>
+                        <div class="diff-line add">servo_manager_submit_preset() // 按预设动作索引触发</div>
+                        <div class="diff-line add">// servo_amplitude_t / servo_direction_t 枚举</div>
+                        <div class="diff-line add">// SERVO_SPEED_* 全部从 bsp_config.h 统一引用</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="file-diff">
+                  <div class="file-header">
+                    <span class="file-path">main/ui/interaction.c（重构）</span>
+                    <div class="diff-stat"><span class="diff-add">+350</span><span class="diff-del">-100</span></div>
+                  </div>
+                  <div class="diff-split">
+                    <div class="diff-col before">
+                      <div class="diff-col-header before">修改前（同步阻塞）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line del">// ui_interaction_play() 直接同步执行舵机动作</div>
+                        <div class="diff-line del">// 阻塞调用方（session/UI）数百毫秒</div>
+                      </div>
+                    </div>
+                    <div class="diff-col after">
+                      <div class="diff-col-header after">修改后（非阻塞 worker）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line add">interaction_manager_init() // 创建队列 + worker task</div>
+                        <div class="diff-line add">ui_interaction_play(emo) // 仅入队，立即返回</div>
+                        <div class="diff-line add">// interaction_worker_task 串行消费队列</div>
+                        <div class="diff-line add">// 屏幕动画→音效→震动→三轴舵机→归中</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="file-diff">
+                  <div class="file-header">
+                    <span class="file-path">main/bsp/bsp_servo.c（重构）</span>
+                    <div class="diff-stat"><span class="diff-add">+40</span><span class="diff-del">-50</span></div>
+                  </div>
+                  <div class="diff-split">
+                    <div class="diff-col before">
+                      <div class="diff-col-header before">修改前</div>
+                      <div class="diff-lines">
+                        <div class="diff-line del">// 无 mutex，多任务并发调用 bsp_servo_move_smooth 不安全</div>
+                        <div class="diff-line del">// max_width_us = 2500</div>
+                        <div class="diff-line del">typedef enum { EMO_HAPPY, ... } robot_emotion_t; // 重复定义</div>
+                      </div>
+                    </div>
+                    <div class="diff-col after">
+                      <div class="diff-col-header after">修改后</div>
+                      <div class="diff-lines">
+                        <div class="diff-line add">static SemaphoreHandle_t s_ch_mutex[3]; // per-channel mutex</div>
+                        <div class="diff-line add">// max_width_us = 2400（更准确匹配实物）</div>
+                        <div class="diff-line add">// robot_emotion_t 移至 interaction.h，此处删除</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="diff-note">
+                  <strong>bsp_config.h</strong> 新增 <code>SERVO_SPEED_VERY_FAST 2U</code> 和
+                  <code>SERVO_SPEED_VERY_SLOW 50U</code>，速度宏统一在此定义，bsp_servo.c 和 servo_manager.h 共同引用，消除重复定义。
+                  <br><br><strong>reminder.c</strong> 同步重构（+114行）：事件队列架构，poll_timer_callback 仅投递事件，reminder_task 串行处理 7
+                  种事件类型。
+                </div>
+                <div class="file-links">
+                  <a href="daily/2026-04-15.md" class="file-link">📄 日报详情</a>
                 </div>
               </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">set(SOURCES</div>
-                  <div class="diff-line ctx"> "bsp/bsp_codec.c"</div>
-                  <div class="diff-line ctx"> "bsp/bsp_wifi.c"</div>
-                  <div class="diff-line add"> "bsp/bsp_lcd.c"</div>
-                  <div class="diff-line ctx">)</div>
-                </div>
-              </div>
             </div>
-          </div>
-          <div class="diff-note">
-            ST7789 LCD 240×320 SPI 驱动正式加入构建系统。新文件 <strong>bsp_lcd.c</strong> (+135行) 包含背光控制、初始化、显示接口。
-            <br><br>同日完成 <strong>13 个文件 +1553 行</strong>注释补全（bsp_codec.c +327、bsp_wifi.c +420、audio_decoder/encoder
-            +各240/253、session.h +106 等）。
-          </div>
-          <div class="file-links">
-            <a href="daily/2026-04-10.md" class="file-link">📄 日报详情</a>
-            <a href="decisions/DEC-005-pin-assignment.md" class="file-link">📐 DEC-005 引脚分配</a>
-          </div>
-        </div>
-      </div>
 
-      <!-- 7279cc6 -->
-      <div class="commit" id="7279cc6">
-        <div class="commit-header" onclick="toggle('7279cc6')">
-          <div class="dot-red"></div>
-          <div class="commit-info">
-            <div class="commit-title">fix(audio): 禁用opus编码器可变比特率以保证延迟稳定</div>
-            <div class="commit-meta">
-              <a class="hash" href="#7279cc6">7279cc6</a>
-              <span class="time-badge">10:15</span>
-              <span class="tag tag-fix">回退修复</span>
-              <span class="tag tag-dec">DEC-001</span>
-            </div>
           </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/audio/audio_encoder.c</span>
-              <div class="diff-stat"><span class="diff-add">+2</span><span class="diff-del">-1</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前（04-09 启用了 VBR）</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">opus_encoder_ctl(enc,</div>
-                  <div class="diff-line del"> OPUS_SET_VBR(1)); // 可变比特率</div>
-                  <div class="diff-line ctx">opus_encoder_ctl(enc,</div>
-                  <div class="diff-line ctx"> OPUS_SET_BITRATE(32000));</div>
-                </div>
-              </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后（禁用 VBR，CBR 稳定）</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">opus_encoder_ctl(enc,</div>
-                  <div class="diff-line add"> OPUS_SET_VBR(0)); // 禁用VBR，CBR更稳定</div>
-                  <div class="diff-line ctx">opus_encoder_ctl(enc,</div>
-                  <div class="diff-line add"> OPUS_SET_BITRATE(24000)); // 32→24kbps</div>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/protocol/websocket_client.c</span>
-              <div class="diff-stat"><span class="diff-add">+8</span><span class="diff-del">-3</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">if (strcmp(type, "stt") == 0) {</div>
-                  <div class="diff-line del"> handle_stt(data);</div>
-                  <div class="diff-line del">}</div>
-                  <div class="diff-line del">// transcript 类型无处理</div>
-                  <div class="diff-line ctx">// 音频格式</div>
-                  <div class="diff-line del">send_audio_frame("pcm", buf, len);</div>
-                </div>
-              </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">if (strcmp(type, "stt") == 0) {</div>
-                  <div class="diff-line add"> // handle_stt(data); // 注释掉重复处理</div>
-                  <div class="diff-line add">}</div>
-                  <div class="diff-line add">if (strcmp(type, "transcript") == 0) {</div>
-                  <div class="diff-line add"> handle_stt(data); // transcript路由到stt</div>
-                  <div class="diff-line add">}</div>
-                  <div class="diff-line ctx">// 音频格式</div>
-                  <div class="diff-line add">send_audio_frame("opus", buf, len); // pcm→opus</div>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div class="diff-note">
-            VBR 在低语音活动段会突发低码率导致质量抖动，禁用后延迟稳定。确立 <strong>DEC-001</strong>：OPUS CBR 24kbps / 60ms / 复杂度3 为最终稳定配置。
-          </div>
-          <div class="file-links">
-            <a href="daily/2026-04-10.md" class="file-link">📄 日报详情</a>
-            <a href="decisions/DEC-001.md" class="file-link">📐 DEC-001 OPUS参数</a>
-          </div>
-        </div>
-      </div>
-    </div>
+          <!-- ========== END 2026-04-15 ========== -->
 
-    <!-- ========== 2026-04-09 ========== -->
-    <div class="day-section">
-      <div class="day-header">
-        <div class="day-date">2026-04-09</div>
-        <div class="day-summary">BUG-006/007修复 · VAD架构重构 · OPUS调参 · session事件队列</div>
-        <div class="day-line"></div>
-        <a href="daily/2026-04-09.md" class="file-link">📄 日报</a>
-      </div>
-
-      <!-- aee301c -->
-      <div class="commit" id="aee301c">
-        <div class="commit-header" onclick="toggle('aee301c')">
-          <div class="dot-green"></div>
-          <div class="commit-info">
-            <div class="commit-title">feat(session): 添加VAD延迟启动机制防止唤醒词尾音误触发</div>
-            <div class="commit-meta">
-              <a class="hash" href="#aee301c">aee301c</a>
-              <span class="time-badge">11:15</span>
-              <span class="tag tag-bug">BUG-007</span>
-              <span class="tag tag-fix">已修复</span>
+          <!-- ========== 2026-04-14 ========== -->
+          <div class="day-section">
+            <div class="day-header">
+              <div class="day-date">2026-04-14</div>
+              <div class="day-summary">session 方案A/B切换 · 定时器栈溢出修复 · servo/touch/reminder 新模块骨架</div>
+              <div class="day-line"></div>
+              <a href="daily/2026-04-14.md" class="file-link">📄 日报</a>
             </div>
-          </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/session/session.c</span>
-              <div class="diff-stat"><span class="diff-add">+30</span><span class="diff-del">-17</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前（立即激活 VAD）</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">// 收到服务端 "started" 后</div>
-                  <div class="diff-line del">// 立即开始 VAD 检测</div>
-                  <div class="diff-line del">s_vad_active = true;</div>
-                  <div class="diff-line ctx"></div>
-                  <div class="diff-line ctx">// VAD 检测逻辑</div>
-                  <div class="diff-line del">if (vad_state == AFE_VAD_SILENCE) {</div>
-                  <div class="diff-line del"> start_eos_timer();</div>
-                  <div class="diff-line del">}</div>
+            <div class="commit" id="2eea04d">
+              <div class="commit-header" onclick="toggle('2eea04d')">
+                <div class="dot-blue"></div>
+                <div class="commit-info">
+                  <div class="commit-title">feat(wake_word): 移除bsp前缀并优化音频处理接口</div>
+                  <div class="commit-meta">
+                    <a class="hash" href="#2eea04d">2eea04d</a>
+                    <span class="tag tag-feat">接口重构</span>
+                  </div>
                 </div>
+                <span class="chevron">▶</span>
               </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后（500ms 消退保护期）</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">// 收到服务端 "started" 后</div>
-                  <div class="diff-line add">s_vad_ready_tick = xTaskGetTickCount();</div>
-                  <div class="diff-line add">s_stop_sent = false;</div>
-                  <div class="diff-line ctx"></div>
-                  <div class="diff-line ctx">// VAD 检测逻辑</div>
-                  <div class="diff-line add">TickType_t elapsed =</div>
-                  <div class="diff-line add"> xTaskGetTickCount() - s_vad_ready_tick;</div>
-                  <div class="diff-line add">bool grace_over =</div>
-                  <div class="diff-line add"> elapsed > pdMS_TO_TICKS(VAD_GRACE_MS); // 500ms</div>
-                  <div class="diff-line add">if (grace_over && vad == AFE_VAD_SILENCE) {</div>
-                  <div class="diff-line add"> if (!s_stop_sent) {</div>
-                  <div class="diff-line add"> send_stop(); s_stop_sent = true;</div>
-                  <div class="diff-line add"> }</div>
-                  <div class="diff-line add">}</div>
+              <div class="commit-body">
+                <div class="diff-note">
+                  自定义唤醒词模块去掉 <code>bsp_</code> 前缀，优化音频处理接口命名。对应 2026-04-14 日报的最后一次提交。
+                </div>
+                <div class="file-links">
+                  <a href="daily/2026-04-14.md" class="file-link">📄 日报详情</a>
                 </div>
               </div>
             </div>
-          </div>
-          <div class="diff-note">
-            <strong>问题根因</strong>：唤醒词尾音 + 呼吸停顿被立即激活的 VAD 判定为句末静音，发送 stop 打断了用户真正的问话。
-            <br><strong>修复方案</strong>：服务端 started 响应后等待 500ms 才开始 VAD 检测，消退期内静音不触发 EOS。
-          </div>
-          <div class="file-links">
-            <a href="bugs/BUG-007.md" class="file-link">🐛 BUG-007 详情</a>
-            <a href="decisions/DEC-004.md" class="file-link">📐 DEC-004 AFE VAD</a>
-            <a href="daily/2026-04-09.md" class="file-link">📄 日报</a>
-          </div>
-        </div>
-      </div>
-
-      <!-- 24d10cc -->
-      <div class="commit" id="24d10cc">
-        <div class="commit-header" onclick="toggle('24d10cc')">
-          <div class="dot-green"></div>
-          <div class="commit-info">
-            <div class="commit-title">feat(wifi): 修复按钮监控任务创建参数错误（多模块合并提交）</div>
-            <div class="commit-meta">
-              <a class="hash" href="#24d10cc">24d10cc</a>
-              <span class="time-badge">11:12</span>
-              <span class="tag tag-bug">BUG-006</span>
-              <span class="tag tag-fix">已修复</span>
-              <span class="tag tag-dec">DEC-004</span>
-            </div>
-          </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/wake_word/custom_wake_word.c — BUG-006 MultiNet CPU限频</span>
-              <div class="diff-stat"><span class="diff-add">+9</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前（无限制 detect）</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">while (1) {</div>
-                  <div class="diff-line ctx"> afe_data = afe_handle->fetch(...);</div>
-                  <div class="diff-line del"> // 每次循环调用多次 detect</div>
-                  <div class="diff-line del"> while (有数据) {</div>
-                  <div class="diff-line del"> multinet->detect(...);</div>
-                  <div class="diff-line del"> }</div>
-                  <div class="diff-line ctx">}</div>
+            <div class="commit" id="c2df9e1">
+              <div class="commit-header" onclick="toggle('c2df9e1')">
+                <div class="dot-blue"></div>
+                <div class="commit-info">
+                  <div class="commit-title">feat(session): 会话模式A/B预留+定时器栈溢出修复+新增servo/touch/reminder模块</div>
+                  <div class="commit-meta">
+                    <a class="hash" href="#c2df9e1">c2df9e1</a>
+                    <span class="tag tag-fix">BUG-008</span>
+                    <span class="tag tag-feat">新模块</span>
+                  </div>
                 </div>
+                <span class="chevron">▶</span>
               </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后（每次最多 1 次 detect）</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">while (1) {</div>
-                  <div class="diff-line ctx"> afe_data = afe_handle->fetch(...);</div>
-                  <div class="diff-line add"> // 官方推荐：每次 fetch 只调用 1 次 detect</div>
-                  <div class="diff-line add"> if (afe_data) {</div>
-                  <div class="diff-line add"> multinet->detect(afe_data->data);</div>
-                  <div class="diff-line add"> }</div>
-                  <div class="diff-line ctx">}</div>
+              <div class="commit-body">
+                <div class="diff-note">
+                  <strong>BUG-008 修复：</strong>软件定时器栈溢出。定时器回调中直接执行 <code>session_close()</code> →
+                  <code>protocol_disconnect()</code> 等网络操作，导致定时器任务栈溢出。修复：所有定时器回调改为只往事件队列投递消息，由独立的
+                  <code>session_event_task</code>（8KB 栈）处理耗时操作。
+                  <br><br>同时新增 <strong>servo/touch/reminder</strong> 三个模块骨架（CMakeLists.txt 添加注册，头文件/接口定义完成）。
+                </div>
+                <div class="file-links">
+                  <a href="daily/2026-04-14.md" class="file-link">📄 日报详情</a>
+                  <a href="bugs/BUG-008.md" class="file-link">🐛 BUG-008</a>
                 </div>
               </div>
             </div>
           </div>
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/protocol/websocket_client.c — 移除 "listen" 指令</span>
-              <div class="diff-stat"><span class="diff-add">+5</span><span class="diff-del">-1</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前</div>
-                <div class="diff-lines">
-                  <div class="diff-line del">send_json("{\"type\":\"listen\"}");</div>
-                </div>
-              </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后（服务端不支持 listen）</div>
-                <div class="diff-lines">
-                  <div class="diff-line add">// "listen" 服务端不支持，移除</div>
-                  <div class="diff-line add">// send_json("{\"type\":\"listen\"}");</div>
-                  <div class="diff-line add">send_json("{\"type\":\"stop\"}");</div>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div class="file-links">
-            <a href="bugs/BUG-006.md" class="file-link">🐛 BUG-006 详情</a>
-            <a href="decisions/DEC-004.md" class="file-link">📐 DEC-004 AFE WebRTC VAD</a>
-            <a href="daily/2026-04-09.md" class="file-link">📄 日报</a>
-          </div>
-        </div>
-      </div>
+          <!-- ========== END 2026-04-14 ========== -->
 
-      <!-- 0153c28 -->
-      <div class="commit" id="0153c28">
-        <div class="commit-header" onclick="toggle('0153c28')">
-          <div class="dot-warn"></div>
-          <div class="commit-info">
-            <div class="commit-title">feat(audio): 优化音频编码参数提升语音质量</div>
-            <div class="commit-meta">
-              <a class="hash" href="#0153c28">0153c28</a>
-              <span class="time-badge">17:22</span>
-              <span class="tag tag-warn">⚠️ VBR后来回退</span>
-              <span class="tag tag-warn">⚠️ pcm后来改回opus</span>
+          <!-- ========== 2026-04-11 ========== -->
+          <div class="day-section">
+            <div class="day-header">
+              <div class="day-date">2026-04-11</div>
+              <div class="day-summary">唤醒词API命名空间重构 · LCD业务层开发 · 触摸/舵机模块加入构建</div>
+              <div class="day-line"></div>
+              <a href="daily/2026-04-11.md" class="file-link">📄 日报</a>
             </div>
-          </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/audio/audio_encoder.c — OPUS参数调整</span>
-              <div class="diff-stat"><span class="diff-add">+8</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">// 比特率</div>
-                  <div class="diff-line del">OPUS_SET_BITRATE(32000) // 32kbps</div>
-                  <div class="diff-line ctx">// 复杂度</div>
-                  <div class="diff-line del">OPUS_SET_COMPLEXITY(0)</div>
-                  <div class="diff-line ctx">// VBR</div>
-                  <div class="diff-line del">OPUS_SET_VBR(0) // CBR</div>
-                </div>
-              </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后（⚠️ VBR在04-10发现问题回退）</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">// 比特率</div>
-                  <div class="diff-line add">OPUS_SET_BITRATE(24000) // 32→24kbps</div>
-                  <div class="diff-line ctx">// 复杂度</div>
-                  <div class="diff-line add">OPUS_SET_COMPLEXITY(3) // 0→3</div>
-                  <div class="diff-line ctx">// VBR</div>
-                  <div class="diff-line add">OPUS_SET_VBR(1) // 启用VBR ⚠️ 次日回退</div>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div class="diff-note">
-            ⚠️ <strong>注意</strong>：此提交启用的 VBR 在次日（04-10）发现导致延迟抖动，已在提交 <a href="#7279cc6" class="file-link">7279cc6</a>
-            中回退。最终稳定配置见 <a href="decisions/DEC-001.md" class="file-link">DEC-001</a>。
-          </div>
-          <div class="file-links">
-            <a href="decisions/DEC-001.md" class="file-link">📐 DEC-001 最终OPUS参数</a>
-            <a href="daily/2026-04-09.md" class="file-link">📄 日报</a>
-          </div>
-        </div>
-      </div>
-    </div>
 
-    <!-- ========== 2026-04-08 ========== -->
-    <div class="day-section">
-      <div class="day-header">
-        <div class="day-date">2026-04-08</div>
-        <div class="day-summary">AFE集成 · BUG-003/004修复 · 内存安全增强</div>
-        <div class="day-line"></div>
-        <a href="daily/2026-04-08.md" class="file-link">📄 日报</a>
-      </div>
+            <!-- 3fe7c5b -->
+            <div class="commit" id="3fe7c5b">
+              <div class="commit-header" onclick="toggle('3fe7c5b')">
+                <div class="dot-red"></div>
+                <div class="commit-info">
+                  <div class="commit-title">BREAKING CHANGE: 唤醒词引擎API重构，统一使用wake_word_*命名空间替代bsp_wake_word_*</div>
+                  <div class="commit-meta">
+                    <a class="hash" href="#3fe7c5b">3fe7c5b</a>
+                    <span class="time-badge">16:01</span>
+                    <span class="tag tag-fix">BREAKING</span>
+                    <span class="tag tag-feat">接口重构</span>
+                  </div>
+                </div>
+                <span class="chevron">▶</span>
+              </div>
+              <div class="commit-body">
+                <div class="file-diff">
+                  <div class="file-header">
+                    <span class="file-path">main/wake_word/custom_wake_word.h / .c</span>
+                    <div class="diff-stat"><span class="diff-add">+N</span><span class="diff-del">-N</span></div>
+                  </div>
+                  <div class="diff-split">
+                    <div class="diff-col before">
+                      <div class="diff-col-header before">修改前（bsp_wake_word_* 前缀）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line del">bsp_wake_word_init(cb)</div>
+                        <div class="diff-line del">bsp_wake_word_set_vad_cb(cb)</div>
+                        <div class="diff-line del">bsp_wake_word_set_enhanced_pcm_hook(hook)</div>
+                        <div class="diff-line del">bsp_wake_word_set_aec_ref_cb(cb)</div>
+                        <div class="diff-line del">bsp_wake_word_update(disp, pinyin)</div>
+                      </div>
+                    </div>
+                    <div class="diff-col after">
+                      <div class="diff-col-header after">修改后（wake_word_* 命名空间）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line add">wake_word_init(cb)</div>
+                        <div class="diff-line add">wake_word_set_vad_cb(cb)</div>
+                        <div class="diff-line add">wake_word_set_enhanced_pcm_hook(hook)</div>
+                        <div class="diff-line add">wake_word_set_aec_ref_cb(cb)</div>
+                        <div class="diff-line add">wake_word_update(disp, pinyin)</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="diff-note">
+                  去掉 <code>bsp_</code> 前缀，统一使用 <code>wake_word_*</code> 命名，与模块功能更匹配（唤醒词是应用层概念，非单纯 BSP 硬件层）。
+                  <br>本次 BREAKING CHANGE 为后续 session.c 调用方全部更新命名空间。
+                </div>
+                <div class="file-links">
+                  <a href="daily/2026-04-11.md" class="file-link">📄 日报详情</a>
+                </div>
+              </div>
+            </div>
 
-      <!-- 0bbfe76 -->
-      <div class="commit" id="0bbfe76">
-        <div class="commit-header" onclick="toggle('0bbfe76')">
-          <div class="dot-green"></div>
-          <div class="commit-info">
-            <div class="commit-title">feat(audio): 添加音频处理器内存管理和错误处理机制</div>
-            <div class="commit-meta">
-              <a class="hash" href="#0bbfe76">0bbfe76</a>
-              <span class="time-badge">23:25</span>
-              <span class="tag tag-bug">BUG-003</span>
-              <span class="tag tag-fix">已修复</span>
-            </div>
           </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/bsp/bsp_wifi.c — BUG-003 参数顺序修正</span>
-              <div class="diff-stat"><span class="diff-add">+2</span><span class="diff-del">-1</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前（顺序写反）</div>
-                <div class="diff-lines">
-                  <div class="diff-line del">xTaskCreatePinnedToCoreWithCaps(</div>
-                  <div class="diff-line del"> btn_monitor_task, "btn",</div>
-                  <div class="diff-line del"> 5, // ← 这是优先级，但传到了stack_depth位置</div>
-                  <div class="diff-line del"> NULL,</div>
-                  <div class="diff-line del"> 4096, // ← 这是stack_depth，但传到了priority位置</div>
-                  <div class="diff-line del"> NULL, 0, MALLOC_CAP_INTERNAL);</div>
-                </div>
-              </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后（顺序正确）</div>
-                <div class="diff-lines">
-                  <div class="diff-line add">xTaskCreatePinnedToCoreWithCaps(</div>
-                  <div class="diff-line add"> btn_monitor_task, "btn",</div>
-                  <div class="diff-line add"> 4096, // stack_depth（正确位置）</div>
-                  <div class="diff-line add"> NULL,</div>
-                  <div class="diff-line add"> 5, // priority（正确位置）</div>
-                  <div class="diff-line add"> NULL, 0, MALLOC_CAP_INTERNAL);</div>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/audio/audio_processor.c — 编解码器回滚保护</span>
-              <div class="diff-stat"><span class="diff-add">+28</span><span class="diff-del">-3</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前（无失败回滚）</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">encoder = audio_encoder_create(cfg);</div>
-                  <div class="diff-line del">// 无失败检查，直接继续</div>
-                  <div class="diff-line ctx">decoder = audio_decoder_create(cfg);</div>
-                </div>
-              </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后（失败时回滚释放）</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">encoder = audio_encoder_create(cfg);</div>
-                  <div class="diff-line add">if (!encoder) {</div>
-                  <div class="diff-line add"> ESP_LOGE(TAG, "encoder create failed");</div>
-                  <div class="diff-line add"> goto cleanup;</div>
-                  <div class="diff-line add">}</div>
-                  <div class="diff-line ctx">decoder = audio_decoder_create(cfg);</div>
-                  <div class="diff-line add">if (!decoder) {</div>
-                  <div class="diff-line add"> audio_encoder_destroy(encoder);</div>
-                  <div class="diff-line add"> goto cleanup;</div>
-                  <div class="diff-line add">}</div>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div class="file-links">
-            <a href="bugs/BUG-003.md" class="file-link">🐛 BUG-003 详情</a>
-            <a href="daily/2026-04-08.md" class="file-link">📄 日报</a>
-          </div>
-        </div>
-      </div>
+          <!-- ========== END 2026-04-11 ========== -->
 
-      <!-- e96b8bc -->
-      <div class="commit" id="e96b8bc">
-        <div class="commit-header" onclick="toggle('e96b8bc')">
-          <div class="dot-green"></div>
-          <div class="commit-info">
-            <div class="commit-title">feat(audio): 集成AFE音频前端处理并优化PCM数据流</div>
-            <div class="commit-meta">
-              <a class="hash" href="#e96b8bc">e96b8bc</a>
-              <span class="time-badge">21:28</span>
-              <span class="tag tag-bug">BUG-004</span>
-              <span class="tag tag-fix">已修复</span>
-              <span class="tag tag-feat">AFE集成</span>
+          <!-- ========== 2026-04-10 ========== -->
+          <div class="day-section">
+            <div class="day-header">
+              <div class="day-date">2026-04-10</div>
+              <div class="day-summary">禁用VBR · 协议修复 · LCD接入构建 · 大规模文档补全</div>
+              <div class="day-line"></div>
+              <a href="daily/2026-04-10.md" class="file-link">📄 日报</a>
             </div>
-          </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/protocol/websocket_client.c — BUG-004 握手类型修正</span>
-              <div class="diff-stat"><span class="diff-add">+3</span><span class="diff-del">-1</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前（类型字段写错）</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">// 握手消息</div>
-                  <div class="diff-line del">cJSON_AddStringToObject(</div>
-                  <div class="diff-line del"> msg, "type", "hello"); // ❌ 服务端不认识</div>
+
+            <!-- a884816 -->
+            <div class="commit" id="a884816">
+              <div class="commit-header" onclick="toggle('a884816')">
+                <div class="dot-blue"></div>
+                <div class="commit-info">
+                  <div class="commit-title">feat(audio): 添加LCD BSP支持并完善音频解码器文档</div>
+                  <div class="commit-meta">
+                    <a class="hash" href="#a884816">a884816</a>
+                    <span class="time-badge">10:31</span>
+                    <span class="tag tag-feat">新增</span>
+                    <span class="tag tag-feat">LCD</span>
+                    <span class="tag tag-feat">文档补全</span>
+                  </div>
+                </div>
+                <span class="chevron">▶</span>
+              </div>
+              <div class="commit-body">
+                <div class="file-diff">
+                  <div class="file-header">
+                    <span class="file-path">main/CMakeLists.txt</span>
+                    <div class="diff-stat"><span class="diff-add">+1</span></div>
+                  </div>
+                  <div class="diff-split">
+                    <div class="diff-col before">
+                      <div class="diff-col-header before">修改前</div>
+                      <div class="diff-lines">
+                        <div class="diff-line ctx">set(SOURCES</div>
+                        <div class="diff-line ctx"> "bsp/bsp_codec.c"</div>
+                        <div class="diff-line ctx"> "bsp/bsp_wifi.c"</div>
+                        <div class="diff-line del"> # bsp_lcd.c 未加入</div>
+                        <div class="diff-line ctx">)</div>
+                      </div>
+                    </div>
+                    <div class="diff-col after">
+                      <div class="diff-col-header after">修改后</div>
+                      <div class="diff-lines">
+                        <div class="diff-line ctx">set(SOURCES</div>
+                        <div class="diff-line ctx"> "bsp/bsp_codec.c"</div>
+                        <div class="diff-line ctx"> "bsp/bsp_wifi.c"</div>
+                        <div class="diff-line add"> "bsp/bsp_lcd.c"</div>
+                        <div class="diff-line ctx">)</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="diff-note">
+                  ST7789 LCD 240×320 SPI 驱动正式加入构建系统。新文件 <strong>bsp_lcd.c</strong> (+135行) 包含背光控制、初始化、显示接口。
+                  <br><br>同日完成 <strong>13 个文件 +1553 行</strong>注释补全（bsp_codec.c +327、bsp_wifi.c
+                  +420、audio_decoder/encoder
+                  +各240/253、session.h +106 等）。
+                </div>
+                <div class="file-links">
+                  <a href="daily/2026-04-10.md" class="file-link">📄 日报详情</a>
+                  <a href="decisions/DEC-005-pin-assignment.md" class="file-link">📐 DEC-005 引脚分配</a>
                 </div>
               </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后（对照服务端协议）</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">// 握手消息</div>
-                  <div class="diff-line add">cJSON_AddStringToObject(</div>
-                  <div class="diff-line add"> msg, "type", "started"); // ✅ 服务端期望值</div>
+            </div>
+
+            <!-- 7279cc6 -->
+            <div class="commit" id="7279cc6">
+              <div class="commit-header" onclick="toggle('7279cc6')">
+                <div class="dot-red"></div>
+                <div class="commit-info">
+                  <div class="commit-title">fix(audio): 禁用opus编码器可变比特率以保证延迟稳定</div>
+                  <div class="commit-meta">
+                    <a class="hash" href="#7279cc6">7279cc6</a>
+                    <span class="time-badge">10:15</span>
+                    <span class="tag tag-fix">回退修复</span>
+                    <span class="tag tag-dec">DEC-001</span>
+                  </div>
+                </div>
+                <span class="chevron">▶</span>
+              </div>
+              <div class="commit-body">
+                <div class="file-diff">
+                  <div class="file-header">
+                    <span class="file-path">main/audio/audio_encoder.c</span>
+                    <div class="diff-stat"><span class="diff-add">+2</span><span class="diff-del">-1</span></div>
+                  </div>
+                  <div class="diff-split">
+                    <div class="diff-col before">
+                      <div class="diff-col-header before">修改前（04-09 启用了 VBR）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line ctx">opus_encoder_ctl(enc,</div>
+                        <div class="diff-line del"> OPUS_SET_VBR(1)); // 可变比特率</div>
+                        <div class="diff-line ctx">opus_encoder_ctl(enc,</div>
+                        <div class="diff-line ctx"> OPUS_SET_BITRATE(32000));</div>
+                      </div>
+                    </div>
+                    <div class="diff-col after">
+                      <div class="diff-col-header after">修改后（禁用 VBR，CBR 稳定）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line ctx">opus_encoder_ctl(enc,</div>
+                        <div class="diff-line add"> OPUS_SET_VBR(0)); // 禁用VBR，CBR更稳定</div>
+                        <div class="diff-line ctx">opus_encoder_ctl(enc,</div>
+                        <div class="diff-line add"> OPUS_SET_BITRATE(24000)); // 32→24kbps</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="file-diff">
+                  <div class="file-header">
+                    <span class="file-path">main/protocol/websocket_client.c</span>
+                    <div class="diff-stat"><span class="diff-add">+8</span><span class="diff-del">-3</span></div>
+                  </div>
+                  <div class="diff-split">
+                    <div class="diff-col before">
+                      <div class="diff-col-header before">修改前</div>
+                      <div class="diff-lines">
+                        <div class="diff-line ctx">if (strcmp(type, "stt") == 0) {</div>
+                        <div class="diff-line del"> handle_stt(data);</div>
+                        <div class="diff-line del">}</div>
+                        <div class="diff-line del">// transcript 类型无处理</div>
+                        <div class="diff-line ctx">// 音频格式</div>
+                        <div class="diff-line del">send_audio_frame("pcm", buf, len);</div>
+                      </div>
+                    </div>
+                    <div class="diff-col after">
+                      <div class="diff-col-header after">修改后</div>
+                      <div class="diff-lines">
+                        <div class="diff-line ctx">if (strcmp(type, "stt") == 0) {</div>
+                        <div class="diff-line add"> // handle_stt(data); // 注释掉重复处理</div>
+                        <div class="diff-line add">}</div>
+                        <div class="diff-line add">if (strcmp(type, "transcript") == 0) {</div>
+                        <div class="diff-line add"> handle_stt(data); // transcript路由到stt</div>
+                        <div class="diff-line add">}</div>
+                        <div class="diff-line ctx">// 音频格式</div>
+                        <div class="diff-line add">send_audio_frame("opus", buf, len); // pcm→opus</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="diff-note">
+                  VBR 在低语音活动段会突发低码率导致质量抖动，禁用后延迟稳定。确立 <strong>DEC-001</strong>：OPUS CBR 24kbps / 60ms / 复杂度3 为最终稳定配置。
+                </div>
+                <div class="file-links">
+                  <a href="daily/2026-04-10.md" class="file-link">📄 日报详情</a>
+                  <a href="decisions/DEC-001.md" class="file-link">📐 DEC-001 OPUS参数</a>
                 </div>
               </div>
             </div>
           </div>
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/wake_word/custom_wake_word.c — AFE集成（+282/-143）</span>
-            </div>
-            <div class="diff-note" style="border:none;">
-              重构音频数据流：<br>
-              <strong>修改前</strong>：麦克风 PCM → 直接传 MultiNet<br>
-              <strong>修改后</strong>：麦克风 PCM → <span style="color:var(--green)">AFE降噪(NS+AEC)</span> → MultiNet →
-              云端传输<br><br>
-              移除 <code>audio_set_pcm_hook</code> 接口，统一通过 AFE 处理链路输出降噪后的 PCM 数据。
-            </div>
-          </div>
-          <div class="file-links">
-            <a href="bugs/BUG-004.md" class="file-link">🐛 BUG-004 详情</a>
-            <a href="decisions/DEC-004.md" class="file-link">📐 DEC-004 AFE架构</a>
-            <a href="daily/2026-04-08.md" class="file-link">📄 日报</a>
-          </div>
-        </div>
-      </div>
-    </div>
 
-    <!-- ========== 2026-04-07 ========== -->
-    <div class="day-section">
-      <div class="day-header">
-        <div class="day-date">2026-04-07</div>
-        <div class="day-summary">auth健壮性 · BUG-005修复 · WS地址切换 · LCD驱动新增</div>
-        <div class="day-line"></div>
-        <a href="daily/2026-04-07.md" class="file-link">📄 日报</a>
-      </div>
+          <!-- ========== 2026-04-09 ========== -->
+          <div class="day-section">
+            <div class="day-header">
+              <div class="day-date">2026-04-09</div>
+              <div class="day-summary">BUG-006/007修复 · VAD架构重构 · OPUS调参 · session事件队列</div>
+              <div class="day-line"></div>
+              <a href="daily/2026-04-09.md" class="file-link">📄 日报</a>
+            </div>
 
-      <!-- d5adbba -->
-      <div class="commit" id="d5adbba">
-        <div class="commit-header" onclick="toggle('d5adbba')">
-          <div class="dot-green"></div>
-          <div class="commit-info">
-            <div class="commit-title">feat: auth兼容HTTP 201 + WS地址切换 + LCD驱动新增</div>
-            <div class="commit-meta">
-              <a class="hash" href="#d5adbba">d5adbba</a>
-              <span class="tag tag-bug">BUG-005</span>
-              <span class="tag tag-fix">已修复</span>
-              <span class="tag tag-feat">LCD新增</span>
-            </div>
-          </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/protocol/auth.c:74 — BUG-005 HTTP状态码兼容</span>
-              <div class="diff-stat"><span class="diff-add">+2</span><span class="diff-del">-2</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前（只接受200）</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">int status = esp_http_client_get_status_code(client);</div>
-                  <div class="diff-line del">if (status != 200) {</div>
-                  <div class="diff-line del"> ESP_LOGE(TAG, "Auth failed: %d", status);</div>
-                  <div class="diff-line ctx"> goto cleanup;</div>
-                  <div class="diff-line ctx">}</div>
+            <!-- aee301c -->
+            <div class="commit" id="aee301c">
+              <div class="commit-header" onclick="toggle('aee301c')">
+                <div class="dot-green"></div>
+                <div class="commit-info">
+                  <div class="commit-title">feat(session): 添加VAD延迟启动机制防止唤醒词尾音误触发</div>
+                  <div class="commit-meta">
+                    <a class="hash" href="#aee301c">aee301c</a>
+                    <span class="time-badge">11:15</span>
+                    <span class="tag tag-bug">BUG-007</span>
+                    <span class="tag tag-fix">已修复</span>
+                  </div>
                 </div>
+                <span class="chevron">▶</span>
               </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后（兼容201 Created）</div>
-                <div class="diff-lines">
-                  <div class="diff-line ctx">int status = esp_http_client_get_status_code(client);</div>
-                  <div class="diff-line add">if (status != 200 && status != 201) {</div>
-                  <div class="diff-line add"> ESP_LOGE(TAG, "Auth failed: %d", status);</div>
-                  <div class="diff-line ctx"> goto cleanup;</div>
-                  <div class="diff-line ctx">}</div>
+              <div class="commit-body">
+                <div class="file-diff">
+                  <div class="file-header">
+                    <span class="file-path">main/session/session.c</span>
+                    <div class="diff-stat"><span class="diff-add">+30</span><span class="diff-del">-17</span></div>
+                  </div>
+                  <div class="diff-split">
+                    <div class="diff-col before">
+                      <div class="diff-col-header before">修改前（立即激活 VAD）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line ctx">// 收到服务端 "started" 后</div>
+                        <div class="diff-line del">// 立即开始 VAD 检测</div>
+                        <div class="diff-line del">s_vad_active = true;</div>
+                        <div class="diff-line ctx"></div>
+                        <div class="diff-line ctx">// VAD 检测逻辑</div>
+                        <div class="diff-line del">if (vad_state == AFE_VAD_SILENCE) {</div>
+                        <div class="diff-line del"> start_eos_timer();</div>
+                        <div class="diff-line del">}</div>
+                      </div>
+                    </div>
+                    <div class="diff-col after">
+                      <div class="diff-col-header after">修改后（500ms 消退保护期）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line ctx">// 收到服务端 "started" 后</div>
+                        <div class="diff-line add">s_vad_ready_tick = xTaskGetTickCount();</div>
+                        <div class="diff-line add">s_stop_sent = false;</div>
+                        <div class="diff-line ctx"></div>
+                        <div class="diff-line ctx">// VAD 检测逻辑</div>
+                        <div class="diff-line add">TickType_t elapsed =</div>
+                        <div class="diff-line add"> xTaskGetTickCount() - s_vad_ready_tick;</div>
+                        <div class="diff-line add">bool grace_over =</div>
+                        <div class="diff-line add"> elapsed > pdMS_TO_TICKS(VAD_GRACE_MS); // 500ms</div>
+                        <div class="diff-line add">if (grace_over && vad == AFE_VAD_SILENCE) {</div>
+                        <div class="diff-line add"> if (!s_stop_sent) {</div>
+                        <div class="diff-line add"> send_stop(); s_stop_sent = true;</div>
+                        <div class="diff-line add"> }</div>
+                        <div class="diff-line add">}</div>
+                      </div>
+                    </div>
+                  </div>
                 </div>
-              </div>
-            </div>
-          </div>
-          <div class="file-diff">
-            <div class="file-header">
-              <span class="file-path">main/application.c:93 — WS连接地址切换</span>
-              <div class="diff-stat"><span class="diff-add">+1</span><span class="diff-del">-1</span></div>
-            </div>
-            <div class="diff-split">
-              <div class="diff-col before">
-                <div class="diff-col-header before">修改前（无Token的旧地址）</div>
-                <div class="diff-lines">
-                  <div class="diff-line del">session_init(</div>
-                  <div class="diff-line del"> "wss://api.tenclass.net/xiaozhi/v1/");</div>
+                <div class="diff-note">
+                  <strong>问题根因</strong>：唤醒词尾音 + 呼吸停顿被立即激活的 VAD 判定为句末静音，发送 stop 打断了用户真正的问话。
+                  <br><strong>修复方案</strong>：服务端 started 响应后等待 500ms 才开始 VAD 检测，消退期内静音不触发 EOS。
                 </div>
-              </div>
-              <div class="diff-col after">
-                <div class="diff-col-header after">修改后（带Token的正式接口）</div>
-                <div class="diff-lines">
-                  <div class="diff-line add">session_init(</div>
-                  <div class="diff-line add"> "ws://122.224.191.2:4888/ws/voice"</div>
-                  <div class="diff-line add"> "?token=&lt;accessToken&gt;");</div>
+                <div class="file-links">
+                  <a href="bugs/BUG-007.md" class="file-link">🐛 BUG-007 详情</a>
+                  <a href="decisions/DEC-004.md" class="file-link">📐 DEC-004 AFE VAD</a>
+                  <a href="daily/2026-04-09.md" class="file-link">📄 日报</a>
                 </div>
               </div>
             </div>
-          </div>
-          <div class="diff-note">
-            <strong>BUG-005 根因</strong>：HTTP POST 创建新资源时服务端返回 201 而非 200，原代码将认证成功判定为失败，导致无法获取 accessToken。
-          </div>
-          <div class="file-links">
-            <a href="bugs/BUG-005.md" class="file-link">🐛 BUG-005 详情</a>
-            <a href="daily/2026-04-07.md" class="file-link">📄 日报</a>
-            <a href="decisions/DEC-003.md" class="file-link">📐 DEC-003 Token刷新策略</a>
-          </div>
-        </div>
-      </div>
 
-      <!-- 0a35652 -->
-      <div class="commit" id="0a35652">
-        <div class="commit-header" onclick="toggle('0a35652')">
-          <div class="dot-blue"></div>
-          <div class="commit-info">
-            <div class="commit-title">feat(protocol): 添加设备认证模块并完善音频处理文档</div>
-            <div class="commit-meta">
-              <a class="hash" href="#0a35652">0a35652</a>
-              <span class="tag tag-feat">新模块</span>
-              <span class="tag tag-feat">auth.c/h</span>
+            <!-- 24d10cc -->
+            <div class="commit" id="24d10cc">
+              <div class="commit-header" onclick="toggle('24d10cc')">
+                <div class="dot-green"></div>
+                <div class="commit-info">
+                  <div class="commit-title">feat(wifi): 修复按钮监控任务创建参数错误（多模块合并提交）</div>
+                  <div class="commit-meta">
+                    <a class="hash" href="#24d10cc">24d10cc</a>
+                    <span class="time-badge">11:12</span>
+                    <span class="tag tag-bug">BUG-006</span>
+                    <span class="tag tag-fix">已修复</span>
+                    <span class="tag tag-dec">DEC-004</span>
+                  </div>
+                </div>
+                <span class="chevron">▶</span>
+              </div>
+              <div class="commit-body">
+                <div class="file-diff">
+                  <div class="file-header">
+                    <span class="file-path">main/wake_word/custom_wake_word.c — BUG-006 MultiNet CPU限频</span>
+                    <div class="diff-stat"><span class="diff-add">+9</span></div>
+                  </div>
+                  <div class="diff-split">
+                    <div class="diff-col before">
+                      <div class="diff-col-header before">修改前（无限制 detect）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line ctx">while (1) {</div>
+                        <div class="diff-line ctx"> afe_data = afe_handle->fetch(...);</div>
+                        <div class="diff-line del"> // 每次循环调用多次 detect</div>
+                        <div class="diff-line del"> while (有数据) {</div>
+                        <div class="diff-line del"> multinet->detect(...);</div>
+                        <div class="diff-line del"> }</div>
+                        <div class="diff-line ctx">}</div>
+                      </div>
+                    </div>
+                    <div class="diff-col after">
+                      <div class="diff-col-header after">修改后（每次最多 1 次 detect）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line ctx">while (1) {</div>
+                        <div class="diff-line ctx"> afe_data = afe_handle->fetch(...);</div>
+                        <div class="diff-line add"> // 官方推荐：每次 fetch 只调用 1 次 detect</div>
+                        <div class="diff-line add"> if (afe_data) {</div>
+                        <div class="diff-line add"> multinet->detect(afe_data->data);</div>
+                        <div class="diff-line add"> }</div>
+                        <div class="diff-line ctx">}</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="file-diff">
+                  <div class="file-header">
+                    <span class="file-path">main/protocol/websocket_client.c — 移除 "listen" 指令</span>
+                    <div class="diff-stat"><span class="diff-add">+5</span><span class="diff-del">-1</span></div>
+                  </div>
+                  <div class="diff-split">
+                    <div class="diff-col before">
+                      <div class="diff-col-header before">修改前</div>
+                      <div class="diff-lines">
+                        <div class="diff-line del">send_json("{\"type\":\"listen\"}");</div>
+                      </div>
+                    </div>
+                    <div class="diff-col after">
+                      <div class="diff-col-header after">修改后（服务端不支持 listen）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line add">// "listen" 服务端不支持，移除</div>
+                        <div class="diff-line add">// send_json("{\"type\":\"listen\"}");</div>
+                        <div class="diff-line add">send_json("{\"type\":\"stop\"}");</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="file-links">
+                  <a href="bugs/BUG-006.md" class="file-link">🐛 BUG-006 详情</a>
+                  <a href="decisions/DEC-004.md" class="file-link">📐 DEC-004 AFE WebRTC VAD</a>
+                  <a href="daily/2026-04-09.md" class="file-link">📄 日报</a>
+                </div>
+              </div>
+            </div>
+
+            <!-- 0153c28 -->
+            <div class="commit" id="0153c28">
+              <div class="commit-header" onclick="toggle('0153c28')">
+                <div class="dot-warn"></div>
+                <div class="commit-info">
+                  <div class="commit-title">feat(audio): 优化音频编码参数提升语音质量</div>
+                  <div class="commit-meta">
+                    <a class="hash" href="#0153c28">0153c28</a>
+                    <span class="time-badge">17:22</span>
+                    <span class="tag tag-warn">⚠️ VBR后来回退</span>
+                    <span class="tag tag-warn">⚠️ pcm后来改回opus</span>
+                  </div>
+                </div>
+                <span class="chevron">▶</span>
+              </div>
+              <div class="commit-body">
+                <div class="file-diff">
+                  <div class="file-header">
+                    <span class="file-path">main/audio/audio_encoder.c — OPUS参数调整</span>
+                    <div class="diff-stat"><span class="diff-add">+8</span></div>
+                  </div>
+                  <div class="diff-split">
+                    <div class="diff-col before">
+                      <div class="diff-col-header before">修改前</div>
+                      <div class="diff-lines">
+                        <div class="diff-line ctx">// 比特率</div>
+                        <div class="diff-line del">OPUS_SET_BITRATE(32000) // 32kbps</div>
+                        <div class="diff-line ctx">// 复杂度</div>
+                        <div class="diff-line del">OPUS_SET_COMPLEXITY(0)</div>
+                        <div class="diff-line ctx">// VBR</div>
+                        <div class="diff-line del">OPUS_SET_VBR(0) // CBR</div>
+                      </div>
+                    </div>
+                    <div class="diff-col after">
+                      <div class="diff-col-header after">修改后（⚠️ VBR在04-10发现问题回退）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line ctx">// 比特率</div>
+                        <div class="diff-line add">OPUS_SET_BITRATE(24000) // 32→24kbps</div>
+                        <div class="diff-line ctx">// 复杂度</div>
+                        <div class="diff-line add">OPUS_SET_COMPLEXITY(3) // 0→3</div>
+                        <div class="diff-line ctx">// VBR</div>
+                        <div class="diff-line add">OPUS_SET_VBR(1) // 启用VBR ⚠️ 次日回退</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="diff-note">
+                  ⚠️ <strong>注意</strong>：此提交启用的 VBR 在次日（04-10）发现导致延迟抖动，已在提交 <a href="#7279cc6"
+                    class="file-link">7279cc6</a>
+                  中回退。最终稳定配置见 <a href="decisions/DEC-001.md" class="file-link">DEC-001</a>。
+                </div>
+                <div class="file-links">
+                  <a href="decisions/DEC-001.md" class="file-link">📐 DEC-001 最终OPUS参数</a>
+                  <a href="daily/2026-04-09.md" class="file-link">📄 日报</a>
+                </div>
+              </div>
             </div>
           </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="diff-note">
-            新增 <strong>main/protocol/auth.c</strong> 和 <strong>auth.h</strong>：设备向服务端注册并获取 accessToken 的完整认证模块。
-            <br><br>
-            认证流程：<br>
-            1. HTTP POST → <code>/api/v1/devices/register</code><br>
-            2. 解析响应 JSON 提取 <code>accessToken</code><br>
-            3. 写入 NVS <code>sys_config:ws_token</code> 持久化
-          </div>
-          <div class="file-links">
-            <a href="decisions/DEC-003.md" class="file-link">📐 DEC-003 Token双重刷新</a>
-            <a href="daily/2026-04-07.md" class="file-link">📄 日报</a>
-          </div>
-        </div>
-      </div>
-    </div>
 
-    <!-- ========== 2026-03-17 ~ 03-31 早期历史 ========== -->
-    <div class="day-section">
-      <div class="day-header">
-        <div class="day-date">2026-03-17 ~ 03-31</div>
-        <div class="day-summary">项目起步 · WiFi配网 · 唤醒词集成 · ES8311 · BSP架构 · 音频三层重构</div>
-        <div class="day-line"></div>
-        <a href="daily/2026-03-17_to_03-31.md" class="file-link">📄 历史总结</a>
-      </div>
+          <!-- ========== 2026-04-08 ========== -->
+          <div class="day-section">
+            <div class="day-header">
+              <div class="day-date">2026-04-08</div>
+              <div class="day-summary">AFE集成 · BUG-003/004修复 · 内存安全增强</div>
+              <div class="day-line"></div>
+              <a href="daily/2026-04-08.md" class="file-link">📄 日报</a>
+            </div>
 
-      <!-- b002a3e -->
-      <div class="commit" id="b002a3e">
-        <div class="commit-header" onclick="toggle('b002a3e')">
-          <div class="dot-blue"></div>
-          <div class="commit-info">
-            <div class="commit-title">ap与设备联网成功（项目初始化）</div>
-            <div class="commit-meta">
-              <a class="hash" href="#b002a3e">b002a3e</a>
-              <span class="time-badge">03-17</span>
-              <span class="tag tag-feat">项目起点</span>
+            <!-- 0bbfe76 -->
+            <div class="commit" id="0bbfe76">
+              <div class="commit-header" onclick="toggle('0bbfe76')">
+                <div class="dot-green"></div>
+                <div class="commit-info">
+                  <div class="commit-title">feat(audio): 添加音频处理器内存管理和错误处理机制</div>
+                  <div class="commit-meta">
+                    <a class="hash" href="#0bbfe76">0bbfe76</a>
+                    <span class="time-badge">23:25</span>
+                    <span class="tag tag-bug">BUG-003</span>
+                    <span class="tag tag-fix">已修复</span>
+                  </div>
+                </div>
+                <span class="chevron">▶</span>
+              </div>
+              <div class="commit-body">
+                <div class="file-diff">
+                  <div class="file-header">
+                    <span class="file-path">main/bsp/bsp_wifi.c — BUG-003 参数顺序修正</span>
+                    <div class="diff-stat"><span class="diff-add">+2</span><span class="diff-del">-1</span></div>
+                  </div>
+                  <div class="diff-split">
+                    <div class="diff-col before">
+                      <div class="diff-col-header before">修改前（顺序写反）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line del">xTaskCreatePinnedToCoreWithCaps(</div>
+                        <div class="diff-line del"> btn_monitor_task, "btn",</div>
+                        <div class="diff-line del"> 5, // ← 这是优先级，但传到了stack_depth位置</div>
+                        <div class="diff-line del"> NULL,</div>
+                        <div class="diff-line del"> 4096, // ← 这是stack_depth，但传到了priority位置</div>
+                        <div class="diff-line del"> NULL, 0, MALLOC_CAP_INTERNAL);</div>
+                      </div>
+                    </div>
+                    <div class="diff-col after">
+                      <div class="diff-col-header after">修改后（顺序正确）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line add">xTaskCreatePinnedToCoreWithCaps(</div>
+                        <div class="diff-line add"> btn_monitor_task, "btn",</div>
+                        <div class="diff-line add"> 4096, // stack_depth（正确位置）</div>
+                        <div class="diff-line add"> NULL,</div>
+                        <div class="diff-line add"> 5, // priority（正确位置）</div>
+                        <div class="diff-line add"> NULL, 0, MALLOC_CAP_INTERNAL);</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="file-diff">
+                  <div class="file-header">
+                    <span class="file-path">main/audio/audio_processor.c — 编解码器回滚保护</span>
+                    <div class="diff-stat"><span class="diff-add">+28</span><span class="diff-del">-3</span></div>
+                  </div>
+                  <div class="diff-split">
+                    <div class="diff-col before">
+                      <div class="diff-col-header before">修改前（无失败回滚）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line ctx">encoder = audio_encoder_create(cfg);</div>
+                        <div class="diff-line del">// 无失败检查，直接继续</div>
+                        <div class="diff-line ctx">decoder = audio_decoder_create(cfg);</div>
+                      </div>
+                    </div>
+                    <div class="diff-col after">
+                      <div class="diff-col-header after">修改后（失败时回滚释放）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line ctx">encoder = audio_encoder_create(cfg);</div>
+                        <div class="diff-line add">if (!encoder) {</div>
+                        <div class="diff-line add"> ESP_LOGE(TAG, "encoder create failed");</div>
+                        <div class="diff-line add"> goto cleanup;</div>
+                        <div class="diff-line add">}</div>
+                        <div class="diff-line ctx">decoder = audio_decoder_create(cfg);</div>
+                        <div class="diff-line add">if (!decoder) {</div>
+                        <div class="diff-line add"> audio_encoder_destroy(encoder);</div>
+                        <div class="diff-line add"> goto cleanup;</div>
+                        <div class="diff-line add">}</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="file-links">
+                  <a href="bugs/BUG-003.md" class="file-link">🐛 BUG-003 详情</a>
+                  <a href="daily/2026-04-08.md" class="file-link">📄 日报</a>
+                </div>
+              </div>
+            </div>
+
+            <!-- e96b8bc -->
+            <div class="commit" id="e96b8bc">
+              <div class="commit-header" onclick="toggle('e96b8bc')">
+                <div class="dot-green"></div>
+                <div class="commit-info">
+                  <div class="commit-title">feat(audio): 集成AFE音频前端处理并优化PCM数据流</div>
+                  <div class="commit-meta">
+                    <a class="hash" href="#e96b8bc">e96b8bc</a>
+                    <span class="time-badge">21:28</span>
+                    <span class="tag tag-bug">BUG-004</span>
+                    <span class="tag tag-fix">已修复</span>
+                    <span class="tag tag-feat">AFE集成</span>
+                  </div>
+                </div>
+                <span class="chevron">▶</span>
+              </div>
+              <div class="commit-body">
+                <div class="file-diff">
+                  <div class="file-header">
+                    <span class="file-path">main/protocol/websocket_client.c — BUG-004 握手类型修正</span>
+                    <div class="diff-stat"><span class="diff-add">+3</span><span class="diff-del">-1</span></div>
+                  </div>
+                  <div class="diff-split">
+                    <div class="diff-col before">
+                      <div class="diff-col-header before">修改前（类型字段写错）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line ctx">// 握手消息</div>
+                        <div class="diff-line del">cJSON_AddStringToObject(</div>
+                        <div class="diff-line del"> msg, "type", "start"); // ❌ 服务端不认识</div>
+                      </div>
+                    </div>
+                    <div class="diff-col after">
+                      <div class="diff-col-header after">修改后（对照服务端协议）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line ctx">// 握手消息</div>
+                        <div class="diff-line add">cJSON_AddStringToObject(</div>
+                        <div class="diff-line add"> msg, "type", "started"); // ✅ 服务端期望值</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="file-diff">
+                  <div class="file-header">
+                    <span class="file-path">main/wake_word/custom_wake_word.c — AFE集成（+282/-143）</span>
+                  </div>
+                  <div class="diff-note" style="border:none;">
+                    重构音频数据流：<br>
+                    <strong>修改前</strong>：麦克风 PCM → 直接传 MultiNet<br>
+                    <strong>修改后</strong>：麦克风 PCM → <span style="color:var(--green)">AFE降噪(NS+AEC)</span> → MultiNet →
+                    云端传输<br><br>
+                    移除 <code>audio_set_pcm_hook</code> 接口，统一通过 AFE 处理链路输出降噪后的 PCM 数据。
+                  </div>
+                </div>
+                <div class="file-links">
+                  <a href="bugs/BUG-004.md" class="file-link">🐛 BUG-004 详情</a>
+                  <a href="decisions/DEC-004.md" class="file-link">📐 DEC-004 AFE架构</a>
+                  <a href="daily/2026-04-08.md" class="file-link">📄 日报</a>
+                </div>
+              </div>
             </div>
           </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="diff-note">
-            项目第一次提交。初始结构：<strong>WIFI/WIFI.c</strong>（BLE配网+STA连接）、<strong>audio/audio.c</strong>（音频占位）、开发环境（.devcontainer
-            / .vscode）全部就绪。
-          </div>
-        </div>
-      </div>
 
-      <!-- 85ab6cb -->
-      <div class="commit" id="85ab6cb">
-        <div class="commit-header" onclick="toggle('85ab6cb')">
-          <div class="dot-blue"></div>
-          <div class="commit-info">
-            <div class="commit-title">feat(WIFI): 添加WiFi配置清除功能和按钮监控任务</div>
-            <div class="commit-meta">
-              <a class="hash" href="#85ab6cb">85ab6cb</a>
-              <span class="time-badge">03-18</span>
-              <span class="tag tag-feat">WiFi</span>
+          <!-- ========== 2026-04-07 ========== -->
+          <div class="day-section">
+            <div class="day-header">
+              <div class="day-date">2026-04-07</div>
+              <div class="day-summary">auth健壮性 · BUG-005修复 · WS地址切换 · LCD驱动新增</div>
+              <div class="day-line"></div>
+              <a href="daily/2026-04-07.md" class="file-link">📄 日报</a>
+            </div>
+
+            <!-- d5adbba -->
+            <div class="commit" id="d5adbba">
+              <div class="commit-header" onclick="toggle('d5adbba')">
+                <div class="dot-green"></div>
+                <div class="commit-info">
+                  <div class="commit-title">feat: auth兼容HTTP 201 + WS地址切换 + LCD驱动新增</div>
+                  <div class="commit-meta">
+                    <a class="hash" href="#d5adbba">d5adbba</a>
+                    <span class="tag tag-bug">BUG-005</span>
+                    <span class="tag tag-fix">已修复</span>
+                    <span class="tag tag-feat">LCD新增</span>
+                  </div>
+                </div>
+                <span class="chevron">▶</span>
+              </div>
+              <div class="commit-body">
+                <div class="file-diff">
+                  <div class="file-header">
+                    <span class="file-path">main/protocol/auth.c:74 — BUG-005 HTTP状态码兼容</span>
+                    <div class="diff-stat"><span class="diff-add">+2</span><span class="diff-del">-2</span></div>
+                  </div>
+                  <div class="diff-split">
+                    <div class="diff-col before">
+                      <div class="diff-col-header before">修改前（只接受200）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line ctx">int status = esp_http_client_get_status_code(client);</div>
+                        <div class="diff-line del">if (status != 200) {</div>
+                        <div class="diff-line del"> ESP_LOGE(TAG, "Auth failed: %d", status);</div>
+                        <div class="diff-line ctx"> goto cleanup;</div>
+                        <div class="diff-line ctx">}</div>
+                      </div>
+                    </div>
+                    <div class="diff-col after">
+                      <div class="diff-col-header after">修改后（兼容201 Created）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line ctx">int status = esp_http_client_get_status_code(client);</div>
+                        <div class="diff-line add">if (status != 200 && status != 201) {</div>
+                        <div class="diff-line add"> ESP_LOGE(TAG, "Auth failed: %d", status);</div>
+                        <div class="diff-line ctx"> goto cleanup;</div>
+                        <div class="diff-line ctx">}</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="file-diff">
+                  <div class="file-header">
+                    <span class="file-path">main/application.c:93 — WS连接地址切换</span>
+                    <div class="diff-stat"><span class="diff-add">+1</span><span class="diff-del">-1</span></div>
+                  </div>
+                  <div class="diff-split">
+                    <div class="diff-col before">
+                      <div class="diff-col-header before">修改前（无Token的旧地址）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line del">session_init(</div>
+                        <div class="diff-line del"> "wss://api.tenclass.net/xiaozhi/v1/");</div>
+                      </div>
+                    </div>
+                    <div class="diff-col after">
+                      <div class="diff-col-header after">修改后（带Token的正式接口）</div>
+                      <div class="diff-lines">
+                        <div class="diff-line add">session_init(</div>
+                        <div class="diff-line add"> "ws://122.224.191.2:4888/ws/voice"</div>
+                        <div class="diff-line add"> "?token=&lt;accessToken&gt;");</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="diff-note">
+                  <strong>BUG-005 根因</strong>：HTTP POST 创建新资源时服务端返回 201 而非 200，原代码将认证成功判定为失败，导致无法获取 accessToken。
+                </div>
+                <div class="file-links">
+                  <a href="bugs/BUG-005.md" class="file-link">🐛 BUG-005 详情</a>
+                  <a href="daily/2026-04-07.md" class="file-link">📄 日报</a>
+                  <a href="decisions/DEC-003.md" class="file-link">📐 DEC-003 Token刷新策略</a>
+                </div>
+              </div>
+            </div>
+
+            <!-- 0a35652 -->
+            <div class="commit" id="0a35652">
+              <div class="commit-header" onclick="toggle('0a35652')">
+                <div class="dot-blue"></div>
+                <div class="commit-info">
+                  <div class="commit-title">feat(protocol): 添加设备认证模块并完善音频处理文档</div>
+                  <div class="commit-meta">
+                    <a class="hash" href="#0a35652">0a35652</a>
+                    <span class="tag tag-feat">新模块</span>
+                    <span class="tag tag-feat">auth.c/h</span>
+                  </div>
+                </div>
+                <span class="chevron">▶</span>
+              </div>
+              <div class="commit-body">
+                <div class="diff-note">
+                  新增 <strong>main/protocol/auth.c</strong> 和 <strong>auth.h</strong>：设备向服务端注册并获取 accessToken 的完整认证模块。
+                  <br><br>
+                  认证流程：<br>
+                  1. HTTP POST → <code>/api/v1/devices/register</code><br>
+                  2. 解析响应 JSON 提取 <code>accessToken</code><br>
+                  3. 写入 NVS <code>sys_config:ws_token</code> 持久化
+                </div>
+                <div class="file-links">
+                  <a href="decisions/DEC-003.md" class="file-link">📐 DEC-003 Token双重刷新</a>
+                  <a href="daily/2026-04-07.md" class="file-link">📄 日报</a>
+                </div>
+              </div>
             </div>
           </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="diff-note">
-            长按3秒清除WiFi配置并重启。新增 <code>CLEAR_WIFI_BUTTON_PIN</code> 宏和 <code>button_monitor_task</code>。
-            <br><span style="color:var(--yellow)">⚠ 埋坑</span>：任务创建参数写法有问题，后于 4/9（BUG-003）复现修复。
-          </div>
-        </div>
-      </div>
 
-      <!-- e38486f + 4a4f816 + ba1b8c3 -->
-      <div class="commit" id="e38486f">
-        <div class="commit-header" onclick="toggle('e38486f')">
-          <div class="dot-blue"></div>
-          <div class="commit-info">
-            <div class="commit-title">feat(main): 自定义唤醒词 + 应用层架构 + MQTT远程配置</div>
-            <div class="commit-meta">
-              <a class="hash" href="#e38486f">e38486f</a>
-              <span class="time-badge">03-22</span>
-              <span class="tag tag-feat">唤醒词</span>
-              <span class="tag tag-feat">架构</span>
-              <span class="tag tag-feat">MQTT</span>
+          <!-- ========== 2026-03-17 ~ 03-31 早期历史 ========== -->
+          <div class="day-section">
+            <div class="day-header">
+              <div class="day-date">2026-03-17 ~ 03-31</div>
+              <div class="day-summary">项目起步 · WiFi配网 · 唤醒词集成 · ES8311 · BSP架构 · 音频三层重构</div>
+              <div class="day-line"></div>
+              <a href="daily/2026-03-17_to_03-31.md" class="file-link">📄 历史总结</a>
             </div>
-          </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="diff-note">
-            同日3次提交：① 集成 esp-sr，新建 <strong>wake_words/custom_wake_word.c</strong>（NVS持久化）；② 引入
-            <strong>application.c</strong> 应用层，WiFi重连最大5次；③ MQTT基于MAC动态订阅，JSON解析云端推送唤醒词更新。
-            <br><br><span style="color:var(--red)">🐛 BUG-001
-              暴露</span>：<code>esp_bt_controller_mem_release(ESP_BT_MODE_BTDM)</code> 调用后系统不稳定 → 注释绕过（至今未彻底解决）。
-            <br><span style="color:var(--red)">🐛 BUG-002 暴露</span>：<code>init_spiffs()</code> 引起内存冲突 → 注释绕过，后重构为
-            srmodel→model 分区。
-          </div>
-          <div class="file-links">
-            <a href="bugs/BUG-001.md" class="file-link">🐛 BUG-001</a>
-            <a href="bugs/BUG-002.md" class="file-link">🐛 BUG-002</a>
-          </div>
-        </div>
-      </div>
 
-      <!-- edbed9a -->
-      <div class="commit" id="edbed9a">
-        <div class="commit-header" onclick="toggle('edbed9a')">
-          <div class="dot-yellow"></div>
-          <div class="commit-info">
-            <div class="commit-title">feat(wake_word): 重构唤醒词引擎存储和初始化流程</div>
-            <div class="commit-meta">
-              <a class="hash" href="#edbed9a">edbed9a</a>
-              <span class="time-badge">03-23</span>
-              <span class="tag tag-fix">SPIFFS分区名修正</span>
+            <!-- b002a3e -->
+            <div class="commit" id="b002a3e">
+              <div class="commit-header" onclick="toggle('b002a3e')">
+                <div class="dot-blue"></div>
+                <div class="commit-info">
+                  <div class="commit-title">ap与设备联网成功（项目初始化）</div>
+                  <div class="commit-meta">
+                    <a class="hash" href="#b002a3e">b002a3e</a>
+                    <span class="time-badge">03-17</span>
+                    <span class="tag tag-feat">项目起点</span>
+                  </div>
+                </div>
+                <span class="chevron">▶</span>
+              </div>
+              <div class="commit-body">
+                <div class="diff-note">
+                  项目第一次提交。初始结构：<strong>WIFI/WIFI.c</strong>（BLE配网+STA连接）、<strong>audio/audio.c</strong>（音频占位）、开发环境（.devcontainer
+                  / .vscode）全部就绪。
+                </div>
+              </div>
             </div>
-          </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="diff-note">
-            SPIFFS分区名 <code>"storage"</code> → <code>"srmodel"</code>（第一次修正，与 esp-sr 模型路径对齐）。NVS初始化提前，优先于其他模块。
-          </div>
-        </div>
-      </div>
 
-      <!-- ee3c02c -->
-      <div class="commit" id="ee3c02c">
-        <div class="commit-header" onclick="toggle('ee3c02c')">
-          <div class="dot-blue"></div>
-          <div class="commit-info">
-            <div class="commit-title">feat: 集成ES8311音频编解码器并重构项目架构（里程碑）</div>
-            <div class="commit-meta">
-              <a class="hash" href="#ee3c02c">ee3c02c</a>
-              <span class="time-badge">03-26</span>
-              <span class="tag tag-feat">ES8311</span>
-              <span class="tag tag-feat">BSP模块</span>
+            <!-- 85ab6cb -->
+            <div class="commit" id="85ab6cb">
+              <div class="commit-header" onclick="toggle('85ab6cb')">
+                <div class="dot-blue"></div>
+                <div class="commit-info">
+                  <div class="commit-title">feat(WIFI): 添加WiFi配置清除功能和按钮监控任务</div>
+                  <div class="commit-meta">
+                    <a class="hash" href="#85ab6cb">85ab6cb</a>
+                    <span class="time-badge">03-18</span>
+                    <span class="tag tag-feat">WiFi</span>
+                  </div>
+                </div>
+                <span class="chevron">▶</span>
+              </div>
+              <div class="commit-body">
+                <div class="diff-note">
+                  长按3秒清除WiFi配置并重启。新增 <code>CLEAR_WIFI_BUTTON_PIN</code> 宏和 <code>button_monitor_task</code>。
+                  <br><span style="color:var(--yellow)">⚠ 埋坑</span>：任务创建参数写法有问题，后于 4/9（BUG-003）复现修复。
+                </div>
+              </div>
             </div>
-          </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="diff-note">
-            <strong>重要里程碑</strong>：音频芯片从 MAX98357A（纯DAC）升级为 ES8311（全双工编解码）。引入 <strong>main/bsp/</strong> 目录，建立 BSP
-            硬件抽象层。
-            <br>SPIFFS分区名再次修正：<code>"srmodel"</code> → <code>"model"</code>（第二次，最终稳定值）。
-            <br>注：分区名经历了 storage → srmodel → model 三次变更。
-          </div>
-        </div>
-      </div>
 
-      <!-- c547cd5 -->
-      <div class="commit" id="c547cd5">
-        <div class="commit-header" onclick="toggle('c547cd5')">
-          <div class="dot-blue"></div>
-          <div class="commit-info">
-            <div class="commit-title">feat(protocol): 添加MQTT心跳机制并完善协议功能</div>
-            <div class="commit-meta">
-              <a class="hash" href="#c547cd5">c547cd5</a>
-              <span class="time-badge">03-27</span>
-              <span class="tag tag-feat">MQTT心跳</span>
-              <span class="tag tag-fix">ES8311引脚</span>
+            <!-- e38486f + 4a4f816 + ba1b8c3 -->
+            <div class="commit" id="e38486f">
+              <div class="commit-header" onclick="toggle('e38486f')">
+                <div class="dot-blue"></div>
+                <div class="commit-info">
+                  <div class="commit-title">feat(main): 自定义唤醒词 + 应用层架构 + MQTT远程配置</div>
+                  <div class="commit-meta">
+                    <a class="hash" href="#e38486f">e38486f</a>
+                    <span class="time-badge">03-22</span>
+                    <span class="tag tag-feat">唤醒词</span>
+                    <span class="tag tag-feat">架构</span>
+                    <span class="tag tag-feat">MQTT</span>
+                  </div>
+                </div>
+                <span class="chevron">▶</span>
+              </div>
+              <div class="commit-body">
+                <div class="diff-note">
+                  同日3次提交：① 集成 esp-sr，新建 <strong>wake_words/custom_wake_word.c</strong>（NVS持久化）；② 引入
+                  <strong>application.c</strong> 应用层，WiFi重连最大5次；③ MQTT基于MAC动态订阅，JSON解析云端推送唤醒词更新。
+                  <br><br><span style="color:var(--red)">🐛 BUG-001
+                    暴露</span>：<code>esp_bt_controller_mem_release(ESP_BT_MODE_BTDM)</code> 调用后系统不稳定 → 注释绕过（至今未彻底解决）。
+                  <br><span style="color:var(--red)">🐛 BUG-002 暴露</span>：<code>init_spiffs()</code> 引起内存冲突 → 注释绕过，后重构为
+                  srmodel→model 分区。
+                </div>
+                <div class="file-links">
+                  <a href="bugs/BUG-001.md" class="file-link">🐛 BUG-001</a>
+                  <a href="bugs/BUG-002.md" class="file-link">🐛 BUG-002</a>
+                </div>
+              </div>
             </div>
-          </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="diff-note">
-            MQTT心跳任务：设备ID + 电池电量上报（JSON格式）。同时修正 ES8311 I2S 引脚分配（BCLK/MCLK 首次配错，此次调整）。
-          </div>
-        </div>
-      </div>
 
-      <!-- dd0b7bd + e7ad379 -->
-      <div class="commit" id="dd0b7bd">
-        <div class="commit-header" onclick="toggle('dd0b7bd')">
-          <div class="dot-blue"></div>
-          <div class="commit-info">
-            <div class="commit-title">feat(application/wake_word): NVS封装到BSP + 唤醒词阈值配置</div>
-            <div class="commit-meta">
-              <a class="hash" href="#dd0b7bd">dd0b7bd</a>
-              <span class="time-badge">03-29 ~ 03-30</span>
-              <span class="tag tag-feat">BSP规范化</span>
+            <!-- edbed9a -->
+            <div class="commit" id="edbed9a">
+              <div class="commit-header" onclick="toggle('edbed9a')">
+                <div class="dot-yellow"></div>
+                <div class="commit-info">
+                  <div class="commit-title">feat(wake_word): 重构唤醒词引擎存储和初始化流程</div>
+                  <div class="commit-meta">
+                    <a class="hash" href="#edbed9a">edbed9a</a>
+                    <span class="time-badge">03-23</span>
+                    <span class="tag tag-fix">SPIFFS分区名修正</span>
+                  </div>
+                </div>
+                <span class="chevron">▶</span>
+              </div>
+              <div class="commit-body">
+                <div class="diff-note">
+                  SPIFFS分区名 <code>"storage"</code> → <code>"srmodel"</code>（第一次修正，与 esp-sr 模型路径对齐）。NVS初始化提前，优先于其他模块。
+                </div>
+              </div>
             </div>
-          </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="diff-note">
-            <code>nvs_flash_init()</code> 封装为 <code>bsp_board_nvs_init()</code>，BSP宏替代硬编码引脚。
-            <br>唤醒词检测阈值 <code>multinet_det_treshold = 0.6</code>，互斥锁保护更新流程。
-          </div>
-        </div>
-      </div>
 
-      <!-- a154812 + e1bd277 -->
-      <div class="commit" id="a154812">
-        <div class="commit-header" onclick="toggle('a154812')">
-          <div class="dot-blue"></div>
-          <div class="commit-info">
-            <div class="commit-title">feat(audio): 重构音频模块架构并集成音频编解码功能（里程碑）</div>
-            <div class="commit-meta">
-              <a class="hash" href="#a154812">a154812</a>
-              <span class="time-badge">03-31</span>
-              <span class="tag tag-feat">三层音频架构</span>
-              <span class="tag tag-feat">Opus</span>
+            <!-- ee3c02c -->
+            <div class="commit" id="ee3c02c">
+              <div class="commit-header" onclick="toggle('ee3c02c')">
+                <div class="dot-blue"></div>
+                <div class="commit-info">
+                  <div class="commit-title">feat: 集成ES8311音频编解码器并重构项目架构（里程碑）</div>
+                  <div class="commit-meta">
+                    <a class="hash" href="#ee3c02c">ee3c02c</a>
+                    <span class="time-badge">03-26</span>
+                    <span class="tag tag-feat">ES8311</span>
+                    <span class="tag tag-feat">BSP模块</span>
+                  </div>
+                </div>
+                <span class="chevron">▶</span>
+              </div>
+              <div class="commit-body">
+                <div class="diff-note">
+                  <strong>重要里程碑</strong>：音频芯片从 MAX98357A（纯DAC）升级为 ES8311（全双工编解码）。引入 <strong>main/bsp/</strong> 目录，建立 BSP
+                  硬件抽象层。
+                  <br>SPIFFS分区名再次修正：<code>"srmodel"</code> → <code>"model"</code>（第二次，最终稳定值）。
+                  <br>注：分区名经历了 storage → srmodel → model 三次变更。
+                </div>
+              </div>
             </div>
+
+            <!-- c547cd5 -->
+            <div class="commit" id="c547cd5">
+              <div class="commit-header" onclick="toggle('c547cd5')">
+                <div class="dot-blue"></div>
+                <div class="commit-info">
+                  <div class="commit-title">feat(protocol): 添加MQTT心跳机制并完善协议功能</div>
+                  <div class="commit-meta">
+                    <a class="hash" href="#c547cd5">c547cd5</a>
+                    <span class="time-badge">03-27</span>
+                    <span class="tag tag-feat">MQTT心跳</span>
+                    <span class="tag tag-fix">ES8311引脚</span>
+                  </div>
+                </div>
+                <span class="chevron">▶</span>
+              </div>
+              <div class="commit-body">
+                <div class="diff-note">
+                  MQTT心跳任务：设备ID + 电池电量上报（JSON格式）。同时修正 ES8311 I2S 引脚分配（BCLK/MCLK 首次配错，此次调整）。
+                </div>
+              </div>
+            </div>
+
+            <!-- dd0b7bd + e7ad379 -->
+            <div class="commit" id="dd0b7bd">
+              <div class="commit-header" onclick="toggle('dd0b7bd')">
+                <div class="dot-blue"></div>
+                <div class="commit-info">
+                  <div class="commit-title">feat(application/wake_word): NVS封装到BSP + 唤醒词阈值配置</div>
+                  <div class="commit-meta">
+                    <a class="hash" href="#dd0b7bd">dd0b7bd</a>
+                    <span class="time-badge">03-29 ~ 03-30</span>
+                    <span class="tag tag-feat">BSP规范化</span>
+                  </div>
+                </div>
+                <span class="chevron">▶</span>
+              </div>
+              <div class="commit-body">
+                <div class="diff-note">
+                  <code>nvs_flash_init()</code> 封装为 <code>bsp_board_nvs_init()</code>，BSP宏替代硬编码引脚。
+                  <br>唤醒词检测阈值 <code>multinet_det_treshold = 0.6</code>，互斥锁保护更新流程。
+                </div>
+              </div>
+            </div>
+
+            <!-- a154812 + e1bd277 -->
+            <div class="commit" id="a154812">
+              <div class="commit-header" onclick="toggle('a154812')">
+                <div class="dot-blue"></div>
+                <div class="commit-info">
+                  <div class="commit-title">feat(audio): 重构音频模块架构并集成音频编解码功能（里程碑）</div>
+                  <div class="commit-meta">
+                    <a class="hash" href="#a154812">a154812</a>
+                    <span class="time-badge">03-31</span>
+                    <span class="tag tag-feat">三层音频架构</span>
+                    <span class="tag tag-feat">Opus</span>
+                  </div>
+                </div>
+                <span class="chevron">▶</span>
+              </div>
+              <div class="commit-body">
+                <div class="diff-note">
+                  <strong>里程碑</strong>：<code>audio.c</code> 拆分为三个独立模块：
+                  <br>① <strong>audio_processor.c</strong>（AFE降噪 + VAD）
+                  <br>② <strong>audio_encoder.c</strong>（Opus编码）
+                  <br>③ <strong>audio_decoder.c</strong>（Opus解码 → I2S DAC）
+                  <br>新增依赖：<code>esp_audio_codec</code>、<code>esp_websocket_client</code>，新增 <strong>object.h</strong>
+                  工具头。
+                  <br>随后 <code>audio.c</code> 正式重命名为 <code>bsp_codec.c</code>，BSP命名规范完全统一。
+                </div>
+              </div>
+            </div>
+
           </div>
-          <span class="chevron">▶</span>
-        </div>
-        <div class="commit-body">
-          <div class="diff-note">
-            <strong>里程碑</strong>：<code>audio.c</code> 拆分为三个独立模块：
-            <br>① <strong>audio_processor.c</strong>（AFE降噪 + VAD）
-            <br>② <strong>audio_encoder.c</strong>（Opus编码）
-            <br>③ <strong>audio_decoder.c</strong>（Opus解码 → I2S DAC）
-            <br>新增依赖：<code>esp_audio_codec</code>、<code>esp_websocket_client</code>，新增 <strong>object.h</strong> 工具头。
-            <br>随后 <code>audio.c</code> 正式重命名为 <code>bsp_codec.c</code>，BSP命名规范完全统一。
+
+          <!-- Footer -->
+          <div
+            style="text-align:center; color: var(--text2); font-size: 12px; padding: 32px 0; border-top: 1px solid var(--border); margin-top: 24px;">
+            Echo2 变更日志 · 覆盖 2026-03-17 ~ 04-10 · 共 29 次提交 · 7 个 BUG 修复
+            <br>早期详细历史见 <a href="daily/2026-03-17_to_03-31.md" class="file-link">2026-03-17~03-31 早期历史总结</a> ·
+            完整 BUG 清单见 <a href="bugs/ALL_BUGS.md" class="file-link">ALL_BUGS.md</a>
           </div>
-        </div>
-      </div>
 
-    </div>
+        </div><!-- /container -->
 
-    <!-- Footer -->
-    <div
-      style="text-align:center; color: var(--text2); font-size: 12px; padding: 32px 0; border-top: 1px solid var(--border); margin-top: 24px;">
-      Echo2 变更日志 · 覆盖 2026-03-17 ~ 04-10 · 共 29 次提交 · 7 个 BUG 修复
-      <br>早期详细历史见 <a href="daily/2026-03-17_to_03-31.md" class="file-link">2026-03-17~03-31 早期历史总结</a> ·
-      完整 BUG 清单见 <a href="bugs/ALL_BUGS.md" class="file-link">ALL_BUGS.md</a>
-    </div>
+        <script>
+          function toggle(id) {
+            const el = document.getElementById(id);
+            el.classList.toggle('open');
+          }
 
-  </div><!-- /container -->
+          let allOpen = false;
+          function toggleAll() {
+            allOpen = !allOpen;
+            document.querySelectorAll('.commit').forEach(el => {
+              if (allOpen) el.classList.add('open');
+              else el.classList.remove('open');
+            });
+            document.querySelector('.expand-all').textContent = allOpen ? '收起全部' : '展开全部';
+          }
 
-  <script>
-    function toggle(id) {
-      const el = document.getElementById(id);
-      el.classList.toggle('open');
-    }
-
-    let allOpen = false;
-    function toggleAll() {
-      allOpen = !allOpen;
-      document.querySelectorAll('.commit').forEach(el => {
-        if (allOpen) el.classList.add('open');
-        else el.classList.remove('open');
-      });
-      document.querySelector('.expand-all').textContent = allOpen ? '收起全部' : '展开全部';
-    }
-
-    // 支持 hash 跳转后自动展开对应提交
-    window.addEventListener('load', () => {
-      if (location.hash) {
-        const id = location.hash.slice(1);
-        const el = document.getElementById(id);
-        if (el) { el.classList.add('open'); el.scrollIntoView({ behavior: 'smooth' }); }
-      }
-    });
-  </script>
+          // 支持 hash 跳转后自动展开对应提交
+          window.addEventListener('load', () => {
+            if (location.hash) {
+              const id = location.hash.slice(1);
+              const el = document.getElementById(id);
+              if (el) { el.classList.add('open'); el.scrollIntoView({ behavior: 'smooth' }); }
+            }
+          });
+        </script>
 </body>
 
 </html>

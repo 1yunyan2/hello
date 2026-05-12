@@ -15,14 +15,14 @@
  *       │ PROTOCOL_EVENT_TTS_START（TTS 开始）
  *       ↓
  *   SESSION_PLAYING    ← OPUS 解码→扬声器，唤醒词引擎监听打断
- *       │ PROTOCOL_EVENT_TTS_STOP（TTS 结束）→ 连续对话
+ *       │ PROTOCOL_EVENT_TTS_END（TTS 结束）→ 连续对话
  *       │ PROTOCOL_EVENT_COMPLETE 或 60s 超时
  *       ↓
  *   SESSION_IDLE
  *
  * 连接策略：
  *   WiFi 就绪后立即预建立 WebSocket 连接（含 TLS 握手），
- *   唤醒词触发时直接发送 Hello，无需等待连接，实现零等待唤醒响应。
+ *   唤醒词触发时直接发送 start，无需等待连接，实现零等待唤醒响应。
  *
  * 关键定时参数：
  *   SESSION_TIMEOUT_MS  = 60000 ms  ← 会话整体超时（60 秒无活动自动关闭）
@@ -89,7 +89,7 @@ void session_init(const char *ws_uri);
  *   2. 创建 audio_processor_t（编解码管道）
  *   3. 注册 enhanced_pcm 钩子（麦克风降噪 PCM 进入编码器）
  *   4. 创建 ws_sender_task（负责读取 OPUS 并发送）
- *   5. 若 WebSocket 已连接，立即发送 Hello 握手
+ *   5. 若 WebSocket 已连接，立即发送 start 握手
  *   6. 启动 60 秒会话超时定时器
  *
  * 情形 B — PLAYING 状态中打断 TTS：
@@ -98,7 +98,7 @@ void session_init(const char *ws_uri);
  *   3. 状态 → SESSION_LISTENING（继续录音）
  *   4. 重置会话超时定时器
  *
- * @param display  唤醒词显示文字，如 "你好伙伴" 或 "Hello Echo"
+ * @param display  唤醒词显示文字，如 "你好伙伴" 或 "start Echo"
  *                 （从 custom_wake_word 的触发回调中透传而来）
  *
  * @note 调用者：custom_wake_word.c → afe_fetch_task → user_callback

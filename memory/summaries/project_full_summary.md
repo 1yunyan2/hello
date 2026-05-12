@@ -174,17 +174,17 @@ TOKEN_REFRESH_MS = 110*60*1000    // Token 主动刷新 110min
 
 **WebSocket 双轨**：Text Frame（JSON 控制）+ Binary Frame（OPUS 音频）
 
-**上行 JSON**：`hello`（握手）/ `stop`（停止监听）/ `abort`（打断TTS）
+**上行 JSON**：`start`（握手）/ `stop`（停止监听）/ `abort`（打断TTS）
 
 **下行 JSON**：`started`（握手响应）/ `stt`（识别结果）/ `llm`（情感）/ `tts`（TTS控制）/ `iot`（设备控制）/ `complete` / `error`
 
-**协议事件枚举**：`CONNECTED / DISCONNECTED / HELLO / STT / LLM / TTS_START / TTS_SENTENCE_START / TTS_STOP / AUDIO / IOT / ERROR / COMPLETE`
+**协议事件枚举**：`CONNECTED / DISCONNECTED / start / STT / LLM / TTS_START / TTS_SENTENCE_START / TTS_STOP / AUDIO / IOT / ERROR / COMPLETE`
 
 **认证链**：`deviceToken`（NVS长效）→ POST `/api/auth/device-login` → `accessToken`（~2h）→ WS Bearer 头，NVS 缓存备份
 
 **MQTT 主题**：发布 `heartbeat`（50s）/ `reset`；订阅 `wake-word`（远程更新）；回调内禁止耗时操作，需创建异步任务
 
-**WS 接口**：`protocol_create/connect/disconnect/is_connected()` / `send_hello/audio_data/stop_listening/abort_speaking()` / `register_callback()`
+**WS 接口**：`protocol_create/connect/disconnect/is_connected()` / `send_start/audio_data/stop_listening/abort_speaking()` / `register_callback()`
 
 ---
 
@@ -206,7 +206,7 @@ TOKEN_REFRESH_MS = 110*60*1000    // Token 主动刷新 110min
 
 | 亮点 | 实现方式 |
 |------|---------|
-| 零等待唤醒响应 | WiFi 就绪即预建 WebSocket，唤醒词触发直接发 Hello |
+| 零等待唤醒响应 | WiFi 就绪即预建 WebSocket，唤醒词触发直接发 start |
 | 环形缓冲解耦 | 四层 RingBuffer（BYTEBUF/NOSPLIT 按帧边界选型） |
 | 定时器安全 | 回调仅推事件入队，网络操作剥离到独立任务 |
 | 语音打断 | abort 消息 + flush 缓冲，毫秒级切换 |

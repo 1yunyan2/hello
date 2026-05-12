@@ -23,7 +23,7 @@
  *
  * 默认唤醒词：
  *   中文："你好伙伴" (拼音: ni hao huo ban)
- *   英文："Hello Echo"
+ *   英文："start Echo"
  *
  * @note wake_word_init() 必须在 audio_init() 之前调用（采集任务需要 feed_chunksize）
  * @note MultiNet6 命令词要求至少 2 个音节/单词，否则初始化时自动回退到默认词
@@ -55,7 +55,7 @@
  * MultiNet6 检测到命令词时，从 afe_fetch_task 中调用此回调。
  * 回调函数不应在内部阻塞（会阻塞 AFE fetch 任务导致环形缓冲区积压）。
  *
- * @param wake_word_display 唤醒词显示文字（如 "你好伙伴" 或 "Hello Echo"）
+ * @param wake_word_display 唤醒词显示文字（如 "你好伙伴" 或 "start Echo"）
  */
 typedef void (*wake_word_detected_cb_t)(const char *wake_word_display);
 
@@ -101,8 +101,8 @@ void wake_word_load_from_nvs(char *dest, size_t max_len);
  * 语言自动从 wake_word_display 检测：含汉字→中文模型，纯 ASCII→英文模型。
  * 英文命令词自动转大写，无需调用方处理。
  *
- * @param wake_word_display  显示文字，如 "云炎" 或 "Hello Echo"
- * @param wake_word_pinyin   命令词，中文用拼音 "yun yan"，英文用单词 "hello echo"
+ * @param wake_word_display  显示文字，如 "云炎" 或 "start Echo"
+ * @param wake_word_pinyin   命令词，中文用拼音 "yun yan"，英文用单词 "start echo"
  */
 esp_err_t wake_word_update(const char *wake_word_display, const char *wake_word_pinyin);
 
@@ -119,7 +119,7 @@ esp_err_t wake_word_update(const char *wake_word_display, const char *wake_word_
  *       * 中文（display 含汉字）：原样比较
  *       * 英文：传入值自动转大写后再与 current_wake_word 比较
  *
- * @param display 显示文字（如 "你好小熊" / "Hello Echo"）
+ * @param display 显示文字（如 "你好小熊" / "start Echo"）
  * @param pinyin  命令词（中文拼音 / 英文单词）
  * @return true   两者与当前生效值完全相同，调用方应跳过更新
  * @return false  引擎未初始化或任一字段不同，调用方应执行更新

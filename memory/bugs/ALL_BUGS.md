@@ -23,7 +23,7 @@
 - **BUG-003** — `xTaskCreatePinnedToCoreWithCaps` API 参数顺序与 `xTaskCreate` 不同
 
 ### 协议层
-- **BUG-004** — WebSocket `type:"hello"` → 应为 `type:"started"`（服务端协议字段）
+- **BUG-004** — WebSocket `type:"start"` → 应为 `type:"started"`（服务端协议字段）
 - **BUG-005** — HTTP POST 创建资源返回 201，但原代码只接受 200
 
 ### 音频 / AI 处理层
@@ -49,7 +49,7 @@
 ### 2026-04-08（提交 `e96b8bc` `0bbfe76`）
 | 类型 | 内容 | 文件 |
 |------|------|------|
-| 修复 BUG-004 | WS 握手 `"type":"hello"` → `"type":"started"` | `websocket_client.c` |
+| 修复 BUG-004 | WS 握手 `"type":"start"` → `"type":"started"` | `websocket_client.c` |
 | 修复 BUG-003 | `xTaskCreatePinnedToCoreWithCaps` 参数顺序修正 | `bsp_wifi.c` |
 | 集成 | ESP-AFE 音频前端框架（NS 降噪 + WebRTC VAD） | `custom_wake_word.c/h` |
 | 改进 | 音频发送超时 10s → 100ms（实时场景要求） | `websocket_client.c` |

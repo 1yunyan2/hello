@@ -119,8 +119,8 @@ static void get_short_device_id(char *out, size_t out_size)
  */
 typedef struct
 {
-    char display[64]; ///< 显示文字（如 "云炎"、"Hello Echo"），用于自动检测语言
-    char pinyin[64];  ///< 命令词（中文拼音 "yun yan" 或英文单词 "hello echo"）
+    char display[64]; ///< 显示文字（如 "云炎"、"start Echo"），用于自动检测语言
+    char pinyin[64];  ///< 命令词（中文拼音 "yun yan" 或英文单词 "start echo"）
 } ww_update_params_t;
 
 // 独立处理唤醒词更新的后台任务

@@ -20,12 +20,12 @@ typedef enum
 {
     PROTOCOL_EVENT_CONNECTED,          ///< WebSocket 底层连接成功
     PROTOCOL_EVENT_DISCONNECTED,       ///< WebSocket 连接断开
-    PROTOCOL_EVENT_HELLO,              ///< 收到服务器 Hello(started) 响应
+    PROTOCOL_EVENT_start,              ///< 收到服务器 start(started) 响应
     PROTOCOL_EVENT_STT,                ///< 收到 STT 文字结果 (数据为 char*)
     PROTOCOL_EVENT_LLM,                ///< 收到 LLM 状态 (数据为 char*)
     PROTOCOL_EVENT_TTS_START,          ///< TTS 音频开始播放事件
     PROTOCOL_EVENT_TTS_SENTENCE_START, ///< TTS 句子开始播报 (数据为 char*)
-    PROTOCOL_EVENT_TTS_STOP,           ///< TTS 播放结束事件
+    PROTOCOL_EVENT_TTS_END,            ///< TTS 播放结束事件
     PROTOCOL_EVENT_AUDIO,              ///< 收到下行音频数据 (数据为 binary_data_t*)
     PROTOCOL_EVENT_IOT,                ///< 收到 IoT 遥测控制指令 (数据为 cJSON*)
     PROTOCOL_EVENT_ERROR,              ///< 收到服务端错误报警事件
@@ -111,7 +111,7 @@ bool protocol_is_connected(protocol_t *protocol);
  * @return 无
  * @note 调用者：session.c
  */
-void protocol_send_hello(protocol_t *protocol);
+void protocol_send_start(protocol_t *protocol);
 
 /**
  * @brief 发送打断/结束会话 TTS 指令

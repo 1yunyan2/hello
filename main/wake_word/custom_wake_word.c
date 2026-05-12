@@ -33,8 +33,8 @@ static void afe_fetch_task(void *arg);
 #define NVS_KEY_DISP_WORD "ww_disp"      // NVS Key：显示文字（用于下次启动判断语言）
 #define DEFAULT_DISP_CN "你好"           // 出厂默认中文显示词
 #define DEFAULT_WAKEWORD_CN "ni hao "    // 出厂默认中文命令词（拼音）
-#define DEFAULT_DISP_EN "Hello Echo"     // 出厂默认英文显示词
-#define DEFAULT_WAKEWORD_EN "HELLO ECHO" // 出厂默认英文命令词（mn6_en 词表全大写）
+#define DEFAULT_DISP_EN "start Echo"     // 出厂默认英文显示词
+#define DEFAULT_WAKEWORD_EN "start ECHO" // 出厂默认英文命令词（mn6_en 词表全大写）
 #define AUDIO_BUFFER_MAX 8192            // MultiNet 音频积累缓冲区最大采样点数
 // AEC 交织缓冲区大小：最大 feed chunksize（每通道）* 2 通道
 // 通常 chunksize = 512，因此此处取保守上限 1024 * 2 = 2048 个 int16_t
@@ -203,7 +203,7 @@ void wake_word_load_from_nvs(char *dest, size_t max_len)
 
 // ─── 词数统计 ─────────────────────────────────────────────────────────────
 // 按空格分隔统计词/音节数量
-// 规则：中文拼音"yun yan"=2，英文"hello echo"=2，单音节"yun"=1（不允许）
+// 规则：中文拼音"yun yan"=2，英文"start echo"=2，单音节"yun"=1（不允许）
 
 /**
  * @brief 统计字符串中的词（音节）数量，按空格分隔
@@ -211,7 +211,7 @@ void wake_word_load_from_nvs(char *dest, size_t max_len)
  * MultiNet6 要求命令词至少包含 2 个音节/单词，否则 esp_mn_commands_update()
  * 在构建 FST 时会内部崩溃。此函数用于初始化和更新时的前置安全校验。
  *
- * @param s 输入字符串（如 "yun yan"、"HELLO ECHO"）
+ * @param s 输入字符串（如 "yun yan"、"start ECHO"）
  * @return int 词数量（空字符串或 NULL 返回 0）
  *
  * @note 调用者：wake_word_init()（校验 NVS 词）、wake_word_update()（校验新词）
@@ -674,8 +674,8 @@ bool wake_word_is_same(const char *display, const char *pinyin)
  *   7. 持久化到 NVS（下次上电恢复）
  *   8. 恢复 is_running=true，释放锁
  *
- * @param wake_word_display  显示文字（如 "云炎" 或 "Hello Echo"），用于语言自动检测
- * @param wake_word_pinyin   命令词（中文拼音 "yun yan" / 英文单词 "hello echo"）
+ * @param wake_word_display  显示文字（如 "云炎" 或 "start Echo"），用于语言自动检测
+ * @param wake_word_pinyin   命令词（中文拼音 "yun yan" / 英文单词 "start echo"）
  * @return ESP_OK              更新成功
  * @return ESP_FAIL            引擎未初始化或语言切换失败
  * @return ESP_ERR_INVALID_ARG 命令词词数 < 2

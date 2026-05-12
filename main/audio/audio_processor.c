@@ -43,7 +43,7 @@
 #define ENC_INPUT_BUF_SIZE 131072
 // 编码器输出（OPUS 帧）：32KB ≈ 500+ 帧（每帧约 60 字节）
 // 历史 12288（~200 帧）在 SILK NSQ 尖峰 + ws_sender 网络抖动时仍会打满丢帧，
-// 扩到 32KB 吸收 CPU0 拥堵时的编码追赶脉冲，同时保留 Hello 握手期的积压余量。
+// 扩到 32KB 吸收 CPU0 拥堵时的编码追赶脉冲，同时保留 start 握手期的积压余量。
 #define ENC_OUTPUT_BUF_SIZE 32768
 #define DEC_INPUT_BUF_SIZE 16384  //! 原为5120 解码器输入（OPUS 帧）：云端下发的音频缓冲,
 #define DEC_OUTPUT_BUF_SIZE 40960 // 解码器输出（PCM 播放）：~1.28s 缓冲，保证播放流畅
@@ -147,7 +147,7 @@ static void audio_processor_play_task(void *arg)
             // 200ms 足够覆盖 DMA 释放一个 slot（@32kHz 约 32ms），
             // 同时远小于看门狗超时（5s），即使偶发超时也只丢失极少量 PCM（< 10ms）。
             esp_err_t wr_ret = i2s_channel_write(board->i2s_tx_handle, buf, size_read,
-                                                 &bytes_written, pdMS_TO_TICKS(200));
+                                                 &bytes_written, portMAX_DELAY);
             if (wr_ret != ESP_OK)
                 ESP_LOGW(TAG, "I2S write 超时 (size=%d ret=%d)，可能瞬间卡顿", (int)size_read, wr_ret);
             xRingbufferSend(audio_processor->aec_ref_buf, buf, size_read, 0);
