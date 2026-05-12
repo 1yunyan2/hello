@@ -217,8 +217,8 @@ typedef struct
     char city_name[32]; ///< 城市名（如"杭州"）
     char temp[8];       ///< 当前温度（如"25"）
     char text[32];      ///< 天气状况（如"晴"、"多云"）
-    char humidity[8];   ///< 湿度百分比（如"60"）
-    bool valid;         ///< 数据是否有效（true=已获取成功）
+    // char humidity[8];   ///< 湿度百分比（如"60"）
+    bool valid; ///< 数据是否有效（true=已获取成功）
 } weather_data_t;
 
 /**

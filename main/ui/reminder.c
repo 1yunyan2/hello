@@ -498,7 +498,7 @@ static esp_err_t weather_fetch_and_notify(void)
         strncpy(s_ctx.weather_data.text, info->weather, sizeof(s_ctx.weather_data.text) - 1);
     }
     // 心知免费版无湿度，设为固定值或 "--"
-    strncpy(s_ctx.weather_data.humidity, "--", sizeof(s_ctx.weather_data.humidity) - 1);
+    // strncpy(s_ctx.weather_data.humidity, "--", sizeof(s_ctx.weather_data.humidity) - 1);
 
     s_ctx.weather_data.valid = true;
     xSemaphoreGive(s_ctx.mutex);

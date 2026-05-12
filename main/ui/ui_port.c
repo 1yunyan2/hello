@@ -24,6 +24,7 @@
 #include "bsp/bsp_board.h"
 #include "esp_spiffs.h"
 #include "ui/reminder.h"
+#include "object.h"
 #include <string.h>
 #include <limits.h>
 #include <stdio.h>
@@ -174,6 +175,62 @@ static lv_obj_t *s_emo_anim_lbl = NULL;
 static lv_obj_t *s_emo_audio_lbl = NULL;
 static lv_timer_t *s_emo_timer = NULL;
 
+// 1 为启用月历组件，0 为回退到原本的文字显示
+#define CONFIG_UI_USE_CALENDAR 1
+/* 在 ui_port.c 的全局变量区域添加 */
+#if CONFIG_UI_USE_CALENDAR
+static lv_obj_t *s_calendar = NULL;
+#endif
+/**
+ * @brief 实现月历网格渲染
+ * 依据：使用 LVGL 内置日历组件并配合已有的 font_cn_16 字体
+ */
+#if CONFIG_UI_USE_CALENDAR
+static lv_obj_t *s_calendar_clock = NULL; // 定义一个新的独立时钟标签
+
+static void time_page_render_calendar(void)
+{
+    if (s_menu_panel == NULL)
+        return;
+
+    if (s_calendar == NULL)
+    {
+        // 1. 创建日历网格
+        s_calendar = lv_calendar_create(s_menu_panel);
+        lv_obj_set_size(s_calendar, 230, 190);
+        lv_obj_align(s_calendar, LV_ALIGN_BOTTOM_MID, 0, 0);
+        lv_obj_set_style_text_font(s_calendar, &font_cn_16, 0); // 设置字体为中文字体
+
+        // 2. 创建一个“不被覆盖”的右上角时间标签
+        s_calendar_clock = lv_label_create(s_menu_panel);
+        lv_obj_set_style_text_font(s_calendar_clock, &font_cn_16, 0);
+        lv_obj_set_style_text_color(s_calendar_clock, lv_color_white(), 0);
+        // 精确对齐到右上角，这样它就永远在日历网格的上方
+        lv_obj_align(s_calendar_clock, LV_ALIGN_TOP_RIGHT, -10, 8);
+    }
+
+    // 3. 同时更新日历日期和右上角的时间数字
+    if (reminder_is_time_synced())
+    {
+        uint8_t h, m, s;
+        reminder_get_current_time(&h, &m, &s);
+        char time_buf[16];
+        snprintf(time_buf, sizeof(time_buf), "%02d:%02d", h, m);
+        lv_label_set_text(s_calendar_clock, time_buf); // 更新右上角时钟
+
+        // 更新日历主体
+        struct tm tm_now;
+        time_t now = time(NULL);
+        localtime_r(&now, &tm_now);
+        lv_calendar_set_today_date(s_calendar, tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday);
+        lv_calendar_set_showed_date(s_calendar, tm_now.tm_year + 1900, tm_now.tm_mon + 1);
+    }
+
+    lv_obj_clear_flag(s_calendar, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_calendar_clock, LV_OBJ_FLAG_HIDDEN); // 确保时钟可见
+}
+#endif
+
 /* ═══════════════════════════════════════════════════════════════
  * SPIFFS 文件系统初始化
  * ═══════════════════════════════════════════════════════════════ */
@@ -211,8 +268,7 @@ static const char *const s_main_gif_paths[] = {
     "S:/one.gif",
     "S:/two.gif",
     "S:/three.gif",
-    "S:/four.gif",
-    "S:/five.gif",
+
 };
 
 static const char *pick_main_gif_path(void)
@@ -270,9 +326,9 @@ static esp_err_t app_lvgl_init(void)
     }
 
     const lvgl_port_cfg_t lvgl_cfg = {
-        .task_priority = 3,
+        .task_priority = 5,
         .task_stack = 8192,
-        .task_affinity = 1,
+        .task_affinity = 0,
         .task_max_sleep_ms = 500,
         .timer_period_ms = 10,
         // 栈必须在内部 SRAM，因为 GIF 播放会读 SPIFFS（flash cache 禁用期间 PSRAM 不可访问）
@@ -281,35 +337,64 @@ static esp_err_t app_lvgl_init(void)
     esp_err_t err = lvgl_port_init(&lvgl_cfg);
     if (err != ESP_OK)
         return err;
+    PRINT_MEM_INFO(TAG, "lvgl_port 8KB INTERNAL 任务栈分配后");
 
+    // ── LVGL 显示配置（内部 SRAM 单缓冲 PARTIAL 模式）─────────────────────────
+    // 必须放内部 SRAM 的根因（已通过对照实验定位）：
+    //   AFE/WakeNet 推理任务持续高频访问 PSRAM，会抢占 PSRAM 总线带宽。
+    //   若 LCD flush buffer 在 PSRAM，SPI master 的 GDMA 来不及从 PSRAM 喂数据
+    //   → SPI FIFO underflow → tx_color failed + 屏幕花屏。
+    //   只有把 buffer 放内部 SRAM，DMA 才能恒速供数，彻底脱离 PSRAM 带宽竞争。
+    //
+    // 缓冲尺寸权衡：
+    //   - W*H/4 = 38400 字节：DMA-capable 内部 SRAM 装不下（碎片化后子集 < 38KB）
+    //   - W*H/8 = 19200 字节：当前可分配（启动时 SRAM free ~55KB），PARTIAL 模式
+    //                         会按 1/8 屏多次 flush 完成整屏，GIF 仍能流畅
+    //   - 单缓冲：PARTIAL 模式不需要双缓冲，避免内存翻倍
     const lvgl_port_display_cfg_t disp_cfg = {
         .io_handle = board->lcd_io,
         .panel_handle = board->lcd_panel,
-        // .buffer_size = (BSP_LCD_WIDTH * BSP_LCD_HEIGHT) / 15,
-        .buffer_size = (BSP_LCD_WIDTH * BSP_LCD_HEIGHT) / 8,
-
-        .double_buffer = true,
+        // 经实测的尺寸权衡（启动时 DMA-capable 内部 SRAM ~50KB 可用）：
+        //   W*H/4 = 38400 字节：分配失败（DMA SRAM 连续块不够）
+        //   W*H/5 = 30720 字节：分到但 WebSocket 等模块缺内存创建失败，1kSRAM 余量太小不稳
+        //   W*H/6 = 24576 字节：分到但 WebSocket 等模块缺内存创建失败，2kSRAM 余量太小不稳
+        //   W*H/7 = 20480 字节：分到但 WebSocket 等模块缺内存创建失败，8kSRAM 余量太小不稳已经带有拖影了
+        //   W*H/8 = 19200 字节：分到且留 ~11KB 给其他模块（稳态） ，已经带有拖影了
+        //   W*H/16 = 9600 字节：余量更大但 GIF 帧率会更慢
+        .buffer_size = (BSP_LCD_WIDTH * BSP_LCD_HEIGHT) / 7, // 1/8 屏 = 19200 字节
+        .double_buffer = false,                              // 单缓冲（SRAM 紧张，PARTIAL 模式无需双缓冲）
         .hres = BSP_LCD_WIDTH,
         .vres = BSP_LCD_HEIGHT,
         .monochrome = false,
         .color_format = LV_COLOR_FORMAT_RGB565,
         .rotation = {.swap_xy = true, .mirror_x = false, .mirror_y = true},
-        .flags = {.buff_dma = true, .swap_bytes = false, .buff_spiram = true}};
+        // buff_dma=true + buff_spiram=false：强制使用 DMA-capable 内部 SRAM
+        .flags = {.buff_dma = true, .swap_bytes = false, .buff_spiram = false}};
 
     lvgl_disp = lvgl_port_add_disp(&disp_cfg);
-    if (lvgl_disp != NULL)
+    if (lvgl_disp == NULL)
     {
-        lv_display_set_render_mode(lvgl_disp, LV_DISPLAY_RENDER_MODE_PARTIAL);
-        if (lvgl_port_lock(1000))
+        // disp 创建失败时必须返回错误，否则 ui_init 后续会调 lv_screen_active()
+        // 拿到失效对象，main_desplay_create 解引用导致 LoadProhibited 崩溃
+        ESP_LOGE(TAG, "lvgl_port_add_disp 失败：DMA 内部 SRAM 不足 19200 字节连续区");
+        PRINT_MEM_INFO(TAG, "LVGL flush buffer 19200B DMA-SRAM 分配失败");
+        return ESP_ERR_NO_MEM;
+    }
+    PRINT_MEM_INFO(TAG, "LVGL flush buffer 19200B DMA-SRAM 分配后");
+
+    // 注意：esp_lvgl_port 在 double_buffer=false 时已自动注册为 PARTIAL 模式，
+    // 这里不再调 lv_display_set_render_mode 覆盖（之前调用会与内部 flush 逻辑冲突）
+
+    // 设置默认屏幕背景色为黑色（避免初始化期间花屏）
+    if (lvgl_port_lock(1000))
+    {
+        lv_obj_t *screen = lv_screen_active();
+        if (screen != NULL)
         {
-            lv_obj_t *screen = lv_screen_active();
-            if (screen != NULL)
-            {
-                lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
-                lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
-            }
-            lvgl_port_unlock();
+            lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
+            lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
         }
+        lvgl_port_unlock();
     }
     return ESP_OK;
 }
@@ -338,6 +423,11 @@ static void make_clock_cell(lv_obj_t *scr, lv_obj_t **out,
 static void main_desplay_create(void)
 {
     lv_obj_t *scr = lv_screen_active();
+    if (scr == NULL)
+    {
+        ESP_LOGE(TAG, "lv_screen_active 返回 NULL，跳过样式设置");
+        return;
+    }
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
     lv_obj_set_scrollbar_mode(scr, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_style_text_font(scr, &font_cn_16, 0);
@@ -447,6 +537,11 @@ void ui_show_emotion(const char *name, const char *anim_desc, const char *audio_
     if (!lvgl_port_lock(100))
         return;
     lv_obj_t *scr = lv_screen_active();
+    if (scr == NULL)
+    {
+        ESP_LOGE(TAG, "lv_screen_active 返回 NULL，跳过样式设置");
+        return;
+    }
 
     if (s_emo_panel == NULL)
     {
@@ -534,6 +629,11 @@ static void ensure_menu_panel(void)
     if (s_menu_panel != NULL)
         return;
     lv_obj_t *scr = lv_screen_active();
+    if (scr == NULL)
+    {
+        ESP_LOGE(TAG, "lv_screen_active 返回 NULL，跳过菜单面板创建");
+        return;
+    }
 
     s_menu_panel = lv_obj_create(scr);
     lv_obj_set_size(s_menu_panel, BSP_LCD_WIDTH, BSP_LCD_HEIGHT);
@@ -690,6 +790,11 @@ static void alarm_edit_create(void)
         return;
 
     lv_obj_t *scr = lv_screen_active();
+    if (scr == NULL)
+    {
+        ESP_LOGE(TAG, "lv_screen_active 返回 NULL，跳过编辑面板创建");
+        return;
+    }
 
     s_edit_panel = lv_obj_create(scr);
     lv_obj_set_size(s_edit_panel, BSP_LCD_WIDTH, BSP_LCD_HEIGHT);
@@ -800,8 +905,6 @@ static void alarm_edit_render(void) // 显示界面
 
 static void alarm_edit_enter(void)
 {
-    alarm_edit_create();
-
     alarm_entry_t list[1];
     uint8_t count = 0;
     reminder_alarm_get_all(list, &count);
@@ -825,6 +928,7 @@ static void alarm_edit_enter(void)
 
     if (lvgl_port_lock(100))
     {
+        alarm_edit_create(); /* 创建LVGL对象必须在锁内，防止与LVGL定时器任务竞争 */
         alarm_edit_render();
         lv_obj_clear_flag(s_edit_panel, LV_OBJ_FLAG_HIDDEN);
         if (s_menu_panel)
@@ -1228,11 +1332,26 @@ static void render_fn_page(fn_page_t page)
 
     lv_label_set_text(s_menu_title, s_fn_page_titles[page]);
 
+#if CONFIG_UI_USE_CALENDAR
+    // 如果启用了月历，则尝试隐藏它（防止在其他页面显示）
+    if (s_calendar)
+        lv_obj_add_flag(s_calendar, LV_OBJ_FLAG_HIDDEN);
+#endif
+
+    lv_label_set_text(s_menu_title, s_fn_page_titles[page]);
+
     switch (page)
     {
     case FN_PAGE_TIME:
-        time_page_render_text();
+#if CONFIG_UI_USE_CALENDAR
+        // 模式 A: 显示月历，隐藏文字标签
+        lv_obj_add_flag(s_menu_body, LV_OBJ_FLAG_HIDDEN);
+        time_page_render_calendar();
+#else
+        // 模式 B: 回退到原始逻辑，显示文字标签
         lv_obj_clear_flag(s_menu_body, LV_OBJ_FLAG_HIDDEN);
+        time_page_render_text();
+#endif
         break;
 
     case FN_PAGE_ALARM:
@@ -1254,12 +1373,13 @@ static void render_fn_page(fn_page_t page)
             snprintf(buf, sizeof(buf),
                      "%s\n\n"
                      "温度:  %s%sC\n"
-                     "天气:  %s\n"
-                     "湿度:  %s%%",
+                     "天气:  %s\n",
+                     //  "湿度:  %s%%",
                      wd.city_name,
                      wd.temp, "\xC2\xB0",
-                     wd.text,
-                     wd.humidity);
+                     wd.text
+                     //  wd.humidity
+            );
         }
         else
         {
@@ -1267,7 +1387,7 @@ static void render_fn_page(fn_page_t page)
                      "%s\n\n"
                      "温度:  --%sC\n"
                      "天气:  --\n"
-                     "湿度:  --\n\n"
+                     //  "湿度:  --\n\n"
                      "等待天气数据...",
                      wd.city_name[0] ? wd.city_name : "定位中",
                      "\xC2\xB0");
