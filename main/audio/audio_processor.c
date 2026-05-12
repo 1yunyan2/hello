@@ -40,7 +40,7 @@
 // 编码器输入（原始 PCM）：131072 B ≈ 4.1s @ 16kHz 16-bit 单声道
 // 历史值 81920 B（~2.56s）在 SILK 编码偶发耗时 + CPU0 拥堵时仍会被打满，
 // 导致 audio_processor_write_pcm 丢帧（即"尾部音频丢失"），扩到 4s 给 encoder 更多追赶时间。
-#define ENC_INPUT_BUF_SIZE 131072
+#define ENC_INPUT_BUF_SIZE 131072 // 采样率16kHz × 2字节/采样点 × 1声道 = 131072 / (16000*18/2*1) ≈ 4.1秒
 // 编码器输出（OPUS 帧）：32KB ≈ 500+ 帧（每帧约 60 字节）
 // 历史 12288（~200 帧）在 SILK NSQ 尖峰 + ws_sender 网络抖动时仍会打满丢帧，
 // 扩到 32KB 吸收 CPU0 拥堵时的编码追赶脉冲，同时保留 start 握手期的积压余量。
@@ -102,6 +102,10 @@ static void audio_processor_play_task(void *arg)
     // 🟢 智能预缓冲状态机变量
     bool prebuffering = true;
     TickType_t buffer_start_tick = xTaskGetTickCount();
+    // 连续欠载计数器：连续 N 次从 dec_output 读不到数据才触发预缓冲重置，
+    // 过滤解码器两帧之间的瞬间间隙（约 20ms），避免误触发"滴滴"电音。
+    int underrun_count = 0;
+#define UNDERRUN_THRESHOLD 3 // 连续 3 次 × 20ms = 60ms 真空才重置
 
     while (audio_processor->is_running)
     {
@@ -120,6 +124,7 @@ static void audio_processor_play_task(void *arg)
             if (bytes_waiting >= 16384 || wait_ms >= 600)
             {
                 prebuffering = false; // 开闸放水！
+                underrun_count = 0;   // 重置欠载计数
                 if (bytes_waiting > 0)
                 {
                     ESP_LOGI(TAG, "TTS 预缓冲完成 (数据:%d B, 耗时:%d ms)，开始流畅播放", bytes_waiting, (int)wait_ms);
@@ -140,6 +145,7 @@ static void audio_processor_play_task(void *arg)
 
         if (buf)
         {
+            underrun_count = 0; // 读到数据，清零欠载计数
             size_t bytes_written = 0;
             // 【看门狗修复】portMAX_DELAY → 200ms：
             // I2S DMA buffer 若短暂满载，portMAX_DELAY 会让 play_task 永久阻塞，
@@ -157,12 +163,22 @@ static void audio_processor_play_task(void *arg)
         {
             // 🟢 阶段 3：缓冲欠载（网络太卡，播放速度追上了云端下载速度）
             // ⚠️ 极其关键：必须立刻重新进入预缓冲状态！否则会出现鬼畜的"一帧一卡"电音！
-            prebuffering = true;
-            buffer_start_tick = xTaskGetTickCount(); // 重置计时器，重新开始蓄水
-
-            // 喂入静音包，平滑过渡
+            // prebuffering = true;
+            // buffer_start_tick = xTaskGetTickCount(); // 重置计时器，重新开始蓄水
+            // 连续超过 UNDERRUN_THRESHOLD 次（约 60ms）读不到数据，才判定为真正欠载。
+            // 单次超时可能只是解码器两帧之间的瞬间空档，不应立刻重置预缓冲，
+            // 否则静音包和有效 PCM 交替写入 I2S DAC 会产生"滴滴"电音。
+            underrun_count++;
+            if (underrun_count >= UNDERRUN_THRESHOLD)
+            {
+                underrun_count = 0;
+                prebuffering = true;
+                buffer_start_tick = xTaskGetTickCount(); // 重置计时器，重新开始蓄水
+                ESP_LOGW(TAG, "dec_output 持续欠载 %d ms，重新进入预缓冲", UNDERRUN_THRESHOLD * 20);
+            }
+            // 欠载期间持续喂静音包，维持 I2S 时钟稳定
             size_t silence_written = 0;
-            i2s_channel_write(board->i2s_tx_handle, silence_buf, sizeof(silence_buf), &silence_written, pdMS_TO_TICKS(50));
+            i2s_channel_write(board->i2s_tx_handle, silence_buf, sizeof(silence_buf), &silence_written, pdMS_TO_TICKS(20));
         }
     }
 
