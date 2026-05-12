@@ -31,6 +31,62 @@
 #define PRINT_INTERNAL_HEAP \
     ESP_LOGI(TAG, "[heap] internal free: %lu B", esp_get_free_internal_heap_size())
 
+#include "ui/flash.c" // 注意：此处直接 include，避免与 ui_port.h 形成循环依赖
+#include <dirent.h>   // 必须包含这个，才能使用 DIR 和 readdir
+#include "esp_log.h"  // 确保能使用 ESP_LOGI 等日志宏
+// 一个函数扫描所有资源
+void scan_production_assets(const char *root_path)
+{
+    ESP_LOGI("FS", "========================================");
+    ESP_LOGI("FS", "🔍 开始资源完整性校验: %s", root_path);
+
+    const char *sub_folders[] = {"/gif", "/audio"}; // 你关心的子目录
+
+    for (int i = 0; i < 2; i++)
+    {
+        char full_path[128];
+        snprintf(full_path, sizeof(full_path), "%s%s", root_path, sub_folders[i]);
+
+        DIR *dir = opendir(full_path);
+        if (dir == NULL)
+        {
+            ESP_LOGW("FS", "⚠️ 未发现目录: %s (请检查 storage.bin 打包结构)", full_path);
+            continue;
+        }
+
+        struct dirent *de;
+        while ((de = readdir(dir)) != NULL)
+        {
+            // 忽略系统隐藏文件
+            if (de->d_name[0] == '.')
+                continue;
+            ESP_LOGI("FS", "[%s] 🚀 发现资源: %s", sub_folders[i], de->d_name);
+        }
+        closedir(dir);
+    }
+    ESP_LOGI("FS", "========================================");
+}
+void debug_root_files(void)
+{
+    DIR *dir = opendir("/S");
+    if (!dir)
+    {
+        ESP_LOGE("DEBUG", "连 /S 都打不开！");
+        return;
+    }
+    struct dirent *de;
+    int count = 0;
+    printf("--- 物理搜索开始 ---\n");
+    while ((de = readdir(dir)) != NULL)
+    {
+        printf("[%d] 找到条目: %s (类型: %d)\n", count++, de->d_name, de->d_type);
+    }
+    if (count == 0)
+    {
+        printf("🚨 警告：外挂 Flash 根目录下空无一物！\n");
+    }
+    closedir(dir);
+}
 // ═══════════════════════════════════════════════════════════════════════════════
 // 2. 唤醒提示音
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -129,8 +185,14 @@ static void wake_word_callback(const char *wake_word_display)
  */
 void application_init(void)
 {
+    bsp_flash_init();
     PRINT_INTERNAL_HEAP;
-
+    debug_root_files();
+    scan_production_assets("/S"); // 扫描 /S 目录下的所有资源
+    if (access("/S/assets/gif/one.gif", F_OK) == 0)
+        printf("路径 A 物理存在！\n");
+    if (access("/S/gif/one.gif", F_OK) == 0)
+        printf("路径 B 物理存在！\n");
     /* ── 步骤 1: BSP 单例 ──────────────────────────────────────────────────── */
     bsp_board_t *bsp_board = bsp_board_get_instance();
 
@@ -141,8 +203,8 @@ void application_init(void)
     bsp_board_wifi_main(bsp_board);
     PRINT_INTERNAL_HEAP;
     // // 提醒系统初始化（含 MOCK_TIME 模式下的系统时间设置）
-    // reminder_init(NULL); // NULL = 暂无 TTS 回调，后续接入 session 层时替换
-    // PRINT_INTERNAL_HEAP;
+    reminder_init(NULL); // NULL = 暂无 TTS 回调，后续接入 session 层时替换
+    PRINT_INTERNAL_HEAP;
 
     /* ── 步骤 3: 音频硬件 + 采集任务 ──────────────────────────────────────── */
     audio_init(bsp_board);
