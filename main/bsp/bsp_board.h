@@ -312,3 +312,5 @@ void bsp_touch_init(void);
  * @note 扫描结果将写入 bsp_touch_get_event() 的输出参数
  */
 void bsp_motor_pulse(void);
+
+void bsp_flash_init(void);
