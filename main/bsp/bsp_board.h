@@ -46,6 +46,7 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_dev.h"
 #include "iot_servo.h"
+#include "esp_heap_caps.h"
 
 // ─── 设备状态位定义（统一使用 board_status EventGroup）─────────────────────
 // 各模块完成初始化或达到特定状态时置位对应 BIT，其他模块通过 WaitBits 同步等待。

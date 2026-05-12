@@ -1,6 +1,7 @@
 #include "bsp_board.h"
 #include "protocol/mqtt_protocol.h"
 #include "protocol/auth.h"
+#include "esp_heap_caps.h"
 // ─── 模块常量 ─────────────────────────────────────────────────────────────────
 #define CLEAR_WIFI_BUTTON_PIN GPIO_NUM_0 ///< 清除 WiFi 凭证的长按按键（Boot 按钮）
 #define MAX_RETRY_COUNT 5                ///< WiFi 断线后最大自动重连次数
@@ -484,11 +485,12 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
     //     0,                  // CPU0
     //     MALLOC_CAP_SPIRAM); // 栈分配在外部 SPIRAM（节省内部 SRAM）
 
-    // 使用了分配内存的api，导致和nvs冲突了？因为清除token需要写nvs_erase_key，但是外部psram访问不到nvs？
-    xTaskCreatePinnedToCore(
+    // button_monitor_task 会调用 nvs_erase_key/nvs_set_str/nvs_commit（Flash 操作），
+    // Flash 操作占用 SPI 总线期间 CPU 需访问任务栈，栈必须在内部 SRAM，否则 WDT 复位。
+    xTaskCreatePinnedToCoreWithCaps(
         button_monitor_task, "btn_task",
         2048, NULL, 5, NULL,
-        0);
+        0, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     // ── 步骤 7：检查是否已配网 ───────────────────────────────────────────────
     bool provisioned = false;
     ESP_ERROR_CHECK(wifi_prov_mgr_is_provisioned(&provisioned));
