@@ -57,6 +57,20 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.5.4
+  espressif/esp_lvgl_port:
+    component_hash: b6360960f47b6776462e7092861b3ea66477ffb762a01baa0aecbb3d74cd50f4
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.1'
+    - name: lvgl/lvgl
+      registry_url: https://components.espressif.com
+      require: public
+      version: '>=8,<10'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 2.7.2
   espressif/esp_websocket_client:
     component_hash: c5a067a9fddea370c478017e66fac302f4b79c3d4027e9bdd42a019786cceb92
     dependencies:
@@ -77,16 +91,50 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 0.1.0
+  espressif/zlib:
+    component_hash: 64ea2fd6754c5a05951f1ddb312ac835cd782e68cb5bd9dfcd1c3a107c8fbfbc
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.4'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.3.2
   idf:
     source:
       type: idf
     version: 5.3.4
+  lvgl/lvgl:
+    component_hash: 184e532558c1c45fefed631f3e235423d22582aafb4630f3e8885c35281a49ae
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 9.5.0
+  ningzixi/weather:
+    component_hash: cba903a06f8e9a30d7def18c5ba7313fa8689e746ff3239f387a164ce5e0d3dc
+    dependencies:
+    - name: espressif/zlib
+      registry_url: https://components.espressif.com
+      require: private
+      version: ^1.3.1
+    - name: idf
+      require: private
+      version: '>=5.3.1'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.1.2
 direct_dependencies:
 - espressif/esp-sr
 - espressif/esp_audio_codec
 - espressif/esp_codec_dev
+- espressif/esp_lvgl_port
 - espressif/esp_websocket_client
 - espressif/servo
-manifest_hash: 97dddcc9da7d30273d0443aae64fa7c51714467459fd0a72c42350741403da61
+- lvgl/lvgl
+- ningzixi/weather
+manifest_hash: 7cfdf05db535185dd2a0196aaed0d92b2f1bf00378ad1503ea67d1638b027396
 target: esp32s3
 version: 2.0.0

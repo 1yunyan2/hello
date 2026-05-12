@@ -227,8 +227,16 @@ audio_decoder_t *audio_decoder_create(int sample_rate, int channels)
     audio_decoder->sample_rate = sample_rate;
     audio_decoder->channels = channels;
 
-    // ── 步骤 2：注册 OPUS 解码器 ──────────────────────────────────────────────
-    ESP_ERROR_CHECK(esp_opus_dec_register());
+    // ── 步骤 2：注册 OPUS 解码器（全局只需注册一次）──────────────────────────
+    // ★ 使用静态标志确保只注册一次，避免反复 register/unregister 导致内部 SRAM 泄漏（每次约 0.7KB）
+    {
+        static bool s_opus_dec_registered = false;
+        if (!s_opus_dec_registered)
+        {
+            ESP_ERROR_CHECK(esp_opus_dec_register());
+            s_opus_dec_registered = true;
+        }
+    }
 
     // ── 步骤 3：配置解码参数（必须与编码端严格一致）─────────────────────────
     esp_opus_dec_cfg_t opus_cfg = {
@@ -263,8 +271,8 @@ void audio_decoder_destroy(audio_decoder_t *audio_decoder)
     // 关闭解码器：释放 OPUS 解码状态机内部资源
     esp_audio_dec_close(audio_decoder->dec);
 
-    // 注销 OPUS 解码器类型（从框架注册表移除）
-    esp_audio_dec_unregister(ESP_AUDIO_TYPE_OPUS);
+    // ★ 不再注销 OPUS 解码器类型：全局只注册一次，避免反复 register/unregister 泄漏内部 SRAM
+    // esp_audio_dec_unregister(ESP_AUDIO_TYPE_OPUS);
 
     // 释放解码器结构体
     free(audio_decoder);

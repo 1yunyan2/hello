@@ -15,7 +15,7 @@
 - [分类指令批量执行](feedback_batch_execute.md) — 说大类名自动执行所有子能力
 - [用户积极性](feedback_enthusiasm.md) — 用户愿意全面启用所有辅助能力
 - [Token预算意识](feedback_token_budget.md) — 回答前先评估token够不够，避免半途浪费
-- 踩坑日志：[BUG-001](bugs/BUG-001.md) 蓝牙释放崩溃 | [BUG-002](bugs/BUG-002.md) SPIFFS内存冲突 | [BUG-003](bugs/BUG-003.md) 任务参数顺序错 | [BUG-004](bugs/BUG-004.md) WS握手类型错 | [BUG-005](bugs/BUG-005.md) HTTP 201未兼容 | [BUG-006](bugs/BUG-006.md) MultiNet CPU占满 | [BUG-007](bugs/BUG-007.md) 唤醒尾音误触EOS | [BUG-008](bugs/BUG-008.md) 定时器栈溢出
+- 踩坑日志：[BUG-001](bugs/BUG-001.md) 蓝牙释放崩溃 | [BUG-002](bugs/BUG-002.md) SPIFFS内存冲突 | [BUG-003](bugs/BUG-003.md) 任务参数顺序错 | [BUG-004](bugs/BUG-004.md) WS握手类型错 | [BUG-005](bugs/BUG-005.md) HTTP 201未兼容 | [BUG-006](bugs/BUG-006.md) MultiNet CPU占满 | [BUG-007](bugs/BUG-007.md) 唤醒尾音误触EOS | [BUG-008](bugs/BUG-008.md) 定时器栈溢出 | [BUG-013](bugs/BUG-013.md) 长TTS残留被识别为下一轮输入 | [BUG-014](bugs/BUG-014.md) 多轮SERVER_READY丢失+尾端字保护被风扇噪声玩坏
 - 决策记录：[DEC-001](decisions/DEC-001.md) OPUS 24kbps CBR | [DEC-002](decisions/DEC-002.md) 四层环形缓冲 | [DEC-003](decisions/DEC-003.md) Token双重刷新 | [DEC-004](decisions/DEC-004.md) AFE WebRTC VAD | [DEC-005](decisions/DEC-005.md) GPIO引脚分配
 - [Bug汇总索引](bugs/ALL_BUGS.md) — BUG-001~008 快速查表，按模块分类
 - [CHANGELOG.html](CHANGELOG.html) — 可点击查看每次提交的修改前后 diff（浏览器打开）

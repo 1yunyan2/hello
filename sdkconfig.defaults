@@ -1,6 +1,9 @@
-# This file was generated using idf.py save-defconfig. It can be edited manually.
-# Espressif IoT Development Framework (ESP-IDF) 5.3.4 Project Minimal Configuration
-#
+# --- 新增：LVGL 日志配置 (从 reminder 引入) ---
+CONFIG_LV_USE_LOG=y
+CONFIG_LV_LOG_LEVEL_WARN=y
+CONFIG_LV_LOG_PRINTF=y
+
+# --- 基础硬件配置 ---
 CONFIG_IDF_TARGET="esp32s3"
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
@@ -9,9 +12,26 @@ CONFIG_SR_MN_CN_MULTINET6_QUANT=y
 CONFIG_SR_MN_EN_MULTINET6_QUANT=y
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
+
+# --- 关键：PSRAM 与 DMA 支持配置 (修复 LCD 报错) ---
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
-# MultiNet6 计算密集，240MHz 确保 detect() 不拖慢实时音频管道
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+CONFIG_SPIRAM_MALLOC_CAP_DEFAULT=y
+# 允许数据缓存，这是 SPI DMA 访问 PSRAM 的前提条件之一
+CONFIG_SPIRAM_ALLOW_BCACHE=y
+
+# --- 性能与调试 ---
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
-# CPU1 被 afe_fetch + audio_feed 占满是设计行为，IDLE1 无法运行不是故障
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+# --- 强制将 NimBLE 蓝牙协议栈内存分配到 PSRAM ---
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+
+# --- 强制将 WiFi 和 LwIP 相关的内存分配到 PSRAM ---
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_LWIP_DEFAULT_TCP_RECVMBOX_IN_PSRAM=y
+
+# --- 顺手把 mbedTLS (MQTT/WebSocket 加密握手) 的内存也挪出去 ---
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y

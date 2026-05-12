@@ -14,9 +14,14 @@
 #include "esp_log.h"
 #include "cJSON.h"
 #include "nvs.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 /** @brief 模块日志标签 */
 #define TAG "Auth"
+
+/** @brief 服务器不可达标志：Auth HTTP 失败时置 false，成功时置 true */
+static volatile bool s_server_reachable = true;
 
 /**
  * @brief 内部扩展结构体（面向对象封装设计）
@@ -127,39 +132,63 @@ void auth_perform(auth_t *auth, const char *device_token)
     wrapper->response = NULL;
     wrapper->response_len = 0;
 
-    // ─── 逻辑块 2：配置并发起 HTTP POST 请求 ─────────────────────
+    // ─── 逻辑块 2：配置并发起 HTTP POST 请求（含 1 次重试）─────
     // 说明：组装 JSON 格式的 deviceToken 字段，调用 ESP-IDF HTTP 客户端发起 POST 阻塞请求。
+    //       失败后等待 1 秒重试 1 次，两次均失败则标记服务器不可达。
     // API：esp_http_client_init, esp_http_client_set_header, cJSON_CreateObject, cJSON_AddStringToObject, cJSON_PrintUnformatted, esp_http_client_set_post_field, esp_http_client_perform, esp_http_client_cleanup
     // 数据：构建 post_body 字符串用于请求体发送。
-    esp_http_client_config_t config = {
-        .url = AUTH_LOGIN_URL,
-        .method = HTTP_METHOD_POST,
-        .event_handler = auth_http_event_handler,
-        .user_data = wrapper,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "deviceToken", device_token);
     char *post_body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
 
-    esp_http_client_set_post_field(client, post_body, strlen(post_body));
-    esp_err_t ret = esp_http_client_perform(client);
-    free(post_body);
+    esp_err_t ret = ESP_FAIL;
+    int status_code = 0;
+    const int max_retries = 2; // 最多重试 2 次（首次 + 1 次重试）
 
-    int status_code = esp_http_client_get_status_code(client);
-    esp_http_client_cleanup(client);
+    for (int attempt = 0; attempt < max_retries; attempt++)
+    {
+        esp_http_client_config_t config = {
+            .url = AUTH_LOGIN_URL,
+            .method = HTTP_METHOD_POST,
+            .event_handler = auth_http_event_handler,
+            .user_data = wrapper,
+            .timeout_ms = 3000, // 3秒超时，与 WebSocket 网络超时一致，服务器不可达时快速失败
+        };
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        esp_http_client_set_header(client, "Content-Type", "application/json");
+        esp_http_client_set_post_field(client, post_body, strlen(post_body));
+
+        ret = esp_http_client_perform(client);
+        status_code = esp_http_client_get_status_code(client);
+        esp_http_client_cleanup(client);
+        PRINT_MEM_INFO(TAG, "Auth HTTP 请求完成");
+
+        if (ret == ESP_OK && (status_code == 200 || status_code == 201))
+        {
+            s_server_reachable = true; // 服务器可达
+            break;                     // 成功，跳出重试循环
+        }
+
+        if (attempt == 0)
+        {
+            ESP_LOGW(TAG, "Auth 请求失败 (ret=%s, status=%d)，1 秒后重试...",
+                     esp_err_to_name(ret), status_code);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+    free(post_body);
 
     if (ret != ESP_OK)
     {
-        ESP_LOGW(TAG, "Auth 请求发送失败: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "Auth 请求发送失败: %s（已重试 %d 次）", esp_err_to_name(ret), max_retries);
+        s_server_reachable = false; // 服务器不可达，通知上层跳过后续连接
         return;
     }
     if (status_code != 200 && status_code != 201)
     {
         ESP_LOGW(TAG, "Auth 请求失败，HTTP 状态码: %d", status_code);
+        s_server_reachable = false;
         return;
     }
 
@@ -194,4 +223,14 @@ void auth_perform(auth_t *auth, const char *device_token)
         }
         cJSON_Delete(resp_json);
     }
+}
+
+/**
+ * @brief 查询服务器是否可达
+ * @return true 可达，false 不可达
+ * @note 调用者：session.c, mqtt_protocol.c
+ */
+bool auth_is_server_reachable(void)
+{
+    return s_server_reachable;
 }

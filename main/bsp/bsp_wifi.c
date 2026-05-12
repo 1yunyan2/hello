@@ -487,7 +487,7 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
     // 使用了分配内存的api，导致和nvs冲突了？因为清除token需要写nvs_erase_key，但是外部psram访问不到nvs？
     xTaskCreatePinnedToCore(
         button_monitor_task, "btn_task",
-        3072, NULL, 5, NULL,
+        2048, NULL, 5, NULL,
         0);
     // ── 步骤 7：检查是否已配网 ───────────────────────────────────────────────
     bool provisioned = false;

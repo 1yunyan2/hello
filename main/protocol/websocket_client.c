@@ -26,6 +26,7 @@
 #include "esp_log.h"
 #include "esp_crt_bundle.h"
 #include "esp_mac.h"
+#include "esp_heap_caps.h"
 #include "cJSON.h"
 #include <string.h>
 #include "object.h"
@@ -70,6 +71,15 @@ struct protocol
     esp_event_handler_t callback;                   ///< 上层注册的事件回调函数
     void *handler_args;                             ///< 回调函数的用户自定义参数
 };
+
+/* ★ 音频接收 buffer：放在 SPIRAM 节省 8KB 内部 SRAM（仅一个 protocol 实例，文件级共享） */
+#define AUDIO_RX_BUF_SIZE 8192
+static uint8_t *s_audio_rx_buf = NULL;
+
+/* ★ 文本消息接收缓冲区：用于 JSON 分片重组，断连时需要清理 */
+static char *s_text_rx_buf = NULL;
+static int s_text_rx_offset = 0;
+static int s_text_rx_total_len = 0;
 
 // ─── 下行消息处理器 ────────────────────────────────────────────────────────
 // 每个 handler 负责解析一种 type 的 JSON 消息，提取数据后通过回调通知上层
@@ -291,7 +301,12 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
         /* opcode 0x02 = Binary Frame -> 云端下发的 OPUS 音频帧 */
         if (data->op_code == 0x02)
         {
-            static uint8_t s_audio_rx_buf[8192];
+            // ★ 使用 SPIRAM 分配的 buffer，节省 8KB 内部 SRAM
+            if (s_audio_rx_buf == NULL)
+            {
+                ESP_LOGE(TAG, "audio_rx_buf 未初始化，丢弃音频帧");
+                return;
+            }
             static int s_audio_rx_offset = 0;
 
             // 🟢 救命装甲 1：新帧强制复位！
@@ -303,7 +318,8 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
             }
 
             // 🟢 救命装甲 2：溢出保护，防止内存踩踏
-            if (s_audio_rx_offset + data->data_len > (int)sizeof(s_audio_rx_buf))
+            if (s_audio_rx_offset + data->data_len > AUDIO_RX_BUF_SIZE)
+
             {
                 ESP_LOGW(TAG, "音频帧分片异常或过大(len=%d)，丢弃防爆内存", data->payload_len);
                 s_audio_rx_offset = 0;
@@ -331,11 +347,6 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
         /* opcode 0x01 = Text Frame → JSON 控制消息 */
         if (data->op_code == 0x01)
         {
-            // 🟢 实现文本消息重组逻辑，处理分片的JSON消息
-            static char *s_text_rx_buf = NULL;
-            static int s_text_rx_offset = 0;
-            static int s_text_rx_total_len = 0;
-
             // 如果是新消息的开始（payload_offset == 0），重置缓冲区
             if (data->payload_offset == 0)
             {
@@ -408,7 +419,7 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
                         //  兼容你服务端的 tts_start
                         else if (strcmp(type->valuestring, "tts_start") == 0)
                             protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_TTS_START, NULL);
-                        //  兼容你服务端的 tts_end，这会触发上面我们刚写的方案A关机！
+                        //  兼容你服务端的 tts_end，
                         else if (strcmp(type->valuestring, "tts_end") == 0)
                             protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_TTS_STOP, NULL);
                         else if (strcmp(type->valuestring, "iot") == 0)
@@ -448,6 +459,13 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
      */
     case WEBSOCKET_EVENT_DISCONNECTED:
     case WEBSOCKET_EVENT_FINISH:
+        // 清理文本消息缓冲区，防止断连时正在重组的 JSON 消息泄漏
+        if (s_text_rx_buf) {
+            free(s_text_rx_buf);
+            s_text_rx_buf = NULL;
+        }
+        s_text_rx_offset = 0;
+        s_text_rx_total_len = 0;
         protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_DISCONNECTED, NULL);
         break;
     }
@@ -476,6 +494,10 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
 protocol_t *protocol_create(const char *url, const char *token)
 {
     protocol_t *protocol = (protocol_t *)calloc(1, sizeof(protocol_t));
+    if (protocol == NULL) {
+        ESP_LOGE(TAG, "protocol calloc 失败，内存不足");
+        return NULL;
+    }
 
     /* 读取设备 WiFi MAC 地址作为 Device-Id 和 Client-Id */
     uint8_t mac[6];
@@ -514,6 +536,14 @@ protocol_t *protocol_create(const char *url, const char *token)
     // 注册事件回调，监听所有 WebSocket 事件（WEBSOCKET_EVENT_ANY），传递协议实例指针作为参数
     esp_websocket_register_events(protocol->websocket_client, WEBSOCKET_EVENT_ANY, protocol_websocket_event_handler, protocol);
 
+    /* ★ 分配音频接收 buffer 到 SPIRAM（节省 8KB 内部 SRAM） */
+    if (s_audio_rx_buf == NULL)
+    {
+        s_audio_rx_buf = (uint8_t *)heap_caps_malloc(AUDIO_RX_BUF_SIZE, MALLOC_CAP_SPIRAM);
+        if (s_audio_rx_buf == NULL)
+            ESP_LOGE(TAG, "audio_rx_buf SPIRAM 分配失败，音频接收将不可用");
+    }
+
     free(headers); // headers 已被底层拷贝，可安全释放
     return protocol;
 }
@@ -531,6 +561,13 @@ void protocol_destroy(protocol_t *protocol)
         free(protocol->session_id);
     esp_websocket_client_destroy(protocol->websocket_client);
     free(protocol);
+
+    /* ★ 释放音频接收 buffer */
+    if (s_audio_rx_buf)
+    {
+        free(s_audio_rx_buf);
+        s_audio_rx_buf = NULL;
+    }
 }
 
 // ─── 公开 API：连接控制 ────────────────────────────────────────────────────

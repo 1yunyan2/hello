@@ -15,7 +15,11 @@
  *   async_update_wakeword_task → wake_word_update()（唤醒词引擎）
  */
 #include "mqtt_protocol.h"
+#include "auth.h"
+#include "object.h"
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *MQTT_TAG = "MQTT"; ///< 日志 TAG
 
@@ -83,6 +87,11 @@ static void mqtt_credentials_load(void)
 // 全局静态 MQTT 客户端句柄和连接状态标志
 static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 static volatile bool s_mqtt_connected = false;
+
+// MQTT 重连退避状态
+static volatile TaskHandle_t s_mqtt_reconnect_handle = NULL;
+static int s_mqtt_reconnect_attempts = 0;
+#define MQTT_RECONNECT_BASE_DELAY_MS 5000 // MQTT 基础退避 5 秒（比 WebSocket 慢，避免同时竞争）
 
 // ─── 工具函数：获取设备 MAC 后三字节作为短 ID ──────────────────────────────
 // 多处需要 device_id（心跳、订阅、重置通知），统一提取避免重复代码
@@ -219,6 +228,52 @@ static void heartbeat_task(void *arg)
     vTaskDelete(NULL);
 }
 
+// ─── MQTT 重连退避任务 ─────────────────────────────────────────────────────
+/**
+ * @brief MQTT 指数退避重连任务
+ * 停止 MQTT 客户端的自动重连，改为手动控制退避策略，
+ * 避免 MQTT 重连与 WebSocket 重连同时竞争内部 SRAM。
+ *
+ * @param arg 未使用
+ */
+static void mqtt_reconnect_task(void *arg)
+{
+    // 指数退避：5s → 10s → 20s → 40s → 60s（上限）
+    s_mqtt_reconnect_attempts++;
+    int shift = s_mqtt_reconnect_attempts - 1;
+    if (shift > 4)
+        shift = 4;
+    int delay_ms = MQTT_RECONNECT_BASE_DELAY_MS * (1 << shift);
+    if (delay_ms > 60000)
+        delay_ms = 60000;
+
+    ESP_LOGW(MQTT_TAG, "MQTT 第 %d 次重连，%d 秒后执行...", s_mqtt_reconnect_attempts, delay_ms / 1000);
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+
+    // ★ 检查服务器可达性：不可达时跳过本次重连，避免浪费内部 SRAM
+    if (!auth_is_server_reachable())
+    {
+        ESP_LOGW(MQTT_TAG, "服务器不可达，跳过 MQTT 重连");
+        goto exit;
+    }
+
+    // 内部 SRAM 不足时跳过
+    size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (internal_free < 8192)
+    {
+        ESP_LOGW(MQTT_TAG, "[MEM] 内部 SRAM 仅剩 %d B，跳过 MQTT 重连", (int)internal_free);
+        goto exit;
+    }
+
+    ESP_LOGI(MQTT_TAG, "正在重连 MQTT...");
+    esp_mqtt_client_start(s_mqtt_client);
+    ESP_LOGW(MQTT_TAG, "MQTT 重连尝试完成");
+
+exit:
+    s_mqtt_reconnect_handle = NULL;
+    vTaskDelete(NULL);
+}
+
 // MQTT 事件回调函数
 /**
  * @brief MQTT客户端事件处理回调
@@ -242,6 +297,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     {
         ESP_LOGI(MQTT_TAG, "MQTT 服务器连接成功！");
         s_mqtt_connected = true;
+        s_mqtt_reconnect_attempts = 0; // 连接成功，重置退避计数
 
         char dev_id[16];
         get_short_device_id(dev_id, sizeof(dev_id));
@@ -266,6 +322,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             if (!json_data)
             {
                 ESP_LOGE(MQTT_TAG, "内存不足，无法分配 JSON 缓冲区");
+                PRINT_MEM_INFO(MQTT_TAG, "json_data calloc 失败");
                 break;
             }
             memcpy(json_data, event->data, event->data_len);
@@ -297,6 +354,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                              display_item->valuestring, pinyin_item->valuestring);
 
                     ww_update_params_t *params = malloc(sizeof(ww_update_params_t));
+                    if (!params)
+                    {
+                        PRINT_MEM_INFO(MQTT_TAG, "ww_update_params_t malloc 失败");
+                    }
                     if (params)
                     {
                         strncpy(params->display, display_item->valuestring, sizeof(params->display) - 1);
@@ -315,7 +376,17 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         if (ret != pdPASS)
                         {
                             ESP_LOGE(MQTT_TAG, "内存不足，无法创建唤醒词更新任务！");
+                            PRINT_MEM_INFO(MQTT_TAG, "async_ww_update 4KB INTERNAL 栈分配失败");
                             free(params);
+                        }
+                        else
+                        {
+                            static bool s_printed_async_ww = false;
+                            if (!s_printed_async_ww)
+                            {
+                                PRINT_MEM_INFO(MQTT_TAG, "async_ww_update 4KB INTERNAL 栈首次分配后");
+                                s_printed_async_ww = true;
+                            }
                         }
                     }
                 }
@@ -325,9 +396,29 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         break;
 
     case MQTT_EVENT_DISCONNECTED:
-        ESP_LOGW(MQTT_TAG, "MQTT 已断开，检查网络...");
+    {
+        ESP_LOGW(MQTT_TAG, "MQTT 已断开，启动退避重连...");
         s_mqtt_connected = false;
+
+        // ★ P3：停止 MQTT 默认自动重连，改为手动指数退避
+        esp_mqtt_client_stop(s_mqtt_client);
+
+        // 创建退避重连任务（如果尚未在运行）
+        if (s_mqtt_reconnect_handle == NULL)
+        {
+            xTaskCreatePinnedToCoreWithCaps(mqtt_reconnect_task, "mqtt_reconn",
+                                            3072, NULL, 3,
+                                            (TaskHandle_t *)&s_mqtt_reconnect_handle,
+                                            tskNO_AFFINITY, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            static bool s_printed_mqtt_reconn = false;
+            if (!s_printed_mqtt_reconn)
+            {
+                PRINT_MEM_INFO(MQTT_TAG, "mqtt_reconn 3KB SPIRAM 栈首次分配后");
+                s_printed_mqtt_reconn = true;
+            }
+        }
         break;
+    }
 
     default:
         break;

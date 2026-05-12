@@ -197,7 +197,15 @@ audio_encoder_t *audio_encoder_create(int sample_rate, int channels)
 
     // ── 步骤 2：向 esp_audio_codec 框架注册 OPUS 编码器（全局只需注册一次）──
     // 注册后框架可识别 ESP_AUDIO_TYPE_OPUS 类型，后续 open() 才能找到对应实现
-    ESP_ERROR_CHECK(esp_opus_enc_register());
+    // ★ 使用静态标志确保只注册一次，避免反复 register/unregister 导致内部 SRAM 泄漏（每次约 0.7KB）
+    {
+        static bool s_opus_enc_registered = false;
+        if (!s_opus_enc_registered)
+        {
+            ESP_ERROR_CHECK(esp_opus_enc_register());
+            s_opus_enc_registered = true;
+        }
+    }
 
     // ── 步骤 3：配置 OPUS 编码参数 ────────────────────────────────────────────
     esp_opus_enc_config_t opus_config = {
@@ -243,8 +251,8 @@ void audio_encoder_destroy(audio_encoder_t *audio_encoder)
     // 关闭编码器：释放 OPUS 运行时内部状态（编码缓冲区、滤波器状态等）
     esp_audio_enc_close(audio_encoder->enc);
 
-    // 注销 OPUS 编码器类型（从框架注册表中移除）
-    esp_audio_enc_unregister(ESP_AUDIO_TYPE_OPUS);
+    // ★ 不再注销 OPUS 编码器类型：全局只注册一次，避免反复 register/unregister 泄漏内部 SRAM
+    // esp_audio_enc_unregister(ESP_AUDIO_TYPE_OPUS);
 
     // 释放编码器结构体本身
     free(audio_encoder);

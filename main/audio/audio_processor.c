@@ -141,7 +141,15 @@ static void audio_processor_play_task(void *arg)
         if (buf)
         {
             size_t bytes_written = 0;
-            i2s_channel_write(board->i2s_tx_handle, buf, size_read, &bytes_written, portMAX_DELAY);
+            // 【看门狗修复】portMAX_DELAY → 200ms：
+            // I2S DMA buffer 若短暂满载，portMAX_DELAY 会让 play_task 永久阻塞，
+            // IDLE0（CPU0）超过 5s 喂不了狗 → task_wdt 触发。
+            // 200ms 足够覆盖 DMA 释放一个 slot（@32kHz 约 32ms），
+            // 同时远小于看门狗超时（5s），即使偶发超时也只丢失极少量 PCM（< 10ms）。
+            esp_err_t wr_ret = i2s_channel_write(board->i2s_tx_handle, buf, size_read,
+                                                 &bytes_written, pdMS_TO_TICKS(200));
+            if (wr_ret != ESP_OK)
+                ESP_LOGW(TAG, "I2S write 超时 (size=%d ret=%d)，可能瞬间卡顿", (int)size_read, wr_ret);
             xRingbufferSend(audio_processor->aec_ref_buf, buf, size_read, 0);
             vRingbufferReturnItem(audio_processor->dec_output, buf);
         }
@@ -154,7 +162,7 @@ static void audio_processor_play_task(void *arg)
 
             // 喂入静音包，平滑过渡
             size_t silence_written = 0;
-            i2s_channel_write(board->i2s_tx_handle, silence_buf, sizeof(silence_buf), &silence_written, portMAX_DELAY);
+            i2s_channel_write(board->i2s_tx_handle, silence_buf, sizeof(silence_buf), &silence_written, pdMS_TO_TICKS(50));
         }
     }
 
@@ -486,4 +494,50 @@ void audio_processor_read_ref_pcm(audio_processor_t *audio_processor,
     /* 不足部分置零 → AEC 参考 = 静音 → 不做回声消除（安全退化）*/
     if (bytes_filled < bytes_needed)
         memset((uint8_t *)buf + bytes_filled, 0, bytes_needed - bytes_filled);
+}
+
+/**
+ * @brief 查询下行解码链路当前积压的字节总数（dec_input + dec_output）
+ *
+ * 用于 TTS_STOP 后判定"扬声器是否真正排空"。
+ * 当返回 0 时，意味着：
+ *   - 没有未解码的 OPUS 帧待处理（dec_input 空）
+ *   - 没有已解码未播放的 PCM 数据（dec_output 空）
+ *   - 仅剩 I2S DMA 队列内极少量残留（< 50ms），由调用方再叠加物理静音兜底覆盖
+ *
+ * 实现：调用 vRingbufferGetInfo 获取每个环形缓冲当前 items_waiting，求和。
+ *       该 API 是非阻塞快速查询，可在任意任务上下文调用。
+ *
+ * @param audio_processor 音频处理器实例指针
+ * @return size_t         当前下行积压字节总数；NULL 入参或两者皆空返回 0
+ */
+// size_t audio_processor_get_pending_bytes(audio_processor_t *audio_processor)
+// {
+//     if (audio_processor == NULL)
+//         return 0;
+
+//     size_t dec_in_pending = 0;  // 解码器输入侧（OPUS 帧）积压
+//     size_t dec_out_pending = 0; // 解码器输出侧（PCM 数据）积压
+
+//     /* vRingbufferGetInfo 第 6 个参数返回当前已写入未读出的字节数（items_waiting）*/
+//     if (audio_processor->dec_input != NULL)
+//         vRingbufferGetInfo(audio_processor->dec_input, NULL, NULL, NULL, NULL, &dec_in_pending);
+//     if (audio_processor->dec_output != NULL)
+//         vRingbufferGetInfo(audio_processor->dec_output, NULL, NULL, NULL, NULL, &dec_out_pending);
+
+//     return dec_in_pending + dec_out_pending;
+// }
+
+bool audio_processor_is_playing(audio_processor_t *audio_processor)
+{
+    if (audio_processor == NULL)
+        return false;
+
+    size_t dec_out_pending = 0; // 解码器输出侧（PCM 数据）积压
+
+    /* vRingbufferGetInfo 第 6 个参数返回当前已写入未读出的字节数（items_waiting）*/
+    if (audio_processor->dec_output != NULL)
+        vRingbufferGetInfo(audio_processor->dec_output, NULL, NULL, NULL, NULL, &dec_out_pending);
+
+    return dec_out_pending > 0;
 }

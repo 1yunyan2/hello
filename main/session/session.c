@@ -106,9 +106,9 @@ static bool s_is_continuous_turn = false;
 // 服务器就绪时刻（用于VAD延迟启动基准）
 static TickType_t s_vad_ready_tick = 0;
 // static TickType_t s_tts_stop_tick = 0;
-static bool s_waiting_for_silence = false; // 等待静音
-static int s_vad_silence_count = 0;        // 连续静音帧计数器
-static TickType_t s_wait_silence_start = 0;
+static bool s_waiting_for_silence = false;  // 等待静音
+static int s_vad_silence_count = 0;         // 连续静音帧计数器
+static TickType_t s_wait_silence_start = 0; // 静音等待开始时刻
 // 唤醒词尾音消退期：1500ms，避免唤醒词尾音被误判为用户语音
 // 实测唤醒词尾音 + 硬件排空延迟约 1.2s，保护期需覆盖此窗口
 #define VAD_GRACE_MS 1000
@@ -124,6 +124,19 @@ static TickType_t s_wait_silence_start = 0;
 #define VAD_SILENCE_TOLERANCE_FRAMES 1
 static int s_vad_speech_count = 0;   // 连续 VAD_SPEECH 帧计数
 static int s_vad_silence_streak = 0; // 当前连续 VAD_SILENCE 帧计数（用于 1 帧容忍判定）
+// ── 方案 A：尾端字保护超时熔断 ────────────────────────────────────────────────
+// 已确认人声后，"尾端字保护"会把低能量帧（"啦/啊/吗"）强制改判为 SPEECH 防 EOS。
+// 但风扇/空调等持续噪声 avg_amp 也可能 > 100，会被同样"保护"导致 EOS 永不触发。
+// 熔断思路：只在第一帧 SILENCE 之后 TAIL_PROTECT_MAX_MS 窗口内启用保护，
+// 超过该窗口（尾字不可能撑这么久）就把判断权交回 AFE VAD。
+#define TAIL_PROTECT_MAX_MS 800
+static TickType_t s_first_silence_tick = 0; // speech_detected 后第一帧 SILENCE 的 tick；0 = 尚未进入静音
+// ── 方案 B：单句最大时长硬切（兜底）──────────────────────────────────────────
+// 即使方案 A 失效（异常 VAD/噪声谱），从 speech_detected = true 起最多录 N ms，
+// 到点强制启动 EOS 定时器，避免无限录音把 enc_output 撑爆 + 上行带宽浪费。
+// 正常对话一句话很少超过 6s；留 8s 余量覆盖较长的连续陈述。
+#define UTTERANCE_MAX_MS 8000
+static TickType_t s_speech_start_tick = 0; // s_speech_detected 由 false→true 的时刻
 // WebSocket服务器URI地址
 static char s_ws_uri[128] = DEFAULT_WS_URI;
 // deviceToken（App绑定时下发的长期凭证）
@@ -136,9 +149,9 @@ static volatile TaskHandle_t s_sender_handle = NULL;
 static volatile TaskHandle_t s_reconnect_handle = NULL;
 // 连续重连次数，用于指数退避算法
 static int s_reconnect_attempts = 0;
-// 最大重连次数，超过后停止重连
-#define RECONNECT_MAX_ATTEMPTS 5
-// 基础退避延迟时间：2秒（原定义500ms但从未使用，实际代码写死5000ms，此处统一修正）
+// 重连中 auth 重试计数器：服务器不可达时避免反复创建 HTTP 客户端浪费内部 SRAM
+static int s_auth_retry_in_reconnect = 0;
+// 基础退避延迟时间：2秒，指数退避上限为 60s（无最大次数限制，服务端重启场景需要无限重试）
 #define RECONNECT_BASE_DELAY_MS 2000
 // 唤醒词操作互斥锁，防止多线程操作冲突
 static SemaphoreHandle_t s_wake_word_mutex = NULL;
@@ -378,10 +391,16 @@ static void on_enhanced_pcm(const int16_t *data, size_t samples)
                 return; // 丢弃音频
             }
 
+            // 查询下行解码链路当前积压（dec_input + dec_output）字节数
+            // pending > 0 表示喇叭/解码器还有未播完的 TTS 数据
+            // size_t pending_bytes = audio_processor_get_pending_bytes(s_processor);
+
             if (vad == VAD_SILENCE)
             {
                 s_vad_silence_count++;
                 // 2. 将连续静音帧数提高到 15 帧（约 480ms），确保空气中真的没有余音了
+                // if (s_vad_silence_count > 8&& pending_bytes == 0)
+
                 if (s_vad_silence_count > 8)
                 {
                     s_waiting_for_silence = false;
@@ -394,12 +413,43 @@ static void on_enhanced_pcm(const int16_t *data, size_t samples)
                 s_vad_silence_count = 0; // 只要有声音，就重置静音计数器继续死等
             }
 
-            // 防卡死兜底：等了 1.5s 喇叭仍未静音（环境极吵或硬件异常），强行切入监听
+            // 防卡死兜底：等了 5s 仍未达成排空（极端长句 + 环境噪音 + 硬件异常），强行切入监听
+            // 历史 1500ms 对长句子（dec_output 40KB ≈ 1.28s + dec_input 16KB ≈ 5s OPUS 帧）严重不足
+            // if (wait_ms > 5000)
+            // {
+            //     // 【TTS 自激修复】5s 后先检查扬声器是否真正静音（pending == 0）。
+            //     // 若还有残余 PCM 未播完，继续等到 pending 清零或绝对超时 10s。
+            //     // 根因：之前 5s 超时时 pending=22016 字节（≈ 344ms 残余）仍在播，
+            //     //       AEC 来不及消化就开监听 → TTS 尾音被 VAD 误触发上传 → 自激。
+            //     // 绝对超时 10s：防止 I2S 硬件异常导致 pending 永不清零而卡死。
+            //     if (pending_bytes > 0 && wait_ms <= 10000)
+            //     {
+            //         if (((int)wait_ms % 1000) < 50) // 每 1s 打印一次，避免日志刷屏
+            //             ESP_LOGW(TAG, ">>> 5s 超时但扬声器仍有 %u 字节残余，等待排空 (%d ms) <<<",
+            //                      (unsigned)pending_bytes, (int)wait_ms);
+            //         return; // 继续等 pending 清零
+            //     }
+            //     s_waiting_for_silence = false;
+            //     ESP_LOGW(TAG, ">>> 排空等待超时 (%d ms)，强制开启监听 (残余 pending=%u 字节) <<<",
+            //              (int)wait_ms, (unsigned)pending_bytes);
+            //     s_vad_ready_tick = xTaskGetTickCount();
+            // }
+            // return; // ⚠️ 排空期间，丢弃所有音频数据，绝对不触发人声判定！
+
             if (wait_ms > 1500)
             {
-                s_waiting_for_silence = false;
-                ESP_LOGW(TAG, ">>> 排空等待超时 (1.5s)，强制开启监听 <<<");
-                s_vad_ready_tick = xTaskGetTickCount();
+                if (audio_processor_is_playing(s_processor) && wait_ms < 10000)
+                {
+                    // 扬声器还在播长句子，继续等，每 1.5s 提示一次
+                    if (((int)wait_ms % 1500) < 50)
+                        ESP_LOGW(TAG, ">>> 排空等待中，扬声器仍在播放 (%d ms) <<<", (int)wait_ms);
+                }
+                else
+                {
+                    s_waiting_for_silence = false;
+                    ESP_LOGW(TAG, ">>> 排空等待结束 (%d ms)，开启监听 <<<", (int)wait_ms);
+                    s_vad_ready_tick = xTaskGetTickCount();
+                }
             }
             return; // ⚠️ 排空期间，丢弃所有音频数据，绝对不触发人声判定！
         }
@@ -448,9 +498,24 @@ static void on_enhanced_pcm(const int16_t *data, size_t samples)
         //     2. vad==VAD_SILENCE（AFE 判静音，与降级逻辑互斥）
         //     3. avg_amp > 100（覆盖"的/吗/啦/啊"等中等能量尾字；原值 200 会漏掉 50~200 的衰减段）
         //   效果：每当还有能量时，EOS 定时器就被 stop 重置；真正静音触发结束
+        //
+        // 【BUG-014 修复 / 方案 A】尾端字保护熔断（A/B 测试中临时禁用）
+        //   原逻辑会被风扇/空调等持续噪声（avg_amp 稳定 > 100）一直触发，
+        //   导致 EOS 永远启动不起来，录音停不下来 → enc_output 撑爆 + 丢帧。
+        //   修复：只在"第一帧 SILENCE 之后 TAIL_PROTECT_MAX_MS 窗口内"启用保护，
+        //         超过 800ms 仍是 SILENCE 就直接放手（尾字不可能撑这么久）。
         if (s_speech_detected && vad == VAD_SILENCE && avg_amp > 100)
         {
-            vad = VAD_SPEECH;
+            if (s_first_silence_tick == 0)
+                s_first_silence_tick = xTaskGetTickCount(); // 记录首次进入静音的时刻
+            uint32_t silence_ms = (xTaskGetTickCount() - s_first_silence_tick) * portTICK_PERIOD_MS;
+            if (silence_ms < TAIL_PROTECT_MAX_MS)
+                vad = VAD_SPEECH; // 仍在保护窗口内 → 维持 SPEECH 防 EOS 截断尾字
+            // else: 窗口外，保持 vad = VAD_SILENCE 让 EOS 正常推进
+        }
+        else if (vad == VAD_SPEECH)
+        {
+            s_first_silence_tick = 0; // 收到真语音帧，重置静音起点
         }
         // 🟢 阶段 2：正常监听用户讲话 (确保此处没有重复定义 in_grace_period)
         bool in_grace_period = (s_vad_ready_tick != 0) &&
@@ -472,18 +537,20 @@ static void on_enhanced_pcm(const int16_t *data, size_t samples)
             if (!s_speech_detected && s_vad_speech_count >= current_threshold)
             {
                 s_speech_detected = true;
+                s_speech_start_tick = xTaskGetTickCount(); // 方案 B：记录单句起点，用于最大时长硬切
+                s_first_silence_tick = 0;                  // 方案 A：刚确认人声，重置静音窗口起点
                 ESP_LOGI(TAG, "[MIC] VAD 确认人声（连续 %d 帧, 保护期内:%d），有效输入！",
                          s_vad_speech_count, in_grace_period);
 
-                if (s_is_continuous_turn)
-                {
-                    if (s_protocol && protocol_is_connected(s_protocol))
-                    {
-                        protocol_send_hello(s_protocol);
-                        ESP_LOGI(TAG, "连续对话：已向服务器补发 Start 握手");
-                    }
-                    s_is_continuous_turn = false;
-                }
+                // if (s_is_continuous_turn)
+                // {
+                //     if (s_protocol && protocol_is_connected(s_protocol))
+                //     {
+                //         protocol_send_hello(s_protocol);
+                //         ESP_LOGI(TAG, "连续对话：已向服务器补发 Start 握手");
+                //     }
+                //     s_is_continuous_turn = false;
+                // }
             }
             if (s_eos_timer)
                 xTimerStop(s_eos_timer, 0);
@@ -516,6 +583,29 @@ static void on_enhanced_pcm(const int16_t *data, size_t samples)
                 }
             }
         }
+
+        // 【BUG-014 修复 / 方案 B】单句最大时长硬切（A/B 测试中临时禁用）
+        //   即使 VAD 被噪声持续拉成 SPEECH（方案 A 失效），单句不允许超过 UTTERANCE_MAX_MS。
+        //   超时直接走 SESSION_EVT_VAD_STOP 队列，与 on_eos_timeout 行为一致，
+        //   避免无限录音把 enc_output 撑爆 + 上行带宽浪费 + 云端等输入。
+        if (s_speech_detected && !s_stop_sent && s_speech_start_tick != 0)
+        {
+            uint32_t talked_ms = (xTaskGetTickCount() - s_speech_start_tick) * portTICK_PERIOD_MS;
+            if (talked_ms > UTTERANCE_MAX_MS)
+            {
+                ESP_LOGW(TAG, "[MIC] 单句录音已 %d ms 超过 %d ms，强制结束（兜底）",
+                         (int)talked_ms, UTTERANCE_MAX_MS);
+                s_stop_sent = true; // 防止后续帧重复触发
+                if (s_eos_timer)
+                    xTimerStop(s_eos_timer, 0); // 停掉原 EOS 定时器
+                if (s_session_evt_queue != NULL)
+                {
+                    session_evt_t evt = SESSION_EVT_VAD_STOP;
+                    xQueueSend(s_session_evt_queue, &evt, 0);
+                }
+            }
+        }
+
         if (is_active_audio)
         {
             audio_processor_write_pcm(s_processor, (void *)data, samples * sizeof(int16_t));
@@ -553,7 +643,8 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
      */
     case PROTOCOL_EVENT_CONNECTED:
         ESP_LOGI(TAG, "WebSocket 已连接（预连接就绪）");
-        s_reconnect_attempts = 0; // 连接成功，重置退避计数
+        s_reconnect_attempts = 0;      // 连接成功，重置退避计数
+        s_auth_retry_in_reconnect = 0; // 连接成功，重置 auth 重试计数
         xEventGroupSetBits(s_session_eg, SESSION_WS_CONNECTED_BIT);
         xTimerChangePeriod(s_session_timer, pdMS_TO_TICKS(SESSION_TIMEOUT_MS), 0);
         // 如果有会话正在等待连接（极少数情况：唤醒时恰好断线重连中）
@@ -601,7 +692,9 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
     case PROTOCOL_EVENT_TTS_START:
         ESP_LOGI(TAG, "[TTS] 服务器 TTS 开始播放");
         s_state = SESSION_PLAYING;
-        s_speech_detected = false;
+        s_speech_detected = false;       // TTS 播放中不再检测语音
+        s_speech_start_tick = 0;         // 方案 B：清单句起点
+        s_first_silence_tick = 0;        // 方案 A：清静音窗口起点
         s_vad_speech_count = 0;          // 重置防抖计数，TTS 播放中不再累计语音帧
         xTimerStop(s_eos_timer, 0);      // 停止说话结束检测，TTS 播放期间不检测说话结束
         xTimerReset(s_session_timer, 0); // 重置会话超时定时器，防止 TTS 播放过长被误判超时
@@ -631,11 +724,14 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
     case PROTOCOL_EVENT_TTS_STOP:
 #if 1 /* ✅ 方案 B：多轮对话（当前启用） */
         ESP_LOGI(TAG, "[TTS] TTS 播放结束，切换到多轮监听，等待用户下一句话");
-        s_state = SESSION_LISTENING;
-        s_speech_detected = false;
-        s_stop_sent = false;
-        s_is_continuous_turn = true;
-        s_reset_frame_counter = true; // ★ 每次 AI 闭嘴，准备新一轮记录
+        s_state = SESSION_LISTENING; // 监听模式
+        s_speech_detected = false;   // 语音检测未开始
+        s_speech_start_tick = 0;     // 方案 B：清单句起点
+        s_first_silence_tick = 0;    // 方案 A：清静音窗口起点
+        s_stop_sent = false;         // 停止播放未开始
+        // s_is_continuous_turn = true;
+
+        s_reset_frame_counter = true; // 重置帧计数器
         // // ★ 核心修复：不再依赖写死的消退时间，改为动态检测静音
         // s_waiting_for_silence = true;
         // s_vad_silence_count = 0;
@@ -646,10 +742,10 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
         s_vad_ready_tick = 0;                       // 重置服务器就绪时刻，确保 VAD 保护期正确计算
         // s_vad_ready_tick = xTaskGetTickCount();
 
-        xTimerReset(s_session_timer, 0);
-        xEventGroupClearBits(s_session_eg, SESSION_SERVER_READY_BIT);
+        xTimerReset(s_session_timer, 0); // 重置会话计时器
+        // xEventGroupSetBits(s_session_eg, SESSION_SERVER_READY_BIT); // 设置服务器就绪位
         // TTS 播放结束，恢复正常检测阈值（多轮监听需要较低阈值感知用户说话）
-        wake_word_set_det_threshold(0.18f);
+        wake_word_set_det_threshold(0.55f);
         wake_word_stop();
 #else /* ❌ 方案 A：单轮对话（已禁用，仅保留作参考） */
         ESP_LOGI(TAG, "[TTS] TTS 播放结束，单轮模式关闭会话");
@@ -733,14 +829,16 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
         {
             ESP_LOGW(TAG, "重连任务已在运行中，跳过");
         }
-        else if (s_reconnect_attempts >= RECONNECT_MAX_ATTEMPTS)
-        {
-            ESP_LOGE(TAG, "已连续重连 %d 次均失败，停止重连。", s_reconnect_attempts);
-        }
         else
         {
+            // ★ 无上限重试：服务端重启可能需要较长时间，不能在若干次失败后彻底放弃。
+            //   指数退避：2s→4s→8s→16s→32s→60s（上限），之后保持 60s 间隔无限重试。
+            //   位移上限：shift > 5 时 delay 已超 60s，cap 住防止 int 溢出（1<<30 = UB）。
             s_reconnect_attempts++;
-            int delay_ms = RECONNECT_BASE_DELAY_MS * (1 << (s_reconnect_attempts - 1));
+            int shift = s_reconnect_attempts - 1;
+            if (shift > 5)
+                shift = 5;
+            int delay_ms = RECONNECT_BASE_DELAY_MS * (1 << shift);
             if (delay_ms > 60000)
                 delay_ms = 60000;
             ESP_LOGW(TAG, "第 %d 次重连，%d 秒后执行...", s_reconnect_attempts, delay_ms / 1000);
@@ -792,13 +890,17 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
             // 若用户不再说话，session_timer 60s 超时后自动关闭
             ESP_LOGI(TAG, "多轮模式：收到 Complete，保持监听等待下一轮");
             s_speech_detected = false;
+            s_speech_start_tick = 0;  // 方案 B：清单句起点
+            s_first_silence_tick = 0; // 方案 A：清静音窗口起点
             s_stop_sent = false;
-            s_is_continuous_turn = true;
+            // s_is_continuous_turn = true;
+            s_is_continuous_turn = false;
+
             s_reset_frame_counter = true;
             s_vad_speech_count = 0;
             s_vad_silence_streak = 0; // 多轮模式：进入下一轮前清零静音连击，避免容忍机制残留
             s_vad_ready_tick = xTaskGetTickCount();
-            xEventGroupClearBits(s_session_eg, SESSION_SERVER_READY_BIT);
+            xEventGroupSetBits(s_session_eg, SESSION_SERVER_READY_BIT);
             xTimerReset(s_session_timer, 0);
         }
         else if (s_state != SESSION_IDLE)
@@ -931,15 +1033,46 @@ static void session_reconnect_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
 
+    // ★ P2 优化：内部 SRAM 不足时跳过本次重连，避免 TLS 握手导致 OOM
+    size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (internal_free < 8192) // 内部 SRAM 不足 8KB，跳过重连
+    {
+        ESP_LOGW(TAG, "[MEM] 内部 SRAM 仅剩 %d B，跳过本次重连，等待下次周期...", (int)internal_free);
+        goto exit_task;
+    }
+
+    // ★ P1 优化：服务器不可达时，先做一次 Auth 探测，确认服务器是否恢复
+    if (!auth_is_server_reachable())
+    {
+        ESP_LOGW(TAG, "服务器上次不可达，先做 Auth 探测...");
+        auth_t *probe_auth = auth_create();
+        auth_perform(probe_auth, s_ws_token);
+        if (probe_auth->access_token != NULL)
+        {
+            // 服务器恢复了！更新 token
+            strncpy(s_access_token, probe_auth->access_token, sizeof(s_access_token) - 1);
+            ESP_LOGI(TAG, "服务器已恢复，拿到新 accessToken");
+        }
+        auth_destroy(probe_auth);
+
+        if (!auth_is_server_reachable())
+        {
+            ESP_LOGW(TAG, "服务器仍不可达，跳过 WebSocket 重连");
+            goto exit_task;
+        }
+    }
+
     ESP_LOGI(TAG, "开始重连流程...");
 
     const char *new_token = s_access_token;
     bool token_refreshed = false;
 
     // 极端异常兜底：仅当 s_access_token 已清空时才走 HTTP 认证获取新 Token
-    if (strlen(new_token) == 0 && strlen(s_ws_token) > 0)
+    // 限制最多重试 3 次：服务器不可达时反复 auth_create/perform/destroy 会累积内部 SRAM 碎片
+    if (strlen(new_token) == 0 && strlen(s_ws_token) > 0 && s_auth_retry_in_reconnect < 3)
     {
-        ESP_LOGW(TAG, "内存无可用 Token，发起 HTTP 认证...");
+        s_auth_retry_in_reconnect++;
+        ESP_LOGW(TAG, "内存无可用 Token，发起 HTTP 认证（第 %d 次重试）...", s_auth_retry_in_reconnect);
         auth_t *auth = auth_create();
         auth_perform(auth, s_ws_token);
 
@@ -952,15 +1085,39 @@ static void session_reconnect_task(void *arg)
         auth_destroy(auth);
     }
 
-    // ★ 普通重连（Token 未变）：直接 stop+start 复用现有客户端对象
-    // 避免每次重连都 destroy+create 导致 esp_websocket_client 内部缓冲区反复分配，
-    // 引发内部 SRAM 每次丢 ~5KB 的碎片化泄漏
+    // ★ 普通重连（Token 未变）
     if (s_protocol != NULL && !token_refreshed)
     {
-        ESP_LOGI(TAG, "Token 未变，复用 WebSocket 客户端对象直接重连...");
+        // 每次重连都做完整 destroy/重建：释放 mbedTLS 上下文（session ticket、证书缓存等约 5KB 内部 SRAM）
+        // stop/start 复用模式会导致 TLS 缓冲区泄漏，内部 SRAM 持续下降
+        ESP_LOGI(TAG, "Token 未变，destroy+create 重建连接（释放 TLS 碎片）...");
         protocol_disconnect(s_protocol);
+        protocol_destroy(s_protocol);
+        s_protocol = NULL;
+
+        char *full_ws_uri = (char *)malloc_zeroed(1024);
+        if (full_ws_uri == NULL)
+        {
+            ESP_LOGE(TAG, "full_ws_uri 分配失败，放弃重连");
+            goto exit_task;
+        }
+        if (strlen(new_token) > 0)
+            snprintf(full_ws_uri, 1024, "%s?token=%s", s_ws_uri, new_token);
+        else
+            strncpy(full_ws_uri, s_ws_uri, 1024 - 1);
+
+        s_protocol = protocol_create(full_ws_uri, new_token);
+        free(full_ws_uri);
+
+        if (s_protocol == NULL)
+        {
+            ESP_LOGE(TAG, "protocol_create 失败，内存不足，放弃重连");
+            goto exit_task;
+        }
+        protocol_register_callback(s_protocol, protocol_event_handler, NULL);
         protocol_connect(s_protocol);
         ESP_LOGI(TAG, "重连完成，WebSocket 正在建立连接... URI: %s", s_ws_uri);
+        PRINT_MEM_INFO(TAG, "WS 重连尝试完成");
         goto exit_task;
     }
 
@@ -998,6 +1155,7 @@ static void session_reconnect_task(void *arg)
         protocol_register_callback(s_protocol, protocol_event_handler, NULL);
         protocol_connect(s_protocol);
         ESP_LOGI(TAG, "重连完成（新 Token），WebSocket 正在建立连接... URI: %s", s_ws_uri);
+        PRINT_MEM_INFO(TAG, "WS 重连尝试完成（新 Token）");
     }
 
 exit_task:
@@ -1021,6 +1179,8 @@ static void session_close(void)
     ESP_LOGI(TAG, "关闭会话");
     s_state = SESSION_IDLE;       // 先置状态，sender 任务循环条件会检测到退出
     s_speech_detected = false;    // 重置语音检测状态
+    s_speech_start_tick = 0;      // 方案 B：清单句起点
+    s_first_silence_tick = 0;     // 方案 A：清静音窗口起点
     s_is_continuous_turn = false; // 关闭会话后不再认为是连续对话，下一次唤醒即新会话
     s_vad_speech_count = 0;       // 重置 VAD 相关状态，确保下次唤醒后从干净状态开始
     s_vad_silence_streak = 0;     // 同步清零静音连击计数（防容忍机制残留状态污染下一轮）
@@ -1178,9 +1338,19 @@ void session_init(const char *ws_uri)
 
     ESP_LOGW(TAG, "最终请求的完整 WebSocket URI: %s", full_ws_uri);
 
+    // 始终创建 protocol 对象（但不一定连接），避免 s_protocol 为 NULL 导致后续崩溃
     s_protocol = protocol_create(full_ws_uri, ws_bearer_token);
     protocol_register_callback(s_protocol, protocol_event_handler, NULL);
-    protocol_connect(s_protocol);
+
+    // ★ P1 优化：Auth 失败且服务器不可达时，跳过 WebSocket 连接，避免白白消耗内部 SRAM
+    if (!auth_is_server_reachable())
+    {
+        ESP_LOGW(TAG, "[WARN] 服务器不可达，跳过 WebSocket 连接，等待重连任务周期性探测...");
+    }
+    else
+    {
+        protocol_connect(s_protocol);
+    }
 
     if (strlen(s_access_token) > 0)
         ESP_LOGI(TAG, "已使用 accessToken 认证连接（%d 分钟后自动刷新）", TOKEN_REFRESH_MS / 60000);
@@ -1218,6 +1388,8 @@ void session_on_wake_word(const char *display)
         // 重置全部 VAD / 会话状态
         s_state = SESSION_LISTENING;
         s_speech_detected = false;
+        s_speech_start_tick = 0;      // 方案 B：清单句起点
+        s_first_silence_tick = 0;     // 方案 A：清静音窗口起点
         s_stop_sent = false;          // 允许本轮新语音触发 EOS
         s_is_continuous_turn = false; // 打断后直接发 Hello，不走延迟补发路径
         s_vad_speech_count = 0;
@@ -1273,6 +1445,8 @@ void session_on_wake_word(const char *display)
     ESP_LOGI(TAG, "会话开始 [%s]", display);
     s_state = SESSION_LISTENING;
     s_speech_detected = false;
+    s_speech_start_tick = 0;  // 方案 B：清单句起点
+    s_first_silence_tick = 0; // 方案 A：清静音窗口起点
     s_stop_sent = false;
     s_vad_speech_count = 0;                 // 新会话从零开始，不带上次会话残留帧数
     s_vad_ready_tick = xTaskGetTickCount(); // 从当前时刻开始计算保护期
@@ -1331,6 +1505,8 @@ error:
     ESP_LOGE(TAG, "会话启动失败，回滚所有资源");
     s_state = SESSION_IDLE;
     s_speech_detected = false;
+    s_speech_start_tick = 0;
+    s_first_silence_tick = 0;
     xEventGroupClearBits(s_session_eg, SESSION_SERVER_READY_BIT);
     wake_word_start();
 }

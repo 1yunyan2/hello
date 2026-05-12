@@ -1,10 +1,11 @@
 #pragma once
-
 /**
  * @file auth.h
  * @brief 设备认证模块头文件 — 负责交换 WebSocket 令牌
  * * 职责：定义通过长期 deviceToken 换取短效 accessToken 的接口及数据结构。
  */
+
+#include <stdbool.h>
 
 /** @brief 请求认证令牌的后端 HTTP API 地址 */
 #define AUTH_LOGIN_URL "http://122.224.191.2:4888/api/auth/device-login"
@@ -42,3 +43,16 @@ void auth_destroy(auth_t *auth);
  * @note 调用者：session.c -> session_init(), session_reconnect_task()
  */
 void auth_perform(auth_t *auth, const char *device_token);
+
+/**
+ * @brief 查询服务器是否可达（Auth HTTP 最近一次是否成功）
+ *
+ * 用于 session/mqtt 在发起连接前快速判断服务器是否可达，
+ * 避免在服务器不可达时白白消耗内部 SRAM 建立 TLS 连接。
+ *
+ * @return true  服务器可达（最近一次 Auth 成功，或尚未尝试）
+ * @return false 服务器不可达（最近一次 Auth 超时/失败）
+ *
+ * @note 调用者：session.c -> session_init(), session_reconnect_task()
+ */
+bool auth_is_server_reachable(void);

@@ -28,7 +28,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-
+#include <stdbool.h>
 /** @brief 音频处理器句柄（不透明类型，内部结构在 audio_processor.c 中定义） */
 typedef struct audio_processor audio_processor_t;
 
@@ -193,3 +193,24 @@ size_t audio_processor_read_timeout(audio_processor_t *audio_processor,
  */
 void audio_processor_read_ref_pcm(audio_processor_t *audio_processor,
                                   int16_t *buf, size_t samples);
+
+/**
+ * @brief 查询下行解码链路当前积压的字节总数（待解码 + 已解码未播放）
+ *
+ * 用于 TTS 播放结束后的"扬声器真正排空"判定。
+ * 服务端发送 TTS_STOP 时只代表数据流推送完毕，但本地下游仍可能有：
+ *   1. dec_input  ：尚未解码的 OPUS 帧
+ *   2. dec_output ：已解码但尚未送入 I2S 的 PCM 数据
+ * 必须等到 **两者都为 0**，才可认为下游缓冲已经播完，进入监听不会回灌。
+ *
+ * 实现：非阻塞读取 dec_input 和 dec_output 当前 items_waiting，求和返回。
+ *
+ * @param audio_processor 音频处理器实例指针（允许为 NULL，NULL 返回 0）
+ * @return size_t         当前下行积压字节总数；返回 0 表示已完全排空
+ *
+ * @note 调用者：session.c → on_enhanced_pcm() 的排空等待阶段
+ * @note 仍需配合 VAD 静音 + 物理静音兜底，本接口只解决"缓冲未排空"漏洞
+ * @note 线程安全：vRingbufferGetInfo 内部加锁，可在任意任务上下文调用
+ */
+// size_t audio_processor_get_pending_bytes(audio_processor_t *audio_processor);
+bool audio_processor_is_playing(audio_processor_t *audio_processor);

@@ -436,13 +436,299 @@
     <h1>Echo2 开发变更日志</h1>
     <div class="stats">
       <div class="stat">提交 <span>34</span></div>
-      <div class="stat">BUG修复 <span>8</span></div>
-      <div class="stat">日期范围 <span>03-17 ~ 04-15</span></div>
+      <div class="stat">BUG修复 <span>13</span></div>
+      <div class="stat">日期范围 <span>03-17 ~ 05-11</span></div>
       <button class="expand-all" onclick="toggleAll()">展开全部</button>
     </div>
   </header>
 
   <div class="container">
+
+    <!-- ========== 2026-05-12 ========== -->
+    <div class="day-section">
+      <div class="day-header">
+        <div class="day-date">2026-05-12</div>
+        <div class="day-summary">BUG-014 修复：多轮 SERVER_READY 错误清除 + 风扇噪声把尾端字保护机制玩坏（800ms 熔断 + 8s 硬切）</div>
+        <div class="day-line"></div>
+      </div>
+
+      <!-- BUG-014（未提交） -->
+      <div class="commit" id="bug014-0512">
+        <div class="commit-header" onclick="toggle('bug014-0512')">
+          <div class="dot-red"></div>
+          <div class="commit-info">
+            <div class="commit-title">fix(session): 多轮 SERVER_READY 丢失 + 尾端字保护被噪声玩坏</div>
+            <div class="commit-meta">
+              <span class="time-badge">2026-05-12（未提交）</span>
+              <span class="tag tag-fix">BUG-014</span>
+              <span class="tag tag-fix">VAD/EOS</span>
+            </div>
+          </div>
+          <span class="chevron">▶</span>
+        </div>
+        <div class="commit-body">
+          <div class="diff-note">
+            <strong>症状 A</strong>：多轮第二句卡 9~10 秒后云端报 <code>buffer too small, or have no audio</code>。<br>
+            <strong>症状 B</strong>：风扇环境下"几点了"被录 26 秒，enc_output 撑爆持续丢帧。<br>
+            <strong>根因 A</strong>：<code>PROTOCOL_EVENT_COMPLETE</code> 在多轮分支清掉 SERVER_READY_BIT，但多轮模式没有新 Hello/Started 来重新置位 → ws_sender_task 卡在 L890 continue 循环 → enc_output 撑爆 + 上行无数据。<br>
+            <strong>根因 B</strong>：尾端字保护逻辑 <code>if (s_speech_detected && vad==SILENCE && avg_amp&gt;100) vad=SPEECH</code> 被风扇噪声（avg_amp 稳定 &gt;100）持续命中 → EOS 定时器永远启动不起来 → 无限录音。<br>
+            <strong>详见</strong>：<a href="bugs/BUG-014.md">bugs/BUG-014.md</a>
+          </div>
+
+          <div class="file-diff">
+            <div class="file-header">
+              <span class="file-path">main/session/session.c — COMPLETE 多轮分支</span>
+              <div class="diff-stat"><span class="diff-add">+1</span><span class="diff-del">-1</span></div>
+            </div>
+            <div class="diff-split">
+              <div class="diff-col before">
+                <div class="diff-col-header before">修改前（清掉就再没人 Set 回来）</div>
+                <div class="diff-lines">
+                  <div class="diff-line ctx">case PROTOCOL_EVENT_COMPLETE:</div>
+                  <div class="diff-line ctx">  if (s_state == LISTENING) {</div>
+                  <div class="diff-line ctx">    s_vad_ready_tick = now;</div>
+                  <div class="diff-line del">    xEventGroupClearBits(</div>
+                  <div class="diff-line del">      s_session_eg,</div>
+                  <div class="diff-line del">      SERVER_READY_BIT);</div>
+                  <div class="diff-line ctx">    xTimerReset(...);</div>
+                  <div class="diff-line ctx">  }</div>
+                </div>
+              </div>
+              <div class="diff-col after">
+                <div class="diff-col-header after">修改后（维持 TTS_STOP 已 set 的 READY）</div>
+                <div class="diff-lines">
+                  <div class="diff-line ctx">case PROTOCOL_EVENT_COMPLETE:</div>
+                  <div class="diff-line ctx">  if (s_state == LISTENING) {</div>
+                  <div class="diff-line ctx">    s_vad_ready_tick = now;</div>
+                  <div class="diff-line add">    xEventGroupSetBits(</div>
+                  <div class="diff-line add">      s_session_eg,</div>
+                  <div class="diff-line add">      SERVER_READY_BIT);</div>
+                  <div class="diff-line ctx">    xTimerReset(...);</div>
+                  <div class="diff-line ctx">  }</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="file-diff">
+            <div class="file-header">
+              <span class="file-path">main/session/session.c — 尾端字保护熔断（方案 A）</span>
+              <div class="diff-stat"><span class="diff-add">+12</span><span class="diff-del">-3</span></div>
+            </div>
+            <div class="diff-split">
+              <div class="diff-col before">
+                <div class="diff-col-header before">修改前（无熔断，噪声永远救场）</div>
+                <div class="diff-lines">
+                  <div class="diff-line ctx">if (s_speech_detected</div>
+                  <div class="diff-line ctx">    && vad == VAD_SILENCE</div>
+                  <div class="diff-line del">    && avg_amp > 100) {</div>
+                  <div class="diff-line del">  vad = VAD_SPEECH;</div>
+                  <div class="diff-line del">}</div>
+                </div>
+              </div>
+              <div class="diff-col after">
+                <div class="diff-col-header after">修改后（800ms 静音窗口外放手）</div>
+                <div class="diff-lines">
+                  <div class="diff-line ctx">if (s_speech_detected</div>
+                  <div class="diff-line ctx">    && vad == VAD_SILENCE</div>
+                  <div class="diff-line add">    && avg_amp > 100) {</div>
+                  <div class="diff-line add">  if (s_first_silence_tick == 0)</div>
+                  <div class="diff-line add">    s_first_silence_tick = now;</div>
+                  <div class="diff-line add">  if (now - tick < 800ms)</div>
+                  <div class="diff-line add">    vad = VAD_SPEECH;</div>
+                  <div class="diff-line add">  // 否则放手交回 AFE VAD</div>
+                  <div class="diff-line add">} else if (vad == VAD_SPEECH) {</div>
+                  <div class="diff-line add">  s_first_silence_tick = 0;</div>
+                  <div class="diff-line add">}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="file-diff">
+            <div class="file-header">
+              <span class="file-path">main/session/session.c — 单句最大时长硬切（方案 B 兜底）</span>
+              <div class="diff-stat"><span class="diff-add">+18</span><span class="diff-del">-0</span></div>
+            </div>
+            <div class="diff-split">
+              <div class="diff-col before">
+                <div class="diff-col-header before">修改前（无硬切）</div>
+                <div class="diff-lines">
+                  <div class="diff-line ctx">// is_active_audio 写入 PCM</div>
+                  <div class="diff-line ctx">// 全靠 EOS 定时器收尾</div>
+                </div>
+              </div>
+              <div class="diff-col after">
+                <div class="diff-col-header after">修改后（speech_detected 后 8s 强制 EOS）</div>
+                <div class="diff-lines">
+                  <div class="diff-line add">if (s_speech_detected</div>
+                  <div class="diff-line add">    && !s_stop_sent</div>
+                  <div class="diff-line add">    && now - s_speech_start_tick</div>
+                  <div class="diff-line add">         > 8000ms) {</div>
+                  <div class="diff-line add">  s_stop_sent = true;</div>
+                  <div class="diff-line add">  xTimerStop(s_eos_timer, 0);</div>
+                  <div class="diff-line add">  xQueueSend(s_session_evt_queue,</div>
+                  <div class="diff-line add">    &SESSION_EVT_VAD_STOP, 0);</div>
+                  <div class="diff-line add">}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="diff-note">
+            <strong>新增静态变量</strong>：<code>s_first_silence_tick</code>（方案 A 静音窗口起点）、<code>s_speech_start_tick</code>（方案 B 单句起点）。<br>
+            <strong>状态机同步</strong>：TTS_START / TTS_STOP / COMPLETE / session_close / wake_word（打断/新会话/error）7 处入口同步清零，防止上一轮残留 tick 在新轮误触发硬切。<br>
+            <strong>验证</strong>：编译通过，Echo.bin 0x1ddb30 字节（38% 余量）；待实测多轮 + 风扇噪声场景。
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ========== 2026-05-11 ========== -->
+    <div class="day-section">
+      <div class="day-header">
+        <div class="day-date">2026-05-11</div>
+        <div class="day-summary">BUG-013 修复：长 TTS 残留被识别为下一轮用户输入（排空三重锁 + 解码器水位检查）</div>
+        <div class="day-line"></div>
+      </div>
+
+      <!-- BUG-013（未提交） -->
+      <div class="commit" id="bug013-0511">
+        <div class="commit-header" onclick="toggle('bug013-0511')">
+          <div class="dot-red"></div>
+          <div class="commit-info">
+            <div class="commit-title">fix(session): 长 TTS 残留被误识别为下一轮提问 — 排空三重锁 + 5s 兜底</div>
+            <div class="commit-meta">
+              <span class="time-badge">2026-05-11（未提交）</span>
+              <span class="tag tag-fix">BUG-013</span>
+              <span class="tag tag-fix">回声防护</span>
+            </div>
+          </div>
+          <span class="chevron">▶</span>
+        </div>
+        <div class="commit-body">
+          <div class="diff-note">
+            <strong>症状</strong>：TTS 播放<strong>长句</strong>（≥3s）时，残留音频被麦克风采集后当作下一轮用户提问上传。<br>
+            <strong>根因</strong>：TTS_STOP 是服务端逻辑事件，本地下游 dec_input(16KB) + dec_output(40KB) + I2S DMA 仍有 1~3s 未播完；旧版 1500ms 兜底超时强制开监听后喇叭仍在响。<br>
+            <strong>详见</strong>：<a href="bugs/BUG-013.md">bugs/BUG-013.md</a>
+          </div>
+
+          <div class="file-diff">
+            <div class="file-header">
+              <span class="file-path">main/audio/audio_processor.h</span>
+              <div class="diff-stat"><span class="diff-add">+20</span><span class="diff-del">-0</span></div>
+            </div>
+            <div class="diff-split">
+              <div class="diff-col before">
+                <div class="diff-col-header before">修改前</div>
+                <div class="diff-lines">
+                  <div class="diff-line ctx">// 仅暴露 read/write/flush/read_ref_pcm</div>
+                  <div class="diff-line ctx">// 无下游水位查询接口</div>
+                </div>
+              </div>
+              <div class="diff-col after">
+                <div class="diff-col-header after">修改后（新增接口）</div>
+                <div class="diff-lines">
+                  <div class="diff-line add">size_t audio_processor_get_pending_bytes(</div>
+                  <div class="diff-line add">    audio_processor_t *audio_processor);</div>
+                  <div class="diff-line ctx">// 返回 dec_input + dec_output 当前积压字节数</div>
+                  <div class="diff-line ctx">// 0 表示下游链路完全排空</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="file-diff">
+            <div class="file-header">
+              <span class="file-path">main/audio/audio_processor.c</span>
+              <div class="diff-stat"><span class="diff-add">+18</span><span class="diff-del">-0</span></div>
+            </div>
+            <div class="diff-split">
+              <div class="diff-col before">
+                <div class="diff-col-header before">修改前</div>
+                <div class="diff-lines">
+                  <div class="diff-line ctx">（无对应实现）</div>
+                </div>
+              </div>
+              <div class="diff-col after">
+                <div class="diff-col-header after">修改后</div>
+                <div class="diff-lines">
+                  <div class="diff-line add">size_t audio_processor_get_pending_bytes(</div>
+                  <div class="diff-line add">    audio_processor_t *p) {</div>
+                  <div class="diff-line add">  if (p == NULL) return 0;</div>
+                  <div class="diff-line add">  size_t in = 0, out = 0;</div>
+                  <div class="diff-line add">  if (p->dec_input)</div>
+                  <div class="diff-line add">    vRingbufferGetInfo(p->dec_input,</div>
+                  <div class="diff-line add">      NULL,NULL,NULL,NULL,&in);</div>
+                  <div class="diff-line add">  if (p->dec_output)</div>
+                  <div class="diff-line add">    vRingbufferGetInfo(p->dec_output,</div>
+                  <div class="diff-line add">      NULL,NULL,NULL,NULL,&out);</div>
+                  <div class="diff-line add">  return in + out;</div>
+                  <div class="diff-line add">}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="file-diff">
+            <div class="file-header">
+              <span class="file-path">main/session/session.c</span>
+              <div class="diff-stat"><span class="diff-add">+18</span><span class="diff-del">-9</span></div>
+            </div>
+            <div class="diff-split">
+              <div class="diff-col before">
+                <div class="diff-col-header before">修改前（双重锁 + 1.5s 兜底）</div>
+                <div class="diff-lines">
+                  <div class="diff-line ctx">if (s_waiting_for_silence) {</div>
+                  <div class="diff-line ctx">  uint32_t wait_ms = ...;</div>
+                  <div class="diff-line ctx">  if (wait_ms < 400) return;</div>
+                  <div class="diff-line ctx">  if (vad == VAD_SILENCE) {</div>
+                  <div class="diff-line ctx">    s_vad_silence_count++;</div>
+                  <div class="diff-line del">    if (s_vad_silence_count > 8) {</div>
+                  <div class="diff-line del">      // 进入监听</div>
+                  <div class="diff-line del">    }</div>
+                  <div class="diff-line ctx">  } else s_vad_silence_count = 0;</div>
+                  <div class="diff-line del">  if (wait_ms > 1500) {</div>
+                  <div class="diff-line del">    // 强制开监听</div>
+                  <div class="diff-line del">  }</div>
+                  <div class="diff-line ctx">  return;</div>
+                  <div class="diff-line ctx">}</div>
+                </div>
+              </div>
+              <div class="diff-col after">
+                <div class="diff-col-header after">修改后（三重锁 + 5s 兜底）</div>
+                <div class="diff-lines">
+                  <div class="diff-line ctx">if (s_waiting_for_silence) {</div>
+                  <div class="diff-line ctx">  uint32_t wait_ms = ...;</div>
+                  <div class="diff-line ctx">  if (wait_ms < 400) return;</div>
+                  <div class="diff-line add">  size_t pending_bytes =</div>
+                  <div class="diff-line add">    audio_processor_get_pending_bytes(</div>
+                  <div class="diff-line add">      s_processor);</div>
+                  <div class="diff-line ctx">  if (vad == VAD_SILENCE) {</div>
+                  <div class="diff-line ctx">    s_vad_silence_count++;</div>
+                  <div class="diff-line add">    if (s_vad_silence_count > 8</div>
+                  <div class="diff-line add">        && pending_bytes == 0) {</div>
+                  <div class="diff-line add">      // 三重锁 OK，进入监听</div>
+                  <div class="diff-line add">    }</div>
+                  <div class="diff-line ctx">  } else s_vad_silence_count = 0;</div>
+                  <div class="diff-line add">  if (wait_ms > 5000) {</div>
+                  <div class="diff-line add">    // 强制开监听（5s 兜底）</div>
+                  <div class="diff-line add">  }</div>
+                  <div class="diff-line ctx">  return;</div>
+                  <div class="diff-line ctx">}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="diff-note">
+            <strong>排空三重锁</strong>：物理静音 ≥ 400ms · 解码链路 pending == 0 · 连续 8 帧 VAD_SILENCE，三者同时成立才放行。<br>
+            <strong>兜底超时</strong>：1500ms → 5000ms（覆盖 dec_input 16KB + dec_output 40KB 极端长句深度）。<br>
+            <strong>验证</strong>：编译通过，Echo.bin 0x290330 字节（15% 余量）；待实测长句对话场景。
+          </div>
+        </div>
+      </div>
+    </div>
 
     <!-- ========== 2026-04-15 ========== -->
     <div class="day-section">
