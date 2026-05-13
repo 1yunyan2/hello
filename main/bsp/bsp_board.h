@@ -268,18 +268,18 @@ typedef enum
 {
     TOUCH_EVENT_NONE = 0,
     // 单位置触摸（仅短按 1s，按住释放后才触发；参与组合时不触发）
-    TOUCH_EVENT_SHORT_HEAD,    // 头部短按
-    TOUCH_EVENT_SHORT_ABDOMEN, // 腹部短按
-    TOUCH_EVENT_SHORT_BACK,    // 背部短按
+    TOUCH_EVENT_SHORT_HEAD,    // 1头部短按
+    TOUCH_EVENT_SHORT_ABDOMEN, // 2腹部短按
+    TOUCH_EVENT_SHORT_BACK,    // 3背部短按
     // 双位置组合触摸
-    TOUCH_EVENT_COMBO_HEAD_ABDOMEN, // 头部+腹部同时按
-    TOUCH_EVENT_COMBO_HEAD_BACK,    // 头部+背部同时按
-    TOUCH_EVENT_COMBO_ABDOMEN_BACK, // 腹部+背部同时按
+    TOUCH_EVENT_COMBO_HEAD_ABDOMEN, // 4头部+腹部同时按
+    TOUCH_EVENT_COMBO_HEAD_BACK,    // 5头部+背部同时按
+    TOUCH_EVENT_COMBO_ABDOMEN_BACK, // 6腹部+背部同时按
     // 翻页控制触摸（按住释放后触发：≥1s 翻页，≥3s 进入功能菜单）
-    TOUCH_EVENT_SHORT_PREV_PAGE, // 前一页：短按
-    TOUCH_EVENT_SHORT_NEXT_PAGE, // 后一页：短按
-    TOUCH_EVENT_LONG_PREV_PAGE,  // 前一页：长按 → 进入功能菜单
-    TOUCH_EVENT_LONG_NEXT_PAGE   // 后一页：长按 → 进入功能菜单
+    TOUCH_EVENT_SHORT_PREV_PAGE, // 7前一页：短按
+    TOUCH_EVENT_SHORT_NEXT_PAGE, // 8后一页：短按
+    TOUCH_EVENT_LONG_PREV_PAGE,  // 9前一页：长按 → 进入功能菜单
+    TOUCH_EVENT_LONG_NEXT_PAGE   // 10后一页：长按 → 进入功能菜单
 } touch_event_t;
 
 /**

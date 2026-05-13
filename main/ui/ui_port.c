@@ -266,9 +266,9 @@ void init_spiffs(void)
  * GIF 动画
  * ═══════════════════════════════════════════════════════════════ */
 static const char *const s_main_gif_paths[] = {
-    "S:/one.gif",
-    "S:/two.gif",
-    "S:/three.gif",
+    "S:/gif/one.gif",
+    "S:/gif/two.gif",
+    "S:/gif/three.gif",
 
 };
 
@@ -313,8 +313,11 @@ static void main_gif_create(void)
 /* ═══════════════════════════════════════════════════════════════
  * LVGL 初始化
  * ═══════════════════════════════════════════════════════════════ */
+static void on_refr_start(lv_event_t *e);
+static void on_refr_ready(lv_event_t *e);
 static esp_err_t app_lvgl_init(void)
 {
+    ESP_LOGI(TAG, "最大内部连续块: %d", heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
     ESP_LOGI(TAG, "--- Memory Check ---");
     ESP_LOGI(TAG, "Free PSRAM: %d bytes", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     ESP_LOGI(TAG, "Free SRAM: %d bytes", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
@@ -327,9 +330,9 @@ static esp_err_t app_lvgl_init(void)
     }
 
     const lvgl_port_cfg_t lvgl_cfg = {
-        .task_priority = 5,
+        .task_priority = 6,
         .task_stack = 8192,
-        .task_affinity = 0,
+        .task_affinity = 1,
         .task_max_sleep_ms = 500,
         .timer_period_ms = 10,
         // 栈必须在内部 SRAM，因为 GIF 播放会读 SPIFFS（flash cache 禁用期间 PSRAM 不可访问）
@@ -362,8 +365,8 @@ static esp_err_t app_lvgl_init(void)
         //   W*H/7 = 20480 字节：分到但 WebSocket 等模块缺内存创建失败，8kSRAM 余量太小不稳已经带有拖影了
         //   W*H/8 = 19200 字节：分到且留 ~11KB 给其他模块（稳态） ，已经带有拖影了
         //   W*H/16 = 9600 字节：余量更大但 GIF 帧率会更慢
-        .buffer_size = (BSP_LCD_WIDTH * BSP_LCD_HEIGHT) / 7, // 1/8 屏 = 19200 字节
-        .double_buffer = false,                              // 单缓冲（SRAM 紧张，PARTIAL 模式无需双缓冲）
+        .buffer_size = (BSP_LCD_WIDTH * BSP_LCD_HEIGHT) / 5,
+        .double_buffer = false, // 单缓冲（SRAM 紧张，PARTIAL 模式无需双缓冲）
         .hres = BSP_LCD_WIDTH,
         .vres = BSP_LCD_HEIGHT,
         .monochrome = false,
@@ -397,9 +400,23 @@ static esp_err_t app_lvgl_init(void)
         }
         lvgl_port_unlock();
     }
+    lv_display_add_event_cb(lvgl_disp, on_refr_start, LV_EVENT_REFR_START, NULL);
+    lv_display_add_event_cb(lvgl_disp, on_refr_ready, LV_EVENT_REFR_READY, NULL);
     return ESP_OK;
 }
+static void on_refr_start(lv_event_t *e)
+{
+    // flush 开始前暂停 GIF 帧定时器，防止 DMA 传输期间覆盖 draw_buf
+    if (gif_obj)
+        lv_gif_pause(gif_obj);
+}
 
+static void on_refr_ready(lv_event_t *e)
+{
+    // flush 全部完成后恢复 GIF 帧定时器
+    if (gif_obj)
+        lv_gif_resume(gif_obj);
+}
 /* ═══════════════════════════════════════════════════════════════
  * 主时钟 UI
  * ═══════════════════════════════════════════════════════════════ */
@@ -1526,7 +1543,7 @@ void ui_play_animation(const char *anim_id)
  * ═══════════════════════════════════════════════════════════════ */
 void ui_init(void)
 {
-    init_spiffs();
+    // init_spiffs();
     esp_err_t ret = app_lvgl_init();
     if (ret != ESP_OK)
     {

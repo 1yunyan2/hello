@@ -13,7 +13,15 @@
  *   bsp_touch.c 只负责检测事件并入队 → touch_dispatch_task 读取并映射到情绪
  *   映射表集中在此文件，便于后续按产品需求调整（不需改 BSP 或情绪引擎）
  */
+/**
+ * @file application.h
+ * @brief 应用层初始化入口头文件
+ * 负责整合 BSP、协议、唤醒词等模块的统一启动
+ */
 
+#include "bsp/bsp_board.h"
+#include "protocol/mqtt_protocol.h"
+#include "wake_word/custom_wake_word.h"
 #include "application.h"
 #include "session/session.h"
 #include "audio/audio_processor.h"
@@ -31,9 +39,8 @@
 #define PRINT_INTERNAL_HEAP \
     ESP_LOGI(TAG, "[heap] internal free: %lu B", esp_get_free_internal_heap_size())
 
-#include "ui/flash.c" // 注意：此处直接 include，避免与 ui_port.h 形成循环依赖
-#include <dirent.h>   // 必须包含这个，才能使用 DIR 和 readdir
-#include "esp_log.h"  // 确保能使用 ESP_LOGI 等日志宏
+#include <dirent.h>  // 必须包含这个，才能使用 DIR 和 readdir
+#include "esp_log.h" // 确保能使用 ESP_LOGI 等日志宏
 // 一个函数扫描所有资源
 void scan_production_assets(const char *root_path)
 {

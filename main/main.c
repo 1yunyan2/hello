@@ -8,6 +8,8 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 extern void apppp_main(void);
 /**
  * @brief ESP-IDF 程序入口

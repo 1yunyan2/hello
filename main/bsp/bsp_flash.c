@@ -155,17 +155,6 @@ void start_production_dump(void)
  */
 void bsp_flash_init(void)
 {
-    // --- 步骤 0: 安装 USB-Serial-JTAG 驱动(必须最先做,且只装一次)---
-    // 旧实现刻意不装,是因为作者担心 driver TX 和 secondary console (printf)
-    // 同时戳 HW FIFO 出现交错。正确做法是装完之后调用 vfs_use_driver(),
-    // 让 printf/ESP_LOG 也排队走驱动 TX,从根上消除冲突。
-    usb_serial_jtag_driver_config_t usj_cfg = {
-        .rx_buffer_size = USJ_RX_BUF_SIZE,
-        .tx_buffer_size = USJ_TX_BUF_SIZE,
-    };
-    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usj_cfg));
-    usb_serial_jtag_vfs_use_driver();
-
     // --- 步骤 1: 硬件底层初始化 (SPI3) ---
     const spi_bus_config_t bus_config = {
         .mosi_io_num = EXT_FLASH_MOSI,
@@ -187,6 +176,8 @@ void bsp_flash_init(void)
     ESP_ERROR_CHECK(esp_flash_init(ext_flash));
 
     // --- 步骤 2: 产线双模监听 (10秒) ---
+    // 此阶段不安装 USJ 驱动，用默认 secondary console 读写，
+    // 避免 USJ ISR 干扰后续 I2C 总线时序（BUG: ES8311 NACK）。
     ESP_LOGI(TAG, "📢 产线模式开启！发送 'START' 烧录，发送 'DUMP' 提取...");
 
     char cmd[32] = {0};
@@ -199,37 +190,57 @@ void bsp_flash_init(void)
         if (wait_ms % 2000 == 0)
         {
             printf("\nESP32_READY_CMD_WAIT\n"); // Python 握手锚点，勿删
-            fflush(stdout);                     // 确保数据发出
+            fflush(stdout);
         }
 
+        // 不依赖 USJ 驱动，直接读 HW RX FIFO（最多 64 字节，足够检测命令字）
         memset(cmd, 0, sizeof(cmd));
-        int len = usb_serial_jtag_read_bytes((uint8_t *)cmd, sizeof(cmd) - 1,
-                                             pdMS_TO_TICKS(10));
+        int len = 0;
+        while (len < (int)(sizeof(cmd) - 1))
+        {
+            int c = fgetc(stdin);
+            if (c == EOF)
+                break;
+            cmd[len++] = (char)c;
+        }
+
         if (len > 0)
         {
             if (strstr(cmd, "START"))
             {
-                mode = 1; // 触发你的原始烧录逻辑
+                mode = 1;
                 break;
             }
             else if (strstr(cmd, "DUMP"))
             {
-                mode = 2; // 触发现在的提取逻辑
+                mode = 2;
                 break;
             }
         }
+        vTaskDelay(pdMS_TO_TICKS(10));
         wait_ms += 10;
+    }
+
+    // 进入产线模式时才安装 USJ 驱动（大吞吐量需要环形缓冲）
+    if (mode == 1 || mode == 2)
+    {
+        usb_serial_jtag_driver_config_t usj_cfg = {
+            .rx_buffer_size = USJ_RX_BUF_SIZE,
+            .tx_buffer_size = USJ_TX_BUF_SIZE,
+        };
+        ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usj_cfg));
+        usb_serial_jtag_vfs_use_driver();
     }
 
     if (mode == 1)
     {
         printf("\n>>> 进入烧录模式 (PC -> Flash) <<<\n");
-        start_production_burning(); // 调用你原有的烧录函数
+        start_production_burning();
     }
     else if (mode == 2)
     {
         printf("\n>>> 进入提取模式 (Flash -> PC) <<<\n");
-        start_production_dump(); // 调用我们新写的吐数据函数
+        start_production_dump();
     }
 
     else

@@ -489,8 +489,11 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
     // Flash 操作占用 SPI 总线期间 CPU 需访问任务栈，栈必须在内部 SRAM，否则 WDT 复位。
     xTaskCreatePinnedToCoreWithCaps(
         button_monitor_task, "btn_task",
-        2048, NULL, 5, NULL,
+        3072, NULL, 5, NULL,
         0, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    ESP_LOGI(TAG, "[内存] btn_task 创建后 → 内部SRAM剩余: %u B，PSRAM剩余: %u B",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     // ── 步骤 7：检查是否已配网 ───────────────────────────────────────────────
     bool provisioned = false;
     ESP_ERROR_CHECK(wifi_prov_mgr_is_provisioned(&provisioned));

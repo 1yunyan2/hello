@@ -132,7 +132,7 @@ void audio_encoder_task(void *arg)
             if (++accum_segments >= 4)
             {
                 accum_segments = 0;
-                taskYIELD(); // 主动让步，防止饿死 IDLE0/WDT
+                vTaskDelay(1); // 主动让步，防止饿死 IDLE0/WDT
             }
             continue;
         }
@@ -166,7 +166,7 @@ void audio_encoder_task(void *arg)
         //   - vTaskDelay(2) 强制睡 2 tick，累计 10% 吞吐损失，在追赶积压时更慢；
         //   - taskYIELD() 仅在同优先级就绪队列里切一圈，无就绪任务时立即回来。
         // IDLE0 喂狗依靠切换到 play_task / decoder_task 时自然轮到 IDLE0。
-        taskYIELD(); // 主动让步，防止偶发编码耗时拉满 CPU0 饿死同核任务
+        vTaskDelay(1); // 主动让步，防止偶发编码耗时拉满 CPU0 饿死同核任务
     }
 
     // ── 任务退出：释放帧缓冲区，清空句柄，自删除 ─────────────────────────────
