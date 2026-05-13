@@ -465,38 +465,35 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    // ── 步骤 5：初始化 BLE 配网管理器 ────────────────────────────────────────
-    // scheme_ble：使用蓝牙 BLE 作为配网传输通道
-    // FREE_BTDM：配网结束后自动释放 BLE 基带内存（约 60KB），回收给系统使用
-    wifi_prov_mgr_config_t config = {
-        .scheme = wifi_prov_scheme_ble,
-        .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM,
-    };
-    ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
-
-    // 管理器初始化完成，允许按键任务执行重置操作（防止管理器未就绪时崩溃）
-    s_wifi_prov_initialized = true;
+    // ── 步骤 5：检查是否已配网（WiFi 驱动初始化后才能读取 STA config）────────
+    // 直接查询 WiFi STA 配置中的 SSID 是否非空，不依赖 prov_mgr 判断。
+    // 这样可以在未配网时才初始化 prov_mgr，避免"已配网分支 init+deinit 但 BLE
+    // 从未启动"时 FREE_BTDM scheme handler 内部释放未初始化指针导致的 crash。
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    wifi_config_t sta_cfg = {0};
+    esp_wifi_get_config(WIFI_IF_STA, &sta_cfg);
+    bool provisioned = (strlen((char *)sta_cfg.sta.ssid) > 0);
 
     // ── 步骤 6：启动按键监控任务（GPIO0 长按 3s 触发 WiFi 重置）─────────────
-    // xTaskCreatePinnedToCoreWithCaps(
-    //     button_monitor_task, "btn_task",
-    //     4096, NULL, 5, NULL,
-    //     0,                  // CPU0
-    //     MALLOC_CAP_SPIRAM); // 栈分配在外部 SPIRAM（节省内部 SRAM）
-
-    // 使用了分配内存的api，导致和nvs冲突了？因为清除token需要写nvs_erase_key，但是外部psram访问不到nvs？
     xTaskCreatePinnedToCore(
         button_monitor_task, "btn_task",
         2048, NULL, 5, NULL,
         0);
-    // ── 步骤 7：检查是否已配网 ───────────────────────────────────────────────
-    bool provisioned = false;
-    ESP_ERROR_CHECK(wifi_prov_mgr_is_provisioned(&provisioned));
 
     if (!provisioned)
     {
-        // ════ 未配网分支：启动 BLE 广播，等待 App 配网 ════════════════════════
+        // ════ 未配网分支：初始化 prov_mgr，启动 BLE 广播，等待 App 配网 ═══════
         ESP_LOGI(TAG, "设备未配网，启动 BLE 配网广播...");
+
+        // scheme_ble：使用蓝牙 BLE 作为配网传输通道
+        // FREE_BTDM：配网结束后自动释放 BLE 基带内存（约 60KB），回收给系统使用
+        wifi_prov_mgr_config_t config = {
+            .scheme = wifi_prov_scheme_ble,
+            .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM,
+        };
+        ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
+        // 管理器初始化完成，允许按键任务执行重置操作（防止管理器未就绪时崩溃）
+        s_wifi_prov_initialized = true;
 
         // 读取 MAC 地址后三字节，生成唯一蓝牙服务名（格式：EchoPals-AABBCC）
         // 确保多台设备同时配网时不冲突
@@ -542,17 +539,16 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
 
         // 配网流程结束，释放 BLE 基带内存（配网管理器内部调用 FREE_BTDM 释放蓝牙）
         wifi_prov_mgr_deinit();
+        s_wifi_prov_initialized = false;
     }
     else
     {
-        // ════ 已配网分支：直接 STA 模式连接（跳过 BLE 广播）══════════════════
+        // ════ 已配网分支：直接 STA 模式连接，完全不触碰 prov_mgr ══════════════
+        // 不调用 wifi_prov_mgr_init/deinit：FREE_BTDM scheme handler 在 BLE 从未
+        // 启动的情况下 deinit 会 free 未初始化的内部指针，导致 StoreProhibited crash。
         ESP_LOGI(TAG, "设备已配网，直接连接 WiFi...");
 
-        // 无需配网管理器，立即释放（节省约 60KB 内存）
-        wifi_prov_mgr_deinit();
-
-        // 设置 STA 模式并启动 WiFi 驱动（触发 WIFI_EVENT_STA_START → esp_wifi_connect()）
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        // 启动 WiFi 驱动（触发 WIFI_EVENT_STA_START → esp_wifi_connect()）
         ESP_ERROR_CHECK(esp_wifi_start());
     }
 
