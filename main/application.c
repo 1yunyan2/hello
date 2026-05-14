@@ -206,6 +206,32 @@ static void wake_word_callback(const char *wake_word_display)
  */
 void application_init(void)
 {
+
+    /* ⚠️⚠️⚠️ 关键启动顺序：此段必须保持在 application_init 最开头，
+     *    早于 bsp_flash_init / audio_init / bsp_lcd_init 等所有 I2C/SPI 外设初始化。
+     *
+     * 背景：GPIO 14 是 ESP32-S3 的 FSPIWP/SUBSPIWP 复用脚（官方手册 I1 字段表示
+     *       上电默认配置为「输入 + 弱上拉到 1」，约 45kΩ → 3.3V）。
+     *       本项目 PCB 焊死把左臂舵机信号线接到 GPIO 14（无法改换引脚）。
+     *
+     * 现象：若不压低 → 上电瞬间舵机信号被弱上拉拉高 → 舵机识别为短脉冲反复抖动
+     *       → 拉走大电流 → 共用 3.3V 电源轨压降 → ES8311/触摸 IC 报 NACK，
+     *       同时 LEDC TIMER_0 共用的 GPIO 4/9 舵机连锁失灵。
+     *
+     * 修复：用 gpio_config 显式禁用上下拉/中断并主动输出 0V，舵机识别为「无脉冲」
+     *       保持静止。后续 bsp_board_servo_init 启用 LEDC 时会通过 GPIO Matrix
+     *       重新路由 PWM 信号，覆盖此处输出状态，无冲突。
+     *
+     * 详见 memory/bugs/BUG-015.md */
+    gpio_config_t io_conf_g14 = {
+        .pin_bit_mask = (1ULL << GPIO_NUM_14),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE, // 显式关上拉，覆盖 FSPIWP 默认 I1=1
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE, // 显式关中断，避免 SUBSPIWP 残留中断
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf_g14));
+    gpio_set_level(GPIO_NUM_14, 0); // 主动输出 0V，停止舵机误抖动
     bsp_flash_init();
     PRINT_INTERNAL_HEAP;
     debug_root_files();
