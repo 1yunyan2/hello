@@ -24,6 +24,12 @@
  */
 void bsp_board_lcd_init(bsp_board_t *bsp_board)
 {
+    gpio_reset_pin(38); // 释放 时钟线（SCLK）
+    gpio_reset_pin(39); // 释放 数据线（MOSI）
+    gpio_reset_pin(40); // 释放数据/命令选择（D/C）
+    gpio_reset_pin(41); // 释放 片选（CS/NSS）
+    gpio_reset_pin(42); // 释放 背光控制（BK）
+    gpio_reset_pin(45); // 释放 硬件复位（RST）
     // ── 步骤 1：配置背光 GPIO（输出模式）────────────────────────────────────
     // 背光引脚（GPIO48）控制 LCD 背光 LED，高电平开启背光
     // 初始化时先关闭背光（level=0），避免屏幕在初始化过程中显示乱码
@@ -47,7 +53,8 @@ void bsp_board_lcd_init(bsp_board_t *bsp_board)
         .max_transfer_sz = BSP_LCD_WIDTH * BSP_LCD_HEIGHT * 2 + 8,
     };
     // SPI_DMA_CH_AUTO：自动分配 DMA 通道，使用 DMA 可大幅降低 CPU 占用
-    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    // 注意：LCD 引脚（CS=41,MOSI=39,SCLK=38）对应 SPI3_HOST（VSPI），不是 SPI2
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
     // ── 步骤 3：创建 SPI LCD 通信接口 ────────────────────────────────────────
     // 此接口封装了 SPI 事务的时序细节，上层只需调用 esp_lcd_panel_* API

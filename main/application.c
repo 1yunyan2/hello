@@ -147,6 +147,20 @@ static void play_wake_tone(void)
     }
 }
 
+// 舵机循环测试任务（独立运行，不阻塞 LVGL）
+static void servo_test_task(void *arg)
+{
+    while (1)
+    {
+        bsp_servo_move_all_parallel(60.0f, 60.0f, 120.0f, SERVO_SPEED_MID); // 同步运动示例
+        vTaskDelay(pdMS_TO_TICKS(500));
+        bsp_servo_move_all_parallel(120.0f, 120.0f, 60.0f, SERVO_SPEED_MID); // 同步运动示例
+        vTaskDelay(pdMS_TO_TICKS(500));
+        bsp_servo_move_all_parallel(90.0f, 90.0f, 90.0f, SERVO_SPEED_MID); // 同步运动示例
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // 3. 唤醒词回调
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -251,25 +265,36 @@ void application_init(void)
         ESP_LOGE(TAG, "interaction_manager_init 失败: %s", esp_err_to_name(ret));
     }
     PRINT_INTERNAL_HEAP;
-    // 6. 创建触摸扫描任务（栈分配在PSRAM，节省内部SRAM）
-    ret = xTaskCreatePinnedToCoreWithCaps(
-        touch_scan_task,
-        "touch_scan",
-        8192,
+    // // 6. 创建触摸扫描任务（栈分配在PSRAM，节省内部SRAM）
+    // ret = xTaskCreatePinnedToCoreWithCaps(
+    //     touch_scan_task,
+    //     "touch_scan",
+    //     8192,
+    //     NULL,
+    //     4, // 优先级略低于舵机和音频
+    //     NULL,
+    //     tskNO_AFFINITY,
+    //     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    // if (ret != pdPASS)
+    // {
+    //     ESP_LOGE(TAG, "创建触摸扫描任务失败！");
+    // }
+    // else
+    // {
+    //     ESP_LOGI(TAG, "触摸扫描任务创建完成");
+    // }
+
+    // 舵机测试任务（独立跑，不影响 LVGL 刷新）
+    xTaskCreatePinnedToCoreWithCaps(
+        servo_test_task,
+        "servo_test",
+        4096,
         NULL,
-        4, // 优先级略低于舵机和音频
+        5,
         NULL,
         tskNO_AFFINITY,
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-
-    if (ret != pdPASS)
-    {
-        ESP_LOGE(TAG, "创建触摸扫描任务失败！");
-    }
-    else
-    {
-        ESP_LOGI(TAG, "触摸扫描任务创建完成");
-    }
 
     /* ── 步骤 7: 会话模块（WebSocket 预连接）─────────────────────────────── */
 
