@@ -71,6 +71,7 @@ static EventGroupHandle_t s_session_eg = NULL;
  */
 typedef enum
 {
+    SESSION_EVT_ABORT, // 异步发送 CANCEL 信号（在 session_event_task 里执行 WebSocket 发送，避免 Tmr Svc 栈溢出）
     SESSION_EVT_CLOSE, // 异步关闭会话信号
 } session_evt_t;
 
@@ -165,6 +166,13 @@ static void session_event_task(void *arg)
         {
             switch (evt)
             {
+            case SESSION_EVT_ABORT:
+                if (s_protocol && protocol_is_connected(s_protocol))
+                {
+                    protocol_send_abort_speaking(s_protocol);
+                    ESP_LOGI(TAG, "已发送CANCEL消息结束会话");
+                }
+                break;
             case SESSION_EVT_CLOSE: // 【在这里安全地执行关闭】
                 ESP_LOGI(TAG, "接收到异步关闭信号，安全关闭会话...");
                 session_close();
@@ -188,19 +196,14 @@ static void session_event_task(void *arg)
  */
 static void on_session_timeout(TimerHandle_t t)
 {
-    ESP_LOGW(TAG, "会话超时（%d 秒无活动），发送CANCEL结束大节对话", SESSION_TIMEOUT_MS / 1000);
-
-    // 发送CANCEL消息通知服务器整个会话结束
-    if (s_protocol && protocol_is_connected(s_protocol))
-    {
-        protocol_send_abort_speaking(s_protocol);
-        ESP_LOGI(TAG, "已发送CANCEL消息结束会话");
-    }
-
-    // 然后安全关闭会话
+    ESP_LOGW(TAG, "会话超时（%d 秒无活动），发送CANCEL结束会话", SESSION_TIMEOUT_MS / 1000);
+    // 不在 Tmr Svc 里直接调 WebSocket（调用链太深，2048B 栈会溢出）
+    // 改为发队列，由 session_event_task 执行实际的网络操作
     if (s_session_evt_queue != NULL)
     {
-        session_evt_t evt = SESSION_EVT_CLOSE;
+        session_evt_t evt = SESSION_EVT_ABORT;
+        xQueueSend(s_session_evt_queue, &evt, 0);
+        evt = SESSION_EVT_CLOSE;
         xQueueSend(s_session_evt_queue, &evt, 0);
     }
 }

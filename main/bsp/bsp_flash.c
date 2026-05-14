@@ -30,7 +30,7 @@ static wl_handle_t s_wl_handle = WL_INVALID_HANDLE;
 
 // 擦除进度上报:esp_flash_erase_region 是单次原子操作(芯片擦除指令 0xC7),
 // 无法实时拿真实进度,只能按经验值线性估算百分比 —— 真擦完时会强制跳到 100%。
-#define ERASE_ESTIMATE_SEC 81 // 32MB W25Q 整片擦除典型耗时,按你板子实测调
+#define ERASE_ESTIMATE_SEC 103 // 32MB W25Q 整片擦除典型耗时,按你板子实测调
 static volatile bool s_erase_in_progress = false;
 static int64_t s_erase_start_us = 0;
 

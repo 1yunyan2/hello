@@ -269,6 +269,7 @@ static const char *const s_main_gif_paths[] = {
     "S:/gif/one.gif",
     "S:/gif/two.gif",
     "S:/gif/three.gif",
+    "S:/gif/four.gif",
 
 };
 
@@ -330,9 +331,9 @@ static esp_err_t app_lvgl_init(void)
     }
 
     const lvgl_port_cfg_t lvgl_cfg = {
-        .task_priority = 6,
+        .task_priority = 5,
         .task_stack = 8192,
-        .task_affinity = 1,
+        .task_affinity = 1, // CPU0：与 afe_fetch/audio_feed(CPU1) 隔离，避免抢占唤醒词检测
         .task_max_sleep_ms = 500,
         .timer_period_ms = 10,
         // 栈必须在内部 SRAM，因为 GIF 播放会读 SPIFFS（flash cache 禁用期间 PSRAM 不可访问）
@@ -365,15 +366,18 @@ static esp_err_t app_lvgl_init(void)
         //   W*H/7 = 20480 字节：分到但 WebSocket 等模块缺内存创建失败，8kSRAM 余量太小不稳已经带有拖影了
         //   W*H/8 = 19200 字节：分到且留 ~11KB 给其他模块（稳态） ，已经带有拖影了
         //   W*H/16 = 9600 字节：余量更大但 GIF 帧率会更慢
-        .buffer_size = (BSP_LCD_WIDTH * BSP_LCD_HEIGHT) / 5,
-        .double_buffer = false, // 单缓冲（SRAM 紧张，PARTIAL 模式无需双缓冲）
+        // ★ 临时测试：用 PSRAM 全屏 buffer，强制单次 flush，验证撕裂是否由 PARTIAL 多次 flush 引起
+        //   若撕裂消失 → 根因确认是多次 flush 问题，再想办法在内部 SRAM 内解决
+        //   若撕裂依然 → 根因另有其他，排查方向转移
+        .buffer_size = BSP_LCD_WIDTH * BSP_LCD_HEIGHT, // 全屏 150KB
+        .double_buffer = false,
         .hres = BSP_LCD_WIDTH,
         .vres = BSP_LCD_HEIGHT,
         .monochrome = false,
         .color_format = LV_COLOR_FORMAT_RGB565,
         .rotation = {.swap_xy = true, .mirror_x = false, .mirror_y = true},
-        // buff_dma=true + buff_spiram=false：强制使用 DMA-capable 内部 SRAM
-        .flags = {.buff_dma = true, .swap_bytes = false, .buff_spiram = false}};
+        // 临时用 PSRAM（全屏 buffer 内部 SRAM 装不下）
+        .flags = {.buff_dma = false, .swap_bytes = false, .buff_spiram = true}};
 
     lvgl_disp = lvgl_port_add_disp(&disp_cfg);
     if (lvgl_disp == NULL)
@@ -400,8 +404,10 @@ static esp_err_t app_lvgl_init(void)
         }
         lvgl_port_unlock();
     }
-    lv_display_add_event_cb(lvgl_disp, on_refr_start, LV_EVENT_REFR_START, NULL);
-    lv_display_add_event_cb(lvgl_disp, on_refr_ready, LV_EVENT_REFR_READY, NULL);
+    // RENDER_START/READY 在 refr_invalid_areas() 内部触发（第一个 tile 渲染前/全部 flush 后）
+    // 比 REFR_START/READY 更晚/更早，能真正覆盖所有 tile flush 期间，防止 GIF timer 中途更新 draw_buf 导致撕裂
+    lv_display_add_event_cb(lvgl_disp, on_refr_start, LV_EVENT_RENDER_START, NULL);
+    lv_display_add_event_cb(lvgl_disp, on_refr_ready, LV_EVENT_RENDER_READY, NULL);
     return ESP_OK;
 }
 static void on_refr_start(lv_event_t *e)
