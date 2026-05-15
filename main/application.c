@@ -175,7 +175,7 @@ static void wake_word_callback(const char *wake_word_display)
     ESP_LOGW("WAKE_UP", "唤醒词触发: [%s]", wake_word_display);
 
     // 播放 880Hz 提示音给用户听觉反馈
-    play_wake_tone();
+    // play_wake_tone();
 
     session_on_wake_word(wake_word_display);
 }
@@ -250,8 +250,8 @@ void application_init(void)
     bsp_board_wifi_main(bsp_board);
     PRINT_INTERNAL_HEAP;
     // // 提醒系统初始化（含 MOCK_TIME 模式下的系统时间设置）
-    reminder_init(NULL); // NULL = 暂无 TTS 回调，后续接入 session 层时替换
-    PRINT_INTERNAL_HEAP;
+    // reminder_init(NULL); // NULL = 暂无 TTS 回调，后续接入 session 层时替换
+    // PRINT_INTERNAL_HEAP;
 
     /* ── 步骤 3: 音频硬件 + 采集任务 ──────────────────────────────────────── */
     audio_init(bsp_board);
@@ -261,36 +261,36 @@ void application_init(void)
     wake_word_init(wake_word_callback);
     wake_word_start(); /* BUG-024 修复：显式启动，不依赖隐式启动 */
     PRINT_INTERNAL_HEAP;
-
+    printf("唤醒词引擎已启动，等待触发...\n");
     /* ── 步骤 6: MQTT 客户端 ───────────────────────────────────────────────── */
     protocol_mqtt_start();
     PRINT_INTERNAL_HEAP;
 
     // /* ── 步骤 8: 舵机硬件初始化（LEDC/PWM）──────────────────────────────── */
-    bsp_board_servo_init(bsp_board);
-    PRINT_INTERNAL_HEAP;
+    // bsp_board_servo_init(bsp_board);
+    // PRINT_INTERNAL_HEAP;
 
     // /* ── 步骤 9: 舵机管理器（队列 + worker task，栈在 SPIRAM）─────────────── */
-    esp_err_t ret = servo_manager_init();
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "servo_manager_init 失败: %s", esp_err_to_name(ret));
-    }
-    PRINT_INTERNAL_HEAP;
+    // esp_err_t ret = servo_manager_init();
+    // if (ret != ESP_OK)
+    // {
+    //     ESP_LOGE(TAG, "servo_manager_init 失败: %s", esp_err_to_name(ret));
+    // }
+    // PRINT_INTERNAL_HEAP;
 
-    bsp_board_lcd_init(bsp_board); // LCD 初始化（当前未自动置位 LCD_BIT，后续可根据需求调整）
-    PRINT_INTERNAL_HEAP;
-    ui_init();
-    vTaskDelay(pdMS_TO_TICKS(100));
-    PRINT_INTERNAL_HEAP;
-    bsp_board_lcd_on(bsp_board);
-    /* ── 步骤 10: 情绪交互管理器（情绪矩阵 + worker task，栈在 SPIRAM）────── */
-    ret = interaction_manager_init();
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "interaction_manager_init 失败: %s", esp_err_to_name(ret));
-    }
-    PRINT_INTERNAL_HEAP;
+    // bsp_board_lcd_init(bsp_board); // LCD 初始化（当前未自动置位 LCD_BIT，后续可根据需求调整）
+    // PRINT_INTERNAL_HEAP;
+    // ui_init();
+    // vTaskDelay(pdMS_TO_TICKS(100));
+    // PRINT_INTERNAL_HEAP;
+    // bsp_board_lcd_on(bsp_board);
+    // /* ── 步骤 10: 情绪交互管理器（情绪矩阵 + worker task，栈在 SPIRAM）────── */
+    // ret = interaction_manager_init();
+    // if (ret != ESP_OK)
+    // {
+    //     ESP_LOGE(TAG, "interaction_manager_init 失败: %s", esp_err_to_name(ret));
+    // }
+    // PRINT_INTERNAL_HEAP;
     // // 6. 创建触摸扫描任务（栈分配在PSRAM，节省内部SRAM）
     // ret = xTaskCreatePinnedToCoreWithCaps(
     //     touch_scan_task,
@@ -311,16 +311,16 @@ void application_init(void)
     //     ESP_LOGI(TAG, "触摸扫描任务创建完成");
     // }
 
-    // 舵机测试任务（独立跑，不影响 LVGL 刷新）
-    xTaskCreatePinnedToCoreWithCaps(
-        servo_test_task,
-        "servo_test",
-        4096,
-        NULL,
-        5,
-        NULL,
-        tskNO_AFFINITY,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    // // 舵机测试任务（独立跑，不影响 LVGL 刷新）
+    // xTaskCreatePinnedToCoreWithCaps(
+    //     servo_test_task,
+    //     "servo_test",
+    //     4096,
+    //     NULL,
+    //     5,
+    //     NULL,
+    //     tskNO_AFFINITY,
+    //     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
     /* ── 步骤 7: 会话模块（WebSocket 预连接）─────────────────────────────── */
 

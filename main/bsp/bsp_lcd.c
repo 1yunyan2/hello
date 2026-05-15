@@ -53,8 +53,8 @@ void bsp_board_lcd_init(bsp_board_t *bsp_board)
         .max_transfer_sz = BSP_LCD_WIDTH * BSP_LCD_HEIGHT * 2 + 8,
     };
     // SPI_DMA_CH_AUTO：自动分配 DMA 通道，使用 DMA 可大幅降低 CPU 占用
-    // 注意：LCD 引脚（CS=41,MOSI=39,SCLK=38）对应 SPI3_HOST（VSPI），不是 SPI2
-    ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    // 注意：LCD 引脚（CS=41,MOSI=39,SCLK=38）对应 SPI2_HOST（HSPI），不是 SPI3
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
     // ── 步骤 3：创建 SPI LCD 通信接口 ────────────────────────────────────────
     // 此接口封装了 SPI 事务的时序细节，上层只需调用 esp_lcd_panel_* API

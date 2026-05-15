@@ -4,6 +4,7 @@
 #include "driver/i2c_master.h"
 #include "wake_word/custom_wake_word.h"
 #include "esp_heap_caps.h"
+#include <math.h>
 
 static const char *TAG = "BSP_CODEC";
 
@@ -131,8 +132,46 @@ void bsp_board_codec_init(bsp_board_t *bsp_board)
     i2c_master_bus_handle_t bus_handle = NULL;
     bsp_board_codec_i2c_init(bsp_board, &bus_handle);
 
+    // [PCBA 诊断] 裸 I2C 回读 ES8311 chip ID 寄存器，判断 I2C 通信是否真实可靠
+    // R0xFD 出厂值 = 0x83 (CHIP_ID1)；R0xFE 出厂值 = 0x11 (CHIP_ID2)
+    // 若读回值正确 → I2C 干净，问题在模拟侧（MCLK/AVDD/VMID/MIC 焊接）
+    // 若读失败或值错误 → I2C 工艺问题（R17/R18 上拉、SDA/SCL 焊点），需补焊或换电阻
+    {
+        i2c_device_config_t probe_cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = ES8311_CODEC_DEFAULT_ADDR >> 1, // codec_dev 用的是 8-bit 形式
+            .scl_speed_hz = 100000,
+        };
+        i2c_master_dev_handle_t probe_dev = NULL;
+        if (i2c_master_bus_add_device(bus_handle, &probe_cfg, &probe_dev) == ESP_OK)
+        {
+            uint8_t reg_id1 = 0xFD, reg_id2 = 0xFE, reg_ver = 0xFF;
+            uint8_t v_id1 = 0xAA, v_id2 = 0xAA, v_ver = 0xAA;
+            esp_err_t r1 = i2c_master_transmit_receive(probe_dev, &reg_id1, 1, &v_id1, 1, 50);
+            esp_err_t r2 = i2c_master_transmit_receive(probe_dev, &reg_id2, 1, &v_id2, 1, 50);
+            esp_err_t r3 = i2c_master_transmit_receive(probe_dev, &reg_ver, 1, &v_ver, 1, 50);
+            ESP_LOGW(TAG, "[I2C诊断] ES8311 chip_id R0xFD=0x%02X(应=0x83) R0xFE=0x%02X(应=0x11) R0xFF=0x%02X | err=%d/%d/%d",
+                     v_id1, v_id2, v_ver, r1, r2, r3);
+            if (v_id1 == 0x83 && v_id2 == 0x11)
+            {
+                ESP_LOGI(TAG, "[I2C诊断] ✓ I2C 通信正确 → 问题在模拟侧，去测 MCLK/AVDD/VMID");
+            }
+            else
+            {
+                ESP_LOGE(TAG, "[I2C诊断] ✗ I2C 数据不正确 → 检查 R17/R18 上拉电阻和 SDA/SCL 焊点");
+            }
+            i2c_master_bus_rm_device(probe_dev);
+        }
+        else
+        {
+            ESP_LOGE(TAG, "[I2C诊断] 添加探测设备失败，I2C 总线异常");
+        }
+    }
+
     // 将 I2C 总线句柄封装为 Codec 控制接口（统一抽象层）
-    // ES8311_CODEC_DEFAULT_ADDR = 0x18（ES8311 固定 I2C 地址，ADDR 引脚接地）
+    // ES8311_CODEC_DEFAULT_ADDR = 0x18（ES8311 固定 I2C 地址，ADDR 引脚接地）8-bit 左移形式 0x30
+    // 而 ESP-IDF 新版 i2c_master 接口需要 7-bit 形式 0x18
+
     audio_codec_i2c_cfg_t i2c_cfg = {
         .bus_handle = bus_handle,
         .addr = ES8311_CODEC_DEFAULT_ADDR, // ES8311 I2C 设备地址 0x18
@@ -253,6 +292,14 @@ void audio_feed_task(void *arg)
     ESP_LOGI(TAG, "音频采集任务启动 (AFE feed chunk=%d samples, %d bytes)",
              (int)chunk_size, (int)(chunk_size * sizeof(int16_t)));
 
+    // [PCBA 诊断] 每 ~3s 统计一次 PCM 峰值/RMS，用于判断麦克风信号是否正常
+    // peak<100/rms<30 → 信号几乎没进来（硬件层）；peak 200~1000 → 增益不足；peak>5000 → 信号 OK，问题在 AFE
+    uint32_t diag_iter = 0;
+    int32_t diag_peak = 0;
+    uint64_t diag_sumsq = 0;
+    uint32_t diag_samples = 0;
+    const uint32_t DIAG_PRINT_EVERY = 16000 / 512 * 3; // 约 3 秒
+
     // ── 步骤 3：主采集循环（永不退出）───────────────────────────────────────
     while (1)
     {
@@ -267,6 +314,27 @@ void audio_feed_task(void *arg)
 
         if (ret == ESP_OK)
         {
+            // [PCBA 诊断] 累计本帧的峰值和平方和
+            for (size_t i = 0; i < chunk_size; ++i)
+            {
+                int32_t v = buffer[i];
+                int32_t av = v < 0 ? -v : v;
+                if (av > diag_peak)
+                    diag_peak = av;
+                diag_sumsq += (uint64_t)(v * v);
+            }
+            diag_samples += chunk_size;
+            if (++diag_iter >= DIAG_PRINT_EVERY)
+            {
+                uint32_t rms = diag_samples ? (uint32_t)sqrt((double)diag_sumsq / diag_samples) : 0;
+                ESP_LOGI(TAG, "[PCM诊断] peak=%ld rms=%lu samples=%lu (说话时 peak应>2000 rms应>300)",
+                         (long)diag_peak, (unsigned long)rms, (unsigned long)diag_samples);
+                diag_iter = 0;
+                diag_peak = 0;
+                diag_sumsq = 0;
+                diag_samples = 0;
+            }
+
             // 将原始 PCM 投喂给 AFE + MultiNet 引擎
             // 内部流程：AFE.feed() → AFE.fetch()（降噪）→ PCM钩子 + MultiNet检测
             custom_wake_word_feed(buffer, chunk_size);
