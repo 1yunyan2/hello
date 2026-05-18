@@ -14,5 +14,5 @@
     "--compile-commands-dir=d:\\new\\Echopals\\Echo\\build"
   ],
   "idf.flashType": "UART",
-  "idf.portWin": "COM7"
+  "idf.portWin": "COM10"
 }

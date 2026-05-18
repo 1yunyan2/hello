@@ -137,6 +137,17 @@ void bsp_board_nvs_init(bsp_board_t *bsp_board);
 void bsp_board_wifi_main(bsp_board_t *bsp_board);
 
 /**
+ * @brief 清除 NVS 中存储的 WiFi 凭证和认证 Token，并软件重启
+ *
+ * 用于解绑设备：擦除 ws_token / access_token 和 WiFi 配网凭证，
+ * 重启后设备重新进入 BLE 配网模式。重启前会通过 MQTT 发送重置通知。
+ *
+ * @note 调用者：button_monitor_task()（长按触发）或 MQTT command 消息解绑指令
+ * @note 此函数调用 esp_restart()，不会返回
+ */
+void clear_wifi_and_restart(void);
+
+/**
  * @brief 初始化 ES8311 音频编解码器硬件（I2C + I2S + Codec 驱动）
  *
  * 内部步骤：

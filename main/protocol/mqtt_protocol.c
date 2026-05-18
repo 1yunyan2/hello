@@ -15,6 +15,7 @@
  *   async_update_wakeword_task → wake_word_update()（唤醒词引擎）
  */
 #include "mqtt_protocol.h"
+#include "bsp/bsp_board.h"
 #include "auth.h"
 #include "object.h"
 #include "esp_heap_caps.h"
@@ -122,6 +123,21 @@ typedef struct
     char display[64]; ///< 显示文字（如 "云炎"、"start Echo"），用于自动检测语言
     char pinyin[64];  ///< 命令词（中文拼音 "yun yan" 或英文单词 "start echo"）
 } ww_update_params_t;
+
+/**
+ * @brief 异步执行设备解绑的后台任务
+ *
+ * 从 MQTT 事件回调中独立出来，避免在回调栈上执行 NVS 写 + MQTT publish + esp_restart。
+ * 延迟 500ms 确保 MQTT 回调已正常返回后再执行解绑流程。
+ */
+static void async_unbind_task(void *pvParameters)
+{
+    // 等待 MQTT 回调返回，再执行 NVS 写和 MQTT publish，避免回调栈上的死锁风险
+    vTaskDelay(pdMS_TO_TICKS(500));
+    ESP_LOGW(MQTT_TAG, "执行云端解绑：清除凭证并重启...");
+    clear_wifi_and_restart(); // 内部调用 esp_restart()，不会返回
+    vTaskDelete(NULL);        // 不会执行到此处
+}
 
 // 独立处理唤醒词更新的后台任务
 /**
@@ -306,6 +322,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
         esp_mqtt_client_subscribe(client, topic, 0);
         ESP_LOGI(MQTT_TAG, "正在监听此主题: %s", topic);
+
+        // 订阅设备指令主题（云端解绑等控制命令）
+        snprintf(topic, sizeof(topic), "echopal/device/%s/command", dev_id);
+        esp_mqtt_client_subscribe(client, topic, 0);
+        ESP_LOGI(MQTT_TAG, "正在监听此主题: %s", topic);
         break;
     }
 
@@ -389,6 +410,42 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                             }
                         }
                     }
+                }
+                cJSON_Delete(root);
+            }
+        }
+        else if (event->topic_len > 0 && strstr(event->topic, "command") != NULL)
+        {
+            ESP_LOGI(MQTT_TAG, "拦截到设备指令！");
+
+            char *json_data = calloc(1, event->data_len + 1);
+            if (!json_data)
+            {
+                ESP_LOGE(MQTT_TAG, "内存不足，无法分配 command JSON 缓冲区");
+                break;
+            }
+            memcpy(json_data, event->data, event->data_len);
+
+            cJSON *root = cJSON_Parse(json_data);
+            free(json_data);
+            if (root)
+            {
+                cJSON *type_item = cJSON_GetObjectItem(root, "type");
+                if (cJSON_IsString(type_item) && strcmp(type_item->valuestring, "unbind") == 0)
+                {
+                    ESP_LOGW(MQTT_TAG, "收到云端解绑指令，启动异步解绑任务...");
+                    // ★ 必须用异步任务：clear_wifi_and_restart() 内部做 MQTT publish + NVS 写 + esp_restart，
+                    //   不能在 MQTT 事件回调中直接执行，否则会与 MQTT 内部锁死锁
+                    BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(
+                        async_unbind_task, "async_unbind",
+                        3072, NULL, 5, NULL,
+                        tskNO_AFFINITY, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                    if (ret != pdPASS)
+                        ESP_LOGE(MQTT_TAG, "内存不足，无法创建解绑任务！");
+                }
+                else
+                {
+                    ESP_LOGW(MQTT_TAG, "未知指令类型: %s", cJSON_IsString(type_item) ? type_item->valuestring : "null");
                 }
                 cJSON_Delete(root);
             }
