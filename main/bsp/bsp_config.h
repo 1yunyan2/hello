@@ -122,8 +122,8 @@
 #define BSP_CODEC_MCLK_PIN 8  // 8         I2S 主时钟（MCLK），提供给 ES8311 作为参考时钟源
 #define BSP_CODEC_BCLK_PIN 46 // 46        I2S 位时钟（BCLK），每个采样位产生一个时钟沿
 #define BSP_CODEC_WS_PIN 7    // 7         I2S 帧同步（WS / LRCK），区分左右声道，单声道时也必须保留
-#define BSP_CODEC_DIN_PIN 15  // 15        I2S 数据输入（DIN）：麦克风采集数据流向 ESP32
-#define BSP_CODEC_DOUT_PIN 6  // 6         I2S 数据输出（DOUT）：ESP32 播放数据流向 ES8311 → 扬声器
+#define BSP_CODEC_DIN_PIN 6   // 15        I2S 数据输入（DIN）：麦克风采集数据流向 ESP32
+#define BSP_CODEC_DOUT_PIN 15 // 6         I2S 数据输出（DOUT）：ESP32 播放数据流向 ES8311 → 扬声器
 
 // ─── 2. 音频采样参数 ─────────────────────────────────────────────────────────
 // 这些参数必须与 AFE（音频前端）和 OPUS 编解码器的配置保持一致

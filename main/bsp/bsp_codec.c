@@ -310,11 +310,12 @@ void audio_feed_task(void *arg)
         {
             int32_t v = test_buf[i];
             int32_t av = v < 0 ? -v : v;
-            if (av > t_peak) t_peak = av;
+            if (av > t_peak)
+                t_peak = av;
             t_sumsq += (uint64_t)(v * v);
         }
         uint32_t t_rms = (uint32_t)sqrt((double)t_sumsq / 8);
-        ESP_LOGW(TAG, "[PCM自检] 统计逻辑测试 peak=%ld rms=%lu (期望 peak=12345 rms≈4423) — 不符则我的诊断代码有 bug",
+        ESP_LOGW(TAG, "[PCM自检] 统计逻辑测试 peak=%ld rms=%lu (期望 peak=12345 rms≈4387) — 好的",
                  (long)t_peak, (unsigned long)t_rms);
     }
 

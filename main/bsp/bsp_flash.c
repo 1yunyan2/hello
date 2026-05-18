@@ -163,8 +163,13 @@ void bsp_flash_init(void)
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
     };
-    ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &bus_config, SPI_DMA_CH_AUTO));
-
+    // ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &bus_config, SPI_DMA_CH_AUTO));
+    esp_err_t ret = spi_bus_initialize(SPI3_HOST, &bus_config, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "SPI 总线初始化失败，跳过外挂 flash (ret=%d)", ret);
+        return;
+    }
     const esp_flash_spi_device_config_t device_config = {
         .host_id = SPI3_HOST,
         .cs_id = 0,
@@ -172,9 +177,21 @@ void bsp_flash_init(void)
         .io_mode = SPI_FLASH_SLOWRD,
         .freq_mhz = 20,
     };
-    ESP_ERROR_CHECK(spi_bus_add_flash_device(&ext_flash, &device_config));
-    ESP_ERROR_CHECK(esp_flash_init(ext_flash));
-
+    // ESP_ERROR_CHECK(spi_bus_add_flash_device(&ext_flash, &device_config));
+    // ESP_ERROR_CHECK(esp_flash_init(ext_flash));
+    ret = spi_bus_add_flash_device(&ext_flash, &device_config);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "未检测到外挂 flash，跳过产线模式");
+        return;
+    }
+    ret = esp_flash_init(ext_flash);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "外挂 flash init 失败，跳过产线模式");
+        ext_flash = NULL;
+        return;
+    }
     // --- 步骤 2: 产线双模监听 (10秒) ---
     // 此阶段不安装 USJ 驱动，用默认 secondary console 读写，
     // 避免 USJ ISR 干扰后续 I2C 总线时序（BUG: ES8311 NACK）。

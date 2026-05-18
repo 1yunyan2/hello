@@ -81,6 +81,7 @@ typedef struct
     i2s_chan_handle_t i2s_tx_handle;  ///< I2S TX 通道句柄（播放专用），由 bsp_board_codec_init() 填充
                                       ///< play_task 直接调用 i2s_channel_write 绕过 codec_dev mutex，
                                       ///< 使 audio_feed_task 的 read 与播放真正并发，消除 AFE FEED 溢出
+    i2s_chan_handle_t i2s_rx_handle;  ///< [诊断用] I2S RX 通道句柄，用于绕过 codec_dev 直接读取验证
     esp_lcd_panel_io_handle_t lcd_io; ///< LCD SPI 传输接口句柄，由 bsp_board_lcd_init() 填充
     esp_lcd_panel_handle_t lcd_panel; ///< LCD ST7789 面板驱动句柄，由 bsp_board_lcd_init() 填充
     bool servo_initialized;           ///< 记录舵机是否成功初始化
