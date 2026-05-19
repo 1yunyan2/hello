@@ -39,7 +39,52 @@
 #define PRINT_INTERNAL_HEAP \
     ESP_LOGI(TAG, "[heap] internal free: %lu B", esp_get_free_internal_heap_size())
 
+// ─── CPU 占用诊断 ───────────────────────────────────────────────────────────
+// 依赖 sdkconfig：
+//   CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+//   CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
+//   CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+// 调试完毕可注释掉 application_init() 末尾的任务创建语句。
+#define CPU_STATS_PERIOD_MS 10000 // 打印周期：10 秒
+#define CPU_STATS_BUF_SIZE 2048   // ~18 任务 × 70 字节/行 富余
+
+/**
+ * @brief 周期性打印每个任务的运行时间百分比
+ *
+ * 输出格式（vTaskGetRunTimeStats）：
+ *   任务名         绝对运行时间    占总时间 %
+ *   IDLE0          xxxxx           45%      ← CPU0 空闲率，100%-此值 = CPU0 负载
+ *   IDLE1          xxxxx           30%      ← CPU1 空闲率，100%-此值 = CPU1 负载
+ *   encoder_task   xxxxx           12%
+ *   ...
+ *
+ * 注意：%CPU 是"占总 runtime 计数"的百分比；双核累计可超过 100%。
+ *       看单核负载：IDLE0/IDLE1 反向推算更直观。
+ */
+static void cpu_stats_task(void *arg)
+{
+    char *buf = (char *)heap_caps_malloc(CPU_STATS_BUF_SIZE,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buf == NULL)
+    {
+        ESP_LOGE("CPU_STATS", "诊断缓冲分配失败，任务退出");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    while (1)
+    {
+        vTaskDelay(pdMS_TO_TICKS(CPU_STATS_PERIOD_MS));
+        memset(buf, 0, CPU_STATS_BUF_SIZE);
+        vTaskGetRunTimeStats(buf);
+        // 用 printf 直输，避免 ESP_LOGI 多行截断
+        printf("\n=== CPU Runtime Stats ===\n%s===========================\n", buf);
+    }
+}
+
 #include <dirent.h>  // 必须包含这个，才能使用 DIR 和 readdir
+#include <string.h>  // memset 用于 cpu_stats_task
+#include <stdio.h>   // printf 用于 CPU 占用诊断输出
 #include "esp_log.h" // 确保能使用 ESP_LOGI 等日志宏
 // 一个函数扫描所有资源
 void scan_production_assets(const char *root_path)
@@ -249,9 +294,9 @@ void application_init(void)
     /* ── 步骤 5: WiFi（阻塞直至获取 IP 或彻底失败后重启）─────────────────── */
     bsp_board_wifi_main(bsp_board);
     PRINT_INTERNAL_HEAP;
-    // // 提醒系统初始化（含 MOCK_TIME 模式下的系统时间设置）
-    // reminder_init(NULL); // NULL = 暂无 TTS 回调，后续接入 session 层时替换
-    // PRINT_INTERNAL_HEAP;
+    // 提醒系统初始化（含 MOCK_TIME 模式下的系统时间设置）
+    reminder_init(NULL); // NULL = 暂无 TTS 回调，后续接入 session 层时替换
+    PRINT_INTERNAL_HEAP;
 
     /* ── 步骤 3: 音频硬件 + 采集任务 ──────────────────────────────────────── */
     audio_init(bsp_board);
@@ -266,50 +311,50 @@ void application_init(void)
     protocol_mqtt_start();
     PRINT_INTERNAL_HEAP;
 
-    // /* ── 步骤 8: 舵机硬件初始化（LEDC/PWM）──────────────────────────────── */
-    // bsp_board_servo_init(bsp_board);
-    // PRINT_INTERNAL_HEAP;
+    /* ── 步骤 8: 舵机硬件初始化（LEDC/PWM）──────────────────────────────── */
+    bsp_board_servo_init(bsp_board);
+    PRINT_INTERNAL_HEAP;
 
-    // /* ── 步骤 9: 舵机管理器（队列 + worker task，栈在 SPIRAM）─────────────── */
-    // esp_err_t ret = servo_manager_init();
-    // if (ret != ESP_OK)
-    // {
-    //     ESP_LOGE(TAG, "servo_manager_init 失败: %s", esp_err_to_name(ret));
-    // }
-    // PRINT_INTERNAL_HEAP;
+    /* ── 步骤 9: 舵机管理器（队列 + worker task，栈在 SPIRAM）─────────────── */
+    esp_err_t ret = servo_manager_init();
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "servo_manager_init 失败: %s", esp_err_to_name(ret));
+    }
+    PRINT_INTERNAL_HEAP;
 
-    // bsp_board_lcd_init(bsp_board); // LCD 初始化（当前未自动置位 LCD_BIT，后续可根据需求调整）
-    // PRINT_INTERNAL_HEAP;
-    // ui_init();
-    // vTaskDelay(pdMS_TO_TICKS(100));
-    // PRINT_INTERNAL_HEAP;
-    // bsp_board_lcd_on(bsp_board);
-    // /* ── 步骤 10: 情绪交互管理器（情绪矩阵 + worker task，栈在 SPIRAM）────── */
-    // ret = interaction_manager_init();
-    // if (ret != ESP_OK)
-    // {
-    //     ESP_LOGE(TAG, "interaction_manager_init 失败: %s", esp_err_to_name(ret));
-    // }
-    // PRINT_INTERNAL_HEAP;
-    // // 6. 创建触摸扫描任务（栈分配在PSRAM，节省内部SRAM）
-    // ret = xTaskCreatePinnedToCoreWithCaps(
-    //     touch_scan_task,
-    //     "touch_scan",
-    //     8192,
-    //     NULL,
-    //     4, // 优先级略低于舵机和音频
-    //     NULL,
-    //     tskNO_AFFINITY,
-    //     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    bsp_board_lcd_init(bsp_board); // LCD 初始化（当前未自动置位 LCD_BIT，后续可根据需求调整）
+    PRINT_INTERNAL_HEAP;
+    ui_init();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    PRINT_INTERNAL_HEAP;
+    bsp_board_lcd_on(bsp_board);
+    /* ── 步骤 10: 情绪交互管理器（情绪矩阵 + worker task，栈在 SPIRAM）────── */
+    ret = interaction_manager_init();
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "interaction_manager_init 失败: %s", esp_err_to_name(ret));
+    }
+    PRINT_INTERNAL_HEAP;
+    // 6. 创建触摸扫描任务（栈分配在PSRAM，节省内部SRAM）
+    ret = xTaskCreatePinnedToCoreWithCaps(
+        touch_scan_task,
+        "touch_scan",
+        8192,
+        NULL,
+        4, // 优先级略低于舵机和音频
+        NULL,
+        tskNO_AFFINITY,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
-    // if (ret != pdPASS)
-    // {
-    //     ESP_LOGE(TAG, "创建触摸扫描任务失败！");
-    // }
-    // else
-    // {
-    //     ESP_LOGI(TAG, "触摸扫描任务创建完成");
-    // }
+    if (ret != pdPASS)
+    {
+        ESP_LOGE(TAG, "创建触摸扫描任务失败！");
+    }
+    else
+    {
+        ESP_LOGI(TAG, "触摸扫描任务创建完成");
+    }
 
     // // 舵机测试任务（独立跑，不影响 LVGL 刷新）
     // xTaskCreatePinnedToCoreWithCaps(
@@ -328,6 +373,19 @@ void application_init(void)
     // session_init(" ws://122.224.191.2:4888/ws/voice");
 
     PRINT_INTERNAL_HEAP;
+
+    /* ── 步骤 8: CPU 占用诊断任务（调试用，可注释掉）─────────────────────── */
+    // 低优先级、tskNO_AFFINITY、栈在 SPIRAM，对业务无干扰
+    // xTaskCreatePinnedToCoreWithCaps(
+    //     cpu_stats_task,
+    //     "cpu_stats",
+    //     4096,
+    //     NULL,
+    //     1,                  // 最低优先级（仅次于 IDLE）
+    //     NULL,
+    //     tskNO_AFFINITY,
+    //     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    // ESP_LOGI(TAG, "CPU 占用诊断任务已启动，每 10 秒打印一次");
 
     ESP_LOGI(TAG, "application_init 完成，系统就绪");
 }

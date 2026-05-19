@@ -156,6 +156,19 @@ void audio_processor_write(audio_processor_t *audio_processor, void *buffer, siz
 void audio_processor_flush_output(audio_processor_t *audio_processor);
 
 /**
+ * @brief 清空编码器输入和输出缓冲区（上行链路，打断场景使用）
+ *
+ * 非阻塞快速清空 enc_input（未编码的 PCM）和 enc_output（已编码未发送的 OPUS）。
+ * 用于唤醒词打断时清理旧会话残留，防止新一轮 ASR 头部混入上一轮尾音。
+ *
+ * @param audio_processor 音频处理器实例指针
+ * @return void
+ *
+ * @note 调用者：session.c → session_on_wake_word()（打断 TTS 时调用）
+ */
+void audio_processor_flush_input(audio_processor_t *audio_processor);
+
+/**
  * @brief 带超时的 OPUS 数据读取（供发送任务使用，避免永久阻塞）
  *
  * 类似 audio_processor_read，但超过 timeout_ms 后返回 0 而不是无限等待。

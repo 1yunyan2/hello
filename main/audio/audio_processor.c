@@ -97,7 +97,9 @@ static void audio_processor_play_task(void *arg)
         return;
     }
 
-    static const uint8_t silence_buf[1024] = {0};
+    // 静音包 640 B = 20ms @16kHz 16-bit 单声道，与下面 I2S write 20ms 超时对齐：
+    // 每次灌静音消耗的"音频时长"恰好 = write 等待 DMA 释放的最大时长，DMA 抖动最小。
+    static const uint8_t silence_buf[640] = {0};
 
     // 🟢 智能预缓冲状态机变量
     bool prebuffering = true;
@@ -106,6 +108,12 @@ static void audio_processor_play_task(void *arg)
     // 过滤解码器两帧之间的瞬间间隙（约 20ms），避免误触发"滴滴"电音。
     int underrun_count = 0;
 #define UNDERRUN_THRESHOLD 3 // 连续 3 次 × 20ms = 60ms 真空才重置
+
+    // active_playback：当前轮次是否正在（或曾经）播放 TTS。
+    // 读到真实 PCM 时置 true；预缓冲以超时（无数据）退出时重置为 false。
+    // 效果：TTS 结束后 LISTENING 期的 660ms 噪音告警被抑制；
+    //       下一轮 TTS 真正开始时重新激活告警。
+    bool active_playback = false;
 
     while (audio_processor->is_running)
     {
@@ -119,22 +127,44 @@ static void audio_processor_play_task(void *arg)
             // 计算从开始蓄水到现在过了多久
             uint32_t wait_ms = (xTaskGetTickCount() - buffer_start_tick) * portTICK_PERIOD_MS;
 
-            // 🚀 核心调优区：智能开闸条件
-            // 攒够 16384 字节（约 0.5 秒） OR 已经干等了 600ms（防大模型说短句导致死锁）
-            if (bytes_waiting >= 16384 || wait_ms >= 600)
+            // 🚀 核心调优区：三分支开闸 / 蓄水 / 空窗期
+            // 关键设计：开闸的唯一充分条件是 bytes_waiting > 0；
+            //   wait_ms 仅用作"已在预缓冲状态待了多久"，不再用作"新 TTS 触发器"。
+            //   这样 TTS 自然结束后即使 buffer_start_tick 是旧值，也不会误开闸进入
+            //   阶段 2 → underrun 高频循环（曾导致 CPU0 拥堵 + MultiNet buffer overflow）。
+            if (bytes_waiting >= 16384)
             {
-                prebuffering = false; // 开闸放水！
-                underrun_count = 0;   // 重置欠载计数
-                if (bytes_waiting > 0)
-                {
-                    ESP_LOGI(TAG, "TTS 预缓冲完成 (数据:%d B, 耗时:%d ms)，开始流畅播放", bytes_waiting, (int)wait_ms);
-                }
+                // ① 攒够水（≈0.5s）→ 开闸正常播放
+                prebuffering = false;
+                underrun_count = 0;
+                active_playback = true;
+                ESP_LOGI(TAG, "TTS 预缓冲完成 (数据:%d B, 耗时:%d ms)，开始流畅播放",
+                         bytes_waiting, (int)wait_ms);
+            }
+            else if (wait_ms >= 600 && bytes_waiting > 0)
+            {
+                // ② 超时但已有少量数据（大模型短句）→ 开闸，避免死锁
+                prebuffering = false;
+                underrun_count = 0;
+                active_playback = true;
+                ESP_LOGI(TAG, "TTS 预缓冲短句开闸 (数据:%d B, 耗时:%d ms)",
+                         bytes_waiting, (int)wait_ms);
             }
             else
             {
-                // 还没攒够水，继续喂入静音包，维持 I2S 时钟稳定，并让喇叭"等一等"
+                // ③ 蓄水中 或 空窗期（wait_ms>=600 且 bytes_waiting==0）
+                //    都保持 prebuffering，持续灌静音维持 I2S 时钟稳定。
+                //    新 TTS 数据一到，下一轮就走 ① 或 ② 开闸。
                 size_t silence_written = 0;
-                i2s_channel_write(board->i2s_tx_handle, silence_buf, sizeof(silence_buf), &silence_written, pdMS_TO_TICKS(20));
+                i2s_channel_write(board->i2s_tx_handle, silence_buf, sizeof(silence_buf),
+                                  &silence_written, pdMS_TO_TICKS(20));
+                // 空窗期降频让出 CPU0：
+                //   - 蓄水期（wait_ms < 600）：delay 10ms，与原行为一致，确保 IDLE0 喂狗
+                //   - 空窗期（wait_ms >= 600 且无数据）：delay 30ms，给 MultiNet 让出
+                //     CPU 时间片，避免 play_task 高频自转挤占唤醒词推理。
+                vTaskDelay(pdMS_TO_TICKS((wait_ms >= 600 && bytes_waiting == 0) ? 30 : 10));
+                // ⚠️ 不重置 buffer_start_tick：wait_ms 持续累计无害，
+                //    开闸只看 bytes_waiting，永远不会因旧 tick 误触发。
                 continue;
             }
         }
@@ -145,7 +175,8 @@ static void audio_processor_play_task(void *arg)
 
         if (buf)
         {
-            underrun_count = 0; // 读到数据，清零欠载计数
+            underrun_count = 0;      // 读到数据，清零欠载计数
+            active_playback = true;  // 正在播放真实 TTS，激活欠载告警
             size_t bytes_written = 0;
             // 【看门狗修复】portMAX_DELAY → 200ms：
             // I2S DMA buffer 若短暂满载，portMAX_DELAY 会让 play_task 永久阻塞，
@@ -174,7 +205,11 @@ static void audio_processor_play_task(void *arg)
                 underrun_count = 0;
                 prebuffering = true;
                 buffer_start_tick = xTaskGetTickCount(); // 重置计时器，重新开始蓄水
-                ESP_LOGW(TAG, "dec_output 持续欠载 %d ms，重新进入预缓冲", UNDERRUN_THRESHOLD * 20);
+                // 仅在当前轮次 TTS 真正播过数据后才告警。
+                // active_playback 在预缓冲超时无数据退出时已置 false，
+                // 所以 TTS 结束后的 LISTENING 噪音循环不会再打印。
+                if (active_playback)
+                    ESP_LOGW(TAG, "dec_output 持续欠载 %d ms，重新进入预缓冲", UNDERRUN_THRESHOLD * 20);
             }
             // 欠载期间持续喂静音包，维持 I2S 时钟稳定
             size_t silence_written = 0;
@@ -392,9 +427,38 @@ void audio_processor_write_pcm(audio_processor_t *audio_processor, void *buffer,
     // 旧 50ms 会在 enc_input 满时阻塞 afe_fetch_task 整整一帧半，
     // 导致 AFE FEED ringbuffer 溢出（fetch 跟不上 feed 速率）。
     // 丢几帧上行 PCM 只影响 ASR 质量，远好于卡死整条 AFE 链路。
+
+    // ── 预警：enc_input 接近满（>75%）说明 encoder 跟不上 ─────────────
+    // 限频 500ms：避免每帧 PCM 都打印，调试期足以定位触发场景（UI 渲染脉冲、长会话等）
+    static TickType_t s_high_warn_tick = 0;
+    size_t pending = 0;
+    vRingbufferGetInfo(audio_processor->enc_input, NULL, NULL, NULL, NULL, &pending);
+    if (pending > ENC_INPUT_BUF_SIZE * 3 / 4)
+    {
+        TickType_t now = xTaskGetTickCount();
+        if ((uint32_t)((now - s_high_warn_tick) * portTICK_PERIOD_MS) >= 500)
+        {
+            ESP_LOGW(TAG, "enc_input 积压预警：%u/%u B (%u%%)，encoder 即将跟不上",
+                     (unsigned)pending, (unsigned)ENC_INPUT_BUF_SIZE,
+                     (unsigned)(100UL * pending / ENC_INPUT_BUF_SIZE));
+            s_high_warn_tick = now;
+        }
+    }
+
     if (xRingbufferSend(audio_processor->enc_input, buffer, size, 0) != pdTRUE)
     {
-        ESP_LOGW(TAG, "enc_input 满，丢弃 PCM 帧 (%d bytes)", (int)size);
+        // 限频 + 累计计数：满载时通常连续丢几十帧，逐帧打印会刷屏并加剧 CPU 拥堵
+        static TickType_t s_drop_tick = 0;
+        static uint32_t s_drop_count = 0;
+        s_drop_count++;
+        TickType_t now = xTaskGetTickCount();
+        if ((uint32_t)((now - s_drop_tick) * portTICK_PERIOD_MS) >= 500)
+        {
+            ESP_LOGE(TAG, "enc_input 满，最近 500ms 累计丢弃 %lu 帧 PCM（每帧 %d B）",
+                     (unsigned long)s_drop_count, (int)size);
+            s_drop_count = 0;
+            s_drop_tick = now;
+        }
     }
 }
 
@@ -441,6 +505,39 @@ void audio_processor_flush_output(audio_processor_t *audio_processor)
     /* 清空解码器输出（已解码但未播放的 PCM 数据） */
     while ((buf = xRingbufferReceive(audio_processor->dec_output, &size, 0)) != NULL)
         vRingbufferReturnItem(audio_processor->dec_output, buf);
+}
+
+/**
+ * @brief 清空编码器输入和输出缓冲区（上行链路）
+ *
+ * 用于唤醒词打断场景：避免旧会话尚未发出的 PCM/OPUS 残留帧，
+ * 在新 started 到来后被 ws_sender_task 当作新一轮的开头音频上传，
+ * 污染新轮 ASR 识别结果。
+ *
+ * enc_input：BYTEBUF（PCM 字节流） → ReceiveUpTo 一次拉空
+ * enc_output：NOSPLIT（OPUS 帧）   → Receive 循环逐帧释放
+ */
+void audio_processor_flush_input(audio_processor_t *audio_processor)
+{
+    if (audio_processor == NULL)
+        return;
+
+    size_t size;
+    void *buf;
+
+    /* 清空编码器输入（BYTEBUF：尚未编码的 PCM 字节流）*/
+    if (audio_processor->enc_input != NULL)
+    {
+        while ((buf = xRingbufferReceiveUpTo(audio_processor->enc_input, &size, 0, SIZE_MAX)) != NULL)
+            vRingbufferReturnItem(audio_processor->enc_input, buf);
+    }
+
+    /* 清空编码器输出（NOSPLIT：已编码但尚未发送的 OPUS 帧）*/
+    if (audio_processor->enc_output != NULL)
+    {
+        while ((buf = xRingbufferReceive(audio_processor->enc_output, &size, 0)) != NULL)
+            vRingbufferReturnItem(audio_processor->enc_output, buf);
+    }
 }
 
 /**

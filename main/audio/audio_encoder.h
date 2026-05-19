@@ -14,11 +14,11 @@
  *   采样率  : 16000 Hz
  *   比特率  : 24 kbps（VoIP 场景优化）
  *   帧时长  : 20 ms（每帧 320 采样点 = 640 字节 PCM）
- *   复杂度  : 3（最低，节省 ESP32 CPU 资源）
+ *   复杂度  : 0（最低，避开 SILK delayed-decision NSQ 路径，CPU 负载更平稳）
  *   模式    : OPUS_APPLICATION_VOIP（针对语音优化）
  *   FEC/DTX/VBR : 全部禁用（保证延迟稳定性）
  *
- * @note 编码器任务绑定 CPU0，栈分配在 SPIRAM（节省内部 SRAM）
+ * @note 编码器任务绑定 CPU1（与 audio_feed_task 同核），栈分配在 SPIRAM（节省内部 SRAM）
  */
 
 #include "freertos/FreeRTOS.h"
@@ -34,7 +34,8 @@
  *   - input_buffer  : RingbufHandle_t（BYTEBUF，PCM 输入）
  *   - output_buffer : RingbufHandle_t（NOSPLIT，OPUS 输出）
  *   - enc            : esp_audio_enc_handle_t（OPUS 编码器句柄）
- *   - is_running     : bool（任务运行标志）
+ *   - is_running     : volatile bool（任务运行标志，跨任务可见）
+ *   - in_buf/out_buf : 帧缓冲（16 字节对齐 SPIRAM，在 start 中分配 stop 中释放）
  */
 typedef struct audio_encoder audio_encoder_t;
 
@@ -94,7 +95,7 @@ void audio_encoder_set_buffer(audio_encoder_t *audio_encoder,
  *
  * 任务配置：
  *   - 名称：encoder_task
- *   - CPU 核心：0（与解码器和播放任务同核，减少核间通信开销）
+ *   - CPU 核心：1（与 audio_feed_task 同核，编码与采集共核靠让步调度）
  *   - 栈大小：32KB（SPIRAM 分配，OPUS 运算需要较大栈空间）
  *   - 优先级：5
  *
