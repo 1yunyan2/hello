@@ -366,18 +366,16 @@ static esp_err_t app_lvgl_init(void)
         //   W*H/7 = 20480 字节：分到但 WebSocket 等模块缺内存创建失败，8kSRAM 余量太小不稳已经带有拖影了
         //   W*H/8 = 19200 字节：分到且留 ~11KB 给其他模块（稳态） ，已经带有拖影了
         //   W*H/16 = 9600 字节：余量更大但 GIF 帧率会更慢
-        // ★ 临时测试：用 PSRAM 全屏 buffer，强制单次 flush，验证撕裂是否由 PARTIAL 多次 flush 引起
-        //   若撕裂消失 → 根因确认是多次 flush 问题，再想办法在内部 SRAM 内解决
-        //   若撕裂依然 → 根因另有其他，排查方向转移
-        .buffer_size = BSP_LCD_WIDTH * BSP_LCD_HEIGHT, // 全屏 150KB
+        // PSRAM 全屏 buffer 导致 SPI DMA 无法访问 PSRAM 指针 → tx_color failed
+        // 稳态：W*H/8 = 19200 字节，内部 SRAM + DMA，PARTIAL 模式分 8 次 flush
+        .buffer_size = BSP_LCD_WIDTH * BSP_LCD_HEIGHT / 5, // 30720 字节：理论上可分配但实测不稳，但是已经是极限了
         .double_buffer = false,
         .hres = BSP_LCD_WIDTH,
         .vres = BSP_LCD_HEIGHT,
         .monochrome = false,
         .color_format = LV_COLOR_FORMAT_RGB565,
         .rotation = {.swap_xy = true, .mirror_x = false, .mirror_y = true},
-        // 临时用 PSRAM（全屏 buffer 内部 SRAM 装不下）
-        .flags = {.buff_dma = false, .swap_bytes = false, .buff_spiram = true}};
+        .flags = {.buff_dma = true, .swap_bytes = false, .buff_spiram = false}};
 
     lvgl_disp = lvgl_port_add_disp(&disp_cfg);
     if (lvgl_disp == NULL)

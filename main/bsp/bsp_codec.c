@@ -292,32 +292,32 @@ void audio_feed_task(void *arg)
     ESP_LOGI(TAG, "音频采集任务启动 (AFE feed chunk=%d samples, %d bytes)",
              (int)chunk_size, (int)(chunk_size * sizeof(int16_t)));
 
-    // [PCBA 诊断] 每 ~3s 统计一次 PCM 峰值/RMS，用于判断麦克风信号是否正常
-    // peak<100/rms<30 → 信号几乎没进来（硬件层）；peak 200~1000 → 增益不足；peak>5000 → 信号 OK，问题在 AFE
-    uint32_t diag_iter = 0;
-    int32_t diag_peak = 0;
-    uint64_t diag_sumsq = 0;
-    uint32_t diag_samples = 0;
-    const uint32_t DIAG_PRINT_EVERY = 16000 / 512 * 3; // 约 3 秒
+    // // [PCBA 诊断] 每 ~3s 统计一次 PCM 峰值/RMS，用于判断麦克风信号是否正常
+    // // peak<100/rms<30 → 信号几乎没进来（硬件层）；peak 200~1000 → 增益不足；peak>5000 → 信号 OK，问题在 AFE
+    // uint32_t diag_iter = 0;
+    // int32_t diag_peak = 0;
+    // uint64_t diag_sumsq = 0;
+    // uint32_t diag_samples = 0;
+    // const uint32_t DIAG_PRINT_EVERY = 16000 / 512 * 3; // 约 3 秒
 
-    // [PCBA 诊断·自检] 启动时人为塞已知值，验证统计代码本身没问题
-    // 期望输出 peak=12345 rms≈8731（√((12345²+1000²+...)/8)的近似）
-    {
-        int16_t test_buf[8] = {12345, -1000, 500, -500, 200, -200, 0, 0};
-        int32_t t_peak = 0;
-        uint64_t t_sumsq = 0;
-        for (int i = 0; i < 8; ++i)
-        {
-            int32_t v = test_buf[i];
-            int32_t av = v < 0 ? -v : v;
-            if (av > t_peak)
-                t_peak = av;
-            t_sumsq += (uint64_t)(v * v);
-        }
-        uint32_t t_rms = (uint32_t)sqrt((double)t_sumsq / 8);
-        ESP_LOGW(TAG, "[PCM自检] 统计逻辑测试 peak=%ld rms=%lu (期望 peak=12345 rms≈4387) — 好的",
-                 (long)t_peak, (unsigned long)t_rms);
-    }
+    // // [PCBA 诊断·自检] 启动时人为塞已知值，验证统计代码本身没问题
+    // // 期望输出 peak=12345 rms≈8731（√((12345²+1000²+...)/8)的近似）
+    // {
+    //     int16_t test_buf[8] = {12345, -1000, 500, -500, 200, -200, 0, 0};
+    //     int32_t t_peak = 0;
+    //     uint64_t t_sumsq = 0;
+    //     for (int i = 0; i < 8; ++i)
+    //     {
+    //         int32_t v = test_buf[i];
+    //         int32_t av = v < 0 ? -v : v;
+    //         if (av > t_peak)
+    //             t_peak = av;
+    //         t_sumsq += (uint64_t)(v * v);
+    //     }
+    //     uint32_t t_rms = (uint32_t)sqrt((double)t_sumsq / 8);
+    //     ESP_LOGW(TAG, "[PCM自检] 统计逻辑测试 peak=%ld rms=%lu (期望 peak=12345 rms≈4387) — 好的",
+    //              (long)t_peak, (unsigned long)t_rms);
+    // }
 
     // ── 步骤 3：主采集循环（永不退出）───────────────────────────────────────
     while (1)
@@ -333,29 +333,29 @@ void audio_feed_task(void *arg)
 
         if (ret == ESP_OK)
         {
-            // [PCBA 诊断] 累计本帧的峰值和平方和
-            for (size_t i = 0; i < chunk_size; ++i)
-            {
-                int32_t v = buffer[i];
-                int32_t av = v < 0 ? -v : v;
-                if (av > diag_peak)
-                    diag_peak = av;
-                diag_sumsq += (uint64_t)(v * v);
-            }
-            diag_samples += chunk_size;
-            if (++diag_iter >= DIAG_PRINT_EVERY)
-            {
-                uint32_t rms = diag_samples ? (uint32_t)sqrt((double)diag_sumsq / diag_samples) : 0;
-                // 同步打印 buffer 前 8 个原始采样的十六进制，证明读到的字节真是 0x00 而不是统计 bug
-                ESP_LOGI(TAG, "[PCM诊断] peak=%ld rms=%lu samples=%lu | 原始bytes[0..7]=%04X %04X %04X %04X %04X %04X %04X %04X",
-                         (long)diag_peak, (unsigned long)rms, (unsigned long)diag_samples,
-                         (uint16_t)buffer[0], (uint16_t)buffer[1], (uint16_t)buffer[2], (uint16_t)buffer[3],
-                         (uint16_t)buffer[4], (uint16_t)buffer[5], (uint16_t)buffer[6], (uint16_t)buffer[7]);
-                diag_iter = 0;
-                diag_peak = 0;
-                diag_sumsq = 0;
-                diag_samples = 0;
-            }
+            // // [PCBA 诊断] 累计本帧的峰值和平方和
+            // for (size_t i = 0; i < chunk_size; ++i)
+            // {
+            //     int32_t v = buffer[i];
+            //     int32_t av = v < 0 ? -v : v;
+            //     if (av > diag_peak)
+            //         diag_peak = av;
+            //     diag_sumsq += (uint64_t)(v * v);
+            // }
+            // diag_samples += chunk_size;
+            // if (++diag_iter >= DIAG_PRINT_EVERY)
+            // {
+            //     uint32_t rms = diag_samples ? (uint32_t)sqrt((double)diag_sumsq / diag_samples) : 0;
+            //     // 同步打印 buffer 前 8 个原始采样的十六进制，证明读到的字节真是 0x00 而不是统计 bug
+            //     ESP_LOGI(TAG, "[PCM诊断] peak=%ld rms=%lu samples=%lu | 原始bytes[0..7]=%04X %04X %04X %04X %04X %04X %04X %04X",
+            //              (long)diag_peak, (unsigned long)rms, (unsigned long)diag_samples,
+            //              (uint16_t)buffer[0], (uint16_t)buffer[1], (uint16_t)buffer[2], (uint16_t)buffer[3],
+            //              (uint16_t)buffer[4], (uint16_t)buffer[5], (uint16_t)buffer[6], (uint16_t)buffer[7]);
+            //     diag_iter = 0;
+            //     diag_peak = 0;
+            //     diag_sumsq = 0;
+            //     diag_samples = 0;
+            // }
 
             // 将原始 PCM 投喂给 AFE + MultiNet 引擎
             // 内部流程：AFE.feed() → AFE.fetch()（降噪）→ PCM钩子 + MultiNet检测

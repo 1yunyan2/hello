@@ -9,8 +9,7 @@
 static const char *TAG = "EchoPals";
 
 // ─── 模块级状态变量 ────────────────────────────────────────────────────────────
-/// @brief 配网管理器是否已初始化（防止按键在管理器就绪前触发重置导致崩溃）
-static bool s_wifi_prov_initialized = false;
+
 /// @brief 是否正处于 BLE 配网流程中（配网期间禁止断线重连，避免与配网状态机冲突）
 static bool s_is_provisioning = false;
 /// @brief 当前已重连次数（超过 MAX_RETRY_COUNT 后置位 WIFI_FAIL_BIT）
@@ -93,7 +92,6 @@ void clear_wifi_and_restart(void)
  *
  * @note 调用者：bsp_board_wifi_main() 通过 xTaskCreatePinnedToCoreWithCaps() 创建
  * @note 运行核心：CPU0，栈 4096 字节（SPIRAM 分配）
- * @note 内部保护：s_wifi_prov_initialized 为 false 时不执行重置（管理器未就绪）
  */
 static void button_monitor_task(void *pvParameters)
 {
@@ -120,9 +118,7 @@ static void button_monitor_task(void *pvParameters)
             if (press_count >= 300) // 300 × 10ms = 3 秒持续按压
             {
                 // 前置检查：确保配网管理器已初始化，避免过早调用导致崩溃
-                if (s_wifi_prov_initialized)
-                    clear_wifi_and_restart(); // 触发清除和重启（不会返回）
-                press_count = 0;              // 不可达代码，保险起见重置计数
+                clear_wifi_and_restart(); // 触发清除和重启（不会返回）
             }
         }
         else
@@ -475,9 +471,6 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
     };
     ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
 
-    // 管理器初始化完成，允许按键任务执行重置操作（防止管理器未就绪时崩溃）
-    s_wifi_prov_initialized = true;
-
     // ── 步骤 6：启动按键监控任务（GPIO0 长按 3s 触发 WiFi 重置）─────────────
     // xTaskCreatePinnedToCoreWithCaps(
     //     button_monitor_task, "btn_task",
@@ -540,7 +533,7 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
             // 配网超时（用户 120 秒内未完成配网），强制退出并重启
             ESP_LOGE(TAG, "配网超时（120 秒），强制重启设备");
             wifi_prov_mgr_deinit();
-            s_wifi_prov_initialized = false;
+
             s_is_provisioning = false;
             esp_restart();
         }
