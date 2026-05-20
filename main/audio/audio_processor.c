@@ -175,8 +175,8 @@ static void audio_processor_play_task(void *arg)
 
         if (buf)
         {
-            underrun_count = 0;      // 读到数据，清零欠载计数
-            active_playback = true;  // 正在播放真实 TTS，激活欠载告警
+            underrun_count = 0;     // 读到数据，清零欠载计数
+            active_playback = true; // 正在播放真实 TTS，激活欠载告警
             size_t bytes_written = 0;
             // 【看门狗修复】portMAX_DELAY → 200ms：
             // I2S DMA buffer 若短暂满载，portMAX_DELAY 会让 play_task 永久阻塞，

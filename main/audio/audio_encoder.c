@@ -35,16 +35,16 @@ struct audio_encoder
     volatile bool is_running;          ///< 任务运行标志：volatile 确保跨任务可见，stop() 设 false 后任务循环退出
     volatile TaskHandle_t task_handle; ///< 任务句柄，用于超时强制终止和确认退出
     // ── 帧缓冲（在 start() 中一次性分配，stop() 中统一释放，避免强杀任务时堆泄漏） ──
-    void *in_buf;                      ///< PCM 凑帧缓冲（16 字节对齐，SPIRAM）
-    void *out_buf;                     ///< OPUS 输出缓冲（16 字节对齐，SPIRAM）
-    int in_frame_size;                 ///< 每帧 PCM 字节数（编码器查询所得，固定值）
-    int out_frame_size;                ///< OPUS 输出最大字节数
+    void *in_buf;       ///< PCM 凑帧缓冲（16 字节对齐，SPIRAM）
+    void *out_buf;      ///< OPUS 输出缓冲（16 字节对齐，SPIRAM）
+    int in_frame_size;  ///< 每帧 PCM 字节数（编码器查询所得，固定值）
+    int out_frame_size; ///< OPUS 输出最大字节数
     // ── 运行时状态计数器（迁出 static 局部变量，避免 stop→start 后状态残留） ──
-    int frames_in_rush;                ///< 紧急态强制让步计数（积压时使用）
-    int accum_segments;                ///< 凑帧段计数（紧循环防饿死用）
-    int pending_check_cnt;             ///< 每 8 帧采样一次 pending 字节
-    size_t pending_bytes_cached;       ///< 上次采样的 pending 字节数（节流 vRingbufferGetInfo）
-    int drop_cnt;                      ///< enc_output 丢帧累计（每 1 秒汇总打印）
+    int frames_in_rush;          ///< 紧急态强制让步计数（积压时使用）
+    int accum_segments;          ///< 凑帧段计数（紧循环防饿死用）
+    int pending_check_cnt;       ///< 每 8 帧采样一次 pending 字节
+    size_t pending_bytes_cached; ///< 上次采样的 pending 字节数（节流 vRingbufferGetInfo）
+    int drop_cnt;                ///< enc_output 丢帧累计（每 1 秒汇总打印）
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -75,9 +75,9 @@ void audio_encoder_task(void *arg)
     // ── 帧缓冲已由 audio_encoder_start() 预分配在结构体中 ───────────────────
     // 这样即使任务被 stop() 强杀（vTaskDeleteWithCaps），缓冲也由 stop() 统一释放，避免堆泄漏。
     // OPUS 20ms 帧 @ 16kHz 单声道 16-bit = 320采样点 × 2字节 = 640 字节 PCM
-    const int frame_size_total = audio_encoder->in_frame_size;     // 一帧需要的固定字节数
-    int frame_remaining = frame_size_total;                        // 本帧剩余待读字节数（消耗变量）
-    uint8_t *write_ptr = (uint8_t *)audio_encoder->in_buf;         // 当前帧写入位置（指针算术用 uint8_t*）
+    const int frame_size_total = audio_encoder->in_frame_size; // 一帧需要的固定字节数
+    int frame_remaining = frame_size_total;                    // 本帧剩余待读字节数（消耗变量）
+    uint8_t *write_ptr = (uint8_t *)audio_encoder->in_buf;     // 当前帧写入位置（指针算术用 uint8_t*）
 
     // ── 帧描述符：传给 esp_audio_enc_process 的固定结构 ─────────────────────
     esp_audio_enc_in_frame_t in_frame = {
@@ -230,9 +230,12 @@ audio_encoder_t *audio_encoder_create(int sample_rate, int channels)
         .channel = channels,                          // 声道：1（单声道）
         // 比特率：24kbps（实测稳定；过往尝试 16kbps 提升 CPU 余量但语音质量略损，最终回到 24k）
         .bitrate = 24000,
-        .frame_duration = ESP_OPUS_ENC_FRAME_DURATION_20_MS, // 帧时长：20ms（320采样点）
-        // 复杂度：0（原 3，SILK 在 complexity≥2 启用 delayed-decision NSQ，CPU 占用翻倍；
-        // 0 改用简单 NSQ，帧内耗时更平稳，适合 CPU 紧张场景）
+        // 帧时长越长编码效率越高但延迟越大，60ms 是 20ms 的 3 倍，CPU 占用约降到 20ms 的 1/3，适合对延迟要求不苛刻的语音交互场景）
+        // 帧时长为20ms,就会一次fps=50的速率产生OPUS帧,如果网络状况不佳或者对方处理能力有限,可能会导致积压和丢帧.60ms的帧时长可以降低编码频率,减少CPU占用,同时在网络抖动时提供更好的缓冲能力,适合对延迟要求不苛刻的语音交互场景。
+        // 帧时长为60ms,每帧包含960采样点(16kHz * 0.06s),相较于20ms的320采样点,可以提供更高的编码效率和更好的语音质量,同时降低CPU占用,适合对延迟要求不苛刻的语音交互场景。
+        .frame_duration = ESP_OPUS_ENC_FRAME_DURATION_60_MS, // 帧时长：60ms（960采样点）,
+                                                             // 复杂度：0（原 3，SILK 在 complexity≥2 启用 delayed-decision NSQ，CPU 占用翻倍；
+                                                             // 0 改用简单 NSQ，帧内耗时更平稳，适合 CPU 紧张场景）
         .complexity = 0,
         .application_mode = ESP_OPUS_ENC_APPLICATION_VOIP, // 模式：VOIP（针对语音优化）
         .enable_fec = false,                               // 禁用前向纠错（WiFi 无线不需要，有线更稳定）
