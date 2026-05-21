@@ -15,7 +15,8 @@
 - [分类指令批量执行](feedback_batch_execute.md) — 说大类名自动执行所有子能力
 - [用户积极性](feedback_enthusiasm.md) — 用户愿意全面启用所有辅助能力
 - [Token预算意识](feedback_token_budget.md) — 回答前先评估token够不够，避免半途浪费
-- 踩坑日志：[BUG-001](bugs/BUG-001.md) 蓝牙释放崩溃 | [BUG-002](bugs/BUG-002.md) SPIFFS内存冲突 | [BUG-003](bugs/BUG-003.md) 任务参数顺序错 | [BUG-004](bugs/BUG-004.md) WS握手类型错 | [BUG-005](bugs/BUG-005.md) HTTP 201未兼容 | [BUG-006](bugs/BUG-006.md) MultiNet CPU占满 | [BUG-007](bugs/BUG-007.md) 唤醒尾音误触EOS | [BUG-008](bugs/BUG-008.md) 定时器栈溢出 | [BUG-013](bugs/BUG-013.md) 长TTS残留被识别为下一轮输入 | [BUG-014](bugs/BUG-014.md) 多轮SERVER_READY丢失+尾端字保护被风扇噪声玩坏
+- 踩坑日志：[BUG-001](bugs/BUG-001.md) 蓝牙释放崩溃 | [BUG-002](bugs/BUG-002.md) SPIFFS内存冲突 | [BUG-003](bugs/BUG-003.md) 任务参数顺序错 | [BUG-004](bugs/BUG-004.md) WS握手类型错 | [BUG-005](bugs/BUG-005.md) HTTP 201未兼容 | [BUG-006](bugs/BUG-006.md) MultiNet CPU占满 | [BUG-007](bugs/BUG-007.md) 唤醒尾音误触EOS | [BUG-008](bugs/BUG-008.md) 定时器栈溢出 | [BUG-009](bugs/BUG-009.md) LVGL 64KB静态池吃SRAM | [BUG-010](bugs/BUG-010.md) LVGL stack在SPIRAM读SPIFFS崩 | [BUG-011](bugs/BUG-011.md) 音频任务SPIRAM栈泄漏 | [BUG-012](bugs/BUG-012.md) WS文本分片未重组 | [BUG-013](bugs/BUG-013.md) 长TTS残留被识别为下一轮输入 | [BUG-014](bugs/BUG-014.md) 多轮SERVER_READY丢失+尾端字保护被风扇噪声玩坏 | [BUG-015](bugs/BUG-015.md) GPIO14 FSPIWP复用引起I2C NACK+共timer舵机失灵 | [BUG-016](bugs/BUG-016.md) PCM全0/FFFF/高字节恒0x00 — ES8311虚焊诊断指纹
+- [2026-05月度BUG对照表](bugs/MONTHLY-2026-05.md) — 本月新增BUG-013~016 发现↔解决速查
 - 决策记录：[DEC-001](decisions/DEC-001.md) OPUS 24kbps CBR | [DEC-002](decisions/DEC-002.md) 四层环形缓冲 | [DEC-003](decisions/DEC-003.md) Token双重刷新 | [DEC-004](decisions/DEC-004.md) AFE WebRTC VAD | [DEC-005](decisions/DEC-005.md) GPIO引脚分配
 - [Bug汇总索引](bugs/ALL_BUGS.md) — BUG-001~008 快速查表，按模块分类
 - [CHANGELOG.html](CHANGELOG.html) — 可点击查看每次提交的修改前后 diff（浏览器打开）
@@ -35,4 +36,5 @@
 - [周报 W14](weekly/2026-W14.md) — 音频模块→WebSocket协议栈全链路搭建，7次提交
 - [Token刷新机制](project_token_refresh.md) — accessToken 2h过期，主动+被动双重刷新
 - [项目全量技术总结 v1 2026-04-10](summaries/project_full_summary.md) — 总分总结构，5模块详解+设计亮点+技术难点+文件速查
+- [近月总结 2026-04-21~05-21](summaries/2026-04-21_to_05-21_monthly.md) — 22次提交：UI体系/产线工具/协议Hello→start/WS泄漏/内存+70K/长句丢帧（未完）
 - [项目目录结构](reference_project_structure.md) — 完整目录树+模块依赖关系+数据流+关键文件速查（2026-04-11基准）

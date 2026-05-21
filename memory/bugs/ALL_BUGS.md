@@ -12,6 +12,10 @@
 | [BUG-006](BUG-006.md) | MultiNet 检测循环占满 CPU 导致 AFE ringbuffer 溢出 | 已修复 | 2026-04-09 | 2026-04-09 | `custom_wake_word.c` |
 | [BUG-007](BUG-007.md) | 唤醒词尾音误触发 EOS 静音检测 | 已修复 | 2026-04-09 | 2026-04-09 | `session.c` |
 | [BUG-008](BUG-008.md) | 定时器回调直接调 session_close 导致栈溢出 | 已修复 | 2026-04-14 | 2026-04-14 | `session.c` |
+| [BUG-009](BUG-009.md) | LVGL 内置 TLSF 静态池吃 64KB 内部 SRAM | 已修复 | 2026-04-26 | 2026-04-26 | `sdkconfig` `sdkconfig.defaults` |
+| [BUG-010](BUG-010.md) | LVGL task 栈在 SPIRAM + GIF 读 SPIFFS Flash cache 冲突 | 已修复 | 2026-04-26 | 2026-04-26 | `ui_port.c:103` |
+| [BUG-011](BUG-011.md) | 音频任务 SPIRAM 栈未保存句柄导致每次会话泄漏 32KB×2 | 已修复 | 2026-05-06 | 2026-05-06 | `audio_decoder.c` `audio_encoder.c` |
+| [BUG-012](BUG-012.md) | WebSocket 文本帧分片未重组导致长 JSON 消息丢失 | 已修复 | 2026-05-06 | 2026-05-06 | `websocket_client.c` |
 
 ---
 
@@ -23,7 +27,7 @@
 - **BUG-003** — `xTaskCreatePinnedToCoreWithCaps` API 参数顺序与 `xTaskCreate` 不同
 
 ### 协议层
-- **BUG-004** — WebSocket `type:"start"` → 应为 `type:"started"`（服务端协议字段）
+- **BUG-004** — WebSocket `type:"hello"` → 应为 `type:"started"`（服务端协议字段）
 - **BUG-005** — HTTP POST 创建资源返回 201，但原代码只接受 200
 
 ### 音频 / AI 处理层
@@ -32,6 +36,16 @@
 
 ### 会话管理层
 - **BUG-008** — 定时器回调中直接调 `session_close()` 栈溢出死机，改用事件队列投递
+
+### UI / LVGL 层
+- **BUG-009** — LVGL `LV_USE_BUILTIN_MALLOC` + `LV_MEM_SIZE_KILOBYTES=64` 静态吃 64KB 内部 SRAM，改用 `LV_USE_CLIB_MALLOC`
+- **BUG-010** — LVGL task 栈在 SPIRAM 时，GIF 读 SPIFFS 触发 cache 关闭 → SPIRAM 栈不可访问 → assert 崩溃，改回 `MALLOC_CAP_INTERNAL`
+
+### 音频 / 任务生命周期
+- **BUG-011** — `xTaskCreatePinnedToCoreWithCaps` 句柄传 NULL + stop() 仅 vTaskDelay，长跑泄漏 32KB×2 SPIRAM 栈，改为保存句柄+轮询+超时 vTaskDelete
+
+### 协议层（续）
+- **BUG-012** — esp-websocket-client 文本帧自动分片，原代码每片都尝试 cJSON 解析，长 LLM 回复全丢；引入 static 重组缓冲
 
 ---
 
@@ -49,7 +63,7 @@
 ### 2026-04-08（提交 `e96b8bc` `0bbfe76`）
 | 类型 | 内容 | 文件 |
 |------|------|------|
-| 修复 BUG-004 | WS 握手 `"type":"start"` → `"type":"started"` | `websocket_client.c` |
+| 修复 BUG-004 | WS 握手 `"type":"hello"` → `"type":"started"` | `websocket_client.c` |
 | 修复 BUG-003 | `xTaskCreatePinnedToCoreWithCaps` 参数顺序修正 | `bsp_wifi.c` |
 | 集成 | ESP-AFE 音频前端框架（NS 降噪 + WebRTC VAD） | `custom_wake_word.c/h` |
 | 改进 | 音频发送超时 10s → 100ms（实时场景要求） | `websocket_client.c` |
@@ -86,7 +100,26 @@
 
 ---
 
-### 2026-04-14（提交 `c2df9e1`）
+### 2026-04-26（未提交，工作区改动）
+| 类型 | 内容 | 文件 |
+|------|------|------|
+| 修复 BUG-009 | 关闭 LVGL 内置 64KB 静态池，改用 stdlib malloc，内部 SRAM 回血 159KB | `sdkconfig:2571-2572` `sdkconfig.defaults:18-21` |
+| 修复 BUG-010 | LVGL task 栈从 SPIRAM 改回 INTERNAL（GIF 读 SPIFFS 关 cache 冲突） | `ui_port.c:103` |
+| 待办 | `ui_init()` 加 `app_lvgl_init()` 错误检查 | `ui_port.c:160` |
+
+---
+
+### 2026-05-06（提交 `276062e`）
+| 类型 | 内容 | 文件 |
+|------|------|------|
+| 修复 BUG-011 | encoder/decoder 加 task_handle 字段+stop() 轮询+超时 vTaskDelete 强杀 | `audio_decoder.c:51,204,316,343-352` `audio_encoder.c:33,175,296,320-330` |
+| 改进 | destroy 后 vTaskDelay(100ms) 等 IDLE 清理 SPIRAM 栈，内存快照才准 | `audio_processor.c:271` |
+| 修复 BUG-012 | static 缓冲区按 payload_offset/payload_len 重组 WS 文本帧分片 | `websocket_client.c:331-440` |
+| 改进 | LCD 初始化完成后置位 `LCD_BIT` 事件标志 | `bsp_lcd.c:98` |
+
+---
+
+### 2026-04-14（未提交，工作区改动）
 | 类型 | 内容 | 文件 |
 |------|------|------|
 | 修复 BUG-008 | 定时器超时回调改用事件队列投递，防栈溢出 | `session.c` |
