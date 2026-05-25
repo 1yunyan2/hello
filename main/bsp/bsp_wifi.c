@@ -487,6 +487,15 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
     ESP_LOGI(TAG, "[内存] btn_task 创建后 → 内部SRAM剩余: %u B，PSRAM剩余: %u B",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    // ── 步骤 6.5：打印设备唯一标识（不依赖联网，方便离线排查） ─────────────
+    {
+        uint8_t _mac[6];
+        esp_wifi_get_mac(WIFI_IF_STA, _mac);
+        ESP_LOGI(TAG, "🆔 DeviceID: %02X%02X%02X | MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+                 _mac[3], _mac[4], _mac[5],
+                 _mac[0], _mac[1], _mac[2], _mac[3], _mac[4], _mac[5]);
+    }
+
     // ── 步骤 7：检查是否已配网 ───────────────────────────────────────────────
     bool provisioned = false;
     ESP_ERROR_CHECK(wifi_prov_mgr_is_provisioned(&provisioned));
