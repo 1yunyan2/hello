@@ -227,3 +227,13 @@ void audio_processor_read_ref_pcm(audio_processor_t *audio_processor,
  */
 // size_t audio_processor_get_pending_bytes(audio_processor_t *audio_processor);
 bool audio_processor_is_playing(audio_processor_t *audio_processor);
+
+/**
+ * @brief 解除静音：允许 play_task 重新向 I2S 写入 PCM 数据
+ *
+ * 与 audio_processor_flush_output() 配合使用。打断 TTS 后 flush 会置位 mute_output，
+ * 新一轮 TTS 开始前调用本函数清除静音标志，恢复正常播放。
+ *
+ * @param audio_processor 音频处理器实例指针（允许为 NULL，NULL 时无操作）
+ */
+void audio_processor_unmute_output(audio_processor_t *audio_processor);

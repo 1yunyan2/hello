@@ -478,6 +478,8 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
         s_state = SESSION_PLAYING; // 暂停麦克风上传，防止回声/自激
         // TTS_START 隐含云端已开始干活，确保 wait_user 已停止（兜底，正常 STT/AUDIO 已先停）
         wait_user_timer_stop();
+        // 新一轮 TTS 开始，解除打断时置位的静音标志，允许 play_task 正常写 I2S
+        audio_processor_unmute_output(s_processor);
         // 重启唤醒词引擎，TTS 期间可以检测打断唤醒词
         // 当前阈值 0.18f：与 LISTENING 一致；如出现 AEC 残留误触可上调至 0.40~0.55
         wake_word_set_det_threshold(0.18f);
@@ -556,7 +558,7 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
 
         // ★ 核心修复 2：防抖机制，拦截底层网络碎片化导致的疯狂重复断开
         static TickType_t s_last_disconnect_tick = 0;
-        if (xTaskGetTickCount() - s_last_disconnect_tick < pdMS_TO_TICKS(1000))
+        if (xTaskGetTickCount() - s_last_disconnect_tick < pdMS_TO_TICKS(200))
         {
             ESP_LOGW(TAG, "网络轻微抖动，已拦截重复的断开事件");
             break;
@@ -593,10 +595,25 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
             if (delay_ms > 60000)
                 delay_ms = 60000;
             ESP_LOGW(TAG, "第 %d 次重连，%d 秒后执行...", s_reconnect_attempts, delay_ms / 1000);
-            xTaskCreatePinnedToCoreWithCaps(session_reconnect_task, "ws_reconn",
+            BaseType_t reconn_ret = xTaskCreatePinnedToCoreWithCaps(session_reconnect_task, "ws_reconn",
                                             6144, (void *)(intptr_t)delay_ms, 3,
                                             (TaskHandle_t *)&s_reconnect_handle,
                                             1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            if (reconn_ret != pdPASS)
+            {
+                // 内部 SRAM 不足（会话刚结束 TLS 未全部释放），fallback 到 SPIRAM 栈
+                ESP_LOGW(TAG, "[MEM] 内部 SRAM 不足，重连任务 fallback 到 SPIRAM 栈");
+                reconn_ret = xTaskCreatePinnedToCoreWithCaps(session_reconnect_task, "ws_reconn",
+                                                6144, (void *)(intptr_t)delay_ms, 3,
+                                                (TaskHandle_t *)&s_reconnect_handle,
+                                                1, MALLOC_CAP_SPIRAM);
+                if (reconn_ret != pdPASS)
+                {
+                    ESP_LOGE(TAG, "[MEM] 重连任务创建彻底失败，下次断开事件时重试");
+                    s_reconnect_handle = NULL;
+                    s_reconnect_attempts--; // 回退计数，下次仍用相同退避间隔
+                }
+            }
         }
         break;
     } // ★ 对应开头的大括号
@@ -785,80 +802,63 @@ static void session_reconnect_task(void *arg)
 {
     int delay_ms = (int)(intptr_t)arg;
 
-    // 指数退避延迟
+    // 首次进入的指数退避延迟
     if (delay_ms > 0)
     {
         ESP_LOGI(TAG, "重连退避等待 %d 秒...", delay_ms / 1000);
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
 
-    // ★ P2 优化：内部 SRAM 不足时跳过本次重连，避免 TLS 握手导致 OOM
-    size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (internal_free < 8192) // 内部 SRAM 不足 8KB，跳过重连
-    {
-        ESP_LOGW(TAG, "[MEM] 内部 SRAM 仅剩 %d B，跳过本次重连，等待下次周期...", (int)internal_free);
-        goto exit_task;
-    }
+    // 每轮失败后的重试间隔：5s 起，指数增长，最大 60s
+    int retry_interval_ms = 5000;
 
-    // ★ P1 优化：服务器不可达时，先做一次 Auth 探测，确认服务器是否恢复
-    if (!auth_is_server_reachable())
+    // 无限重试循环：直到 WebSocket 真正连上才退出
+    while (true)
     {
-        ESP_LOGW(TAG, "服务器上次不可达，先做 Auth 探测...");
+        // ── 内部 SRAM 检查：不足时等待释放，不放弃重连 ──────────────────
+        size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (internal_free < 8192)
+        {
+            ESP_LOGW(TAG, "[MEM] 内部 SRAM 仅剩 %d B，等 3s 释放后再试...", (int)internal_free);
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            continue;
+        }
+
+        // ── Auth HTTP 探测：刷新 accessToken（同时检测服务器是否在线）────
+        ESP_LOGI(TAG, "探测服务器（Auth HTTP）...");
         auth_t *probe_auth = auth_create();
         auth_perform(probe_auth, s_ws_token);
-        if (probe_auth->access_token != NULL)
-        {
-            // 服务器恢复了！更新 token
+        bool auth_ok = (probe_auth->access_token != NULL);
+        if (auth_ok)
             strncpy(s_access_token, probe_auth->access_token, sizeof(s_access_token) - 1);
-            ESP_LOGI(TAG, "服务器已恢复，拿到新 accessToken");
-        }
         auth_destroy(probe_auth);
 
-        if (!auth_is_server_reachable())
+        if (!auth_ok)
         {
-            ESP_LOGW(TAG, "服务器仍不可达，跳过 WebSocket 重连");
-            goto exit_task;
+            ESP_LOGW(TAG, "Auth 失败（服务器未响应），%d 秒后重试...", retry_interval_ms / 1000);
+            vTaskDelay(pdMS_TO_TICKS(retry_interval_ms));
+            if (retry_interval_ms < 60000)
+                retry_interval_ms = retry_interval_ms * 2 > 60000 ? 60000 : retry_interval_ms * 2;
+            continue;
         }
-    }
 
-    ESP_LOGI(TAG, "开始重连流程...");
-
-    const char *new_token = s_access_token;
-    bool token_refreshed = false;
-
-    // 极端异常兜底：仅当 s_access_token 已清空时才走 HTTP 认证获取新 Token
-    // 限制最多重试 3 次：服务器不可达时反复 auth_create/perform/destroy 会累积内部 SRAM 碎片
-    if (strlen(new_token) == 0 && strlen(s_ws_token) > 0 && s_auth_retry_in_reconnect < 3)
-    {
-        s_auth_retry_in_reconnect++;
-        ESP_LOGW(TAG, "内存无可用 Token，发起 HTTP 认证（第 %d 次重试）...", s_auth_retry_in_reconnect);
-        auth_t *auth = auth_create();
-        auth_perform(auth, s_ws_token);
-
-        if (auth->access_token != NULL)
+        // ── 销毁旧 protocol，重建 WebSocket 连接 ─────────────────────────
+        // 每次都完整 destroy+create，释放 mbedTLS 上下文防止内部 SRAM 泄漏
+        ESP_LOGI(TAG, "Auth 成功，尝试建立 WebSocket 连接...");
+        if (s_protocol != NULL)
         {
-            strncpy(s_access_token, auth->access_token, sizeof(s_access_token) - 1);
-            new_token = s_access_token;
-            token_refreshed = true; // 拿到新 Token，需要用新 URI 重建连接
+            protocol_disconnect(s_protocol);
+            protocol_destroy(s_protocol);
+            s_protocol = NULL;
         }
-        auth_destroy(auth);
-    }
 
-    // ★ 普通重连（Token 未变）
-    if (s_protocol != NULL && !token_refreshed)
-    {
-        // 每次重连都做完整 destroy/重建：释放 mbedTLS 上下文（session ticket、证书缓存等约 5KB 内部 SRAM）
-        // stop/start 复用模式会导致 TLS 缓冲区泄漏，内部 SRAM 持续下降
-        ESP_LOGI(TAG, "Token 未变，destroy+create 重建连接（释放 TLS 碎片）...");
-        protocol_disconnect(s_protocol);
-        protocol_destroy(s_protocol);
-        s_protocol = NULL;
-
+        const char *new_token = s_access_token;
         char *full_ws_uri = (char *)malloc_zeroed(1024);
         if (full_ws_uri == NULL)
         {
-            ESP_LOGE(TAG, "full_ws_uri 分配失败，放弃重连");
-            goto exit_task;
+            ESP_LOGE(TAG, "full_ws_uri 分配失败，5s 后重试");
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
         }
         if (strlen(new_token) > 0)
             snprintf(full_ws_uri, 1024, "%s?token=%s", s_ws_uri, new_token);
@@ -870,55 +870,46 @@ static void session_reconnect_task(void *arg)
 
         if (s_protocol == NULL)
         {
-            ESP_LOGE(TAG, "protocol_create 失败，内存不足，放弃重连");
-            goto exit_task;
-        }
-        protocol_register_callback(s_protocol, protocol_event_handler, NULL);
-        protocol_connect(s_protocol);
-        ESP_LOGI(TAG, "重连完成，WebSocket 正在建立连接... URI: %s", s_ws_uri);
-        PRINT_MEM_INFO(TAG, "WS 重连尝试完成");
-        goto exit_task;
-    }
-
-    // Token 已刷新或首次创建：销毁旧连接，用新 Token URI 重建
-    if (s_protocol != NULL)
-    {
-        ESP_LOGI(TAG, "关闭旧 WebSocket 连接（释放服务端连接计数）...");
-        protocol_disconnect(s_protocol);
-        protocol_destroy(s_protocol);
-        s_protocol = NULL;
-    }
-
-    {
-        char *full_ws_uri = (char *)malloc_zeroed(1024);
-        if (full_ws_uri == NULL)
-        {
-            ESP_LOGE(TAG, "full_ws_uri 分配失败，放弃重连");
-            goto exit_task;
-        }
-
-        if (strlen(new_token) > 0)
-            snprintf(full_ws_uri, 1024, "%s?token=%s", s_ws_uri, new_token);
-        else
-            strncpy(full_ws_uri, s_ws_uri, 1024 - 1);
-
-        s_protocol = protocol_create(full_ws_uri, new_token);
-        free(full_ws_uri);
-
-        if (s_protocol == NULL)
-        {
-            ESP_LOGE(TAG, "protocol_create 失败，内存不足，放弃重连");
-            goto exit_task;
+            ESP_LOGE(TAG, "protocol_create 失败（内存不足），5s 后重试");
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
         }
 
         protocol_register_callback(s_protocol, protocol_event_handler, NULL);
         protocol_connect(s_protocol);
-        ESP_LOGI(TAG, "重连完成（新 Token），WebSocket 正在建立连接... URI: %s", s_ws_uri);
-        PRINT_MEM_INFO(TAG, "WS 重连尝试完成（新 Token）");
+        ESP_LOGI(TAG, "WebSocket 连接请求已发出，等待结果（最多 8s）...");
+
+        // ── 等待 CONNECTED 事件：通过 SESSION_WS_CONNECTED_BIT 判断 ──────
+        EventBits_t bits = xEventGroupWaitBits(
+            s_session_eg,
+            SESSION_WS_CONNECTED_BIT,
+            pdFALSE,          // 不自动清位（由 DISCONNECTED 处理清）
+            pdFALSE,          // 只等任意一位
+            pdMS_TO_TICKS(8000));
+
+        if (bits & SESSION_WS_CONNECTED_BIT)
+        {
+            ESP_LOGI(TAG, "WebSocket 重连成功！");
+            PRINT_MEM_INFO(TAG, "WS 重连成功");
+            break; // 真正连上，退出重试循环
+        }
+
+        // 8s 超时仍未连上（WS 服务可能还没起来），销毁本次 protocol，下轮重试
+        ESP_LOGW(TAG, "WS 连接超时（8s），%d 秒后重试...", retry_interval_ms / 1000);
+        if (s_protocol != NULL)
+        {
+            protocol_disconnect(s_protocol);
+            protocol_destroy(s_protocol);
+            s_protocol = NULL;
+        }
+        vTaskDelay(pdMS_TO_TICKS(retry_interval_ms));
+        if (retry_interval_ms < 60000)
+            retry_interval_ms = retry_interval_ms * 2 > 60000 ? 60000 : retry_interval_ms * 2;
     }
 
-exit_task:
-    // ★ 核心修复 4：无论成功失败，必须清空句柄，防止系统永远以为正在重连从而陷入死锁！
+    // 连接成功后清理状态，下次断开从 2s 退避重新开始
+    s_reconnect_attempts = 0;
+    s_auth_retry_in_reconnect = 0;
     s_reconnect_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -1119,6 +1110,12 @@ void session_init(const char *ws_uri)
  */
 void session_on_wake_word(const char *display)
 {
+    // LISTENING 期间（用户说话中）完全忽略唤醒词触发。
+    // wake_word_stop() 已在进入 LISTENING 时调用，此处兜底防竞态窗口误打断。
+    // 连麦等待期（s_is_continuous_turn=true）属于 LISTENING 中的特殊子状态，仍需响应。
+    if (s_state == SESSION_LISTENING && !s_is_continuous_turn)
+        return;
+
     PRINT_MEM_INFO(TAG, "对话会话开始");
     if (s_state == SESSION_PLAYING)
     {

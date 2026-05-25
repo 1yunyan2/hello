@@ -71,6 +71,7 @@ struct audio_processor
                                  ///< audio_feed_task 读取后交给 AFE AEC 算法消除回声
 
     volatile bool is_running;      ///< 运行标志（控制播放任务循环）
+    volatile bool mute_output;     ///< 静音标志：唤醒词打断时置位，play_task 丢弃 dec_output 数据不写 I2S
     TaskHandle_t play_task_handle; ///< 播放任务句柄（用于等待任务退出）
 };
 
@@ -176,18 +177,21 @@ static void audio_processor_play_task(void *arg)
         if (buf)
         {
             underrun_count = 0;     // 读到数据，清零欠载计数
-            active_playback = true; // 正在播放真实 TTS，激活欠载告警
-            size_t bytes_written = 0;
-            // 【看门狗修复】portMAX_DELAY → 200ms：
-            // I2S DMA buffer 若短暂满载，portMAX_DELAY 会让 play_task 永久阻塞，
-            // IDLE0（CPU0）超过 5s 喂不了狗 → task_wdt 触发。
-            // 200ms 足够覆盖 DMA 释放一个 slot（@32kHz 约 32ms），
-            // 同时远小于看门狗超时（5s），即使偶发超时也只丢失极少量 PCM（< 10ms）。
-            esp_err_t wr_ret = i2s_channel_write(board->i2s_tx_handle, buf, size_read,
-                                                 &bytes_written, portMAX_DELAY);
-            if (wr_ret != ESP_OK)
-                ESP_LOGW(TAG, "I2S write 超时 (size=%d ret=%d)，可能瞬间卡顿", (int)size_read, wr_ret);
-            xRingbufferSend(audio_processor->aec_ref_buf, buf, size_read, 0);
+            if (!audio_processor->mute_output)
+            {
+                active_playback = true; // 正在播放真实 TTS，激活欠载告警
+                size_t bytes_written = 0;
+                // 【看门狗修复】portMAX_DELAY → 200ms：
+                // I2S DMA buffer 若短暂满载，portMAX_DELAY 会让 play_task 永久阻塞，
+                // IDLE0（CPU0）超过 5s 喂不了狗 → task_wdt 触发。
+                // 200ms 足够覆盖 DMA 释放一个 slot（@32kHz 约 32ms），
+                // 同时远小于看门狗超时（5s），即使偶发超时也只丢失极少量 PCM（< 10ms）。
+                esp_err_t wr_ret = i2s_channel_write(board->i2s_tx_handle, buf, size_read,
+                                                     &bytes_written, portMAX_DELAY);
+                if (wr_ret != ESP_OK)
+                    ESP_LOGW(TAG, "I2S write 超时 (size=%d ret=%d)，可能瞬间卡顿", (int)size_read, wr_ret);
+                xRingbufferSend(audio_processor->aec_ref_buf, buf, size_read, 0);
+            }
             vRingbufferReturnItem(audio_processor->dec_output, buf);
         }
         else
@@ -505,6 +509,8 @@ void audio_processor_flush_output(audio_processor_t *audio_processor)
     /* 清空解码器输出（已解码但未播放的 PCM 数据） */
     while ((buf = xRingbufferReceive(audio_processor->dec_output, &size, 0)) != NULL)
         vRingbufferReturnItem(audio_processor->dec_output, buf);
+    /* 置静音标志：play_task 在缓冲再次有数据时也不写 I2S，防止打断后新帧被重复播出 */
+    audio_processor->mute_output = true;
 }
 
 /**
@@ -653,4 +659,11 @@ bool audio_processor_is_playing(audio_processor_t *audio_processor)
         vRingbufferGetInfo(audio_processor->dec_output, NULL, NULL, NULL, NULL, &dec_out_pending);
 
     return dec_out_pending > 0;
+}
+
+void audio_processor_unmute_output(audio_processor_t *audio_processor)
+{
+    if (audio_processor == NULL)
+        return;
+    audio_processor->mute_output = false;
 }
