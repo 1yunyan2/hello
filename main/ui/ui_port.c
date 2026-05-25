@@ -122,6 +122,10 @@ static lv_obj_t *s_time_date_lbl = NULL;
 static lv_timer_t *s_main_tick_tmr = NULL;
 static lv_timer_t *s_gif_hide_tmr = NULL;
 
+/* ─── 全局浮动电量标签（挂在 top-layer，所有页面切换都常驻显示）─── */
+static lv_obj_t *s_battery_lbl = NULL;        ///< 右上角电量标签，纯文字 "85%"
+static lv_timer_t *s_battery_tick_tmr = NULL; ///< 周期刷新电量的 LVGL 定时器
+
 /* 功能菜单 */
 static ui_view_t s_view = UI_VIEW_MAIN;
 static fn_page_t s_fn_page = FN_PAGE_TIME;
@@ -1545,6 +1549,9 @@ void ui_play_animation(const char *anim_id)
 /* ═══════════════════════════════════════════════════════════════
  * UI 系统初始化
  * ═══════════════════════════════════════════════════════════════ */
+// 电池相关函数前置声明
+static void battery_label_create_top(void);
+static void battery_tick_cb(lv_timer_t *t);
 void ui_init(void)
 {
     // init_spiffs();
@@ -1581,6 +1588,17 @@ void ui_init(void)
     if (lvgl_port_lock(100))
     {
         s_main_tick_tmr = lv_timer_create(main_clock_tick_cb, 1000, NULL);
+        lvgl_port_unlock();
+    }
+
+    /* ─── 全局浮动电量显示（顶层 layer，跨页常驻）─── */
+    if (lvgl_port_lock(100))
+    {
+        battery_label_create_top();
+        // 每 5 秒刷新一次电量显示（与底层 BSP 10s 采样独立，不增加 ADC 负担）
+        s_battery_tick_tmr = lv_timer_create(battery_tick_cb, 5000, NULL);
+        // 立即刷新一次，避免开机后等 5s 才有数字
+        battery_tick_cb(s_battery_tick_tmr);
         lvgl_port_unlock();
     }
 }
@@ -1759,44 +1777,108 @@ void ui_update_wifi(int rssi)
     //     lvgl_port_unlock();
     // }
 }
+/* ═══════════════════════════════════════════════════════════════
+ * 全局浮动电量显示（挂在 LVGL top-layer，跟随所有页面常驻）
+ * ═══════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief 创建右上角电量标签并挂到 top-layer（顶层 layer 不受 screen 切换影响）
+ *
+ * 设计说明：
+ *   - lv_layer_top() 是 LVGL 内置的全局浮动层，永远在所有 screen 之上
+ *   - 即使后续切换功能菜单、闹钟编辑等界面，本标签也常驻可见
+ *   - 当前使用纯文字（如 "85%"），后续要换图标只需修改 ui_update_battery() 文字格式
+ *
+ * @note 仅在首次调用时创建，重复调用安全（幂等）
+ */
+static void battery_label_create_top(void)
+{
+    if (s_battery_lbl != NULL)
+        return; // 幂等
+
+    lv_obj_t *top = lv_layer_top();
+    s_battery_lbl = lv_label_create(top);
+    lv_obj_set_style_text_font(s_battery_lbl, &font_cn_16, 0);
+    lv_obj_set_style_text_color(s_battery_lbl, lv_color_white(), 0);
+    // 顶层默认无背景，加一个半透明黑底避免在白色 GIF 上看不清
+    lv_obj_set_style_bg_color(s_battery_lbl, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_battery_lbl, LV_OPA_40, 0);
+    lv_obj_set_style_pad_hor(s_battery_lbl, 4, 0);
+    lv_obj_set_style_pad_ver(s_battery_lbl, 1, 0);
+    lv_obj_set_style_radius(s_battery_lbl, 3, 0);
+    // 右上角对齐，留 4px 边距
+    lv_obj_align(s_battery_lbl, LV_ALIGN_TOP_RIGHT, -4, 4);
+    lv_label_set_text(s_battery_lbl, "--%");
+}
+
+/**
+ * @brief 更新电量显示
+ * @param soc 电量百分比 0~100，传 -1 表示未知（显示 "--%"）
+ *
+ * 修改显示形式：后续如要加图标，仅需调整 snprintf 格式串，
+ * 例如改为 "\xEF\x89\x83 %d%%"（FontAwesome 电池满图标）即可，
+ * 函数其余部分无需改动。
+ */
 void ui_update_battery(int soc)
 {
+    if (s_battery_lbl == NULL)
+        return; // 尚未创建，忽略
 
-    //     static const char *battery_str[] = {
-    //         FONT_AWESOME_BATTERY_EMPTY,          // 0-25
-    //         FONT_AWESOME_BATTERY_QUARTER,        // 25-50/
-    //         FONT_AWESOME_BATTERY_HALF,           // 50-75
-    //         FONT_AWESOME_BATTERY_THREE_QUARTERS, // 75-100
-    //         FONT_AWESOME_BATTERY_FULL,           // 100
-    //         FONT_AWESOME_BATTERY_FULL,           // 100
-    //     };
-    //     lv_obj_t *screen = lv_screen_active();
-    //     lv_obj_t *status_bar = lv_obj_get_child(screen, 0);
-    //     lv_obj_t *battery_label = lv_obj_get_child(status_bar, 1);
+    char buf[16];
+    if (soc < 0)
+    {
+        snprintf(buf, sizeof(buf), "--%%");
+    }
+    else
+    {
+        if (soc > 100)
+            soc = 100;
+        snprintf(buf, sizeof(buf), "%d%%", soc);
+    }
 
-    //     if (soc < 0)
-    //         soc = 0;
-    //     else if (soc > 100)
-    //         soc = 100;
+    if (lvgl_port_lock(100))
+    {
+        lv_label_set_text(s_battery_lbl, buf);
+        // 低电变色：<20% 黄，<10% 红，否则白
+        lv_color_t c = lv_color_white();
+        if (soc >= 0 && soc < 10)
+            c = lv_color_hex(0xFF3B30);
+        else if (soc >= 0 && soc < 20)
+            c = lv_color_hex(0xFF9500);
+        lv_obj_set_style_text_color(s_battery_lbl, c, 0);
+        lvgl_port_unlock();
+    }
+}
 
-    //     if (lvgl_port_lock(1000))
-    //     {
-    //         lv_label_set_text(battery_label, battery_str[soc / 20]);
-    //         lvgl_port_unlock();
-    //     }
+/**
+ * @brief 电量刷新定时器回调（LVGL 上下文，已持有 LVGL 锁）
+ *
+ * 调用 bsp_battery_get_percent() 拿到当前电量，
+ * 因为本回调本身在 LVGL 线程内，所以直接 lv_label_set_text 即可（不再上锁）。
+ */
+static void battery_tick_cb(lv_timer_t *t)
+{
+    (void)t;
+    uint8_t pct = bsp_battery_get_percent();
+    uint32_t mv = bsp_battery_get_voltage_mv();
 
-    // #define BATT_ADC_CHANNEL ADC1_CHANNEL_0
-    //     adc1_config_width(ADC_WIDTH_BIT_12);
-    //     adc1_config_channel_atten(BATT_ADC_CHANNEL, ADC_ATTEN_DB_11);
-
-    //     int adc_raw = adc1_get_raw(BATT_ADC_CHANNEL);
-
-    //     // TODO: 根据实际硬件（分压比、参考电压）替换下列线性映射公式
-    //     int percent = (adc_raw - 2000) * 100 / (4000 - 2000);
-    //     if (percent > 100)
-    //         percent = 100;
-    //     if (percent < 0)
-    //         percent = 0;
-
-    //     return percent;
+    char buf[16];
+    if (mv == 0)
+    {
+        snprintf(buf, sizeof(buf), "--%%");
+    }
+    else
+    {
+        snprintf(buf, sizeof(buf), "%u%%", (unsigned)pct);
+    }
+    if (s_battery_lbl)
+    {
+        lv_label_set_text(s_battery_lbl, buf);
+        lv_color_t c = lv_color_white();
+        if (mv > 0 && pct < 10)
+            c = lv_color_hex(0xFF3B30);
+        else if (mv > 0 && pct < 20)
+            c = lv_color_hex(0xFF9500);
+        lv_obj_set_style_text_color(s_battery_lbl, c, 0);
+    }
 }

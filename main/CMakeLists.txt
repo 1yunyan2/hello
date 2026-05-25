@@ -22,6 +22,11 @@ idf_component_register(SRCS
 "ui/games.c"
 "ui/font_cn_16.c"
 "bsp/bsp_flash.c"
+"bsp/bsp_battery.c"
+"bsp/bsp_ota.c"
 "test_wifi_time.c"
 INCLUDE_DIRS "."
 )
+# 注：main 组件默认会包含所有公共组件（包括 esp_adc），无需显式 PRIV_REQUIRES。
+# 之前尝试添加 PRIV_REQUIRES esp_adc 会触发 IDF 把 main 当作普通组件，
+# 反而导致 esp_wifi / mqtt / wifi_provisioning 等不再自动注入而报错。

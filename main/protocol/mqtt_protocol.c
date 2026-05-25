@@ -16,6 +16,7 @@
  */
 #include "mqtt_protocol.h"
 #include "bsp/bsp_board.h"
+#include "bsp/bsp_ota.h"
 #include "auth.h"
 #include "object.h"
 #include "esp_heap_caps.h"
@@ -442,6 +443,30 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         tskNO_AFFINITY, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
                     if (ret != pdPASS)
                         ESP_LOGE(MQTT_TAG, "内存不足，无法创建解绑任务！");
+                }
+                else if (cJSON_IsString(type_item) && strcmp(type_item->valuestring, "ota") == 0)
+                {
+                    // ★ OTA 升级指令处理
+                    // JSON 格式: {"type":"ota","url":"http://.../firmware.bin","version":"1.0.1"}
+                    // bsp_ota_trigger 内部创建独立异步任务，不阻塞 MQTT 事件循环
+                    cJSON *url_item = cJSON_GetObjectItem(root, "url");
+                    cJSON *ver_item = cJSON_GetObjectItem(root, "version");
+                    if (cJSON_IsString(url_item) && url_item->valuestring)
+                    {
+                        const char *ver = (cJSON_IsString(ver_item) && ver_item->valuestring)
+                                          ? ver_item->valuestring : "unknown";
+                        ESP_LOGW(MQTT_TAG, "收到 OTA 指令: url=%s version=%s",
+                                 url_item->valuestring, ver);
+                        esp_err_t ota_err = bsp_ota_trigger(url_item->valuestring, ver);
+                        if (ota_err != ESP_OK)
+                        {
+                            ESP_LOGE(MQTT_TAG, "OTA 触发失败: %s", esp_err_to_name(ota_err));
+                        }
+                    }
+                    else
+                    {
+                        ESP_LOGE(MQTT_TAG, "OTA 指令缺少 url 字段");
+                    }
                 }
                 else
                 {

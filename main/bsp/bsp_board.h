@@ -60,6 +60,7 @@
 #define LCD_BIT BIT5       ///< LCD 显示屏初始化完成（当前未自动置位）
 #define WIFI_FAIL_BIT BIT6 ///< WiFi 连接彻底失败（超过最大重试次数），系统将重启
 #define PROV_DONE_BIT BIT7 ///< BLE 配网流程结束（无论成功/超时），解除配网阻塞
+#define BATTERY_BIT BIT8   ///< 电池监控模块初始化完成（ADC 就绪，可读取 VBAT）
 
 // ─── BSP 全局单例结构体 ───────────────────────────────────────────────────────
 
@@ -326,3 +327,81 @@ void bsp_touch_init(void);
 void bsp_motor_pulse(void);
 
 void bsp_flash_init(void);
+
+// ─── 8. 电池电压监控 (VBAT_ADC) ─────────────────────────────────────────────
+//
+// 硬件原理：
+//   VBAT ──[R23 200kΩ]──┬──[R24 200kΩ]── GND
+//                       └── 分压点 → ADC 引脚（BSP_BAT_ADC_PIN）
+//   真实电池电压 = ADC 采样电压 × (R23 + R24) / R24 = ADC × 2
+//
+// 软件设计：
+//   - ESP-IDF 新 ADC oneshot API + curve fitting 校准
+//   - 多次平均 + IIR 低通滤波，抑制噪声与抖动
+//   - 锂电池放电曲线分段插值（4.2V→100% ... 3.0V→0%）
+//   - 后台任务周期采样，低电触发回调（带 100mV 滞回）
+
+/**
+ * @brief 低电量告警回调函数原型
+ *
+ * 后台采样发现电池电压低于 BSP_BAT_VOLTAGE_LOW_MV 时调用（只触发一次，
+ * 直到电压回升超过阈值 + 100mV 滞回区间后才会再次允许触发）。
+ *
+ * @param voltage_mv 当前电池电压（毫伏）
+ * @param percent    当前电量百分比（0~100）
+ */
+typedef void (*bsp_battery_low_cb_t)(uint32_t voltage_mv, uint8_t percent);
+
+/**
+ * @brief 初始化电池监控模块（仅初始化 ADC，不启动后台任务）
+ *
+ * 内部完成：配置 ADC1 oneshot 单元，为通道选择 ADC_ATTEN_DB_12（0~3.1V 量程），
+ * 创建 curve fitting 校准句柄。
+ *
+ * @return ESP_OK 成功；ESP_ERR_INVALID_STATE 表示 BSP_BAT_ADC_PIN 未配置；
+ *         其他错误为 ADC 初始化失败。
+ */
+esp_err_t bsp_battery_init(void);
+
+/**
+ * @brief 反初始化（释放 ADC 与校准资源，停止后台任务）
+ */
+esp_err_t bsp_battery_deinit(void);
+
+/**
+ * @brief 同步读取当前电池电压（毫伏，已经过分压还原 ×2 和多次平均）
+ * @return 电池电压（毫伏）；返回 0 表示尚未初始化或读取失败
+ */
+uint32_t bsp_battery_read_voltage_mv(void);
+
+/**
+ * @brief 获取后台任务最近一次采样并滤波后的电池电压（毫伏）
+ *
+ * 若后台任务未启动，则会现场调用一次 ADC 采样。
+ */
+uint32_t bsp_battery_get_voltage_mv(void);
+
+/**
+ * @brief 获取电量百分比（基于锂电池放电曲线，0~100）
+ *
+ * 映射节点（典型 LiPo 放电曲线）：
+ *   4.20V → 100%   4.05V → 90%    3.95V → 80%    3.85V → 70%
+ *   3.80V → 60%    3.75V → 50%    3.70V → 40%    3.65V → 30%
+ *   3.60V → 20%    3.45V → 10%    3.30V → 5%     3.00V → 0%
+ */
+uint8_t bsp_battery_get_percent(void);
+
+/**
+ * @brief 启动后台采样任务（周期 BSP_BAT_TASK_INTERVAL_MS）
+ *
+ * 任务循环：采样 → IIR 滤波 → 判断是否触发低电回调 → 等待下一周期。
+ *
+ * @param low_cb 低电量告警回调，传 NULL 表示不需要回调
+ * @return ESP_OK；若任务已存在则返回 ESP_ERR_INVALID_STATE
+ */
+esp_err_t bsp_battery_start_task(bsp_battery_low_cb_t low_cb);
+
+/**
+ * @brief 停止后台采样任务
+ */
+esp_err_t bsp_battery_stop_task(void);

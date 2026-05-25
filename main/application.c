@@ -26,6 +26,7 @@
 #include "session/session.h"
 #include "audio/audio_processor.h"
 #include "bsp/servo_manager.h"
+#include "bsp/bsp_ota.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -294,6 +295,14 @@ void application_init(void)
     /* ── 步骤 5: WiFi（阻塞直至获取 IP 或彻底失败后重启）─────────────────── */
     bsp_board_wifi_main(bsp_board);
     PRINT_INTERNAL_HEAP;
+
+    bsp_board_lcd_init(bsp_board); // LCD 初始化（当前未自动置位 LCD_BIT，后续可根据需求调整）
+    PRINT_INTERNAL_HEAP;
+    ui_init();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    PRINT_INTERNAL_HEAP;
+    bsp_board_lcd_on(bsp_board);
+
     // 提醒系统初始化（含 MOCK_TIME 模式下的系统时间设置）
     reminder_init(NULL); // NULL = 暂无 TTS 回调，后续接入 session 层时替换
     PRINT_INTERNAL_HEAP;
@@ -323,12 +332,22 @@ void application_init(void)
     }
     PRINT_INTERNAL_HEAP;
 
-    bsp_board_lcd_init(bsp_board); // LCD 初始化（当前未自动置位 LCD_BIT，后续可根据需求调整）
+    /* ── 步骤 9.5: 电池电压监控（VBAT_ADC）── */
+    // 若 BSP_BAT_ADC_PIN 未配置（仍为占位 -1），bsp_battery_init 会返回错误，
+    // 仅打印警告，不影响其他流程。后续硬件确认引脚后即可自动启用。
+    esp_err_t bat_ret = bsp_battery_init();
+    if (bat_ret == ESP_OK)
+    {
+        bsp_battery_start_task(NULL); // 暂不接低电回调，UI 自身已带变色提示
+        xEventGroupSetBits(bsp_board->board_status, BATTERY_BIT);
+        ESP_LOGI(TAG, "电池监控已启动");
+    }
+    else
+    {
+        ESP_LOGW(TAG, "电池监控未启用 (%s)，UI 电量将显示 --%%", esp_err_to_name(bat_ret));
+    }
     PRINT_INTERNAL_HEAP;
-    ui_init();
-    vTaskDelay(pdMS_TO_TICKS(100));
-    PRINT_INTERNAL_HEAP;
-    bsp_board_lcd_on(bsp_board);
+
     /* ── 步骤 10: 情绪交互管理器（情绪矩阵 + worker task，栈在 SPIRAM）────── */
     ret = interaction_manager_init();
     if (ret != ESP_OK)
@@ -356,16 +375,16 @@ void application_init(void)
         ESP_LOGI(TAG, "触摸扫描任务创建完成");
     }
 
-    // // 舵机测试任务（独立跑，不影响 LVGL 刷新）
-    // xTaskCreatePinnedToCoreWithCaps(
-    //     servo_test_task,
-    //     "servo_test",
-    //     4096,
-    //     NULL,
-    //     5,
-    //     NULL,
-    //     tskNO_AFFINITY,
-    //     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    // 舵机测试任务（独立跑，不影响 LVGL 刷新）
+    xTaskCreatePinnedToCoreWithCaps(
+        servo_test_task,
+        "servo_test",
+        4096,
+        NULL,
+        5,
+        NULL,
+        tskNO_AFFINITY,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
     /* ── 步骤 7: 会话模块（WebSocket 预连接）─────────────────────────────── */
 
@@ -387,5 +406,13 @@ void application_init(void)
     //     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     // ESP_LOGI(TAG, "CPU 占用诊断任务已启动，每 10 秒打印一次");
 
-    ESP_LOGI(TAG, "application_init 完成，系统就绪");
+    /* ── 步骤 9: OTA 验证（必须在所有初始化完成后调用）──────────────────── */
+    // 若当前是刚 OTA 升级完首次启动，会进入 PENDING_VERIFY 状态：
+    //   - 调用 esp_ota_mark_app_valid_cancel_rollback() 防止 Bootloader 回滚
+    //   - 把 NVS 中的 pending_ver 提升为 committed_ver
+    // 若启动前期崩溃（未到这里），Bootloader 下次启动会自动回滚到旧固件
+    ESP_LOGI(TAG, "当前固件版本: %s", bsp_ota_get_current_version());
+    bsp_ota_mark_valid();
+
+    ESP_LOGI(TAG, "application_init 1.0.4.1 完成，系统就绪");
 }
