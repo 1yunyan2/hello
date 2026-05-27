@@ -319,3 +319,45 @@ esp_err_t bsp_battery_stop_task(void)
     // 此处不强删，避免在持有 ADC 锁时被删导致死锁
     return ESP_OK;
 }
+
+// ─── 独立的 5s 电池日志任务（纯调试打印，不影响采样/滤波逻辑）──────────────────
+#define BSP_BAT_LOG_INTERVAL_MS 5000   ///< 日志打印周期，固定 5s 一次
+
+static TaskHandle_t s_log_task_handle = NULL;  ///< 日志任务句柄
+
+static void battery_log_task(void *arg)
+{
+    ESP_LOGI(TAG, "电池日志任务启动，每 %d ms 打印一次", BSP_BAT_LOG_INTERVAL_MS);
+    while (1) {
+        // 直接复用现有 API：任务在跑时返回滤波值，否则现场采样一次
+        uint32_t mv = bsp_battery_get_voltage_mv();
+        uint8_t percent = (mv > 0) ? voltage_to_percent(mv) : 0;
+        ESP_LOGI(TAG, "🔋 电池电压 = %lu mV，电量 ≈ %u%%",
+                 (unsigned long)mv, percent);
+        vTaskDelay(pdMS_TO_TICKS(BSP_BAT_LOG_INTERVAL_MS));
+    }
+}
+
+esp_err_t bsp_battery_start_log_task(void)
+{
+    if (!s_ctx.initialized) {
+        ESP_LOGE(TAG, "请先调用 bsp_battery_init()");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_log_task_handle != NULL) {
+        ESP_LOGW(TAG, "电池日志任务已存在");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    BaseType_t ok = xTaskCreate(battery_log_task,
+                                "bat_log",
+                                BSP_BAT_TASK_STACK_SIZE,
+                                NULL,
+                                BSP_BAT_TASK_PRIORITY,
+                                &s_log_task_handle);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "创建电池日志任务失败");
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}

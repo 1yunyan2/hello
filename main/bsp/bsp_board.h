@@ -405,3 +405,13 @@ esp_err_t bsp_battery_start_task(bsp_battery_low_cb_t low_cb);
  * @brief 停止后台采样任务
  */
 esp_err_t bsp_battery_stop_task(void);
+
+/**
+ * @brief 启动独立的电池电压日志任务（固定每 5 秒打印一次）
+ *
+ * 该任务不参与采样/滤波逻辑，仅周期性读取当前电压与电量百分比并以
+ * INFO 级别打印，方便调试观察。需在 bsp_battery_init() 之后调用。
+ *
+ * @return ESP_OK；若任务已存在则返回 ESP_ERR_INVALID_STATE
+ */
+esp_err_t bsp_battery_start_log_task(void);

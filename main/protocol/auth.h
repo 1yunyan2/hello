@@ -8,7 +8,7 @@
 #include <stdbool.h>
 
 /** @brief 请求认证令牌的后端 HTTP API 地址 */
-#define AUTH_LOGIN_URL "http://122.224.191.2:4888/api/auth/device-login"
+#define AUTH_LOGIN_URL "http://122.224.191.2:4889/api/auth/device-login"
 
 /**
  * @brief 认证实体结构体

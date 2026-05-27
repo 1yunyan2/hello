@@ -169,34 +169,6 @@ static void async_update_wakeword_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-//!  重要 ❗: 这是一个【示例】函数，用于演示如何读取ADC值作为电量。
-// 您必须根据您的硬件电路设计，修改此函数。
-/**
- * @brief 获取电池电量百分比
- *
- * 【示例代码】通过ADC1通道0读取电池电压，并将其线性映射为0-100%的电量值。
- * ⚠️ 此函数为示意，您必须根据实际的硬件分压电路参数修改计算公式。
- *
- * @return int 电池电量百分比 (0-100)
- */
-static int get_battery_level(void)
-{
-#define BATT_ADC_CHANNEL ADC1_CHANNEL_0
-    adc1_config_width(ADC_WIDTH_BIT_12);
-    adc1_config_channel_atten(BATT_ADC_CHANNEL, ADC_ATTEN_DB_11);
-
-    int adc_raw = adc1_get_raw(BATT_ADC_CHANNEL);
-
-    // TODO: 根据实际硬件（分压比、参考电压）替换下列线性映射公式
-    int percent = (adc_raw - 2000) * 100 / (4000 - 2000);
-    if (percent > 100)
-        percent = 100;
-    if (percent < 0)
-        percent = 0;
-
-    return percent;
-}
-
 // 后台心跳发送任务
 /**
  * @brief 发送周期性心跳消息的后台任务
@@ -224,7 +196,8 @@ static void heartbeat_task(void *arg)
         {
             cJSON *root = cJSON_CreateObject();
             cJSON_AddStringToObject(root, "deviceId", device_id);
-            // cJSON_AddNumberToObject(root, "battery", get_battery_level());
+            // 电量百分比：复用 bsp_battery 模块（IIR 滤波 + 锂电放电曲线），未初始化时返回 0
+            cJSON_AddNumberToObject(root, "battery", bsp_battery_get_percent());
 
             // if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
             //     cJSON_AddNumberToObject(root, "wifi_signal", ap_info.rssi);

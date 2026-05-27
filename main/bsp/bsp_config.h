@@ -91,15 +91,15 @@
 // #define EXT_FLASH_SCLK 39 // 10
 // #define EXT_FLASH_CS 40   // 12
 
-// ─── 8. 电池电压检测（VBAT_ADC）─────────────────────────────────────────────
-// VBAT 经 R23(200kΩ) + R24(200kΩ) 等比分压后接入 ADC 引脚，再经 C43(1uF) 滤波。
-// 分压比 = R24 / (R23 + R24) = 1/2，故 真实电压 = ADC采样电压 × 2
-// 锂电池 3.0V~4.2V → ADC 端 1.5V~2.1V，落在 ADC_ATTEN_DB_12 量程内
-//
-// ⚠️ 引脚说明：
-//   原理图标注 VBAT_ADC 接到 IO5（GPIO5），但当前固件 GPIO5 已被 I2S WS 占用，
-//   故此处先用占位 -1，等硬件 / 引脚分配确定后再填入实际 GPIO。
-//   ESP32-S3 可用 ADC1 通道：GPIO1~GPIO10（ADC2 与 WiFi 冲突，禁止使用）
+// // ─── 8. 电池电压检测（VBAT_ADC）─────────────────────────────────────────────
+// // VBAT 经 R23(200kΩ) + R24(200kΩ) 等比分压后接入 ADC 引脚，再经 C43(1uF) 滤波。
+// // 分压比 = R24 / (R23 + R24) = 1/2，故 真实电压 = ADC采样电压 × 2
+// // 锂电池 3.0V~4.2V → ADC 端 1.5V~2.1V，落在 ADC_ATTEN_DB_12 量程内
+
+// // ⚠️ 引脚说明：
+// //   原理图标注 VBAT_ADC 接到 IO5（GPIO5），但当前固件 GPIO5 已被 I2S WS 占用，
+// //   故此处先用占位 -1，等硬件 / 引脚分配确定后再填入实际 GPIO。
+// //   ESP32-S3 可用 ADC1 通道：GPIO1~GPIO10（ADC2 与 WiFi 冲突，禁止使用）
 
 // #define BSP_BAT_ADC_PIN -1 ///< ⚠️ 占位：电池分压采样 GPIO（待硬件确认后改为实际引脚，必须属于 ADC1）
 
@@ -152,13 +152,14 @@
 #define BSP_CODEC_MCLK_PIN 8  // 8         I2S 主时钟（MCLK），提供给 ES8311 作为参考时钟源
 #define BSP_CODEC_BCLK_PIN 46 // 46        I2S 位时钟（BCLK），每个采样位产生一个时钟沿
 #define BSP_CODEC_WS_PIN 7    // 7         I2S 帧同步（WS / LRCK），区分左右声道，单声道时也必须保留
-#define BSP_CODEC_DIN_PIN 15  // 15        I2S 数据输入（DIN）：麦克风采集数据流向 ESP32
-#define BSP_CODEC_DOUT_PIN 6  // 6         I2S 数据输出（DOUT）：ESP32 播放数据流向 ES8311 → 扬声器
+#define BSP_CODEC_DIN_PIN 6   // 15        I2S 数据输入（DIN）：麦克风采集数据流向 ESP32
+#define BSP_CODEC_DOUT_PIN 15 // 6         I2S 数据输出（DOUT）：ESP32 播放数据流向 ES8311 → 扬声器
 
 // ─── 2. 音频采样参数 ─────────────────────────────────────────────────────────
 // 这些参数必须与 AFE（音频前端）和 OPUS 编解码器的配置保持一致
 
-#define BSP_CODEC_SAMPLE_RATE 16000  ///< 采样率 16kHz（AFE、MultiNet、OPUS 的标准输入要求）
+#define BSP_CODEC_SAMPLE_RATE 16000 ///< 采样率 16kHz（AFE、MultiNet、OPUS 的标准输入要求）
+// #define BSP_DODEC_BITS_PER_SAMPLE 24000 ///< 采样率 24kHz（AFE、MultiNet、OPUS 的标准输入要求）
 #define BSP_CODEC_BITS_PER_SAMPLE 16 ///< 采样位深 16-bit（每个采样点占 2 字节）
 
 // ─── 3. 触摸铜箔引脚 ─────────────────────────────────────────────────────────
@@ -177,13 +178,17 @@
 
 #define BSP_LCD_CS_PIN 41   // 41 LCD 片选（CS/NSS），低电平激活
 #define BSP_LCD_MOSI_PIN 39 // 39 LCD 数据线（MOSI），主发从收，单向写
-#define BSP_LCD_SCLK_PIN 38 // 38 LCD 时钟线（SCLK），最高 80MHz
-#define BSP_LCD_DC_PIN 40   // 40 LCD 数据/命令选择（D/C）：高=数据，低=命令
+#define BSP_LCD_SCLK_PIN 38 // 40 LCD 时钟线（SCLK），最高 80MHz
+#define BSP_LCD_DC_PIN 40   // 38 LCD 数据/命令选择（D/C）：高=数据，低=命令
 #define BSP_LCD_RST_PIN 45  // 45 LCD 硬件复位（RST），低电平触发复位（从 GPIO14 迁出，腾出 TOUCH14 给翻页）
 #define BSP_LCD_BK_PIN 42   // 42 LCD 背光控制（BK），高电平开启背光
 
-#define BSP_LCD_WIDTH 320  ///< LCD 屏幕宽度（像素，横向）
-#define BSP_LCD_HEIGHT 240 ///< LCD 屏幕高度（像素，纵向）
+// 注意：以下 WIDTH/HEIGHT 是 **LVGL 逻辑分辨率（旋转后视角）**，不是 P3 物理分辨率。
+// P3 屏物理为 240×320 竖屏，UI 通过 LVGL swap_xy=true 旋转为 320×240 横屏显示。
+// 因此 WIDTH=320 HEIGHT=240 = LVGL 画布尺寸，已在 ui_port.c 与之配套。
+// 物理面板坐标由 esp_lcd 框架在 draw_bitmap 时按 swap_xy 自动换算。
+#define BSP_LCD_WIDTH 320  ///< LVGL 逻辑宽度（横屏旋转后视角）
+#define BSP_LCD_HEIGHT 240 ///< LVGL 逻辑高度（横屏旋转后视角）
 
 // ─── 5. 运动与反馈外设引脚 ──────────────────────────────────────────────────
 // 所有运动外设通过 PWM 信号驱动
