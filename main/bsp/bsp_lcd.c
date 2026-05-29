@@ -61,11 +61,15 @@ void bsp_board_lcd_init(bsp_board_t *bsp_board)
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = BSP_LCD_DC_PIN, // DC 引脚（GPIO13）：高=数据，低=命令
         .cs_gpio_num = BSP_LCD_CS_PIN, // CS 引脚（GPIO10）：低电平选中 LCD
-        .pclk_hz = 80 * 1000 * 1000,   // SPI 时钟 80MHz（保证动画流畅）
-        .lcd_cmd_bits = 8,             // 命令字段位宽（ST7789 固定 8-bit）
-        .lcd_param_bits = 8,           // 参数字段位宽（ST7789 固定 8-bit）
-        .spi_mode = 0,                 // SPI 模式 0（CPOL=0，CPHA=0）
-        .trans_queue_depth = 10,       // 事务队列深度（最多 10 个异步事务排队）
+        // SPI 时钟 20MHz：PCBA 板信号完整性比开发板差（更长走线 + 共地不理想 + 寄生电容），
+        // 在 40MHz 下偶发 "上电只有背光 / 白屏 / 卡 GIF 第一帧 / 重影" —— 日志正常但屏幕无显示，
+        // 是典型 SPI 命令丢包征兆（ST7789 没读到完整 init/cmd 序列）。
+        // 20MHz 在开发板已大量验证可流畅刷 GIF，先把时序余量留足，稳定后再尝试 30/40MHz。
+        .pclk_hz = 40 * 1000 * 1000,
+        .lcd_cmd_bits = 8,       // 命令字段位宽（ST7789 固定 8-bit）
+        .lcd_param_bits = 8,     // 参数字段位宽（ST7789 固定 8-bit）
+        .spi_mode = 0,           // SPI 模式 0（CPOL=0，CPHA=0）
+        .trans_queue_depth = 10, // 事务队列深度（最多 10 个异步事务排队）
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(
         (esp_lcd_spi_bus_handle_t)SPI2_HOST, &io_config, &bsp_board->lcd_io));

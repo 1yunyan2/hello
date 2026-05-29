@@ -176,7 +176,7 @@ static void audio_processor_play_task(void *arg)
 
         if (buf)
         {
-            underrun_count = 0;     // 读到数据，清零欠载计数
+            underrun_count = 0; // 读到数据，清零欠载计数
             if (!audio_processor->mute_output)
             {
                 active_playback = true; // 正在播放真实 TTS，激活欠载告警

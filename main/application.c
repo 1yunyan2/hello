@@ -296,12 +296,35 @@ void application_init(void)
     bsp_board_wifi_main(bsp_board);
     PRINT_INTERNAL_HEAP;
 
+    /* ── 步骤 9.5: 电池电压监控（VBAT_ADC）── */
+    // 若 BSP_BAT_ADC_PIN 未配置（仍为占位 -1），bsp_battery_init 会返回错误，
+    // 仅打印警告，不影响其他流程。后续硬件确认引脚后即可自动启用。
+    esp_err_t bat_ret = bsp_battery_init();
+    if (bat_ret == ESP_OK)
+    {
+        bsp_battery_start_task(NULL); // 暂不接低电回调，UI 自身已带变色提示
+        // bsp_battery_start_log_task(); // 新增：每 5s 打印一次电池电压/电量，便于调试
+        xEventGroupSetBits(bsp_board->board_status, BATTERY_BIT);
+        ESP_LOGI(TAG, "电池监控已启动");
+    }
+    else
+    {
+        ESP_LOGW(TAG, "电池监控未启用 (%s)，UI 电量将显示 --%%", esp_err_to_name(bat_ret));
+    }
+    PRINT_INTERNAL_HEAP;
     bsp_board_lcd_init(bsp_board); // LCD 初始化（当前未自动置位 LCD_BIT，后续可根据需求调整）
     PRINT_INTERNAL_HEAP;
+
+    // ── 临时：BSP LCD 自测（绕过 LVGL）──────────────────────────────────────
+    // 排查"主项目 LCD 黑屏"问题：色块出 → BSP OK，问题在 LVGL；色块不出 → BSP 层问题。
+    // 验证完成后请删除以下 3 行，恢复原顺序（ui_init → delay → bsp_board_lcd_on）。
+    bsp_board_lcd_on(bsp_board);          // 临时上移到 ui_init 之前
+    bsp_board_lcd_test_blocks(bsp_board); // 直接画黑底+四色块，绕过 LVGL
+    vTaskDelay(pdMS_TO_TICKS(5000));      // 持续 5s 便于肉眼观察
+
     ui_init();
     vTaskDelay(pdMS_TO_TICKS(100));
     PRINT_INTERNAL_HEAP;
-    bsp_board_lcd_on(bsp_board);
 
     // 提醒系统初始化（含 MOCK_TIME 模式下的系统时间设置）
     reminder_init(NULL); // NULL = 暂无 TTS 回调，后续接入 session 层时替换
@@ -335,16 +358,17 @@ void application_init(void)
     /* ── 步骤 9.5: 电池电压监控（VBAT_ADC）── */
     // 若 BSP_BAT_ADC_PIN 未配置（仍为占位 -1），bsp_battery_init 会返回错误，
     // 仅打印警告，不影响其他流程。后续硬件确认引脚后即可自动启用。
-    esp_err_t bat_ret = bsp_battery_init();
-    if (bat_ret == ESP_OK)
+    ret = bsp_battery_init();
+    if (ret == ESP_OK)
     {
         bsp_battery_start_task(NULL); // 暂不接低电回调，UI 自身已带变色提示
+        // bsp_battery_start_log_task(); // 新增：每 5s 打印一次电池电压/电量，便于调试
         xEventGroupSetBits(bsp_board->board_status, BATTERY_BIT);
         ESP_LOGI(TAG, "电池监控已启动");
     }
     else
     {
-        ESP_LOGW(TAG, "电池监控未启用 (%s)，UI 电量将显示 --%%", esp_err_to_name(bat_ret));
+        ESP_LOGW(TAG, "电池监控未启用 (%s)，UI 电量将显示 --%%", esp_err_to_name(ret));
     }
     PRINT_INTERNAL_HEAP;
 
@@ -375,7 +399,7 @@ void application_init(void)
         ESP_LOGI(TAG, "触摸扫描任务创建完成");
     }
 
-    // 舵机测试任务（独立跑，不影响 LVGL 刷新）
+       // 舵机测试任务（独立跑，不影响 LVGL 刷新）
     xTaskCreatePinnedToCoreWithCaps(
         servo_test_task,
         "servo_test",

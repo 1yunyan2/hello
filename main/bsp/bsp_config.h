@@ -178,8 +178,8 @@
 
 #define BSP_LCD_CS_PIN 41   // 41 LCD 片选（CS/NSS），低电平激活
 #define BSP_LCD_MOSI_PIN 39 // 39 LCD 数据线（MOSI），主发从收，单向写
-#define BSP_LCD_SCLK_PIN 38 // 40 LCD 时钟线（SCLK），最高 80MHz
-#define BSP_LCD_DC_PIN 40   // 38 LCD 数据/命令选择（D/C）：高=数据，低=命令
+#define BSP_LCD_SCLK_PIN 40 // 40 LCD 时钟线（SCLK），最高 80MHz（与 lcd_demo_standalone 一致：硬件实测此接线）
+#define BSP_LCD_DC_PIN 38   // 38 LCD 数据/命令选择（D/C）：高=数据，低=命令（与 lcd_demo_standalone 一致）
 #define BSP_LCD_RST_PIN 45  // 45 LCD 硬件复位（RST），低电平触发复位（从 GPIO14 迁出，腾出 TOUCH14 给翻页）
 #define BSP_LCD_BK_PIN 42   // 42 LCD 背光控制（BK），高电平开启背光
 

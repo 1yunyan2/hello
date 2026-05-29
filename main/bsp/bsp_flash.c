@@ -188,7 +188,38 @@ void bsp_flash_init(void)
     ret = esp_flash_init(ext_flash);
     if (ret != ESP_OK)
     {
-        ESP_LOGW(TAG, "外挂 flash init 失败，跳过产线模式");
+        ESP_LOGW(TAG, "外挂 flash init 失败 (ret=0x%x)，跳过产线模式", ret);
+
+        /* ── JEDEC ID 诊断 ──────────────────────────────────────────────────
+         * init 失败时，芯片句柄（spi_bus_add_flash_device 已挂上）仍可用，
+         * 这里直接读一次厂商/容量 ID，用原始值区分故障类型，避免反复盲猜硬件：
+         *   - 0xFFFFFF  → MISO 恒高：芯片没焊上 / DO 断线 / 没供电（总线被弱上拉拉满）
+         *   - 0x000000  → MISO 恒低：芯片被 HOLD#/RESET# 拉低挂起 / DO 对地短路
+         *   - 其它正常值 → 总线通了但握手没过，多半是 freq/io_mode 或电源纹波问题
+         * ID 字节序：bit23..16=厂商, bit15..8=存储类型, bit7..0=容量
+         * （W25Q 厂商=0xEF，如 0xEF4019=W25Q256 32MB）
+         * 详见 memory/bugs 中 BUG-016 同类虚焊指纹。 */
+        uint32_t jedec_id = 0;
+        esp_err_t id_ret = esp_flash_read_id(ext_flash, &jedec_id);
+        if (id_ret != ESP_OK)
+        {
+            ESP_LOGE(TAG, "[FLASH诊断] 连 JEDEC ID 都读不出 (ret=0x%x)，总线层就没通", id_ret);
+        }
+        else if (jedec_id == 0x000000 || jedec_id == 0xFFFFFF)
+        {
+            ESP_LOGE(TAG, "[FLASH诊断] JEDEC ID=0x%06lX (恒%s) → 芯片无响应："
+                          "查 HOLD#/WP# 上拉、CS/CLK/DI/DO 焊接、VCC 供电",
+                     (unsigned long)jedec_id, jedec_id ? "高" : "低");
+        }
+        else
+        {
+            ESP_LOGW(TAG, "[FLASH诊断] JEDEC ID=0x%06lX (厂商=0x%02lX 容量=0x%02lX) → "
+                          "总线已通但握手未过，查 freq/io_mode/电源纹波",
+                     (unsigned long)jedec_id,
+                     (unsigned long)((jedec_id >> 16) & 0xFF),
+                     (unsigned long)(jedec_id & 0xFF));
+        }
+
         ext_flash = NULL;
         return;
     }

@@ -381,18 +381,18 @@ static void trigger_vibration_motor(uint8_t mode)
     if (mode == 1)
     {
         // 轻微 1 次（50ms）
-        gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
-        vTaskDelay(pdMS_TO_TICKS(50));
         gpio_set_level(BSP_MOTOR_VIB_PIN, 0);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
     }
     else if (mode == 2)
     {
         // 短促 2 次（50ms × 2，间隔 50ms）
         for (int i = 0; i < 2; i++)
         {
-            gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
-            vTaskDelay(pdMS_TO_TICKS(50));
             gpio_set_level(BSP_MOTOR_VIB_PIN, 0);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
             if (i < 1)
                 vTaskDelay(pdMS_TO_TICKS(50)); // 两次之间间隔
         }
@@ -402,9 +402,9 @@ static void trigger_vibration_motor(uint8_t mode)
         // 连续 3 次（30ms × 3，间隔 30ms）
         for (int i = 0; i < 3; i++)
         {
-            gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
-            vTaskDelay(pdMS_TO_TICKS(30));
             gpio_set_level(BSP_MOTOR_VIB_PIN, 0);
+            vTaskDelay(pdMS_TO_TICKS(30));
+            gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
             if (i < 2)
                 vTaskDelay(pdMS_TO_TICKS(30));
         }
@@ -412,9 +412,9 @@ static void trigger_vibration_motor(uint8_t mode)
     else if (mode == 4)
     {
         // 长震 1 次（200ms）
-        gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
-        vTaskDelay(pdMS_TO_TICKS(200));
         gpio_set_level(BSP_MOTOR_VIB_PIN, 0);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
     }
 }
 

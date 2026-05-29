@@ -124,7 +124,7 @@ void bsp_motor_pulse(void)
     // API参数含义：
     //   BSP_MOTOR_VIB_PIN：GPIO引脚号
     //   1：输出高电平（马达启动）
-    gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
+    gpio_set_level(BSP_MOTOR_VIB_PIN, 0);
 
     // API含义：FreeRTOS任务延时，单位为系统时钟节拍
     // API参数含义：pdMS_TO_TICKS(30)：将30毫秒转换为系统时钟节拍数
@@ -134,7 +134,7 @@ void bsp_motor_pulse(void)
     // API参数含义：
     //   BSP_MOTOR_VIB_PIN：GPIO引脚号
     //   0：输出低电平（马达停止）
-    gpio_set_level(BSP_MOTOR_VIB_PIN, 0);
+    gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -151,7 +151,7 @@ void bsp_touch_init(void)
         .pin_bit_mask = (1ULL << BSP_MOTOR_VIB_PIN),
     };
     gpio_config(&motor_conf);
-    gpio_set_level(BSP_MOTOR_VIB_PIN, 0);
+    gpio_set_level(BSP_MOTOR_VIB_PIN, 1); // 停止马达
 
     // TTP223 OUT 引脚：输入 + 内部上拉（低有效，悬空时保持高电平不误触）
     gpio_config_t touch_conf = {
@@ -207,7 +207,7 @@ void bsp_touch_init(void)
         .pin_bit_mask = (1ULL << BSP_MOTOR_VIB_PIN),
     };
     gpio_config(&motor_conf);
-    gpio_set_level(BSP_MOTOR_VIB_PIN, 0);
+    gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
 
     touch_pad_init();
     touch_pad_set_voltage(TOUCH_HVOLT_2V7, TOUCH_LVOLT_0V5, TOUCH_HVOLT_ATTEN_0V);

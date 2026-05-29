@@ -412,7 +412,7 @@ void audio_init(bsp_board_t *bsp_board)
 
     // ── 步骤 4：设置扬声器音量（0~100，60 为适中音量）──────────────────────
     // 音量过大可能导致 ES8311 内部 DAC 饱和，产生爆音
-    esp_codec_dev_set_out_vol(bsp_board->codec_dev, 80);
+    esp_codec_dev_set_out_vol(bsp_board->codec_dev, 50);
 
     ESP_LOGI(TAG, "ES8311 初始化完成（增益=46, 音量=60）");
 
