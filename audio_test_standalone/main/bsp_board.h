@@ -26,8 +26,8 @@
 #include "esp_heap_caps.h"
 
 // ─── 设备状态位定义（仅保留音频相关）────────────────────────────────────────
-#define NVS_BIT BIT3       ///< NVS Flash 初始化完成
-#define CODEC_BIT BIT4     ///< ES8311 音频编解码器初始化完成
+#define NVS_BIT BIT3   ///< NVS Flash 初始化完成
+#define CODEC_BIT BIT4 ///< ES8311 音频编解码器初始化完成
 
 // ─── BSP 全局单例结构体（精简版）────────────────────────────────────────────
 /**
@@ -57,8 +57,5 @@ bool bsp_board_check_status(bsp_board_t *bsp_board, EventBits_t bits_to_check, T
 /** @brief ES8311 硬件初始化（I2C + I2S + Codec 驱动），audio_init 内部调用 */
 void bsp_board_codec_init(bsp_board_t *bsp_board);
 
-/** @brief 完整音频初始化：硬件 + 打开设备 + 创建采集任务（自带 PCM 诊断打印） */
+/** @brief 完整音频初始化：硬件 + 打开设备 + 设置增益。采集任务由 main.c 负责创建 */
 void audio_init(bsp_board_t *bsp_board);
-
-/** @brief 麦克风采集任务（audio_init 内部创建，不可手动调用） */
-void audio_feed_task(void *arg);

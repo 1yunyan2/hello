@@ -2,9 +2,7 @@
 #include "esp_codec_dev_defaults.h"
 #include "driver/i2s_std.h"
 #include "driver/i2c_master.h"
-#include "custom_wake_word.h"
 #include "esp_heap_caps.h"
-#include <math.h>
 
 static const char *TAG = "BSP_CODEC";
 
@@ -101,7 +99,11 @@ static void bsp_board_codec_i2s_init(bsp_board_t *bsp_board,
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(*tx_handle, &std_config));
 
     // ── 步骤 5：使能通道，开始工作 ───────────────────────────────────────────
-    // 使能后 DMA 开始工作：RX 持续从麦克风采集数据，TX 持续向扬声器输出数据
+    // 使能后 DMA 开始工作：RX 持续从麦克风采集数据，TX 持续向扬声器输出数据。
+    // 【必须在这里 enable】：本版 esp_codec_dev 在 open/close 时只做 disable，
+    // 不会主动 enable，它假定通道交给它之前已处于 enabled 状态。若不在此 enable，
+    // codec_dev 一上来就 disable 会报 "the channel has not been enabled yet"。
+    // （注意：采集任务务必只有一处，否则多任务抢 read 锁会破坏 enable/disable 状态机）
     ESP_ERROR_CHECK(i2s_channel_enable(*rx_handle)); // 录音通道：开始采集麦克风数据
     ESP_ERROR_CHECK(i2s_channel_enable(*tx_handle)); // 播放通道：开始向扬声器输出
 }
@@ -230,162 +232,19 @@ void bsp_board_codec_init(bsp_board_t *bsp_board)
     xEventGroupSetBits(bsp_board->board_status, CODEC_BIT);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 音频采集任务与完整初始化
-// ═══════════════════════════════════════════════════════════════════════════════
-
 /**
- * @brief 麦克风采集任务（持续采集 PCM，投喂给 AFE + MultiNet 唤醒引擎）
- *
- * 数据流向：I2S DMA → buffer → custom_wake_word_feed()
- *                               ↓
- *                          AFE 内部处理：
- *                           - NS 降噪（消除背景噪音）
- *                           - VAD 语音活动检测
- *                          ↓              ↓
- *                   enhanced_pcm_hook  MultiNet6 检测
- *                   （→ 编码器入口）   （→ 唤醒词回调）
- *
- * @param arg bsp_board_t* 实例指针（通过 arg 传入，使用 codec_dev 读取音频）
- * @return 无（任务永远运行，除非 FreeRTOS 调度器停止）
- *
- * @note 调用者：audio_init() 通过 xTaskCreatePinnedToCore() 自动创建
- * @note 运行核心：CPU1（避免与 WiFi 协议栈竞争 CPU0）
- * @note 栈大小：8192 字节，优先级：5
- * @note chunk_size 来自 AFE 的 feed_chunksize，必须严格按此大小投喂
- */
-void audio_feed_task(void *arg)
-{
-    bsp_board_t *bsp_board = (bsp_board_t *)arg;
-
-    // ── 步骤 1：获取 AFE 要求的每次投喂采样点数 ──────────────────────────────
-    // AFE 内部要求每次 feed 固定数量的采样点（通常是 512 点 = 32ms@16kHz）
-    // 投喂量不对会导致 AFE 内部缓冲溢出或欠采样，产生 VAD 误检
-    size_t chunk_size = custom_wake_word_get_feed_chunksize();
-    if (chunk_size == 0)
-    {
-        // AFE 未就绪时使用安全默认值（避免任务立即 crash）
-        chunk_size = 512;
-        ESP_LOGW(TAG, "AFE 未就绪，使用默认 chunk_size=%d", (int)chunk_size);
-    }
-
-    // ── 步骤 2：分配 PCM 采集缓冲区 ─────────────────────────────────────────
-
-    // 因为使用的是软件的回音消除，是单声道，所以每个采样点是一个 int16_t（16-bit），不需要乘以通道数。
-    //  // 【修改点 1】增加通道数变量，计算真实的字节数
-    //  int feed_channel = 2; // 因为配了 "MR"，这里必须是 2
-    //  size_t alloc_size = chunk_size * feed_channel * sizeof(int16_t);
-
-    // // 【修改点 2】按新计算的大小分配内存
-    // int16_t *buffer = malloc(alloc_size);
-    // 大小 = 采样点数 × 每点字节数（16-bit = 2 字节）
-    /* 从 SPIRAM 分配采集缓冲区，避免占用宝贵的内部 SRAM */
-    int16_t *buffer = heap_caps_malloc(chunk_size * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (buffer == NULL)
-    {
-        ESP_LOGE(TAG, "audio_feed_task: 内存不足，无法分配 %d 字节采集缓冲区",
-                 (int)(chunk_size * sizeof(int16_t)));
-        vTaskDelete(NULL); // 分配失败，删除自己避免空指针访问
-        return;
-    }
-
-    ESP_LOGI(TAG, "音频采集任务启动 (AFE feed chunk=%d samples, %d bytes)",
-             (int)chunk_size, (int)(chunk_size * sizeof(int16_t)));
-
-    // [PCBA 诊断] 每 ~3s 统计一次 PCM 峰值/RMS，用于判断麦克风信号是否正常
-    // peak<100/rms<30 → 信号几乎没进来（硬件层）；peak 200~1000 → 增益不足；peak>5000 → 信号 OK，问题在 AFE
-    uint32_t diag_iter = 0;
-    int32_t diag_peak = 0;
-    uint64_t diag_sumsq = 0;
-    uint32_t diag_samples = 0;
-    const uint32_t DIAG_PRINT_EVERY = 16000 / 512 * 3; // 约 3 秒
-
-    // [PCBA 诊断·自检] 启动时人为塞已知值，验证统计代码本身没问题
-    // 期望输出 peak=12345 rms≈8731（√((12345²+1000²+...)/8)的近似）
-    {
-        int16_t test_buf[8] = {12345, -1000, 500, -500, 200, -200, 0, 0};
-        int32_t t_peak = 0;
-        uint64_t t_sumsq = 0;
-        for (int i = 0; i < 8; ++i)
-        {
-            int32_t v = test_buf[i];
-            int32_t av = v < 0 ? -v : v;
-            if (av > t_peak)
-                t_peak = av;
-            t_sumsq += (uint64_t)(v * v);
-        }
-        uint32_t t_rms = (uint32_t)sqrt((double)t_sumsq / 8);
-        ESP_LOGW(TAG, "[PCM自检] 统计逻辑测试 peak=%ld rms=%lu (期望 peak=12345 rms≈4387) — 好的",
-                 (long)t_peak, (unsigned long)t_rms);
-    }
-
-    // ── 步骤 3：主采集循环（永不退出）───────────────────────────────────────
-    while (1)
-    {
-        // 从 ES8311 编解码器读取一帧 PCM 数据（阻塞直到 DMA 缓冲区就绪）
-        // esp_codec_dev_read 内部调用 i2s_channel_read，等待 I2S RX DMA 完成
-        esp_err_t ret = esp_codec_dev_read(
-            bsp_board->codec_dev,        // ES8311 设备句柄
-            buffer,                      // 目标缓冲区
-            chunk_size * sizeof(int16_t) // 读取字节数（固定帧大小）
-            // alloc_size
-        );
-
-        if (ret == ESP_OK)
-        {
-            // [PCBA 诊断] 累计本帧的峰值和平方和
-            for (size_t i = 0; i < chunk_size; ++i)
-            {
-                int32_t v = buffer[i];
-                int32_t av = v < 0 ? -v : v;
-                if (av > diag_peak)
-                    diag_peak = av;
-                diag_sumsq += (uint64_t)(v * v);
-            }
-            diag_samples += chunk_size;
-            if (++diag_iter >= DIAG_PRINT_EVERY)
-            {
-                uint32_t rms = diag_samples ? (uint32_t)sqrt((double)diag_sumsq / diag_samples) : 0;
-                // 同步打印 buffer 前 8 个原始采样的十六进制，证明读到的字节真是 0x00 而不是统计 bug
-                ESP_LOGI(TAG, "[PCM诊断] peak=%ld rms=%lu samples=%lu | 原始bytes[0..7]=%04X %04X %04X %04X %04X %04X %04X %04X",
-                         (long)diag_peak, (unsigned long)rms, (unsigned long)diag_samples,
-                         (uint16_t)buffer[0], (uint16_t)buffer[1], (uint16_t)buffer[2], (uint16_t)buffer[3],
-                         (uint16_t)buffer[4], (uint16_t)buffer[5], (uint16_t)buffer[6], (uint16_t)buffer[7]);
-                diag_iter = 0;
-                diag_peak = 0;
-                diag_sumsq = 0;
-                diag_samples = 0;
-            }
-
-            // 将原始 PCM 投喂给 AFE + MultiNet 引擎
-            // 内部流程：AFE.feed() → AFE.fetch()（降噪）→ PCM钩子 + MultiNet检测
-            custom_wake_word_feed(buffer, chunk_size);
-        }
-        else
-        {
-            // 读取失败（DMA 未就绪或 I2S 错误），延迟 10ms 后重试
-            // 避免 CPU 空转，给底层驱动时间恢复
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-    }
-    // 注意：此处代码不可达，malloc 的 buffer 在任务生命周期内始终有效
-}
-
-/**
- * @brief 完整音频初始化：硬件 + 设备打开 + 增益设置 + 采集任务
+ * @brief 完整音频初始化：硬件 + 设备打开 + 增益设置
  *
  * 依次执行：
  *   1. bsp_board_codec_init()：初始化 I2C+I2S+ES8311 硬件（置位 CODEC_BIT）
  *   2. esp_codec_dev_open()：打开音频设备，配置采样参数
  *   3. 设置麦克风输入增益和扬声器输出音量
- *   4. xTaskCreatePinnedToCore(audio_feed_task)：启动麦克风采集任务
  *
  * @param bsp_board BSP 实例指针（codec_dev 在此函数完成后可用）
  * @return void
  *
- * @note 调用者：application.c → application_init()（步骤 4）
- * @note 前置条件：wake_word_init() 必须先完成（采集任务立即向引擎投喂）
- * @note 采集任务绑定 CPU1，与 WiFi（CPU0）隔离，保证实时性
+ * @note 调用者：main.c → app_main()（步骤 2）
+ * @note 采集任务不在此创建，由 main.c 统一启动（避免抢 codec_dev 锁）
  */
 void audio_init(bsp_board_t *bsp_board)
 {
@@ -408,28 +267,17 @@ void audio_init(bsp_board_t *bsp_board)
     // 增益过大>50：产生饱和失真，同样影响识别率
     // 43→46：配合 AFE AGC(WAKENET) 使用，硬件增益提升语音底线幅度，
     //        AGC 再做软件自适应补偿，无需大喊即可达到模型所需置信度
-    // [audio_test_standalone 调整] 主工程值=48（配合 AGC 放大到接近饱和，给唤醒词最大召回率）。
-    // 测试工程不跑 MultiNet，硬件 24dB + 软件 AGC 会让 PCM 持续顶到 ±32768（截幅），VAD 失效。
-    // 这里降到 24，配合下面关掉 AGC，PCM 落在健康区间，VAD 才有正常的人声/静音对比。
     esp_codec_dev_set_in_gain(bsp_board->codec_dev, 24);
 
     // ── 步骤 4：设置扬声器音量（0~100，60 为适中音量）──────────────────────
     // 音量过大可能导致 ES8311 内部 DAC 饱和，产生爆音
     esp_codec_dev_set_out_vol(bsp_board->codec_dev, 50);
 
-    ESP_LOGI(TAG, "ES8311 初始化完成（增益=46, 音量=60）");
+    ESP_LOGI(TAG, "ES8311 初始化完成（增益=24, 音量=50）");
 
-    // ── 步骤 5：创建麦克风采集任务 ────────────────────────────────────────────
-    // 任务立即开始从 I2S DMA 读取 PCM 数据并投喂给 AFE/MultiNet
-    // 必须在 codec_dev 完全打开后才能创建，否则 read() 会失败
-    /* 任务栈分配到 SPIRAM，节省内部 SRAM（audio_feed 无实时 ISR 调用，PSRAM cache 足够快） */
-    xTaskCreatePinnedToCoreWithCaps(
-        audio_feed_task,                      // 任务函数
-        "audio_feed",                         // 任务名称（用于 FreeRTOS 调试工具显示）
-        8192,                                 // 栈大小（8KB：含 DMA 缓冲区指针和局部变量）
-        bsp_board,                            // 传入 bsp_board 指针（任务需要 codec_dev 读取音频）
-        5,                                    // 优先级（与编解码任务对称，保证实时性）
-        NULL,                                 // 不需要保存任务句柄（任务永远运行，无需管理）
-        1,                                    // 固定到 CPU 核心 1（WiFi 协议栈默认用 CPU0，避免竞争）
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); // 栈分配在 SPIRAM
+    // ── 说明：本函数【不再】创建采集任务 ──────────────────────────────────────
+    // 采集任务（读 codec_dev → 投喂 AFE → VAD）由 main.c 统一负责并启动。
+    // 若在这里也启动一个采集任务，两个任务会同时 esp_codec_dev_read() 抢同一把
+    // codec_dev mutex，导致读取时序错乱、I2S 报 "channel is not enabled"、
+    // AFE ringbuffer empty。因此采集逻辑只能有一处，统一放在 main.c。
 }

@@ -49,8 +49,8 @@ bsp_board_t *bsp_board_get_instance(void)
  * @param bsp_board BSP 实例指针（通过 board_status 置位 NVS_BIT）
  * @return void（失败时 ESP_ERROR_CHECK 触发系统重启）
  *
- * @note 调用者：application.c → application_init()（步骤 2，NVS 初始化）
- * @note 必须早于所有使用 NVS 的模块：bsp_wifi、custom_wake_word、session、auth
+ * @note 调用者：app_main（建议作为首个初始化步骤）
+ * @note 必须早于所有使用 NVS 的模块调用
  */
 void bsp_board_nvs_init(bsp_board_t *bsp_board)
 {
