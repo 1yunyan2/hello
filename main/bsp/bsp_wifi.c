@@ -396,6 +396,28 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
+// ─── bsp_wifi_get_rssi ───────────────────────────────────────────────────────
+
+/**
+ * @brief 获取当前 STA 连接的 WiFi 信号强度 RSSI
+ *
+ * 调用 esp_wifi_sta_get_ap_info() 读取关联 AP 的信号强度。
+ *
+ * @return RSSI 值（单位 dBm，负数，值越大信号越好）；未连接或读取失败时返回 0
+ *
+ * @note 调用者：UI 状态栏定时器（每数秒拉取一次刷新显示）
+ * @note 该函数仅读取已缓存的 AP 信息，开销极小，可频繁调用
+ */
+int bsp_wifi_get_rssi(void)
+{
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
+    {
+        return ap_info.rssi;
+    }
+    return 0; // 未连接或读取失败
+}
+
 // ─── bsp_board_wifi_main ─────────────────────────────────────────────────────
 
 /**

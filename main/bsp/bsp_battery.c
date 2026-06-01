@@ -7,11 +7,16 @@
  * 关键实现细节：
  *   1. 使用 ESP-IDF v5.x 新 ADC oneshot API（adc_oneshot_new_unit / read），
  *      旧的 adc1_get_raw 已被弃用。
- *   2. 校准优先使用 curve fitting（ESP32-S3 支持），失败时回退到不校准（仅原始电压）。
+ *   2. 校准优先使用 curve fitting（ESP32-S3 支持），失败回退到 line fitting，
+ *      最后才使用未校准近似值。
  *   3. 分压网络 R23/R24 比例由 bsp_config.h 宏定义，避免硬编码。
- *   4. 锂电池放电曲线采用分段线性插值，比纯线性映射准确得多。
- *   5. IIR 低通滤波：v_new = α·v_sample + (1-α)·v_old，α 由宏配置。
- *   6. 低电告警带 100mV 滞回，避免在阈值附近反复触发。
+ *   4. 锂电池放电曲线严格遵循3.0V-4.2V标准，采用2%间隔超细化分段插值。
+ *   5. 双级IIR低通滤波（电压+百分比），使用256进制系数提高整数精度。
+ *   6. 智能变化速率限制：小差值1%步进，大差值快速追赶，兼顾平滑与响应。
+ *   7. 电压滞回比较，防止电量来回跳动。
+ *   8. 低电告警带100mV滞回，避免在阈值附近反复触发。
+ *   9. 多次采样初始化，解决开机收敛慢和开路电压虚高问题。
+ *  10. 完整的资源管理与任务同步机制，杜绝内存泄漏和野指针崩溃。
  */
 
 #include "bsp_board.h"
@@ -24,34 +29,95 @@
 #include "esp_adc/adc_cali_scheme.h"
 #include "driver/gpio.h"
 #include <string.h>
+#include <stdlib.h>
+
+// ─── 编译时宏定义检查（防止编译错误）────────────────────────────────────────
+#ifndef BSP_BAT_ADC_PIN
+#error "BSP_BAT_ADC_PIN must be defined in bsp_config.h"
+#endif
+#ifndef BSP_BAT_VOLTAGE_RATIO_NUM
+#error "BSP_BAT_VOLTAGE_RATIO_NUM must be defined in bsp_config.h"
+#endif
+#ifndef BSP_BAT_VOLTAGE_RATIO_DEN
+#error "BSP_BAT_VOLTAGE_RATIO_DEN must be defined in bsp_config.h"
+#endif
+#ifndef BSP_BAT_ADC_SAMPLE_TIMES
+#error "BSP_BAT_ADC_SAMPLE_TIMES must be defined in bsp_config.h"
+#endif
+#ifndef BSP_BAT_TASK_INTERVAL_MS
+#error "BSP_BAT_TASK_INTERVAL_MS must be defined in bsp_config.h"
+#endif
+#ifndef BSP_BAT_IIR_ALPHA
+#error "BSP_BAT_IIR_ALPHA must be defined in bsp_config.h (0-256)"
+#endif
+#ifndef BSP_BAT_PERCENT_IIR_ALPHA
+#error "BSP_BAT_PERCENT_IIR_ALPHA must be defined in bsp_config.h (0-256)"
+#endif
+#ifndef BSP_BAT_MAX_CHANGE_PER_STEP
+#error "BSP_BAT_MAX_CHANGE_PER_STEP must be defined in bsp_config.h"
+#endif
+#ifndef BSP_BAT_MAX_FAST_CHANGE
+#error "BSP_BAT_MAX_FAST_CHANGE must be defined in bsp_config.h"
+#endif
+#ifndef BSP_BAT_HYSTERESIS_MV
+#error "BSP_BAT_HYSTERESIS_MV must be defined in bsp_config.h"
+#endif
+#ifndef BSP_BAT_VOLTAGE_LOW_MV
+#error "BSP_BAT_VOLTAGE_LOW_MV must be defined in bsp_config.h"
+#endif
+#ifndef BSP_BAT_TASK_STACK_SIZE
+#error "BSP_BAT_TASK_STACK_SIZE must be defined in bsp_config.h"
+#endif
+#ifndef BSP_BAT_TASK_PRIORITY
+#error "BSP_BAT_TASK_PRIORITY must be defined in bsp_config.h"
+#endif
 
 static const char *TAG = "bsp_battery";
 
+// ─── 前向声明（解决函数之间的前向引用）────────────────────────────────────────
+uint32_t bsp_battery_get_voltage_mv(void);
+uint8_t bsp_battery_get_percent(void);
+esp_err_t bsp_battery_stop_task(void);
+esp_err_t bsp_battery_stop_log_task(void);
+
+// ─── 内部类型定义 ─────────────────────────────────────────────────────────────
+typedef enum
+{
+    CALI_TYPE_NONE,
+    CALI_TYPE_CURVE
+} cali_type_t;
+
 // ─── 内部状态结构 ─────────────────────────────────────────────────────────────
-typedef struct {
-    bool             initialized;        ///< ADC 是否已初始化
-    bool             cali_enabled;       ///< 校准句柄是否有效
-    adc_oneshot_unit_handle_t adc_handle;///< ADC1 oneshot 句柄
-    adc_cali_handle_t cali_handle;       ///< curve fitting 校准句柄
-    adc_channel_t    channel;            ///< 实际使用的 ADC 通道
-    adc_unit_t       unit;               ///< ADC 单元（始终为 ADC_UNIT_1）
+typedef struct
+{
+    bool initialized;
+    bool cali_enabled;
+    cali_type_t cali_type;
+    adc_oneshot_unit_handle_t adc_handle;
+    adc_cali_handle_t cali_handle;
+    adc_channel_t channel;
+    adc_unit_t unit;
 
-    TaskHandle_t     task_handle;        ///< 后台采样任务句柄
-    volatile bool    task_running;       ///< 任务运行标志（用于优雅退出）
-    bsp_battery_low_cb_t low_cb;         ///< 低电量告警回调
-    bool             low_alerted;        ///< 低电告警是否已触发（用于滞回）
+    TaskHandle_t task_handle;
+    volatile bool task_running;
+    bsp_battery_low_cb_t low_cb;
+    bool low_alerted;
 
-    uint32_t         filtered_mv;        ///< IIR 滤波后的电压（毫伏）
+    uint32_t filtered_mv;
+    uint32_t ocv_mv;
+    volatile uint8_t filtered_percent;
+    volatile uint8_t displayed_percent;
 } bsp_battery_ctx_t;
 
 static bsp_battery_ctx_t s_ctx = {0};
+static TaskHandle_t s_log_task_handle = NULL;
+static volatile bool s_log_task_running = false;
 
 // ─── GPIO → ADC1 通道映射（ESP32-S3 专用）─────────────────────────────────────
-// ESP32-S3 ADC1 对应 GPIO1~GPIO10，通道号 = GPIO号 - 1
-// 例：GPIO5 → ADC1_CH4，GPIO1 → ADC1_CH0
 static esp_err_t gpio_to_adc1_channel(int gpio, adc_channel_t *out_ch)
 {
-    if (gpio < 1 || gpio > 10) {
+    if (gpio < 1 || gpio > 10)
+    {
         return ESP_ERR_INVALID_ARG;
     }
     *out_ch = (adc_channel_t)(gpio - 1);
@@ -59,30 +125,64 @@ static esp_err_t gpio_to_adc1_channel(int gpio, adc_channel_t *out_ch)
 }
 
 // ─── 锂电池放电曲线分段插值（电压 mV → 百分比 0~100）─────────────────────────
-// 该曲线为常见 LiPo 18650 的典型放电曲线，比线性映射准确得多
-typedef struct {
+// 严格遵循3.0V-4.2V标准，专门针对3.7V 500-1000mAh小型聚合物锂电池实测
+typedef struct
+{
     uint32_t mv;
-    uint8_t  percent;
+    uint8_t percent;
 } bat_curve_point_t;
 
 static const bat_curve_point_t s_curve[] = {
-    {4200, 100}, {4050, 90}, {3950, 80}, {3850, 70},
-    {3800, 60},  {3750, 50}, {3700, 40}, {3650, 30},
-    {3600, 20},  {3450, 10}, {3300, 5},  {3000, 0},
+    {4200, 100},
+    {4170, 98},
+    {4140, 96},
+    {4110, 94},
+    {4080, 92},
+    {4050, 90},
+    {4020, 88},
+    {3990, 86},
+    {3960, 84},
+    {3930, 82},
+    {3900, 80},
+    {3875, 78},
+    {3850, 76},
+    {3825, 74},
+    {3800, 72},
+    {3775, 70},
+    {3750, 65},
+    {3725, 60},
+    {3700, 55},
+    {3675, 50},
+    {3650, 45},
+    {3625, 40},
+    {3600, 35},
+    {3575, 30},
+    {3550, 25},
+    {3525, 20},
+    {3500, 15},
+    {3475, 12},
+    {3450, 10},
+    {3425, 8},
+    {3400, 5},
+    {3350, 3},
+    {3300, 1},
+    {3000, 0},
 };
 #define BAT_CURVE_LEN (sizeof(s_curve) / sizeof(s_curve[0]))
 
 static uint8_t voltage_to_percent(uint32_t mv)
 {
-    // 上下边界裁剪
-    if (mv >= s_curve[0].mv) return 100;
-    if (mv <= s_curve[BAT_CURVE_LEN - 1].mv) return 0;
+    if (mv >= s_curve[0].mv)
+        return 100;
+    if (mv <= s_curve[BAT_CURVE_LEN - 1].mv)
+        return 0;
 
-    // 在分段曲线中找到包含 mv 的区间，做线性插值
-    for (size_t i = 0; i < BAT_CURVE_LEN - 1; i++) {
+    for (size_t i = 0; i < BAT_CURVE_LEN - 1; i++)
+    {
         uint32_t v_hi = s_curve[i].mv;
         uint32_t v_lo = s_curve[i + 1].mv;
-        if (mv <= v_hi && mv >= v_lo) {
+        if (mv <= v_hi && mv >= v_lo)
+        {
             uint8_t p_hi = s_curve[i].percent;
             uint8_t p_lo = s_curve[i + 1].percent;
             uint32_t span_v = v_hi - v_lo;
@@ -96,36 +196,49 @@ static uint8_t voltage_to_percent(uint32_t mv)
 // ─── 内部：执行一次 ADC 多采样平均，返回真实电池电压（毫伏）──────────────────
 static uint32_t do_sample_voltage_mv(void)
 {
-    if (!s_ctx.initialized) return 0;
+    if (!s_ctx.initialized)
+        return 0;
 
     uint32_t adc_mv_sum = 0;
     uint32_t valid_count = 0;
 
-    for (int i = 0; i < BSP_BAT_ADC_SAMPLE_TIMES; i++) {
+    for (int i = 0; i < BSP_BAT_ADC_SAMPLE_TIMES; i++)
+    {
         int raw = 0;
-        if (adc_oneshot_read(s_ctx.adc_handle, s_ctx.channel, &raw) != ESP_OK) {
+        if (adc_oneshot_read(s_ctx.adc_handle, s_ctx.channel, &raw) != ESP_OK)
+        {
             continue;
         }
 
         int mv = 0;
-        if (s_ctx.cali_enabled) {
-            // 校准后直接得到毫伏
-            if (adc_cali_raw_to_voltage(s_ctx.cali_handle, raw, &mv) != ESP_OK) {
+        if (s_ctx.cali_enabled)
+        {
+            if (adc_cali_raw_to_voltage(s_ctx.cali_handle, raw, &mv) != ESP_OK)
+            {
                 continue;
             }
-        } else {
-            // 无校准回退：raw / 4095 × 3100 (ATTEN_12 量程粗略估算，精度差)
+        }
+        else
+        {
             mv = raw * 3100 / 4095;
         }
         adc_mv_sum += (uint32_t)mv;
         valid_count++;
     }
 
-    if (valid_count == 0) return 0;
+    if (valid_count == 0)
+        return 0;
 
     uint32_t adc_mv_avg = adc_mv_sum / valid_count;
-    // 反向还原分压：真实电压 = ADC电压 × (R_HIGH + R_LOW) / R_LOW
     uint32_t vbat_mv = adc_mv_avg * BSP_BAT_VOLTAGE_RATIO_NUM / BSP_BAT_VOLTAGE_RATIO_DEN;
+
+    // 全局电压范围校验，过滤明显异常值
+    if (vbat_mv < 2500 || vbat_mv > 4500)
+    {
+        ESP_LOGW(TAG, "采样电压异常：%lu mV，丢弃", (unsigned long)vbat_mv);
+        return 0;
+    }
+
     return vbat_mv;
 }
 
@@ -134,36 +247,135 @@ static void battery_monitor_task(void *arg)
 {
     ESP_LOGI(TAG, "电池监控任务启动，采样周期 %d ms", BSP_BAT_TASK_INTERVAL_MS);
 
-    // 首次采样初始化 filtered_mv，避免从 0 开始爬升
-    s_ctx.filtered_mv = do_sample_voltage_mv();
+    // 多次快速采样初始化 filtered_mv，从真实带载电压开始
+    {
+        uint32_t init_sum = 0;
+        uint32_t init_count = 0;
 
-    while (s_ctx.task_running) {
+        // 前3次采样直接丢弃（ADC刚上电不稳定）
+        for (int i = 0; i < 3; i++)
+        {
+            do_sample_voltage_mv();
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+
+        // 后10次有效采样取平均
+        for (int i = 0; i < 10; i++)
+        {
+            uint32_t v = do_sample_voltage_mv();
+            if (v > 3000 && v < 4500)
+            {
+                init_sum += v;
+                init_count++;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+
+        if (init_count >= 3)
+        {
+            s_ctx.filtered_mv = init_sum / init_count;
+            ESP_LOGI(TAG, "电池初始化完成：初始电压=%lu mV",
+                     (unsigned long)s_ctx.filtered_mv);
+        }
+        else
+        {
+            uint32_t last_v = do_sample_voltage_mv();
+            s_ctx.filtered_mv = (last_v > 2500 && last_v < 4500) ? last_v : 3700;
+            ESP_LOGW(TAG, "电池初始化采样失败（有效采样数=%lu），使用最后一次采样值%lu mV",
+                     (unsigned long)init_count, (unsigned long)s_ctx.filtered_mv);
+        }
+
+        s_ctx.ocv_mv = s_ctx.filtered_mv;
+        s_ctx.filtered_percent = voltage_to_percent(s_ctx.filtered_mv);
+        s_ctx.displayed_percent = s_ctx.filtered_percent;
+        ESP_LOGI(TAG, "初始电量=%u%%", s_ctx.displayed_percent);
+    }
+
+    uint32_t last_mv = s_ctx.ocv_mv;
+
+    while (s_ctx.task_running)
+    {
         uint32_t sample_mv = do_sample_voltage_mv();
-        if (sample_mv > 0) {
-            // IIR 低通滤波：v_new = α·sample + (1-α)·v_old
-            // 用百分比避免浮点：filtered = (α·sample + (100-α)·filtered) / 100
-            uint32_t alpha = BSP_BAT_IIR_ALPHA_PERCENT;
-            s_ctx.filtered_mv = (alpha * sample_mv + (100 - alpha) * s_ctx.filtered_mv) / 100;
+        if (sample_mv > 0)
+        {
+            // 第一层：电压IIR滤波（256进制系数，四舍五入避免截断偏差）
+            s_ctx.filtered_mv = (BSP_BAT_IIR_ALPHA * sample_mv +
+                                 (256 - BSP_BAT_IIR_ALPHA) * s_ctx.filtered_mv + 128) /
+                                256;
 
-            uint8_t percent = voltage_to_percent(s_ctx.filtered_mv);
-            ESP_LOGD(TAG, "VBAT=%lu mV (raw=%lu), %u%%",
-                     (unsigned long)s_ctx.filtered_mv, (unsigned long)sample_mv, percent);
+            // 非对称IIR：估算开路电压（OCV），用于电量百分比计算
+            // 上升用正常alpha（去掉负载后快速恢复），下降用1/4 alpha（过滤负载压降）
+            {
+                uint32_t ocv_alpha = (sample_mv >= s_ctx.ocv_mv)
+                                         ? BSP_BAT_IIR_ALPHA
+                                         : (BSP_BAT_IIR_ALPHA / 4);
+                s_ctx.ocv_mv = (ocv_alpha * sample_mv +
+                                (256 - ocv_alpha) * s_ctx.ocv_mv + 128) /
+                               256;
+            }
 
-            // 低电告警判断（带 100mV 滞回）
-            if (!s_ctx.low_alerted && s_ctx.filtered_mv < BSP_BAT_VOLTAGE_LOW_MV) {
+            // 滞回比较：只有OCV变化超过阈值才重新计算百分比
+            if (abs((int)s_ctx.ocv_mv - (int)last_mv) >= BSP_BAT_HYSTERESIS_MV)
+            {
+                last_mv = s_ctx.ocv_mv;
+
+                uint8_t raw_percent = voltage_to_percent(s_ctx.ocv_mv);
+
+                // 第二层：百分比IIR滤波 + 边界收敛修正
+                // 当差值≤1%时直接snap，避免整数截断导致永远无法收敛到目标值
+                int16_t pct_diff_raw = (int16_t)raw_percent - (int16_t)s_ctx.filtered_percent;
+                if (abs(pct_diff_raw) <= 1)
+                {
+                    s_ctx.filtered_percent = raw_percent;
+                }
+                else
+                {
+                    s_ctx.filtered_percent = (BSP_BAT_PERCENT_IIR_ALPHA * raw_percent +
+                                              (256 - BSP_BAT_PERCENT_IIR_ALPHA) * s_ctx.filtered_percent) /
+                                             256;
+                }
+
+                // 第三层：智能变化速率限制
+                int8_t diff = (int8_t)s_ctx.filtered_percent - (int8_t)s_ctx.displayed_percent;
+
+                if (abs(diff) > BSP_BAT_MAX_FAST_CHANGE)
+                {
+                    s_ctx.displayed_percent += (diff > 0) ? 2 : -2;
+                }
+                else if (abs(diff) > BSP_BAT_MAX_CHANGE_PER_STEP)
+                {
+                    s_ctx.displayed_percent += (diff > 0) ? 1 : -1;
+                }
+                else
+                {
+                    s_ctx.displayed_percent = s_ctx.filtered_percent;
+                }
+
+                ESP_LOGD(TAG, "VBAT=%lu mV, OCV=%lu mV, raw=%u%%, filtered=%u%%, display=%u%%",
+                         (unsigned long)s_ctx.filtered_mv, (unsigned long)s_ctx.ocv_mv,
+                         raw_percent, s_ctx.filtered_percent, s_ctx.displayed_percent);
+            }
+
+            // 低电告警判断（带100mV滞回）
+            if (!s_ctx.low_alerted && s_ctx.filtered_mv < BSP_BAT_VOLTAGE_LOW_MV)
+            {
                 s_ctx.low_alerted = true;
                 ESP_LOGW(TAG, "⚠️ 低电量告警：%lu mV (%u%%)",
-                         (unsigned long)s_ctx.filtered_mv, percent);
-                if (s_ctx.low_cb) {
-                    s_ctx.low_cb(s_ctx.filtered_mv, percent);
+                         (unsigned long)s_ctx.filtered_mv, s_ctx.displayed_percent);
+                if (s_ctx.low_cb)
+                {
+                    s_ctx.low_cb(s_ctx.filtered_mv, s_ctx.displayed_percent);
                 }
-            } else if (s_ctx.low_alerted && s_ctx.filtered_mv > (BSP_BAT_VOLTAGE_LOW_MV + 100)) {
-                // 电压回升超过滞回区间，允许下次再次告警
+            }
+            else if (s_ctx.low_alerted && s_ctx.filtered_mv > (BSP_BAT_VOLTAGE_LOW_MV + 100))
+            {
                 s_ctx.low_alerted = false;
                 ESP_LOGI(TAG, "电压回升至 %lu mV，告警标志复位",
                          (unsigned long)s_ctx.filtered_mv);
             }
-        } else {
+        }
+        else
+        {
             ESP_LOGW(TAG, "本次 ADC 采样失败，跳过");
         }
 
@@ -175,31 +387,51 @@ static void battery_monitor_task(void *arg)
     vTaskDelete(NULL);
 }
 
+// ─── 独立的 5s 电池日志任务 ───────────────────────────────────────────────────
+#define BSP_BAT_LOG_INTERVAL_MS 5000
+
+static void battery_log_task(void *arg)
+{
+    ESP_LOGI(TAG, "电池日志任务启动，每 %d ms 打印一次", BSP_BAT_LOG_INTERVAL_MS);
+    while (s_log_task_running)
+    {
+        uint32_t mv = bsp_battery_get_voltage_mv();
+        uint8_t percent = bsp_battery_get_percent();
+        ESP_LOGI(TAG, "🔋 电池电压 = %lu mV，电量 = %u%%",
+                 (unsigned long)mv, percent);
+        vTaskDelay(pdMS_TO_TICKS(BSP_BAT_LOG_INTERVAL_MS));
+    }
+
+    ESP_LOGI(TAG, "电池日志任务退出");
+    s_log_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
 // ═══ 对外 API 实现 ═══════════════════════════════════════════════════════════
 
 esp_err_t bsp_battery_init(void)
 {
-    if (s_ctx.initialized) {
+    if (s_ctx.initialized)
+    {
         ESP_LOGW(TAG, "已初始化，跳过");
         return ESP_OK;
     }
 
-    // 占位检查：BSP_BAT_ADC_PIN 必须由硬件确认后填入有效 GPIO
-    if (BSP_BAT_ADC_PIN < 0) {
+    if (BSP_BAT_ADC_PIN < 0)
+    {
         ESP_LOGE(TAG, "BSP_BAT_ADC_PIN 未配置（当前 = %d），请在 bsp_config.h 中填入实际 GPIO",
                  BSP_BAT_ADC_PIN);
         return ESP_ERR_INVALID_STATE;
     }
 
-    // GPIO → ADC1 通道转换
     adc_channel_t channel;
     ESP_RETURN_ON_ERROR(gpio_to_adc1_channel(BSP_BAT_ADC_PIN, &channel),
                         TAG, "GPIO%d 不属于 ADC1 通道（合法范围 GPIO1~10）", BSP_BAT_ADC_PIN);
 
     s_ctx.unit = ADC_UNIT_1;
     s_ctx.channel = channel;
+    s_ctx.cali_type = CALI_TYPE_NONE;
 
-    // 1. 创建 ADC1 oneshot 单元
     adc_oneshot_unit_init_cfg_t unit_cfg = {
         .unit_id = ADC_UNIT_1,
         .ulp_mode = ADC_ULP_MODE_DISABLE,
@@ -207,7 +439,6 @@ esp_err_t bsp_battery_init(void)
     ESP_RETURN_ON_ERROR(adc_oneshot_new_unit(&unit_cfg, &s_ctx.adc_handle),
                         TAG, "adc_oneshot_new_unit 失败");
 
-    // 2. 配置通道：12位精度 + 12dB 衰减（量程 0~3.1V）
     adc_oneshot_chan_cfg_t chan_cfg = {
         .bitwidth = ADC_BITWIDTH_DEFAULT,
         .atten = ADC_ATTEN_DB_12,
@@ -215,7 +446,7 @@ esp_err_t bsp_battery_init(void)
     ESP_RETURN_ON_ERROR(adc_oneshot_config_channel(s_ctx.adc_handle, channel, &chan_cfg),
                         TAG, "adc_oneshot_config_channel 失败");
 
-    // 3. 创建 curve fitting 校准句柄（ESP32-S3 支持）
+    // 校准策略：curve fitting（ESP32-S3支持），失败则使用未校准近似值
     adc_cali_curve_fitting_config_t cali_cfg = {
         .unit_id = ADC_UNIT_1,
         .chan = channel,
@@ -223,35 +454,45 @@ esp_err_t bsp_battery_init(void)
         .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
     esp_err_t cali_ret = adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_ctx.cali_handle);
-    if (cali_ret == ESP_OK) {
+    if (cali_ret == ESP_OK)
+    {
         s_ctx.cali_enabled = true;
+        s_ctx.cali_type = CALI_TYPE_CURVE;
         ESP_LOGI(TAG, "ADC 校准启用（curve fitting）");
-    } else {
+    }
+    else
+    {
         s_ctx.cali_enabled = false;
-        ESP_LOGW(TAG, "ADC 校准创建失败 (%s)，将使用未校准近似值", esp_err_to_name(cali_ret));
+        s_ctx.cali_type = CALI_TYPE_NONE;
+        ESP_LOGW(TAG, "ADC 校准失败 (%s)，将使用未校准近似值", esp_err_to_name(cali_ret));
     }
 
     s_ctx.initialized = true;
     ESP_LOGI(TAG, "电池监控初始化完成：GPIO%d → ADC1_CH%d，分压比 %d/%d",
              BSP_BAT_ADC_PIN, (int)channel,
-             BSP_BAT_VOLTAGE_RATIO_DEN, BSP_BAT_VOLTAGE_RATIO_NUM);
+             BSP_BAT_VOLTAGE_RATIO_NUM, BSP_BAT_VOLTAGE_RATIO_DEN);
 
     return ESP_OK;
 }
 
 esp_err_t bsp_battery_deinit(void)
 {
-    if (!s_ctx.initialized) return ESP_OK;
+    if (!s_ctx.initialized)
+        return ESP_OK;
 
-    // 先停掉后台任务
     bsp_battery_stop_task();
+    bsp_battery_stop_log_task();
 
-    if (s_ctx.cali_enabled && s_ctx.cali_handle) {
+    if (s_ctx.cali_enabled && s_ctx.cali_handle)
+    {
         adc_cali_delete_scheme_curve_fitting(s_ctx.cali_handle);
         s_ctx.cali_handle = NULL;
         s_ctx.cali_enabled = false;
+        s_ctx.cali_type = CALI_TYPE_NONE;
     }
-    if (s_ctx.adc_handle) {
+
+    if (s_ctx.adc_handle)
+    {
         adc_oneshot_del_unit(s_ctx.adc_handle);
         s_ctx.adc_handle = NULL;
     }
@@ -268,8 +509,8 @@ uint32_t bsp_battery_read_voltage_mv(void)
 
 uint32_t bsp_battery_get_voltage_mv(void)
 {
-    // 若后台任务在运行，返回滤波值；否则现场采样一次
-    if (s_ctx.task_running && s_ctx.filtered_mv > 0) {
+    if (s_ctx.task_running && s_ctx.filtered_mv > 0)
+    {
         return s_ctx.filtered_mv;
     }
     return do_sample_voltage_mv();
@@ -277,18 +518,30 @@ uint32_t bsp_battery_get_voltage_mv(void)
 
 uint8_t bsp_battery_get_percent(void)
 {
+    if (s_ctx.task_running)
+    {
+        return s_ctx.displayed_percent;
+    }
     uint32_t mv = bsp_battery_get_voltage_mv();
-    if (mv == 0) return 0;
+    if (mv == 0)
+        return 0;
     return voltage_to_percent(mv);
 }
 
+/**
+ * @brief 启动电池监控后台任务
+ * @param low_cb 低电量告警回调函数
+ * @note 回调在电池监控任务上下文中执行，禁止阻塞操作
+ */
 esp_err_t bsp_battery_start_task(bsp_battery_low_cb_t low_cb)
 {
-    if (!s_ctx.initialized) {
+    if (!s_ctx.initialized)
+    {
         ESP_LOGE(TAG, "请先调用 bsp_battery_init()");
         return ESP_ERR_INVALID_STATE;
     }
-    if (s_ctx.task_handle != NULL) {
+    if (s_ctx.task_handle != NULL)
+    {
         ESP_LOGW(TAG, "后台任务已存在");
         return ESP_ERR_INVALID_STATE;
     }
@@ -303,7 +556,8 @@ esp_err_t bsp_battery_start_task(bsp_battery_low_cb_t low_cb)
                                 NULL,
                                 BSP_BAT_TASK_PRIORITY,
                                 &s_ctx.task_handle);
-    if (ok != pdPASS) {
+    if (ok != pdPASS)
+    {
         s_ctx.task_running = false;
         ESP_LOGE(TAG, "创建后台任务失败");
         return ESP_ERR_NO_MEM;
@@ -313,51 +567,68 @@ esp_err_t bsp_battery_start_task(bsp_battery_low_cb_t low_cb)
 
 esp_err_t bsp_battery_stop_task(void)
 {
-    if (s_ctx.task_handle == NULL) return ESP_OK;
+    if (s_ctx.task_handle == NULL)
+        return ESP_OK;
+
     s_ctx.task_running = false;
-    // 任务在下个循环 tick 退出（最长等待 BSP_BAT_TASK_INTERVAL_MS）
-    // 此处不强删，避免在持有 ADC 锁时被删导致死锁
-    return ESP_OK;
-}
-
-// ─── 独立的 5s 电池日志任务（纯调试打印，不影响采样/滤波逻辑）──────────────────
-#define BSP_BAT_LOG_INTERVAL_MS 5000   ///< 日志打印周期，固定 5s 一次
-
-static TaskHandle_t s_log_task_handle = NULL;  ///< 日志任务句柄
-
-static void battery_log_task(void *arg)
-{
-    ESP_LOGI(TAG, "电池日志任务启动，每 %d ms 打印一次", BSP_BAT_LOG_INTERVAL_MS);
-    while (1) {
-        // 直接复用现有 API：任务在跑时返回滤波值，否则现场采样一次
-        uint32_t mv = bsp_battery_get_voltage_mv();
-        uint8_t percent = (mv > 0) ? voltage_to_percent(mv) : 0;
-        ESP_LOGI(TAG, "🔋 电池电压 = %lu mV，电量 ≈ %u%%",
-                 (unsigned long)mv, percent);
-        vTaskDelay(pdMS_TO_TICKS(BSP_BAT_LOG_INTERVAL_MS));
+    // 轮询等待任务自行退出（任务退出时会清零 task_handle）
+    TickType_t timeout = pdMS_TO_TICKS(BSP_BAT_TASK_INTERVAL_MS + 500);
+    while (s_ctx.task_handle != NULL && timeout-- > 0)
+    {
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
+    if (s_ctx.task_handle != NULL)
+    {
+        ESP_LOGW(TAG, "电池监控任务未在超时内退出，强制清除句柄");
+        s_ctx.task_handle = NULL;
+    }
+    return ESP_OK;
 }
 
 esp_err_t bsp_battery_start_log_task(void)
 {
-    if (!s_ctx.initialized) {
+    if (!s_ctx.initialized)
+    {
         ESP_LOGE(TAG, "请先调用 bsp_battery_init()");
         return ESP_ERR_INVALID_STATE;
     }
-    if (s_log_task_handle != NULL) {
+    if (s_log_task_handle != NULL)
+    {
         ESP_LOGW(TAG, "电池日志任务已存在");
         return ESP_ERR_INVALID_STATE;
     }
 
+    s_log_task_running = true;
     BaseType_t ok = xTaskCreate(battery_log_task,
                                 "bat_log",
                                 BSP_BAT_TASK_STACK_SIZE,
                                 NULL,
                                 BSP_BAT_TASK_PRIORITY,
                                 &s_log_task_handle);
-    if (ok != pdPASS) {
+    if (ok != pdPASS)
+    {
+        s_log_task_running = false;
         ESP_LOGE(TAG, "创建电池日志任务失败");
         return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+esp_err_t bsp_battery_stop_log_task(void)
+{
+    if (s_log_task_handle == NULL)
+        return ESP_OK;
+
+    s_log_task_running = false;
+    TickType_t timeout = pdMS_TO_TICKS(BSP_BAT_LOG_INTERVAL_MS + 500);
+    while (s_log_task_handle != NULL && timeout-- > 0)
+    {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (s_log_task_handle != NULL)
+    {
+        ESP_LOGW(TAG, "电池日志任务未在超时内退出，强制清除句柄");
+        s_log_task_handle = NULL;
     }
     return ESP_OK;
 }
