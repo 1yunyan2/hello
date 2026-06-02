@@ -24,6 +24,7 @@
 #include "bsp/bsp_board.h"
 #include "esp_spiffs.h"
 #include "ui/reminder.h"
+#include "ui/standby.h"
 #include "object.h"
 #include <string.h>
 #include <limits.h>
@@ -56,6 +57,13 @@ static const char *TAG = "UI_PORT";
 static void main_clock_refresh(void);
 static void main_clock_tick_cb(lv_timer_t *t);
 static void gif_auto_hide_cb(lv_timer_t *t);
+/* 移除 on_refr_start / on_refr_ready：
+ *   PARTIAL 模式 + W*H/5 单缓冲下，LV_EVENT_RENDER_START 每个 invalid area 触发一次（多次），
+ *   而 LV_EVENT_RENDER_READY 整帧只触发一次，pause/resume 不对称 → GIF 帧推进 timer 被永久 pause，
+ *   表现为"卡死第一帧 + UI 切换无效"。在 PCBA 信号不稳的板上，这层多余防护会放大 GIF 不刷新现象。
+ *   BUG-010（栈在 SPIRAM + Flash cache disable）已通过 task_stack_caps = MALLOC_CAP_INTERNAL 解决，
+ *   不再需要这层"渲染期间暂停 GIF"的补丁。
+ */
 static const char *s_alarm_repeat_cn(alarm_repeat_t r);
 static void countdown_tick_cb(lv_timer_t *t);
 static void alarm_edit_render(void);
@@ -122,9 +130,15 @@ static lv_obj_t *s_time_date_lbl = NULL;
 static lv_timer_t *s_main_tick_tmr = NULL;
 static lv_timer_t *s_gif_hide_tmr = NULL;
 
-/* ─── 全局浮动电量标签（挂在 top-layer，所有页面切换都常驻显示）─── */
+/* ─── 全局浮动状态栏（挂在 top-layer，所有页面切换都常驻显示）───
+ * 布局：[时间 HH:MM | 左上角]  …  [WiFi 信号 | 电量左侧]  [电量% | 右上角]
+ * 三个元素均挂 lv_layer_top()，跨页面常驻，独立刷新。
+ */
 static lv_obj_t *s_battery_lbl = NULL;        ///< 右上角电量标签，纯文字 "85%"
-static lv_timer_t *s_battery_tick_tmr = NULL; ///< 周期刷新电量的 LVGL 定时器
+static lv_obj_t *s_status_time_lbl = NULL;    ///< 左上角时间标签 "HH:MM"
+static lv_obj_t *s_status_wifi_lbl = NULL;    ///< 电量左侧 WiFi 信号标签
+static lv_timer_t *s_battery_tick_tmr = NULL; ///< 周期刷新电量+WiFi 的 LVGL 定时器（5s）
+static lv_timer_t *s_status_time_tmr = NULL;  ///< 周期刷新状态栏时间的 LVGL 定时器（1s）
 
 /* 功能菜单 */
 static ui_view_t s_view = UI_VIEW_MAIN;
@@ -318,8 +332,6 @@ static void main_gif_create(void)
 /* ═══════════════════════════════════════════════════════════════
  * LVGL 初始化
  * ═══════════════════════════════════════════════════════════════ */
-static void on_refr_start(lv_event_t *e);
-static void on_refr_ready(lv_event_t *e);
 static esp_err_t app_lvgl_init(void)
 {
     ESP_LOGI(TAG, "最大内部连续块: %d", heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
@@ -406,24 +418,9 @@ static esp_err_t app_lvgl_init(void)
         }
         lvgl_port_unlock();
     }
-    // RENDER_START/READY 在 refr_invalid_areas() 内部触发（第一个 tile 渲染前/全部 flush 后）
-    // 比 REFR_START/READY 更晚/更早，能真正覆盖所有 tile flush 期间，防止 GIF timer 中途更新 draw_buf 导致撕裂
-    lv_display_add_event_cb(lvgl_disp, on_refr_start, LV_EVENT_RENDER_START, NULL);
-    lv_display_add_event_cb(lvgl_disp, on_refr_ready, LV_EVENT_RENDER_READY, NULL);
+    // 不再注册 RENDER_START/READY 回调：PARTIAL 模式下 RENDER_START 多次、READY 一次，
+    // pause/resume 配对失衡使 GIF 永久 pause，在 PCBA 上加剧"GIF 卡第一帧"现象。
     return ESP_OK;
-}
-static void on_refr_start(lv_event_t *e)
-{
-    // flush 开始前暂停 GIF 帧定时器，防止 DMA 传输期间覆盖 draw_buf
-    if (gif_obj)
-        lv_gif_pause(gif_obj);
-}
-
-static void on_refr_ready(lv_event_t *e)
-{
-    // flush 全部完成后恢复 GIF 帧定时器
-    if (gif_obj)
-        lv_gif_resume(gif_obj);
 }
 /* ═══════════════════════════════════════════════════════════════
  * 主时钟 UI
@@ -1512,6 +1509,10 @@ typedef struct
     const char *audio_file;
 } animation_map_t;
 
+/**
+ * 动画映射表：将动画 ID 映射到对应的播放函数和音频文件路径。
+ * 目前仅包含一个示例动画 "anim_happy_stars"，触发时会调用 gif_switch_source() 切换 GIF 图源，并输出关联的音频文件路径。
+ */
 static const animation_map_t s_animation_map[] = {
     {"anim_happy_stars", gif_switch_source, "S:/laugh_short.mp3"},
 };
@@ -1549,9 +1550,11 @@ void ui_play_animation(const char *anim_id)
 /* ═══════════════════════════════════════════════════════════════
  * UI 系统初始化
  * ═══════════════════════════════════════════════════════════════ */
-// 电池相关函数前置声明
+// 状态栏（电池/WiFi/时间）相关函数前置声明
 static void battery_label_create_top(void);
 static void battery_tick_cb(lv_timer_t *t);
+static void status_time_tick_cb(lv_timer_t *t);
+static void status_wifi_refresh(int rssi);
 void ui_init(void)
 {
     // init_spiffs();
@@ -1591,14 +1594,16 @@ void ui_init(void)
         lvgl_port_unlock();
     }
 
-    /* ─── 全局浮动电量显示（顶层 layer，跨页常驻）─── */
+    /* ─── 全局浮动状态栏（时间+WiFi+电量，顶层 layer，跨页常驻）─── */
     if (lvgl_port_lock(100))
     {
         battery_label_create_top();
-        // 每 5 秒刷新一次电量显示（与底层 BSP 10s 采样独立，不增加 ADC 负担）
+        // 电量+WiFi 5 秒刷新一次（WiFi RSSI 拉取开销极小，与电量同 tick 节省一个 timer）
         s_battery_tick_tmr = lv_timer_create(battery_tick_cb, 5000, NULL);
-        // 立即刷新一次，避免开机后等 5s 才有数字
         battery_tick_cb(s_battery_tick_tmr);
+        // 状态栏时间 1 秒刷新一次（只显示 HH:MM，开销极小）
+        s_status_time_tmr = lv_timer_create(status_time_tick_cb, 1000, NULL);
+        status_time_tick_cb(s_status_time_tmr);
         lvgl_port_unlock();
     }
 }
@@ -1612,6 +1617,22 @@ void ui_dispatch_touch_event(touch_event_t event)
 {
     if (event == TOUCH_EVENT_NONE)
         return;
+
+    /* 先记下「本次触摸发生时是否处于待机」。必须在 notify 之前取，
+     * 因为下面的 standby_notify_activity() 会顺带唤醒、把待机标志清掉。 */
+    bool was_standby = standby_is_active();
+
+    /* 任意触摸都算「活动」：刷新待机倒计时，且若在待机中则一并退出待机
+     * （头部/腹背/左右翻页等任意部位皆可唤醒，唤醒逻辑收口在此函数内部）。 */
+    standby_notify_activity();
+
+    /* 待机被本次触摸唤醒时，消费掉这次事件：只做「唤醒」一件事，
+     * 不再继续触发翻页/情绪/菜单等动作，避免“边唤醒边翻页”。 */
+    if (was_standby)
+    {
+        ESP_LOGI(TAG, "触摸唤醒，退出待机（事件 %d）", (int)event);
+        return;
+    }
 
     /* 最高优先级：闹钟响铃中，任意触摸关闭闹钟 */
     if (reminder_get_state() == REMINDER_STATE_RINGING)
@@ -1751,31 +1772,23 @@ void ui_dispatch_touch_event(touch_event_t event)
     }
 }
 
+/**
+ * @brief 外部模块手动推送 WiFi RSSI 到状态栏（带 LVGL 锁）
+ *
+ * 通常无需调用——状态栏定时器（battery_tick_cb）每 5s 自动拉取一次 RSSI。
+ * 该接口保留给外部模块（如 MQTT 心跳）按需主动刷新。
+ *
+ * @param rssi WiFi 信号强度 dBm（负数）；传 0 表示未连接
+ */
 void ui_update_wifi(int rssi)
 {
-    // lv_obj_t *screen = lv_screen_active();
-    // lv_obj_t *status_bar = lv_obj_get_child(screen, 0);
-    // lv_obj_t *wifi_label = lv_obj_get_child(status_bar, 0);
-
-    // char *wifi_str = FONT_AWESOME_WIFI_SLASH;
-    // if (rssi < 0 && rssi >= -50)
-    // {
-    //     wifi_str = FONT_AWESOME_WIFI;
-    // }
-    // else if (rssi < -50 && rssi >= -70)
-    // {
-    //     wifi_str = FONT_AWESOME_WIFI_FAIR;
-    // }
-    // else if (rssi < -70)
-    // {
-    //     wifi_str = FONT_AWESOME_WIFI_WEAK;
-    // }
-
-    // if (lvgl_port_lock(1000))
-    // {
-    //     lv_label_set_text(wifi_label, wifi_str);
-    //     lvgl_port_unlock();
-    // }
+    if (s_status_wifi_lbl == NULL)
+        return;
+    if (lvgl_port_lock(100))
+    {
+        status_wifi_refresh(rssi);
+        lvgl_port_unlock();
+    }
 }
 /* ═══════════════════════════════════════════════════════════════
  * 全局浮动电量显示（挂在 LVGL top-layer，跟随所有页面常驻）
@@ -1797,18 +1810,40 @@ static void battery_label_create_top(void)
         return; // 幂等
 
     lv_obj_t *top = lv_layer_top();
+
+    // ── 公共样式 helper 宏：所有状态栏标签视觉一致 ──
+    #define STATUS_LBL_STYLE(lbl) do {                                   \
+        lv_obj_set_style_text_font((lbl), &font_cn_16, 0);               \
+        lv_obj_set_style_text_color((lbl), lv_color_white(), 0);         \
+        lv_obj_set_style_bg_color((lbl), lv_color_black(), 0);           \
+        lv_obj_set_style_bg_opa((lbl), LV_OPA_40, 0);                    \
+        lv_obj_set_style_pad_hor((lbl), 4, 0);                           \
+        lv_obj_set_style_pad_ver((lbl), 1, 0);                           \
+        lv_obj_set_style_radius((lbl), 3, 0);                            \
+    } while (0)
+
+    // 1. 右上角：电量标签（与时间对角分布）
     s_battery_lbl = lv_label_create(top);
-    lv_obj_set_style_text_font(s_battery_lbl, &font_cn_16, 0);
-    lv_obj_set_style_text_color(s_battery_lbl, lv_color_white(), 0);
-    // 顶层默认无背景，加一个半透明黑底避免在白色 GIF 上看不清
-    lv_obj_set_style_bg_color(s_battery_lbl, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(s_battery_lbl, LV_OPA_40, 0);
-    lv_obj_set_style_pad_hor(s_battery_lbl, 4, 0);
-    lv_obj_set_style_pad_ver(s_battery_lbl, 1, 0);
-    lv_obj_set_style_radius(s_battery_lbl, 3, 0);
-    // 右上角对齐，留 4px 边距
+    STATUS_LBL_STYLE(s_battery_lbl);
     lv_obj_align(s_battery_lbl, LV_ALIGN_TOP_RIGHT, -4, 4);
     lv_label_set_text(s_battery_lbl, "--%");
+
+    // 2. 电量左侧：WiFi 信号图标（使用 Montserrat 14 自带的 LV_SYMBOL_WIFI 单字符图标）
+    //    font_cn_16 是自定义中文字体不含 FontAwesome glyph，所以这里单独指定 Montserrat
+    s_status_wifi_lbl = lv_label_create(top);
+    STATUS_LBL_STYLE(s_status_wifi_lbl);
+    lv_obj_set_style_text_font(s_status_wifi_lbl, &lv_font_montserrat_14, 0); // 覆盖默认 cn 字体
+    // 右上角偏左：图标约 16px + 与电量 4px 间距 + 电量约 40px → 偏移 -52px 起步
+    lv_obj_align(s_status_wifi_lbl, LV_ALIGN_TOP_RIGHT, -52, 4);
+    lv_label_set_text(s_status_wifi_lbl, LV_SYMBOL_WIFI);
+
+    // 3. 左上角：时间标签（与电量对角）
+    s_status_time_lbl = lv_label_create(top);
+    STATUS_LBL_STYLE(s_status_time_lbl);
+    lv_obj_align(s_status_time_lbl, LV_ALIGN_TOP_LEFT, 4, 4);
+    lv_label_set_text(s_status_time_lbl, "--:--");
+
+    #undef STATUS_LBL_STYLE
 }
 
 /**
@@ -1881,4 +1916,71 @@ static void battery_tick_cb(lv_timer_t *t)
             c = lv_color_hex(0xFF9500);
         lv_obj_set_style_text_color(s_battery_lbl, c, 0);
     }
+
+    // 顺带刷新 WiFi 信号（同一 LVGL 上下文，无需再加锁）
+    status_wifi_refresh(bsp_wifi_get_rssi());
+}
+
+/**
+ * @brief 根据 RSSI 刷新 WiFi 状态栏图标（已在 LVGL 上下文调用）
+ *
+ * 仅显示单个 LV_SYMBOL_WIFI 图标，强弱通过颜色区分：
+ *   rssi == 0    灰色 — 未连接
+ *   rssi >= -55  绿色 — 满格（信号强）
+ *   rssi >= -70  白色 — 中等
+ *   rssi >= -85  黄色 — 弱
+ *   rssi <  -85  红色 — 极弱
+ *
+ * 不显示 dBm 数字，纯图标 + 颜色，符合手机/平板风格。
+ */
+static void status_wifi_refresh(int rssi)
+{
+    if (s_status_wifi_lbl == NULL)
+        return;
+
+    lv_color_t color;
+    if (rssi == 0)
+        color = lv_color_hex(0x808080); // 灰：未连接
+    else if (rssi >= -55)
+        color = lv_color_hex(0x34C759); // 绿：满格
+    else if (rssi >= -70)
+        color = lv_color_white();       // 白：中等
+    else if (rssi >= -85)
+        color = lv_color_hex(0xFF9500); // 黄：弱
+    else
+        color = lv_color_hex(0xFF3B30); // 红：极弱
+
+    // 文本固定为 LV_SYMBOL_WIFI 单字符，宽度恒定，无需重新对齐
+    lv_label_set_text(s_status_wifi_lbl, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_color(s_status_wifi_lbl, color, 0);
+}
+
+/**
+ * @brief 状态栏时间刷新定时器回调（1 秒一次，LVGL 上下文）
+ *
+ * 只显示 HH:MM；时间未同步前显示 "--:--"。
+ * 注意：与功能菜单的 FN_PAGE_TIME 页面 body 中的全量时间信息（HH:MM:SS + 日期 + 日程）
+ * 并不冲突，状态栏是跨页面常驻 glance，body 是详情页。
+ */
+static void status_time_tick_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (s_status_time_lbl == NULL)
+        return;
+
+    char buf[8];
+    if (!reminder_is_time_synced())
+    {
+        snprintf(buf, sizeof(buf), "--:--");
+    }
+    else
+    {
+        time_t now = time(NULL);
+        struct tm tm_now;
+        localtime_r(&now, &tm_now);
+        snprintf(buf, sizeof(buf), "%02d:%02d", tm_now.tm_hour, tm_now.tm_min);
+    }
+    lv_label_set_text(s_status_time_lbl, buf);
+    // 文本宽度可能变化，重新对齐到左上角
+    lv_obj_align(s_status_time_lbl, LV_ALIGN_TOP_LEFT, 4, 4);
 }
