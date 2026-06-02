@@ -1,7 +1,47 @@
 #include "bsp_board.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h" // 背光 PWM 调光（LEDC 外设）
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
+
+/**
+ * @brief 设置 LCD 背光亮度（内部 helper，LEDC PWM 占空比方式）
+ *
+ * 将 0~100 的百分比线性映射到 10 位 LEDC 占空比（0~1023），写入并立即生效。
+ * 占空比越大背光越亮（对应硬件「高电平开启背光」）。
+ *
+ * @param pct 亮度百分比，0=熄灭，100=最亮（超过 100 自动钳到 100）
+ * @return void
+ *
+ * @note 调用者：bsp_board_lcd_init/on/off、bsp_board_lcd_set_brightness（待机模块）
+ * @note 前置条件：bsp_board_lcd_init() 已完成 LEDC timer/channel 配置
+ */
+static void bsp_lcd_bk_set_percent(uint8_t pct)
+{
+    if (pct > 100)
+        pct = 100; // 钳位，防止占空比越界
+    // ★ 实测结论：本板背光为「高电平点亮」——GPIO42 高电平占比越大越亮。
+    //   （两次实测确认：duty=DUTY_MAX/高电平→全亮；duty=0/低电平→全灭，故不取反。）
+    //   duty 直接正比于亮度：pct=100→duty=DUTY_MAX(最亮)；pct=0→duty=0(灭)。
+    uint32_t duty = (uint32_t)pct * BSP_LCD_BK_DUTY_MAX / 100;
+    esp_err_t e1 = ledc_set_duty(BSP_LCD_BK_LEDC_MODE, BSP_LCD_BK_LEDC_CHANNEL, duty);
+    esp_err_t e2 = ledc_update_duty(BSP_LCD_BK_LEDC_MODE, BSP_LCD_BK_LEDC_CHANNEL);
+    // 【诊断】打印实际写入的占空比与返回值，确认软件链路生效（验证 OK 后可删）
+    ESP_LOGW("BSP_LCD_BK", "亮度=%u%% → duty=%lu/%d (高电平点亮, set=%d upd=%d)",
+             pct, (unsigned long)duty, BSP_LCD_BK_DUTY_MAX, e1, e2);
+}
+
+/**
+ * @brief 设置 LCD 背光亮度（对外 API，供待机/省电模块调用）
+ *
+ * @param percent 亮度百分比 0~100
+ * @return void
+ * @note 调用者：standby 待机模块（进入待机降至 50%，退出恢复 100%）
+ */
+void bsp_board_lcd_set_brightness(uint8_t percent)
+{
+    bsp_lcd_bk_set_percent(percent);
+}
 
 /**
  * @brief 初始化 LCD 显示屏（ST7789，240×320，RGB565）
@@ -30,14 +70,29 @@ void bsp_board_lcd_init(bsp_board_t *bsp_board)
     gpio_reset_pin(BSP_LCD_CS_PIN);   // 释放 片选（CS/NSS）
     gpio_reset_pin(BSP_LCD_BK_PIN);   // 释放 背光控制（BK）
     gpio_reset_pin(BSP_LCD_RST_PIN);  // 释放 硬件复位（RST）
-    // ── 步骤 1：配置背光 GPIO（输出模式）────────────────────────────────────
-    // 背光引脚（GPIO48）控制 LCD 背光 LED，高电平开启背光
-    // 初始化时先关闭背光（level=0），避免屏幕在初始化过程中显示乱码
-    gpio_config_t bk_gpio_config = {
-        .mode = GPIO_MODE_OUTPUT,               // 推挽输出模式
-        .pin_bit_mask = 1ULL << BSP_LCD_BK_PIN, // 仅配置背光引脚（GPIO48）
+    // ── 步骤 1：配置背光 LEDC PWM（调光）────────────────────────────────────
+    // 背光引脚（GPIO42）由 LEDC PWM 驱动，支持 0~100% 亮度调节（待机模式需 50%）。
+    // LEDC 输出经 GPIO Matrix 自动路由到 GPIO42（ESP32-S3 LEDC 无 IO_MUX 直连），无需手动映射。
+    // ★ 使用独立 TIMER_1 + CHANNEL_3，与舵机的 TIMER_0/CH0-2 隔离（见 BUG-015）。
+    // 初始占空比 0（背光关闭），避免屏幕在初始化过程中显示乱码。
+    ledc_timer_config_t bk_timer_config = {
+        .speed_mode = BSP_LCD_BK_LEDC_MODE,       // 低速模式
+        .timer_num = BSP_LCD_BK_LEDC_TIMER,       // 独立定时器 TIMER_1
+        .duty_resolution = BSP_LCD_BK_LEDC_RES,   // 10 位分辨率（0~1023）
+        .freq_hz = BSP_LCD_BK_LEDC_FREQ_HZ,       // 5kHz
+        .clk_cfg = BSP_LCD_BK_LEDC_CLK,           // RC_FAST：与舵机时钟源统一，避免冲突
     };
-    ESP_ERROR_CHECK(gpio_config(&bk_gpio_config));
+    ESP_ERROR_CHECK(ledc_timer_config(&bk_timer_config));
+
+    ledc_channel_config_t bk_channel_config = {
+        .gpio_num = BSP_LCD_BK_PIN,               // 背光引脚 GPIO42
+        .speed_mode = BSP_LCD_BK_LEDC_MODE,
+        .channel = BSP_LCD_BK_LEDC_CHANNEL,       // 独立通道 CHANNEL_3
+        .timer_sel = BSP_LCD_BK_LEDC_TIMER,       // 绑定到 TIMER_1
+        .duty = 0,                                // 初始占空比 0 = 背光关闭
+        .hpoint = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&bk_channel_config));
 
     // ── 步骤 2：初始化 SPI2 总线 ─────────────────────────────────────────────
     // SPI2_HOST（HSPI）：ESP32-S3 第二个 SPI 控制器，支持 DMA 加速传输
@@ -85,7 +140,7 @@ void bsp_board_lcd_init(bsp_board_t *bsp_board)
         bsp_board->lcd_io, &panel_config, &bsp_board->lcd_panel));
 
     // ── 步骤 5：关闭背光（等待初始化完成后再开启，避免花屏）────────────────
-    ESP_ERROR_CHECK(gpio_set_level(BSP_LCD_BK_PIN, 0)); // 背光关闭（GPIO48 = 低电平）
+    bsp_lcd_bk_set_percent(0); // 背光关闭（PWM 占空比 0）
 
     // ── 步骤 6：硬件复位显示屏 ────────────────────────────────────────────────
     // RST 引脚拉低一段时间，复位 ST7789 内部寄存器到出厂默认值
@@ -125,7 +180,7 @@ void bsp_board_lcd_on(bsp_board_t *bsp_board)
     // 先启用 ST7789 显示输出（DISPON 命令），再点亮背光
     // 顺序：控制器输出 → 背光点亮，避免背光亮时显示未就绪的画面
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(bsp_board->lcd_panel, true)); // 启用显示
-    ESP_ERROR_CHECK(gpio_set_level(BSP_LCD_BK_PIN, 1));                     // 点亮背光
+    bsp_lcd_bk_set_percent(BSP_LCD_BK_DEFAULT_PCT);                        // 点亮背光（默认 100%）
 }
 
 /**
@@ -143,6 +198,6 @@ void bsp_board_lcd_on(bsp_board_t *bsp_board)
 void bsp_board_lcd_off(bsp_board_t *bsp_board)
 {
     // 先关背光（用户立即看不到画面），再关显示控制器
-    ESP_ERROR_CHECK(gpio_set_level(BSP_LCD_BK_PIN, 0));                      // 关闭背光
+    bsp_lcd_bk_set_percent(0);                                              // 关闭背光（PWM 占空比 0）
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(bsp_board->lcd_panel, false)); // 关闭显示
 }

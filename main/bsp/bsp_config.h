@@ -181,7 +181,28 @@
 #define BSP_LCD_SCLK_PIN 40 // 40 LCD 时钟线（SCLK），最高 80MHz（与 lcd_demo_standalone 一致：硬件实测此接线）
 #define BSP_LCD_DC_PIN 38   // 38 LCD 数据/命令选择（D/C）：高=数据，低=命令（与 lcd_demo_standalone 一致）
 #define BSP_LCD_RST_PIN 45  // 45 LCD 硬件复位（RST），低电平触发复位（从 GPIO14 迁出，腾出 TOUCH14 给翻页）
-#define BSP_LCD_BK_PIN 42   // 42 LCD 背光控制（BK），高电平开启背光
+#define BSP_LCD_BK_PIN 42   // 42 LCD 背光控制（BK），高电平开启背光（GPIO42 普通脚，octal PSRAM 占 33-37 不冲突）
+
+// ─── 背光 LEDC PWM 调光配置 ─────────────────────────────────────────────────
+// 背光从「GPIO 开关」升级为 LEDC PWM 调光，支持 0~100% 亮度（待机模式需 50%）。
+// ★ 资源隔离：舵机已占用 LEDC_TIMER_0 + CHANNEL_0/1/2（见 bsp_servo.c），
+//   背光必须使用独立 timer/channel，否则共定时器会导致两边频率打架失灵（见 BUG-015）。
+// 这些宏使用 ledc.h 的枚举名，使用方（bsp_lcd.c）须先 #include "driver/ledc.h"。
+#define BSP_LCD_BK_LEDC_TIMER LEDC_TIMER_1       ///< 背光独立定时器（避开舵机 TIMER_0）
+#define BSP_LCD_BK_LEDC_CHANNEL LEDC_CHANNEL_3   ///< 背光独立通道（避开舵机 CH0/1/2）
+#define BSP_LCD_BK_LEDC_MODE LEDC_LOW_SPEED_MODE ///< 低速模式（与舵机同模式）
+// ★ 时钟源必须与舵机一致：ESP32-S3 LEDC 同一 speed_mode 下所有 timer 共享时钟源。
+//   实测：舵机库（iot_servo）对 50Hz 用 LEDC_AUTO_CLK 会选中 XTAL(40MHz，枚举号 11)。
+//   背光若用 APB(号4) 或 RC_FAST(号9) 都会触发 "timer clock conflict ... attempt to 11"
+//   致舵机初始化失败（报错 ledc_set_timer_div timer clock conflict）。
+//   故背光也强制 XTAL，与舵机统一。分辨率取 10bit：5kHz×2^10=5.12MHz < 40MHz 可产出
+//   （13bit 需 40.96MHz > 40MHz XTAL 做不出）。10bit = 1024 级调光，肉眼足够。
+#define BSP_LCD_BK_LEDC_CLK LEDC_USE_XTAL_CLK ///< 与舵机统一的时钟源（XTAL 40MHz，枚举号 11）
+#define BSP_LCD_BK_LEDC_FREQ_HZ 5000          ///< 背光 PWM 频率 5kHz（无可闻噪声、无屏幕频闪）
+#define BSP_LCD_BK_LEDC_RES LEDC_TIMER_10_BIT ///< 10 位分辨率（占空范围 0~1023，与舵机一致）
+#define BSP_LCD_BK_DUTY_MAX 1023              ///< 10 位满占空（对应 100% 亮度）
+#define BSP_LCD_BK_DEFAULT_PCT 100            ///< 正常点亮亮度（%）
+#define BSP_LCD_BK_STANDBY_PCT 1              ///< 待机模式亮度（%）
 
 // 注意：以下 WIDTH/HEIGHT 是 **LVGL 逻辑分辨率（旋转后视角）**，不是 P3 物理分辨率。
 // P3 屏物理为 240×320 竖屏，UI 通过 LVGL swap_xy=true 旋转为 320×240 横屏显示。
@@ -244,4 +265,20 @@
 #define BSP_BAT_TASK_INTERVAL_MS 10000 ///< 后台采样任务周期（毫秒），默认 10s 一次
 #define BSP_BAT_TASK_STACK_SIZE 3072   ///< 后台任务栈大小（字节）
 #define BSP_BAT_TASK_PRIORITY 3        ///< 后台任务优先级（低优先级即可）
-#define BSP_BAT_IIR_ALPHA_PERCENT 30   ///< IIR 低通滤波系数 α（百分比 0~100，越小越平滑）
+
+// IIR 滤波与平滑参数（256进制系数，精度更高）
+// α=77/256≈30%，α=51/256≈20%，α=128/256=50%
+#define BSP_BAT_IIR_ALPHA 77          ///< 电压IIR滤波系数（256进制，77/256≈30%）
+#define BSP_BAT_PERCENT_IIR_ALPHA 128 ///< 百分比IIR滤波系数（256进制，128/256=50%）
+#define BSP_BAT_MAX_CHANGE_PER_STEP 1 ///< 每次采样周期最大电量变化（%）
+#define BSP_BAT_MAX_FAST_CHANGE 5     ///< 差值超过此值时每次变化2%（加快收敛）
+#define BSP_BAT_HYSTERESIS_MV 10      ///< 电压滞回阈值（mV），防止百分比来回跳动
+
+// ─── 防回弹 / 抗跳动参数（OCV 还原 + 充电判定）──────────────────────────────
+// 锂电池端电压 = 真实开路电压OCV − 负载电流×内阻。舵机/WiFi/音频负载一变，端电压
+// 就抖；卸载后电压回弹。下面这组参数用"非对称慢速IIR"还原真实OCV：
+//   下降跟得较快（真实掉电要反映），上升压到极慢（把舵机卸载回弹滤掉）。
+#define BSP_BAT_OCV_DOWN_ALPHA 51 ///< OCV下降跟随α（256进制，51/256≈20%，较快跟随真实掉电）
+#define BSP_BAT_OCV_UP_ALPHA 32   ///< OCV上升跟随α（256进制，32/256≈12.5%，极慢以滤掉回弹）
+#define BSP_BAT_CHARGE_RISE_MV 30 ///< 单次OCV上升超过此值（mV）计一次"上升"
+#define BSP_BAT_CHARGE_RISE_CNT 3 ///< 连续上升达此次数判定为充电（解锁电量回升）
