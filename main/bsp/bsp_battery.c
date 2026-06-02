@@ -28,8 +28,16 @@
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "driver/gpio.h"
+#include "nvs.h"
 #include <string.h>
 #include <stdlib.h>
+
+// ─── NVS 持久化（断电存档，防止上电电量回弹）─────────────────────────────────
+// 锂电池断电静置后电压会自然回弹，若上电重新查表会导致电量虚高。这里把上次的
+// 显示电量与 OCV 基准存进 NVS，上电时取 min(存档, 实测) 做起点。
+#define BAT_NVS_NS "bat"           ///< NVS 命名空间
+#define BAT_NVS_KEY_PCT "last_pct" ///< uint8  上次显示电量
+#define BAT_NVS_KEY_MV "last_mv"   ///< uint32 上次 OCV 基准电压（mV）
 
 // ─── 编译时宏定义检查（防止编译错误）────────────────────────────────────────
 #ifndef BSP_BAT_ADC_PIN
@@ -107,6 +115,11 @@ typedef struct
     uint32_t ocv_mv;
     volatile uint8_t filtered_percent;
     volatile uint8_t displayed_percent;
+
+    // ─── 防回弹 / 充电判定状态 ───
+    bool charging;        ///< 是否判定为正在充电（无充电脚，靠电压趋势推断）
+    uint8_t rise_cnt;     ///< OCV 连续明显上升计数，达阈值判定为充电
+    uint32_t last_ocv_mv; ///< 上一次用于趋势判定的 OCV，用于检测上升/下降
 } bsp_battery_ctx_t;
 
 static bsp_battery_ctx_t s_ctx = {0};
@@ -193,7 +206,53 @@ static uint8_t voltage_to_percent(uint32_t mv)
     return 0;
 }
 
-// ─── 内部：执行一次 ADC 多采样平均，返回真实电池电压（毫伏）──────────────────
+// ─── NVS 读写（仿 servo_manager 写法，独立 open/commit/close）────────────────
+// 读取上次存档的电量与 OCV 基准；无记录或越界时返回 false，out 参数不被修改。
+static bool battery_nvs_load(uint8_t *out_pct, uint32_t *out_mv)
+{
+    nvs_handle_t h;
+    if (nvs_open(BAT_NVS_NS, NVS_READONLY, &h) != ESP_OK)
+        return false;
+
+    uint8_t pct = 0;
+    uint32_t mv = 0;
+    esp_err_t e1 = nvs_get_u8(h, BAT_NVS_KEY_PCT, &pct);
+    esp_err_t e2 = nvs_get_u32(h, BAT_NVS_KEY_MV, &mv);
+    nvs_close(h);
+
+    // 合法性校验：电量必须 0~100，电压必须在锂电池合理范围
+    if (e1 != ESP_OK || e2 != ESP_OK || pct > 100 || mv < 2500 || mv > 4500)
+        return false;
+
+    if (out_pct)
+        *out_pct = pct;
+    if (out_mv)
+        *out_mv = mv;
+    return true;
+}
+
+// 保存当前电量与 OCV 基准。仅在电量实际变化时由调用方触发，避免频繁擦写 Flash。
+static void battery_nvs_save(uint8_t pct, uint32_t mv)
+{
+    nvs_handle_t h;
+    if (nvs_open(BAT_NVS_NS, NVS_READWRITE, &h) != ESP_OK)
+    {
+        ESP_LOGW(TAG, "NVS 打开失败，本次电量未存档");
+        return;
+    }
+    esp_err_t err = nvs_set_u8(h, BAT_NVS_KEY_PCT, pct);
+    if (err == ESP_OK)
+        err = nvs_set_u32(h, BAT_NVS_KEY_MV, mv);
+    if (err == ESP_OK)
+        err = nvs_commit(h);
+    nvs_close(h);
+    if (err != ESP_OK)
+        ESP_LOGW(TAG, "NVS 存档失败：%s", esp_err_to_name(err));
+}
+
+// ─── 内部：执行一次 ADC 多采样，去极值平均，返回真实电池电压（毫伏）───────────
+// 去掉一个最高值和一个最低值再平均，天然滤掉舵机瞬时启动/堵转造成的压降尖峰，
+// 避免单次负载抖动把电压拉低导致电量跳变。
 static uint32_t do_sample_voltage_mv(void)
 {
     if (!s_ctx.initialized)
@@ -201,6 +260,8 @@ static uint32_t do_sample_voltage_mv(void)
 
     uint32_t adc_mv_sum = 0;
     uint32_t valid_count = 0;
+    int mv_min = 0x7fffffff; // 本轮最小 ADC 电压
+    int mv_max = 0;          // 本轮最大 ADC 电压
 
     for (int i = 0; i < BSP_BAT_ADC_SAMPLE_TIMES; i++)
     {
@@ -224,10 +285,22 @@ static uint32_t do_sample_voltage_mv(void)
         }
         adc_mv_sum += (uint32_t)mv;
         valid_count++;
+        if (mv < mv_min)
+            mv_min = mv;
+        if (mv > mv_max)
+            mv_max = mv;
     }
 
     if (valid_count == 0)
         return 0;
+
+    // 去极值：有效采样数≥3 时，剔除一个最高和一个最低再平均，过滤负载尖峰
+    if (valid_count >= 3)
+    {
+        adc_mv_sum -= (uint32_t)mv_min;
+        adc_mv_sum -= (uint32_t)mv_max;
+        valid_count -= 2;
+    }
 
     uint32_t adc_mv_avg = adc_mv_sum / valid_count;
     uint32_t vbat_mv = adc_mv_avg * BSP_BAT_VOLTAGE_RATIO_NUM / BSP_BAT_VOLTAGE_RATIO_DEN;
@@ -286,12 +359,41 @@ static void battery_monitor_task(void *arg)
         }
 
         s_ctx.ocv_mv = s_ctx.filtered_mv;
-        s_ctx.filtered_percent = voltage_to_percent(s_ctx.filtered_mv);
-        s_ctx.displayed_percent = s_ctx.filtered_percent;
+
+        // ─── 上电防回弹钳制 ───────────────────────────────────────────────
+        // 锂电池断电静置后端电压会自然回弹，若直接用实测电压查表会导致电量虚高
+        // （断电前90%，再上电变100%）。这里读 NVS 上次存档，取 min(存档, 实测)
+        // 做起点，并把 OCV 也下压，从根本上消除回弹。
+        uint8_t boot_pct = voltage_to_percent(s_ctx.filtered_mv);
+        uint8_t saved_pct = 0;
+        uint32_t saved_mv = 0;
+        if (battery_nvs_load(&saved_pct, &saved_mv))
+        {
+            uint8_t start_pct = (saved_pct < boot_pct) ? saved_pct : boot_pct;
+            uint32_t start_mv = (saved_mv < s_ctx.ocv_mv) ? saved_mv : s_ctx.ocv_mv;
+            s_ctx.ocv_mv = start_mv;
+            s_ctx.filtered_percent = start_pct;
+            s_ctx.displayed_percent = start_pct;
+            ESP_LOGI(TAG, "NVS 存档电量=%u%%(%lu mV)，实测=%u%%，防回弹取较小=%u%%",
+                     saved_pct, (unsigned long)saved_mv, boot_pct, start_pct);
+        }
+        else
+        {
+            // 首刷或存档无效：按实测电压显示
+            s_ctx.filtered_percent = boot_pct;
+            s_ctx.displayed_percent = boot_pct;
+            ESP_LOGI(TAG, "NVS 无有效记录，按实测电量=%u%% 起步", boot_pct);
+        }
         ESP_LOGI(TAG, "初始电量=%u%%", s_ctx.displayed_percent);
     }
 
+    // 充电判定趋势基准初始化
+    s_ctx.charging = false;
+    s_ctx.rise_cnt = 0;
+    s_ctx.last_ocv_mv = s_ctx.ocv_mv;
+
     uint32_t last_mv = s_ctx.ocv_mv;
+    uint8_t last_saved_pct = s_ctx.displayed_percent; // NVS 节流：记录上次已存档的电量
 
     while (s_ctx.task_running)
     {
@@ -304,15 +406,43 @@ static void battery_monitor_task(void *arg)
                                 256;
 
             // 非对称IIR：估算开路电压（OCV），用于电量百分比计算
-            // 上升用正常alpha（去掉负载后快速恢复），下降用1/4 alpha（过滤负载压降）
+            // 关键修正：下降用较快alpha（真实掉电要及时反映），上升用极慢alpha
+            // （舵机/WiFi卸载后的瞬时回弹要滤掉，逼近真实OCV，避免电量被顶回去）。
             {
                 uint32_t ocv_alpha = (sample_mv >= s_ctx.ocv_mv)
-                                         ? BSP_BAT_IIR_ALPHA
-                                         : (BSP_BAT_IIR_ALPHA / 4);
+                                         ? BSP_BAT_OCV_UP_ALPHA   // 上升：极慢，滤回弹
+                                         : BSP_BAT_OCV_DOWN_ALPHA; // 下降：较快，跟真实掉电
                 s_ctx.ocv_mv = (ocv_alpha * sample_mv +
                                 (256 - ocv_alpha) * s_ctx.ocv_mv + 128) /
                                256;
             }
+
+            // ─── 充电判定（无充电脚，靠OCV趋势推断）──────────────────────
+            // OCV连续明显上升达阈值次数 → 判定充电，解锁电量回升；
+            // 一旦不再上升（下降或持平）→ 立即清零计数并取消充电态。
+            if ((int)s_ctx.ocv_mv - (int)s_ctx.last_ocv_mv >= BSP_BAT_CHARGE_RISE_MV)
+            {
+                if (s_ctx.rise_cnt < 0xFF)
+                    s_ctx.rise_cnt++;
+                if (s_ctx.rise_cnt >= BSP_BAT_CHARGE_RISE_CNT && !s_ctx.charging)
+                {
+                    s_ctx.charging = true;
+                    ESP_LOGI(TAG, "检测到OCV持续上升，判定为充电，解锁电量回升");
+                }
+                s_ctx.last_ocv_mv = s_ctx.ocv_mv;
+            }
+            else if ((int)s_ctx.last_ocv_mv - (int)s_ctx.ocv_mv >= BSP_BAT_CHARGE_RISE_MV)
+            {
+                // 明显下降：判定为放电，退出充电态
+                s_ctx.rise_cnt = 0;
+                if (s_ctx.charging)
+                {
+                    s_ctx.charging = false;
+                    ESP_LOGI(TAG, "OCV转为下降，退出充电态，恢复单调递减锁");
+                }
+                s_ctx.last_ocv_mv = s_ctx.ocv_mv;
+            }
+            // 介于两者之间（基本持平）：不更新基准，等待趋势明确
 
             // 滞回比较：只有OCV变化超过阈值才重新计算百分比
             if (abs((int)s_ctx.ocv_mv - (int)last_mv) >= BSP_BAT_HYSTERESIS_MV)
@@ -335,10 +465,16 @@ static void battery_monitor_task(void *arg)
                                              256;
                 }
 
-                // 第三层：智能变化速率限制
+                // 第三层：智能变化速率限制 + 单调递减锁
                 int8_t diff = (int8_t)s_ctx.filtered_percent - (int8_t)s_ctx.displayed_percent;
 
-                if (abs(diff) > BSP_BAT_MAX_FAST_CHANGE)
+                // 单调递减锁：未判定充电时，显示电量只许降不许升（上升一律忽略），
+                // 杜绝舵机卸载回弹、平台区电压抖动把电量顶回去。充电时才放开回升。
+                if (!s_ctx.charging && diff > 0)
+                {
+                    // 放电中电量回升 → 忽略，保持当前显示值
+                }
+                else if (abs(diff) > BSP_BAT_MAX_FAST_CHANGE)
                 {
                     s_ctx.displayed_percent += (diff > 0) ? 2 : -2;
                 }
@@ -351,9 +487,17 @@ static void battery_monitor_task(void *arg)
                     s_ctx.displayed_percent = s_ctx.filtered_percent;
                 }
 
-                ESP_LOGD(TAG, "VBAT=%lu mV, OCV=%lu mV, raw=%u%%, filtered=%u%%, display=%u%%",
+                ESP_LOGD(TAG, "VBAT=%lu mV, OCV=%lu mV, raw=%u%%, filtered=%u%%, display=%u%%, charging=%d",
                          (unsigned long)s_ctx.filtered_mv, (unsigned long)s_ctx.ocv_mv,
-                         raw_percent, s_ctx.filtered_percent, s_ctx.displayed_percent);
+                         raw_percent, s_ctx.filtered_percent, s_ctx.displayed_percent,
+                         (int)s_ctx.charging);
+
+                // NVS 节流存档：仅当显示电量实际变化时才写一次，避免频繁擦写 Flash
+                if (s_ctx.displayed_percent != last_saved_pct)
+                {
+                    battery_nvs_save(s_ctx.displayed_percent, s_ctx.ocv_mv);
+                    last_saved_pct = s_ctx.displayed_percent;
+                }
             }
 
             // 低电告警判断（带100mV滞回）
