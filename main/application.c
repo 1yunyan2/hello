@@ -34,6 +34,7 @@
 #include "ui/ui_port.h"
 #include "ui/interaction.h"
 #include "ui/reminder.h"
+#include "ui/standby.h"
 #define TAG "Application"
 
 /** @brief 打印当前内部 SRAM 剩余空间（追踪初始化内存消耗） */
@@ -220,6 +221,8 @@ static void wake_word_callback(const char *wake_word_display)
 {
     ESP_LOGW("WAKE_UP", "唤醒词触发: [%s]", wake_word_display);
 
+    standby_notify_activity(); // 唤醒命中视为活动，刷新待机倒计时
+
     // 播放 880Hz 提示音给用户听觉反馈
     // play_wake_tone();
 
@@ -303,7 +306,7 @@ void application_init(void)
     if (bat_ret == ESP_OK)
     {
         bsp_battery_start_task(NULL); // 暂不接低电回调，UI 自身已带变色提示
-        // bsp_battery_start_log_task(); // 新增：每 5s 打印一次电池电压/电量，便于调试
+        bsp_battery_start_log_task(); // 新增：每 5s 打印一次电池电压/电量，便于调试
         xEventGroupSetBits(bsp_board->board_status, BATTERY_BIT);
         ESP_LOGI(TAG, "电池监控已启动");
     }
@@ -314,18 +317,10 @@ void application_init(void)
     PRINT_INTERNAL_HEAP;
     bsp_board_lcd_init(bsp_board); // LCD 初始化（当前未自动置位 LCD_BIT，后续可根据需求调整）
     PRINT_INTERNAL_HEAP;
-
-    // ── 临时：BSP LCD 自测（绕过 LVGL）──────────────────────────────────────
-    // 排查"主项目 LCD 黑屏"问题：色块出 → BSP OK，问题在 LVGL；色块不出 → BSP 层问题。
-    // 验证完成后请删除以下 3 行，恢复原顺序（ui_init → delay → bsp_board_lcd_on）。
-    bsp_board_lcd_on(bsp_board);          // 临时上移到 ui_init 之前
-    bsp_board_lcd_test_blocks(bsp_board); // 直接画黑底+四色块，绕过 LVGL
-    vTaskDelay(pdMS_TO_TICKS(5000));      // 持续 5s 便于肉眼观察
-
     ui_init();
     vTaskDelay(pdMS_TO_TICKS(100));
     PRINT_INTERNAL_HEAP;
-
+    bsp_board_lcd_on(bsp_board); // 临时上移到 ui_init 之前
     // 提醒系统初始化（含 MOCK_TIME 模式下的系统时间设置）
     reminder_init(NULL); // NULL = 暂无 TTS 回调，后续接入 session 层时替换
     PRINT_INTERNAL_HEAP;
@@ -355,23 +350,6 @@ void application_init(void)
     }
     PRINT_INTERNAL_HEAP;
 
-    /* ── 步骤 9.5: 电池电压监控（VBAT_ADC）── */
-    // 若 BSP_BAT_ADC_PIN 未配置（仍为占位 -1），bsp_battery_init 会返回错误，
-    // 仅打印警告，不影响其他流程。后续硬件确认引脚后即可自动启用。
-    ret = bsp_battery_init();
-    if (ret == ESP_OK)
-    {
-        bsp_battery_start_task(NULL); // 暂不接低电回调，UI 自身已带变色提示
-        // bsp_battery_start_log_task(); // 新增：每 5s 打印一次电池电压/电量，便于调试
-        xEventGroupSetBits(bsp_board->board_status, BATTERY_BIT);
-        ESP_LOGI(TAG, "电池监控已启动");
-    }
-    else
-    {
-        ESP_LOGW(TAG, "电池监控未启用 (%s)，UI 电量将显示 --%%", esp_err_to_name(ret));
-    }
-    PRINT_INTERNAL_HEAP;
-
     /* ── 步骤 10: 情绪交互管理器（情绪矩阵 + worker task，栈在 SPIRAM）────── */
     ret = interaction_manager_init();
     if (ret != ESP_OK)
@@ -379,6 +357,17 @@ void application_init(void)
         ESP_LOGE(TAG, "interaction_manager_init 失败: %s", esp_err_to_name(ret));
     }
     PRINT_INTERNAL_HEAP;
+    // 舵机测试任务（独立跑，不影响 LVGL 刷新）
+    // xTaskCreatePinnedToCoreWithCaps(
+    //     servo_test_task,
+    //     "servo_test",
+    //     4096,
+    //     NULL,
+    //     5,
+    //     NULL,
+    //     tskNO_AFFINITY,
+    //     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
     // 6. 创建触摸扫描任务（栈分配在PSRAM，节省内部SRAM）
     ret = xTaskCreatePinnedToCoreWithCaps(
         touch_scan_task,
@@ -399,23 +388,16 @@ void application_init(void)
         ESP_LOGI(TAG, "触摸扫描任务创建完成");
     }
 
-       // 舵机测试任务（独立跑，不影响 LVGL 刷新）
-    xTaskCreatePinnedToCoreWithCaps(
-        servo_test_task,
-        "servo_test",
-        4096,
-        NULL,
-        5,
-        NULL,
-        tskNO_AFFINITY,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    // /* ── 步骤 10.5: 无活动待机模块（依赖 LCD/唤醒词/舵机管理器均已就绪）──── */
+    // standby_init();
+    // PRINT_INTERNAL_HEAP;
 
     /* ── 步骤 7: 会话模块（WebSocket 预连接）─────────────────────────────── */
 
     session_init("ws://122.224.191.2:4888/ws/omni");
     // session_init(" ws://122.224.191.2:4888/ws/voice");
 
-    PRINT_INTERNAL_HEAP;
+    // PRINT_INTERNAL_HEAP;
 
     /* ── 步骤 8: CPU 占用诊断任务（调试用，可注释掉）─────────────────────── */
     // 低优先级、tskNO_AFFINITY、栈在 SPIRAM，对业务无干扰

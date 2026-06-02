@@ -8,6 +8,13 @@
 
 static const char *TAG = "BSP_CODEC";
 
+// 音量持久化用的 NVS 命名空间与键名（与 mqtt_creds 同款 NVS 用法）
+#define AUDIO_CFG_NVS_NS "audio_cfg" // 音频配置命名空间
+#define AUDIO_CFG_KEY_VOL "out_vol"  // 扬声器输出音量键（int32，0~100）
+#define BSP_CODEC_DEFAULT_VOLUME 50  // 默认扬声器音量（NVS 未配置时使用）
+#define MAX_VOLUME 100
+#define MIN_VOLUME 0
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // 私有硬件初始化函数（仅在本文件内使用，外部不可见）
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -372,6 +379,62 @@ void audio_feed_task(void *arg)
 }
 
 /**
+ * @brief 设置扬声器输出音量（运行期可调，自动持久化到 NVS）
+ *
+ * 见 bsp_board.h 中接口说明。实现要点：
+ *   1. 入参钳位 0~100，防止越界导致 DAC 饱和爆音
+ *   2. 通过 bsp_board_get_instance() 取 codec_dev，未就绪时返回错误（不 panic）
+ *   3. 调用 esp_codec_dev_set_out_vol() 写 ES8311 寄存器
+ *   4. 写入 NVS "audio_cfg/out_vol"，重启后由 audio_init() 读回
+ *
+ * @param volume 目标音量（0~100，超出自动钳位）
+ * @return ESP_OK / ESP_ERR_INVALID_STATE / 其他 esp_err_t
+ */
+esp_err_t bsp_board_codec_set_volume(int volume)
+{
+    // ── 步骤 1：入参钳位到 0~100 ──────────────────────────────────────────────
+    if (volume < MIN_VOLUME)
+        volume = MIN_VOLUME;
+    if (volume > MAX_VOLUME)
+        volume = MAX_VOLUME;
+
+    // ── 步骤 2：获取 codec_dev 句柄，未就绪则拒绝 ────────────────────────────
+    bsp_board_t *bsp_board = bsp_board_get_instance();
+    if (bsp_board == NULL || bsp_board->codec_dev == NULL)
+    {
+        ESP_LOGE(TAG, "设置音量失败：codec_dev 未初始化（音频硬件未就绪）");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // ── 步骤 3：写 ES8311 寄存器设置输出音量 ─────────────────────────────────
+    esp_err_t ret = esp_codec_dev_set_out_vol(bsp_board->codec_dev, volume);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "设置扬声器音量=%d 失败: %s", volume, esp_err_to_name(ret));
+        return ret;
+    }
+    ESP_LOGI(TAG, "设置扬声器音量=%d", volume);
+
+    // ── 步骤 4：持久化到 NVS，重启后保留 ─────────────────────────────────────
+    // NVS 写失败不影响本次音量生效，仅告警（与 mqtt_creds 一致的容错风格）
+    nvs_handle_t nvs;
+    esp_err_t nvs_err = nvs_open(AUDIO_CFG_NVS_NS, NVS_READWRITE, &nvs);
+    if (nvs_err == ESP_OK)
+    {
+        nvs_set_i32(nvs, AUDIO_CFG_KEY_VOL, volume);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+    else
+    {
+        ESP_LOGW(TAG, "音量持久化失败：无法打开 NVS '%s': %s",
+                 AUDIO_CFG_NVS_NS, esp_err_to_name(nvs_err));
+    }
+
+    return ESP_OK;
+}
+
+/**
  * @brief 完整音频初始化：硬件 + 设备打开 + 增益设置 + 采集任务
  *
  * 依次执行：
@@ -410,11 +473,23 @@ void audio_init(bsp_board_t *bsp_board)
     //        AGC 再做软件自适应补偿，无需大喊即可达到模型所需置信度
     esp_codec_dev_set_in_gain(bsp_board->codec_dev, 48);
 
-    // ── 步骤 4：设置扬声器音量（0~100，60 为适中音量）──────────────────────
-    // 音量过大可能导致 ES8311 内部 DAC 饱和，产生爆音
-    esp_codec_dev_set_out_vol(bsp_board->codec_dev, 50);
+    // ── 步骤 4：设置扬声器音量（从 NVS 读回上次保存值，无则用默认 50）──────
+    // 通过统一接口 bsp_board_codec_set_volume() 设置，运行期 MQTT 指令也走同一接口。
+    // 此处读 NVS 决定初始值，避免初始化用默认值覆盖云端设过的音量（回环问题）。
+    int init_volume = BSP_CODEC_DEFAULT_VOLUME;
+    nvs_handle_t nvs;
+    if (nvs_open(AUDIO_CFG_NVS_NS, NVS_READONLY, &nvs) == ESP_OK)
+    {
+        int32_t saved_vol = 0;
+        if (nvs_get_i32(nvs, AUDIO_CFG_KEY_VOL, &saved_vol) == ESP_OK)
+        {
+            init_volume = (int)saved_vol; // 读到则用保存值
+        }
+        nvs_close(nvs);
+    }
+    bsp_board_codec_set_volume(init_volume);
 
-    ESP_LOGI(TAG, "ES8311 初始化完成（增益=46, 音量=60）");
+    ESP_LOGI(TAG, "ES8311 初始化完成（增益=48, 音量=%d）", init_volume);
 
     // ── 步骤 5：创建麦克风采集任务 ────────────────────────────────────────────
     // 任务立即开始从 I2S DMA 读取 PCM 数据并投喂给 AFE/MultiNet

@@ -222,6 +222,26 @@ void audio_init(bsp_board_t *bsp_board);
  */
 void audio_feed_task(void *arg);
 
+/**
+ * @brief 设置扬声器输出音量（运行期可调，自动持久化到 NVS）
+ *
+ * 封装 esp_codec_dev_set_out_vol()，供运行期动态调节扬声器音量使用
+ * （典型场景：MQTT 云端下发 {"type":"volume","value":N} 指令）。
+ * 设置成功后将音量写入 NVS "audio_cfg" 命名空间的 "out_vol" 键，
+ * 设备重启后由 audio_init() 读回作为初始音量。
+ *
+ * @param volume 目标音量（0~100）。超出范围会被自动钳位：<0 取 0，>100 取 100。
+ *               音量过大可能导致 ES8311 内部 DAC 饱和产生爆音，故上限 100。
+ * @return ESP_OK             设置成功
+ *         ESP_ERR_INVALID_STATE  codec_dev 尚未初始化（音频硬件未就绪）
+ *         其他 esp_err_t      底层 codec 写寄存器失败
+ *
+ * @note 通过 bsp_board_get_instance() 获取 codec_dev，无需传入 bsp_board
+ * @note 线程安全：esp_codec_dev 内部有 mutex，可在任意任务/回调中调用
+ * @note 调用者：mqtt_protocol.c（volume 指令）、bsp_codec.c → audio_init()（初始化）
+ */
+esp_err_t bsp_board_codec_set_volume(int volume);
+
 // ─── 公开 API：音频初始化 ─────────────────────────────────────────────────────
 
 void bsp_board_lcd_init(bsp_board_t *bsp_board);
@@ -247,6 +267,18 @@ void bsp_board_lcd_on(bsp_board_t *bsp_board);
  * @note 前置条件：bsp_board_lcd_init() 已调用
  */
 void bsp_board_lcd_off(bsp_board_t *bsp_board);
+
+/**
+ * @brief 设置 LCD 背光亮度（LEDC PWM 调光，0~100%）
+ *
+ * 背光由 LEDC PWM 驱动，可在运行时无级调节亮度。0=熄灭，100=最亮。
+ *
+ * @param percent 亮度百分比（0~100，超 100 自动钳到 100）
+ * @return void
+ * @note 调用者：standby 待机模块（进入待机降至 BSP_LCD_BK_STANDBY_PCT，退出恢复 100%）
+ * @note 前置条件：bsp_board_lcd_init() 已完成 LEDC 配置
+ */
+void bsp_board_lcd_set_brightness(uint8_t percent);
 
 // ========== 3. 在 API 声明区添加 ==========
 /**
@@ -390,6 +422,15 @@ uint32_t bsp_battery_get_voltage_mv(void);
  *   3.60V → 20%    3.45V → 10%    3.30V → 5%     3.00V → 0%
  */
 uint8_t bsp_battery_get_percent(void);
+
+/**
+ * @brief 获取当前 WiFi 信号强度 RSSI
+ *
+ * @return RSSI 值（dBm，负数，越大越好）；未连接或读取失败返回 0
+ *
+ * @note 调用者：UI 状态栏（顶部 WiFi 图标刷新）
+ */
+int bsp_wifi_get_rssi(void);
 
 /**
  * @brief 启动后台采样任务（周期 BSP_BAT_TASK_INTERVAL_MS）

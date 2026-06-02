@@ -441,6 +441,28 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         ESP_LOGE(MQTT_TAG, "OTA 指令缺少 url 字段");
                     }
                 }
+                else if (cJSON_IsString(type_item) && strcmp(type_item->valuestring, "volume") == 0)
+                {
+                    // ★ 音量调节指令处理
+                    // JSON 格式: {"type":"volume","value":80}（value 为 0~100 整数）
+                    // 设置音量是轻量寄存器写 + NVS，无需异步任务（与 unbind/ota 的重操作不同）
+                    cJSON *value_item = cJSON_GetObjectItem(root, "value");
+                    if (cJSON_IsNumber(value_item))
+                    {
+                        int vol = value_item->valueint;
+                        ESP_LOGW(MQTT_TAG, "收到音量指令: value=%d", vol);
+                        // bsp_board_codec_set_volume 内部自动钳位 0~100 并持久化到 NVS
+                        esp_err_t vol_err = bsp_board_codec_set_volume(vol);
+                        if (vol_err != ESP_OK)
+                        {
+                            ESP_LOGE(MQTT_TAG, "设置音量失败: %s", esp_err_to_name(vol_err));
+                        }
+                    }
+                    else
+                    {
+                        ESP_LOGE(MQTT_TAG, "音量指令缺少有效的 value 数字字段");
+                    }
+                }
                 else
                 {
                     ESP_LOGW(MQTT_TAG, "未知指令类型: %s", cJSON_IsString(type_item) ? type_item->valuestring : "null");

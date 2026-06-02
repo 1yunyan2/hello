@@ -19,6 +19,7 @@ idf_component_register(SRCS
 "ui/interaction.c"
 "ui/reminder.c"
 "ui/ui_port.c"
+"ui/standby.c"
 "ui/games.c"
 "ui/font_cn_16.c"
 "bsp/bsp_flash.c"
