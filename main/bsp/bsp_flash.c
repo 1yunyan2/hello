@@ -223,21 +223,54 @@ void bsp_flash_init(void)
         ext_flash = NULL;
         return;
     }
-    // --- 步骤 2: 产线双模监听 (10秒) ---
+    // --- 步骤 2: 先尝试挂载文件系统（成品板零延迟启动） ---
+    // 设计要点：只有"挂载失败"才意味着这块板没有有效镜像（新板/烧坏的板），
+    // 才需要进入产线监听等 burner。已经烧录成功的成品板挂载必然成功，
+    // 这里直接 return，不再像旧逻辑那样无条件硬等 10 秒产线窗口。
+    uint32_t flash_size;
+    esp_flash_get_size(ext_flash, &flash_size);
+    const esp_partition_t *fat_partition;
+
+    ESP_ERROR_CHECK(esp_partition_register_external(ext_flash, 0, flash_size, "ext_storage",
+                                                    ESP_PARTITION_TYPE_DATA,
+                                                    ESP_PARTITION_SUBTYPE_DATA_FAT,
+                                                    &fat_partition));
+
+    const esp_vfs_fat_mount_config_t mount_config = {
+        // ⚠️ 必须为 false：true 会在任何挂载错误时静默格式化整盘，
+        //    用户上传的 GIF/audio 资源会无声丢失。失败时改走下面的
+        //    产线监听分支，等待 burner 发 START 烧录。
+        .format_if_mount_failed = false,
+        .max_files = 5,
+        .allocation_unit_size = 4096};
+    esp_err_t mount_ret = esp_vfs_fat_spiflash_mount_rw_wl("/S", "ext_storage", &mount_config, &s_wl_handle);
+    if (mount_ret == ESP_OK)
+    {
+        // 成品板：挂载成功，直接返回继续正常启动，零延迟，不进产线窗口
+        ESP_LOGI(TAG, "外部 Flash 正常挂载到 /S");
+        return;
+    }
+
+    // --- 步骤 3: 挂载失败 → 进入产线监听（新板/烧坏的板才会走到这里） ---
     // 此阶段不安装 USJ 驱动，用默认 secondary console 读写，
     // 避免 USJ ISR 干扰后续 I2C 总线时序（BUG: ES8311 NACK）。
+    // 不 abort、不重启：保持监听，让 burner.py 在任意时刻插入都能握手接管。
+    ESP_LOGW(TAG, "挂载失败 (0x%x)，无有效镜像，进入产线模式等待烧录...", mount_ret);
     ESP_LOGI(TAG, "📢 产线模式开启！发送 'START' 烧录，发送 'DUMP' 提取...");
 
     char cmd[32] = {0};
     uint32_t wait_ms = 0;
     int mode = 0; // 0: 正常模式, 1: 烧录模式, 2: 提取模式
 
-    while (wait_ms < 10000)
+    // 旧逻辑这里是 10 秒超时窗口；现在挂载已确认失败、没有可启动的文件系统，
+    // 故改为持续监听（死循环里轮询命令字），等 burner 随时接管。
+    while (mode == 0)
     {
-        // 每 2s 喊话一次（10s 内 5 次），够 Python 同步且不刷屏
+        // 每 2s 喊话一次，够 Python 同步且不刷屏
         if (wait_ms % 2000 == 0)
         {
             printf("\nESP32_READY_CMD_WAIT\n"); // Python 握手锚点，勿删
+            printf("NEED_BURN\n");              // 兼容旧约定：告知 burner.py 可发数据
             fflush(stdout);
         }
 
@@ -270,63 +303,21 @@ void bsp_flash_init(void)
     }
 
     // 进入产线模式时才安装 USJ 驱动（大吞吐量需要环形缓冲）
-    if (mode == 1 || mode == 2)
-    {
-        usb_serial_jtag_driver_config_t usj_cfg = {
-            .rx_buffer_size = USJ_RX_BUF_SIZE,
-            .tx_buffer_size = USJ_TX_BUF_SIZE,
-        };
-        ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usj_cfg));
-        usb_serial_jtag_vfs_use_driver();
-    }
+    usb_serial_jtag_driver_config_t usj_cfg = {
+        .rx_buffer_size = USJ_RX_BUF_SIZE,
+        .tx_buffer_size = USJ_TX_BUF_SIZE,
+    };
+    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usj_cfg));
+    usb_serial_jtag_vfs_use_driver();
 
     if (mode == 1)
     {
         printf("\n>>> 进入烧录模式 (PC -> Flash) <<<\n");
-        start_production_burning();
+        start_production_burning(); // 内部全盘擦除+烧录，含 esp_restart，不返回
     }
     else if (mode == 2)
     {
         printf("\n>>> 进入提取模式 (Flash -> PC) <<<\n");
-        start_production_dump();
-    }
-
-    else
-    {
-        // --- 步骤 3: 正常启动流程 (挂载文件系统) ---
-        uint32_t flash_size;
-        esp_flash_get_size(ext_flash, &flash_size);
-        const esp_partition_t *fat_partition;
-
-        ESP_ERROR_CHECK(esp_partition_register_external(ext_flash, 0, flash_size, "ext_storage",
-                                                        ESP_PARTITION_TYPE_DATA,
-                                                        ESP_PARTITION_SUBTYPE_DATA_FAT,
-                                                        &fat_partition));
-
-        const esp_vfs_fat_mount_config_t mount_config = {
-            // ⚠️ 必须为 false：true 会在任何挂载错误时静默格式化整盘，
-            //    用户上传的 GIF/audio 资源会无声丢失。失败时改走下面的
-            //    NEED_BURN 分支，等待主动 START 烧录。
-            .format_if_mount_failed = false,
-            .max_files = 5,
-            .allocation_unit_size = 4096};
-        esp_err_t mount_ret = esp_vfs_fat_spiflash_mount_rw_wl("/S", "ext_storage", &mount_config, &s_wl_handle);
-        if (mount_ret == ESP_OK)
-        {
-            ESP_LOGI(TAG, "外部 Flash 正常挂载到 /S");
-        }
-        else
-        {
-            // 没有有效 FAT 文件系统（首次上电或镜像无效）
-            // 不要 abort，否则会陷入重启循环导致 burner.py 无法接入
-            ESP_LOGW(TAG, "挂载失败 (0x%x)，检查镜像格式或手动发送 START 进入烧录模式。...", mount_ret);
-            printf("NEED_BURN\n"); // 让 burner.py 知道可以直接发数据
-                                   // start_production_burning(); // 内部含 esp_restart，不会返回
-                                   // 建议在这里进入一个死循环或者等待指令的任务，而不是直接重启
-            while (1)
-            {
-                vTaskDelay(pdMS_TO_TICKS(1000));
-            }
-        }
+        start_production_dump(); // 内部含 esp_restart，不返回
     }
 }
