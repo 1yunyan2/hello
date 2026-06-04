@@ -43,12 +43,13 @@ static SemaphoreHandle_t s_ch_mutex[3] = {NULL, NULL, NULL};
 // 强保护机制：物理边界软限位 (Soft Limits)
 // ⚠️ 组装好外壳后，请务必根据实际情况修改这几个极限值！
 // 超出范围时 clamp_safe_angle 会自动修正并打印警告日志。
-#define HEAD_MIN_ANGLE 45.0f   ///< 头部向左最大极限角度（度），防止颈部过度旋转损坏舵机
-#define HEAD_MAX_ANGLE 135.0f  ///< 头部向右最大极限角度（度）
-#define L_ARM_MIN_ANGLE 10.0f  ///< 左臂向后最大极限角度（度），防止手臂撞到机身
-#define L_ARM_MAX_ANGLE 160.0f ///< 左臂向前最大极限角度（度），防止撞头
-#define R_ARM_MIN_ANGLE 10.0f  ///< 右臂向后最大极限角度（度）
-#define R_ARM_MAX_ANGLE 160.0f ///< 右臂向前最大极限角度（度），防止撞头
+//! 需要修改,以90为0度,左右各80为极限
+#define HEAD_MIN_ANGLE 0.0f    ///< 头部向左最大极限角度（度），防止颈部过度旋转损坏舵机
+#define HEAD_MAX_ANGLE 180.0f  ///< 头部向右最大极限角度（度）
+#define L_ARM_MIN_ANGLE 0.0f   ///< 左臂向后最大极限角度（度），防止手臂撞到机身
+#define L_ARM_MAX_ANGLE 180.0f ///< 左臂向前最大极限角度（度），防止撞头
+#define R_ARM_MIN_ANGLE 0.0f   ///< 右臂向后最大极限角度（度）
+#define R_ARM_MAX_ANGLE 180.0f ///< 右臂向前最大极限角度（度），防止撞头
 
 // ==========================================
 // 私有函数：角度边界裁剪 (防止物理撞击)

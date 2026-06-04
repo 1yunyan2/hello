@@ -17,13 +17,23 @@
 #include "mqtt_protocol.h"
 #include "bsp/bsp_board.h"
 #include "bsp/bsp_ota.h"
+// 舵机控制直接走 bsp/bsp_board.h 的 bsp_servo_move_smooth（绝对角度定位），无需 servo_manager.h
 #include "auth.h"
+#include "session/session.h" // session_debug_kill_ws() — MQTT 远程伪造 WS 断连测试
 #include "object.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 static const char *MQTT_TAG = "MQTT"; ///< 日志 TAG
+
+// ─── 音量映射：app 下发 0~100 → 硬件音量 0~APP_VOLUME_HW_MAX ────────────────
+// app 端永远以 0~100 表达音量；硬件实际可用上限不确定（受功放/喇叭/听感影响），
+// 故在此处做一层线性缩放，只需调整 APP_VOLUME_HW_MAX 一个宏即可整体改变最大音量。
+//   value=0   → 硬件 0（静音）
+//   value=100 → 硬件 APP_VOLUME_HW_MAX
+// 当前设为 100 表示不缩放（与历史行为一致），按需下调。
+#define APP_VOLUME_HW_MAX 65 ///< app 满音量(100)对应的硬件音量上限
 
 // ─── MQTT 凭证（运行时从 NVS 加载，回退到编译期默认值）────────────────────
 #define MQTT_DEFAULT_URI "mqtt://122.224.191.2:1883" ///< 默认 Broker 地址（测试环境）
@@ -427,7 +437,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     if (cJSON_IsString(url_item) && url_item->valuestring)
                     {
                         const char *ver = (cJSON_IsString(ver_item) && ver_item->valuestring)
-                                          ? ver_item->valuestring : "unknown";
+                                              ? ver_item->valuestring
+                                              : "unknown";
                         ESP_LOGW(MQTT_TAG, "收到 OTA 指令: url=%s version=%s",
                                  url_item->valuestring, ver);
                         esp_err_t ota_err = bsp_ota_trigger(url_item->valuestring, ver);
@@ -450,9 +461,16 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     if (cJSON_IsNumber(value_item))
                     {
                         int vol = value_item->valueint;
-                        ESP_LOGW(MQTT_TAG, "收到音量指令: value=%d", vol);
+                        // 先把 app 的 0~100 钳位，避免越界后映射出负值/超额
+                        if (vol < 0)
+                            vol = 0;
+                        if (vol > 100)
+                            vol = 100;
+                        // 线性映射到硬件音量 0~APP_VOLUME_HW_MAX（+50 用于四舍五入）
+                        int hw_vol = (vol * APP_VOLUME_HW_MAX + 50) / 100;
+                        ESP_LOGW(MQTT_TAG, "收到音量指令: value=%d → 硬件音量=%d", vol, hw_vol);
                         // bsp_board_codec_set_volume 内部自动钳位 0~100 并持久化到 NVS
-                        esp_err_t vol_err = bsp_board_codec_set_volume(vol);
+                        esp_err_t vol_err = bsp_board_codec_set_volume(hw_vol);
                         if (vol_err != ESP_OK)
                         {
                             ESP_LOGE(MQTT_TAG, "设置音量失败: %s", esp_err_to_name(vol_err));
@@ -461,6 +479,64 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     else
                     {
                         ESP_LOGE(MQTT_TAG, "音量指令缺少有效的 value 数字字段");
+                    }
+                }
+                else if (cJSON_IsString(type_item) && strcmp(type_item->valuestring, "ws_kill") == 0)
+                {
+                    // ★【调试】伪造 WS 断连指令，用于测试断链重连逻辑
+                    // JSON 格式: {"type":"ws_kill"}
+                    // session_debug_kill_ws 内部另起异步任务执行 close（不能在 MQTT 回调里直接断），
+                    // 等效服务端 FIN，触发 PROTOCOL_EVENT_DISCONNECTED → 退避重连。
+                    ESP_LOGW(MQTT_TAG, "收到 ws_kill 调试指令，触发主动断连测试");
+                    session_debug_kill_ws();
+                }
+                else if (cJSON_IsString(type_item) && strcmp(type_item->valuestring, "servo") == 0)
+                {
+                    // ★ 舵机控制指令处理
+                    // JSON 格式: {"type":"servo","servo":"head","angle":90}
+                    //   servo: 舵机名（字符串，固定三选一，与前端约定）
+                    //          "head"      → CH_HEAD  头部
+                    //          "left_arm"  → CH_L_ARM 左臂
+                    //          "right_arm" → CH_R_ARM 右臂
+                    //   angle: 目标角度（0~180，超出由 bsp_servo 内部软限位裁剪）
+                    // 速度写死为 SERVO_SPEED_MID（15ms/度），JSON 不携带 speed、不携带 direction。
+                    // servo_manager_submit_angle 为非阻塞入队操作（与 volume 同属轻量指令），
+                    // 故可直接在 MQTT 事件回调中调用，无需像 unbind/ota 那样另起异步任务。
+                    cJSON *servo_item = cJSON_GetObjectItem(root, "servo");
+                    cJSON *offset_item = cJSON_GetObjectItem(root, "offset");
+                    if (cJSON_IsString(servo_item) && servo_item->valuestring && cJSON_IsNumber(offset_item))
+                    {
+                        const char *servo_name = servo_item->valuestring;
+                        float offset = (float)offset_item->valuedouble;
+
+                        // 舵机名 → 通道宏映射（固定协议，与前端约定一致）
+                        int channel = -1;
+                        if (strcmp(servo_name, "head") == 0)
+                            channel = CH_HEAD;
+                        else if (strcmp(servo_name, "left_arm") == 0)
+                            channel = CH_L_ARM;
+                        else if (strcmp(servo_name, "right_arm") == 0)
+                            channel = CH_R_ARM;
+
+                        if (channel < 0)
+                        {
+                            ESP_LOGE(MQTT_TAG, "舵机指令 servo=\"%s\" 未知（仅支持 head/left_arm/right_arm）", servo_name);
+                        }
+                        else
+                        {
+                            ESP_LOGW(MQTT_TAG, "收到舵机指令: servo=%s(ch=%d) angle=%.1f", servo_name, channel, offset);
+                            float absolute_angle = 90.0f + offset; // 转换：0→90, +30→120, -30→60
+                            // 直接调底层 bsp_servo_move_smooth：按绝对角度定位，自带软限位/平滑/去抖，停位即止。
+                            // 不经 servo_manager_submit_angle —— 其内部"拆幅度+方向再回中"逻辑会导致到位后回弹、
+                            // 且把绝对角度塞进 amplitude enum 会造成角度大小错乱。
+                            // 注意：此函数内部含 vTaskDelay（平滑插值，最长约 1.3s），会阻塞 MQTT 回调线程；
+                            //       MQTT 指令频率低，单条可接受，若后续需连发再改异步。
+                            bsp_servo_move_smooth((uint8_t)channel, absolute_angle, SERVO_SPEED_MID);
+                        }
+                    }
+                    else
+                    {
+                        ESP_LOGE(MQTT_TAG, "舵机指令缺少有效的 servo(字符串)/angle(数字) 字段");
                     }
                 }
                 else

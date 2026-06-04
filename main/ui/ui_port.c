@@ -22,6 +22,7 @@
 #include "esp_random.h"
 #include "bsp/bsp_config.h"
 #include "bsp/bsp_board.h"
+#include "bsp/servo_manager.h" /* GIF 切换时只驱动舵机:非阻塞入队 + 独立 worker 执行 */
 #include "esp_spiffs.h"
 #include "ui/reminder.h"
 #include "ui/standby.h"
@@ -57,6 +58,12 @@ static const char *TAG = "UI_PORT";
 static void main_clock_refresh(void);
 static void main_clock_tick_cb(lv_timer_t *t);
 static void gif_auto_hide_cb(lv_timer_t *t);
+/* ── 主界面 GIF 自动循环 + 舵机联动 前向声明 ── */
+static int main_gif_pick_next_index(int cur);               // 选下一张 GIF 表索引
+static void main_gif_ready_cb(lv_event_t *e);               // GIF 播完一轮事件(只置 flag)
+static void main_gif_switch_timer_cb(lv_timer_t *t);        // 延迟切换:真正 set_src + 入队舵机
+static void main_gif_apply_index(int idx, bool with_servo); // 应用一张 GIF(切图 + 可选触发舵机)
+static void main_gif_kick_resume(void);                     // 退回主界面后重启 GIF 循环
 /* 移除 on_refr_start / on_refr_ready：
  *   PARTIAL 模式 + W*H/5 单缓冲下，LV_EVENT_RENDER_START 每个 invalid area 触发一次（多次），
  *   而 LV_EVENT_RENDER_READY 整帧只触发一次，pause/resume 不对称 → GIF 帧推进 timer 被永久 pause，
@@ -83,7 +90,7 @@ static void alarm_edit_advance(void);
 static void alarm_edit_back_or_cancel(void);
 
 /* ── 配置宏 ── */
-#define UI_MAIN_GIF_RANDOM 0
+#define UI_MAIN_GIF_RANDOM 1
 #define UI_MENU_IDLE_TIMEOUT_MS 30000
 
 /* ═══════════════════════════════════════════════════════════════
@@ -121,6 +128,16 @@ typedef enum
  * ═══════════════════════════════════════════════════════════════ */
 lv_display_t *lvgl_disp = NULL;
 static lv_obj_t *gif_obj = NULL;
+
+/* ── 主界面 GIF 自动循环状态(均在 LVGL 线程读写,无需加锁/原子)──
+ *   s_gif_cur_index   : 当前正在播放的 GIF 表索引;-1 表示尚未开始
+ *   s_gif_pending_idx : 待切换到的索引;-1 表示当前无待切换(防重复排队)
+ *   s_gif_switch_tmr  : 延迟执行 lv_gif_set_src 的 one-shot 定时器
+ *                       (不能在 LV_EVENT_READY 回调里直接切图,见 main_gif_ready_cb 说明)
+ */
+static int s_gif_cur_index = -1;
+static int s_gif_pending_idx = -1;
+static lv_timer_t *s_gif_switch_tmr = NULL;
 
 /* 主时钟 UI */
 static lv_obj_t *s_clock_d[6];
@@ -283,29 +300,245 @@ void init_spiffs(void)
 /* ═══════════════════════════════════════════════════════════════
  * GIF 动画
  * ═══════════════════════════════════════════════════════════════ */
-static const char *const s_main_gif_paths[] = {
-    "S:/gif/one.gif",
-    "S:/gif/two.gif",
-    "S:/gif/three.gif",
-    "S:/gif/four.gif",
+/* ───────────────────────────────────────────────────────────────
+ * 主界面待机 GIF 表(GIF 路径 ↔ 纯舵机动作 一一对应)
+ *
+ * 设计要点:
+ *   - 每张 GIF 直接绑定一组三轴(头/左臂/右臂)舵机动作,【不走情绪矩阵】,
+ *     因此【不带】震动马达、不带音频,只有舵机运动。
+ *   - 动作用 servo_manager 的 servo_request_t 描述(幅度/方向/速度/循环/往返),
+ *     通过 servo_manager_submit_request 非阻塞入队,由独立 worker 串行执行——
+ *     既线程安全又不阻塞 LVGL 渲染线程。
+ *   - 某一轴不想动:把该轴 .count 置 0(下方 apply 时会跳过)。
+ *   - 扩展时【只需在本表追加一行】 { 新路径, {头动作},{左臂},{右臂} },无需改逻辑。
+ *
+ * servo_request_t 字段速查:
+ *   channel    : CH_HEAD / CH_L_ARM / CH_R_ARM(由 apply 自动按轴填,表里写 0 占位即可)
+ *   amplitude  : SERVO_AMPLITUDE_10/15/20/30(相对中位 90° 的偏摆角度)
+ *   direction  : SERVO_DIR_LEFT(+)/RIGHT(-)/NEUTRAL(头:左右;臂:前后)
+ *   speed_ms   : SERVO_SPEED_FAST/MID/SLOW/VERY_SLOW(ms/度,越大越慢)
+ *   loop_count : 往返次数(oscillate=true 时生效)
+ *   oscillate  : true=两侧往返(如摇头),false=单次到位后回中
+ * ─────────────────────────────────────────────────────────────── */
 
-};
-
-static const char *pick_main_gif_path(void)
+/* 单轴动作:复用 servo_request_t,但 channel 由 apply 按轴自动覆盖,这里只关心动作参数。
+ * count==0 表示该轴本张 GIF 不参与运动。 */
+typedef struct
 {
+    servo_amplitude_t amplitude;
+    servo_direction_t direction;
+    servo_speed_level_t speed_ms;
+    uint8_t count;     // 往返/重复次数;0 = 该轴不动
+    bool oscillate;    // true=往返,false=单次到位回中
+} gif_servo_action_t;
+
+typedef struct
+{
+    const char *gif_path;       // SPIFFS 路径,如 "S:/gif/one.gif"
+    gif_servo_action_t head;    // 头部舵机动作
+    gif_servo_action_t l_arm;   // 左臂舵机动作
+    gif_servo_action_t r_arm;   // 右臂舵机动作
+} main_gif_entry_t;
+
+/* 各 GIF 的舵机动作(参数为初版默认值,可边测边调)。
+ * 约定:{幅度, 方向, 速度, 次数, 是否往返} */
+static const main_gif_entry_t s_main_gif_table[] = {
+    // one.gif:活泼 —— 头快速往返摇 3 次,双臂中速各摆 2 次
+    {"S:/gif/one.gif",
+     /*head */ {SERVO_AMPLITUDE_30, SERVO_DIR_LEFT, SERVO_SPEED_FAST, 3, true},
+     /*l_arm*/ {SERVO_AMPLITUDE_20, SERVO_DIR_LEFT, SERVO_SPEED_MID, 2, true},
+     /*r_arm*/ {SERVO_AMPLITUDE_20, SERVO_DIR_RIGHT, SERVO_SPEED_MID, 2, true}},
+
+    // two.gif:好奇 —— 头缓慢侧偏一下(单次回中),双臂不动
+    {"S:/gif/two.gif",
+     /*head */ {SERVO_AMPLITUDE_20, SERVO_DIR_LEFT, SERVO_SPEED_SLOW, 1, false},
+     /*l_arm*/ {SERVO_AMPLITUDE_10, SERVO_DIR_NEUTRAL, SERVO_SPEED_MID, 0, false},
+     /*r_arm*/ {SERVO_AMPLITUDE_10, SERVO_DIR_NEUTRAL, SERVO_SPEED_MID, 0, false}},
+
+    // three.gif:舒服 —— 头慢速轻摇 2 次,双臂慢速小幅各摆 1 次
+    {"S:/gif/three.gif",
+     /*head */ {SERVO_AMPLITUDE_15, SERVO_DIR_LEFT, SERVO_SPEED_SLOW, 2, true},
+     /*l_arm*/ {SERVO_AMPLITUDE_10, SERVO_DIR_LEFT, SERVO_SPEED_SLOW, 1, true},
+     /*r_arm*/ {SERVO_AMPLITUDE_10, SERVO_DIR_RIGHT, SERVO_SPEED_SLOW, 1, true}},
+
+    // four.gif:犯困 —— 头极慢大幅侧偏一下,双臂不动
+    {"S:/gif/four.gif",
+     /*head */ {SERVO_AMPLITUDE_30, SERVO_DIR_RIGHT, SERVO_SPEED_VERY_SLOW, 1, false},
+     /*l_arm*/ {SERVO_AMPLITUDE_10, SERVO_DIR_NEUTRAL, SERVO_SPEED_MID, 0, false},
+     /*r_arm*/ {SERVO_AMPLITUDE_10, SERVO_DIR_NEUTRAL, SERVO_SPEED_MID, 0, false}},
+
+    /* ↓↓↓ 以后加 GIF 只加一行(路径 + 三轴动作)↓↓↓ */
+};
+#define MAIN_GIF_COUNT (sizeof(s_main_gif_table) / sizeof(s_main_gif_table[0]))
+
+/**
+ * @brief 把一张 GIF 的三轴舵机动作非阻塞入队(只动舵机,无震动/音频)
+ *
+ * 每个 count>0 的轴生成一个 servo_request_t 提交到 servo_manager 队列,
+ * 由其独立 worker 串行执行;count==0 的轴跳过。
+ */
+static void main_gif_submit_servo(const main_gif_entry_t *entry)
+{
+    const struct
+    {
+        uint8_t channel;
+        const gif_servo_action_t *act;
+    } axes[] = {
+        {CH_HEAD, &entry->head},
+        {CH_L_ARM, &entry->l_arm},
+        {CH_R_ARM, &entry->r_arm},
+    };
+
+    for (size_t i = 0; i < sizeof(axes) / sizeof(axes[0]); i++)
+    {
+        const gif_servo_action_t *a = axes[i].act;
+        if (a->count == 0)
+            continue; // 该轴本张不参与
+        servo_request_t req = {
+            .channel = axes[i].channel,
+            .amplitude = a->amplitude,
+            .direction = a->direction,
+            .speed_ms = a->speed_ms,
+            .loop_count = a->count,
+            .oscillate = a->oscillate,
+        };
+        servo_manager_submit_request(&req); // 非阻塞入队,失败仅内部打日志,不影响 GIF
+    }
+}
+
+/**
+ * @brief 选择下一张 GIF 的表索引
+ *
+ * 当前策略:随机(do/while 避免连续两次同一张,提升观感)。
+ * 若想改顺序播放,把 UI_MAIN_GIF_RANDOM 置 0 即可退化为 (cur+1)%N。
+ *
+ * @param cur 当前索引(-1 表示尚未开始,允许任意)
+ * @return    下一张的表索引 [0, MAIN_GIF_COUNT)
+ */
+static int main_gif_pick_next_index(int cur)
+{
+    if (MAIN_GIF_COUNT <= 1)
+        return 0;
 #if UI_MAIN_GIF_RANDOM
-    size_t n = sizeof(s_main_gif_paths) / sizeof(s_main_gif_paths[0]);
-    return s_main_gif_paths[esp_random() % n];
+    int next;
+    do
+    {
+        next = (int)(esp_random() % MAIN_GIF_COUNT);
+    } while (next == cur); // 不与上一张重复
+    return next;
 #else
-    return s_main_gif_paths[0];
+    return (cur + 1) % (int)MAIN_GIF_COUNT; // 顺序循环
 #endif
 }
 
+/**
+ * @brief 应用一张 GIF:切图(自动重新播放) + 可选驱动对应舵机动作(纯舵机,无震动/音频)
+ *
+ * 切图机制:lv_gif_set_src 内部 gif_initialize 会 resume timer 并立即播放,
+ *   天然解决"播完一轮停在最后一帧"问题(根因:loop_count<0 时播完 lv_timer_pause)。
+ *
+ * @param idx        目标 GIF 表索引
+ * @param with_servo 是否同时驱动该 GIF 对应的舵机动作
+ *                   (首张开机时 servo_manager 队列尚未就绪,传 false 只显示不入队)
+ *
+ * @note 必须在【已持有 lvgl_port 锁】或【LVGL 线程回调】上下文调用(本函数只做 lv_* 调用,
+ *       舵机动作仅是非阻塞入队,不会阻塞 LVGL 线程)。
+ */
+static void main_gif_apply_index(int idx, bool with_servo)
+{
+    if (gif_obj == NULL || idx < 0 || (size_t)idx >= MAIN_GIF_COUNT)
+        return;
+
+    const main_gif_entry_t *entry = &s_main_gif_table[idx];
+
+    lv_gif_set_src(gif_obj, entry->gif_path); // 切新图,内部自动重新播放
+    s_gif_cur_index = idx;
+
+    if (with_servo)
+    {
+        main_gif_submit_servo(entry); // 仅驱动三轴舵机,非阻塞入队
+        ESP_LOGI(TAG, "主界面 GIF 切换 → [%d] %s (+舵机动作)", idx, entry->gif_path);
+    }
+    else
+    {
+        ESP_LOGI(TAG, "主界面 GIF 显示 → [%d] %s (首张不配舵机)", idx, entry->gif_path);
+    }
+}
+
+/**
+ * @brief GIF 播完一整轮(最后一帧)时 LVGL 触发 LV_EVENT_READY,本回调被同步调用
+ *
+ * 【安全约束·关键】本回调运行在 gif_next_frame_task_cb 内部(lv_gif.c),
+ *   该函数返回后还会继续使用 gif 的 draw_buf/timer。若此处直接 lv_gif_set_src,
+ *   会销毁并重建 draw_buf 与 timer,造成迭代器失效/重入,导致卡死或崩溃。
+ *   因此本回调【只】记录"下一张索引",真正切换交给独立 timer 在下一个 tick 执行。
+ *
+ * 本回调已在 LVGL 线程,严禁再调 lvgl_port_lock(自死锁)。
+ */
+static void main_gif_ready_cb(lv_event_t *e)
+{
+    (void)e;
+    // 仅在主界面才循环切换 GIF + 驱动舵机;进入功能菜单/闹钟编辑后 GIF 被隐藏,
+    // 此时不应继续切图或驱动舵机(否则会出现"已在功能层却仍在动"的异常)。
+    if (s_view != UI_VIEW_MAIN)
+        return;
+    if (s_gif_pending_idx >= 0)
+        return; // 已有待切换,避免本轮重复排队
+    s_gif_pending_idx = main_gif_pick_next_index(s_gif_cur_index);
+    if (s_gif_switch_tmr != NULL)
+        lv_timer_resume(s_gif_switch_tmr); // 唤醒延迟切换 timer,下个 tick 执行
+}
+
+/**
+ * @brief 延迟切换 timer 回调:在 GIF 自己的 timer 回调彻底返回后的下一个
+ *        lv_timer_handler 迭代中执行,此刻 gif_obj 已稳定(pause 在最后一帧),set_src 安全
+ *
+ * 同样在 LVGL 线程,严禁 lvgl_port_lock。one-shot:执行一次后 pause,等下次 READY 再 resume。
+ */
+static void main_gif_switch_timer_cb(lv_timer_t *t)
+{
+    lv_timer_pause(t);
+
+    int idx = s_gif_pending_idx;
+    s_gif_pending_idx = -1;
+    if (idx < 0)
+        return;
+
+    // 双保险:READY 到延迟这一拍之间若已切到功能层,放弃本次切换(不切图、不动舵机)
+    if (s_view != UI_VIEW_MAIN)
+        return;
+
+    // 切换路径(每次切换都伴随对应舵机动作)
+    main_gif_apply_index(idx, /*with_servo=*/true);
+}
+
+/**
+ * @brief 兼容旧接口:供情绪动画映射表(s_animation_map)调用,仅切换 GIF 图源、不触发舵机
+ *
+ * 情绪触发时舵机由 interaction 本身负责,这里若再入队会重复叠加,故只换图。
+ */
 static void gif_switch_source(void)
 {
     if (gif_obj == NULL)
         return;
-    lv_gif_set_src(gif_obj, pick_main_gif_path());
+    main_gif_apply_index(main_gif_pick_next_index(s_gif_cur_index), /*with_servo=*/false);
+}
+
+/**
+ * @brief 从功能层退回主界面后,重新启动 GIF 循环
+ *
+ * 在功能层期间我们屏蔽了 LV_EVENT_READY 的切换,而 GIF 播完一轮会被 LVGL 自动暂停
+ * (loop_count<0),于是退回主界面时可能停在最后一帧、不再播放也不再触发切换。
+ * 这里用 lv_gif_restart 把当前 GIF 从头重播,播完会再次触发 READY,循环随之恢复。
+ *
+ * @note 仅在【已持有 lvgl_port 锁】或【LVGL 线程】上下文调用。
+ */
+static void main_gif_kick_resume(void)
+{
+    if (gif_obj == NULL)
+        return;
+    s_gif_pending_idx = -1; // 清掉功能层期间可能残留的待切换标记
+    lv_gif_restart(gif_obj); // 当前张从头重播,播完触发 READY → 恢复"播完即切"循环
 }
 
 static void main_gif_create(void)
@@ -323,10 +556,21 @@ static void main_gif_create(void)
     lv_obj_set_style_text_font(scr, &font_cn_16, 0);
     gif_obj = lv_gif_create(scr);
     lv_gif_set_color_format(gif_obj, LV_COLOR_FORMAT_RGB565);
-    lv_gif_set_src(gif_obj, pick_main_gif_path());
+
+    // 注册"播完一轮"事件回调(回调里只置 flag,真正切换见 main_gif_switch_timer_cb)
+    lv_obj_add_event_cb(gif_obj, main_gif_ready_cb, LV_EVENT_READY, NULL);
+
+    // 创建延迟切换 one-shot 定时器:周期取很小值(下个 tick 触发即可),先 pause
+    s_gif_switch_tmr = lv_timer_create(main_gif_switch_timer_cb, 10, NULL);
+    lv_timer_pause(s_gif_switch_tmr);
+
+    // 首张:只显示不配舵机(此刻 interaction 队列尚未就绪,且很快会切到下一张)
+    int first = main_gif_pick_next_index(-1);
+    main_gif_apply_index(first, /*with_servo=*/false);
+
     lv_obj_center(gif_obj);
     lv_obj_clear_flag(gif_obj, LV_OBJ_FLAG_HIDDEN);
-    ESP_LOGI(TAG, "GIF待机动画已创建: %s", pick_main_gif_path());
+    ESP_LOGI(TAG, "GIF待机动画已创建,首张索引=%d", first);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -624,6 +868,7 @@ static void menu_idle_timeout_cb(lv_timer_t *t)
     if (gif_obj != NULL)
         lv_obj_clear_flag(gif_obj, LV_OBJ_FLAG_HIDDEN);
     s_view = UI_VIEW_MAIN;
+    main_gif_kick_resume(); // 重启 GIF 循环(功能层期间已暂停)
     ESP_LOGI(TAG, "功能菜单空闲超时，返回主界面");
 }
 
@@ -1227,6 +1472,11 @@ static void countdown_page_hide(void)
     if (s_cd_state_lbl)
         lv_obj_add_flag(s_cd_state_lbl, LV_OBJ_FLAG_HIDDEN);
 }
+/**
+ *  倒计时页面
+ *  - 短按加减分钟，长按开始/取消
+ *  - 运行时显示剩余时间，结束时显示提示并震动
+ * */
 
 static void countdown_tick_cb(lv_timer_t *t)
 {
@@ -1465,6 +1715,7 @@ void ui_function_menu_exit(void)
         if (gif_obj != NULL)
             lv_obj_clear_flag(gif_obj, LV_OBJ_FLAG_HIDDEN);
         s_view = UI_VIEW_MAIN;
+        main_gif_kick_resume(); // 重启 GIF 循环(功能层期间已暂停)
         ESP_LOGI(TAG, "退出功能菜单，返回主界面");
     }
     menu_cancel_idle_timer();
@@ -1811,15 +2062,17 @@ static void battery_label_create_top(void)
 
     lv_obj_t *top = lv_layer_top();
 
-    // ── 公共样式 helper 宏：所有状态栏标签视觉一致 ──
-    #define STATUS_LBL_STYLE(lbl) do {                                   \
-        lv_obj_set_style_text_font((lbl), &font_cn_16, 0);               \
-        lv_obj_set_style_text_color((lbl), lv_color_white(), 0);         \
-        lv_obj_set_style_bg_color((lbl), lv_color_black(), 0);           \
-        lv_obj_set_style_bg_opa((lbl), LV_OPA_40, 0);                    \
-        lv_obj_set_style_pad_hor((lbl), 4, 0);                           \
-        lv_obj_set_style_pad_ver((lbl), 1, 0);                           \
-        lv_obj_set_style_radius((lbl), 3, 0);                            \
+// ── 公共样式 helper 宏：所有状态栏标签视觉一致 ──
+#define STATUS_LBL_STYLE(lbl)                                    \
+    do                                                           \
+    {                                                            \
+        lv_obj_set_style_text_font((lbl), &font_cn_16, 0);       \
+        lv_obj_set_style_text_color((lbl), lv_color_white(), 0); \
+        lv_obj_set_style_bg_color((lbl), lv_color_black(), 0);   \
+        lv_obj_set_style_bg_opa((lbl), LV_OPA_40, 0);            \
+        lv_obj_set_style_pad_hor((lbl), 4, 0);                   \
+        lv_obj_set_style_pad_ver((lbl), 1, 0);                   \
+        lv_obj_set_style_radius((lbl), 3, 0);                    \
     } while (0)
 
     // 1. 右上角：电量标签（与时间对角分布）
@@ -1843,7 +2096,7 @@ static void battery_label_create_top(void)
     lv_obj_align(s_status_time_lbl, LV_ALIGN_TOP_LEFT, 4, 4);
     lv_label_set_text(s_status_time_lbl, "--:--");
 
-    #undef STATUS_LBL_STYLE
+#undef STATUS_LBL_STYLE
 }
 
 /**
@@ -1944,7 +2197,7 @@ static void status_wifi_refresh(int rssi)
     else if (rssi >= -55)
         color = lv_color_hex(0x34C759); // 绿：满格
     else if (rssi >= -70)
-        color = lv_color_white();       // 白：中等
+        color = lv_color_white(); // 白：中等
     else if (rssi >= -85)
         color = lv_color_hex(0xFF9500); // 黄：弱
     else

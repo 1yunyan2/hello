@@ -472,14 +472,26 @@ static void url_encode(const char *src, char *dst, size_t dst_size);
 
 static esp_err_t weather_fetch_and_notify(void)
 {
-    ESP_LOGI(TAG, "使用新组件获取天气(心知): %s", s_ctx.weather_cfg.city_name);
+#if WEATHER_PROVIDER == 0
+#define WEATHER_PROVIDER_NAME "和风"
+#else
+#define WEATHER_PROVIDER_NAME "心知"
+#endif
+    ESP_LOGI(TAG, "使用新组件获取天气(%s): %s",
+             WEATHER_PROVIDER_NAME, s_ctx.weather_cfg.city_name);
 
     // 注意：这里调用的 weather_config_t 是新组件定义的！
+    // api_key / api_host / type 全部由 reminder.h 的 WEATHER_PROVIDER 宏决定，
+    // 改宏即可在心知/和风之间切换，本函数无需改动。
     weather_config_t config = {
         .api_key = WEATHER_API_KEY,          // 使用我们在 reminder.h 定义的宏
-        .api_host = NULL,                    // 心知不需要 host
+        .api_host = WEATHER_API_HOST,        // 和风=专属 host，心知=NULL
         .city = s_ctx.weather_cfg.city_name, // 使用我们本地存储的城市名
-        .type = WEATHER_XINZHI               // 指定心知类型
+#if WEATHER_PROVIDER == 0
+        .type = WEATHER_HEFENG // 和风天气
+#else
+        .type = WEATHER_XINZHI // 心知天气
+#endif
     };
 
     weather_info_t *info = weather_get(&config);

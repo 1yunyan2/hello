@@ -202,7 +202,7 @@
 #define BSP_LCD_BK_LEDC_RES LEDC_TIMER_10_BIT ///< 10 位分辨率（占空范围 0~1023，与舵机一致）
 #define BSP_LCD_BK_DUTY_MAX 1023              ///< 10 位满占空（对应 100% 亮度）
 #define BSP_LCD_BK_DEFAULT_PCT 100            ///< 正常点亮亮度（%）
-#define BSP_LCD_BK_STANDBY_PCT 1              ///< 待机模式亮度（%）
+#define BSP_LCD_BK_STANDBY_PCT 20             ///< 待机模式亮度（%）
 
 // 注意：以下 WIDTH/HEIGHT 是 **LVGL 逻辑分辨率（旋转后视角）**，不是 P3 物理分辨率。
 // P3 屏物理为 240×320 竖屏，UI 通过 LVGL swap_xy=true 旋转为 320×240 横屏显示。
@@ -216,10 +216,10 @@
 // 震动马达：提供触觉反馈（如唤醒、提醒）
 // 舵机（Servo）：控制机器人肢体姿态，范围通常 0~180°
 
-#define BSP_MOTOR_VIB_PIN 3    // 3 震动马达 PWM 引脚（触觉反馈）
-#define BSP_SERVO_R_ARM_PIN 4  // 4 右臂舵机 PWM 引脚
-#define BSP_SERVO_HEAD_PIN 9   // 9 头部舵机 PWM 引脚
-#define BSP_SERVO_L_ARM_PIN 14 // 14 左臂舵机 PWM 引脚
+#define BSP_MOTOR_VIB_PIN 3   // 3 震动马达 PWM 引脚（触觉反馈）
+#define BSP_SERVO_R_ARM_PIN 4 // 4 右臂舵机 PWM 引脚
+#define BSP_SERVO_HEAD_PIN 14 // 14 头部舵机 PWM 引脚
+#define BSP_SERVO_L_ARM_PIN 9 // 9 左臂舵机 PWM 引脚
 // 舵机逻辑通道映射 (供上层调用)
 #define CH_HEAD 0  ///< 头部舵机逻辑通道编号（对应 LEDC_CHANNEL_0，引脚 GPIO38）
 #define CH_L_ARM 1 ///< 左臂舵机逻辑通道编号（对应 LEDC_CHANNEL_1，引脚 GPIO47）
@@ -282,3 +282,10 @@
 #define BSP_BAT_OCV_UP_ALPHA 32   ///< OCV上升跟随α（256进制，32/256≈12.5%，极慢以滤掉回弹）
 #define BSP_BAT_CHARGE_RISE_MV 30 ///< 单次OCV上升超过此值（mV）计一次"上升"
 #define BSP_BAT_CHARGE_RISE_CNT 3 ///< 连续上升达此次数判定为充电（解锁电量回升）
+
+// ─── 满电区绝对电压旁路（解决满电时百分比被单调递减锁冻结）─────────────────────
+// 趋势判定在满电区数学上几乎不可达（OCV上升用慢α，单步涨幅凑不出CHARGE_RISE_MV），
+// 故新增"绝对电压"补充信号：OCV高于阈值即认为进入满电平台，此区端电压回弹幅度有限，
+// 允许显示电量跟随OCV缓慢回升，而放电工作区仍保持单调递减锁防回弹。
+#define BSP_BAT_HIGH_VOLT_UNLOCK_MV 4000 ///< OCV≥此值(mV)进入满电区，放行电量回升（低于满电平台、高于正常放电工作区）
+#define BSP_BAT_HIGH_VOLT_RISE_STEP 1    ///< 满电区每采样周期最大回升步进（%），防止一次跳太多虚高

@@ -146,22 +146,32 @@ typedef struct
 } bat_curve_point_t;
 
 static const bat_curve_point_t s_curve[] = {
-    {4200, 100},
-    {4170, 98},
-    {4140, 96},
-    {4110, 94},
-    {4080, 92},
-    {4050, 90},
-    {4020, 88},
-    {3990, 86},
-    {3960, 84},
-    {3930, 82},
-    {3900, 80},
-    {3875, 78},
-    {3850, 76},
-    {3825, 74},
-    {3800, 72},
-    {3775, 70},
+    {4135, 100}, // 你的满电电压
+    {4100, 97},  // 第1分钟实测
+    {4081, 91},  // 实测：4.081V=91%
+    {4070, 90},  // 实测：4.070V=90%
+    {4055, 89},  // 实测：4.055V=89%
+    {4042, 88},  // 实测：4.042V=88%
+    {4033, 87},  // 实测：4.033V=87%
+    {4027, 86},  // 实测：4.027V=86%
+    {4016, 86},  // 实测：4.016V=86%
+    {4000, 85},  // 推算：4.000V=85%
+    {3990, 84},  // 3.990V=84% ✅
+    {3975, 83},
+    {3960, 82},
+    {3945, 81},
+    {3930, 80},
+    {3915, 79},
+    {3900, 78},
+    {3885, 77},
+    {3870, 76},
+    {3855, 75},
+    {3840, 74},
+    {3825, 73},
+    {3810, 72},
+    {3795, 71},
+    {3780, 70},
+    // 3.78V以下保持标准曲线形状（平台区特性一致）
     {3750, 65},
     {3725, 60},
     {3700, 55},
@@ -181,6 +191,7 @@ static const bat_curve_point_t s_curve[] = {
     {3300, 1},
     {3000, 0},
 };
+
 #define BAT_CURVE_LEN (sizeof(s_curve) / sizeof(s_curve[0]))
 
 static uint8_t voltage_to_percent(uint32_t mv)
@@ -369,13 +380,27 @@ static void battery_monitor_task(void *arg)
         uint32_t saved_mv = 0;
         if (battery_nvs_load(&saved_pct, &saved_mv))
         {
-            uint8_t start_pct = (saved_pct < boot_pct) ? saved_pct : boot_pct;
-            uint32_t start_mv = (saved_mv < s_ctx.ocv_mv) ? saved_mv : s_ctx.ocv_mv;
+            uint8_t start_pct;
+            uint32_t start_mv;
+            if (s_ctx.ocv_mv >= BSP_BAT_HIGH_VOLT_UNLOCK_MV)
+            {
+                // 满电区：实测即真实，不需防回弹，避免被旧存档（如90%）压死冻结
+                start_pct = boot_pct;
+                start_mv = s_ctx.ocv_mv;
+                ESP_LOGI(TAG, "满电区上电：实测=%u%%(%lu mV)，无视NVS存档(%u%%)直接信实测",
+                         boot_pct, (unsigned long)s_ctx.ocv_mv, saved_pct);
+            }
+            else
+            {
+                // 放电工作区：取 min(存档, 实测) 做起点，消除断电回弹导致的电量虚高
+                start_pct = (saved_pct < boot_pct) ? saved_pct : boot_pct;
+                start_mv = (saved_mv < s_ctx.ocv_mv) ? saved_mv : s_ctx.ocv_mv;
+                ESP_LOGI(TAG, "NVS 存档电量=%u%%(%lu mV)，实测=%u%%，防回弹取较小=%u%%",
+                         saved_pct, (unsigned long)saved_mv, boot_pct, start_pct);
+            }
             s_ctx.ocv_mv = start_mv;
             s_ctx.filtered_percent = start_pct;
             s_ctx.displayed_percent = start_pct;
-            ESP_LOGI(TAG, "NVS 存档电量=%u%%(%lu mV)，实测=%u%%，防回弹取较小=%u%%",
-                     saved_pct, (unsigned long)saved_mv, boot_pct, start_pct);
         }
         else
         {
@@ -410,7 +435,7 @@ static void battery_monitor_task(void *arg)
             // （舵机/WiFi卸载后的瞬时回弹要滤掉，逼近真实OCV，避免电量被顶回去）。
             {
                 uint32_t ocv_alpha = (sample_mv >= s_ctx.ocv_mv)
-                                         ? BSP_BAT_OCV_UP_ALPHA   // 上升：极慢，滤回弹
+                                         ? BSP_BAT_OCV_UP_ALPHA    // 上升：极慢，滤回弹
                                          : BSP_BAT_OCV_DOWN_ALPHA; // 下降：较快，跟真实掉电
                 s_ctx.ocv_mv = (ocv_alpha * sample_mv +
                                 (256 - ocv_alpha) * s_ctx.ocv_mv + 128) /
@@ -468,11 +493,21 @@ static void battery_monitor_task(void *arg)
                 // 第三层：智能变化速率限制 + 单调递减锁
                 int8_t diff = (int8_t)s_ctx.filtered_percent - (int8_t)s_ctx.displayed_percent;
 
-                // 单调递减锁：未判定充电时，显示电量只许降不许升（上升一律忽略），
-                // 杜绝舵机卸载回弹、平台区电压抖动把电量顶回去。充电时才放开回升。
-                if (!s_ctx.charging && diff > 0)
+                // 高压解锁区：OCV 已进入满电平台，端电压回弹幅度有限，允许真实回升。
+                // 趋势判定（charging）在满电区几乎不可达（OCV上升慢α凑不出CHARGE_RISE_MV），
+                // 故用绝对电压作旁路，否则满电时单调锁会把百分比永久冻结。
+                bool high_volt_zone = (s_ctx.ocv_mv >= BSP_BAT_HIGH_VOLT_UNLOCK_MV);
+
+                // 单调递减锁：放电工作区未判定充电时，显示电量只许降不许升（上升一律忽略），
+                // 杜绝舵机卸载回弹、平台区电压抖动把电量顶回去。充电或满电区才放开回升。
+                if (diff > 0 && !s_ctx.charging && !high_volt_zone)
                 {
-                    // 放电中电量回升 → 忽略，保持当前显示值
+                    // 放电工作区电量回升 → 忽略，保持当前显示值（防回弹核心）
+                }
+                else if (diff > 0 && !s_ctx.charging && high_volt_zone)
+                {
+                    // 满电区真实回升：限速 1%/周期安全放行，既跟随又不虚高跳变
+                    s_ctx.displayed_percent += BSP_BAT_HIGH_VOLT_RISE_STEP;
                 }
                 else if (abs(diff) > BSP_BAT_MAX_FAST_CHANGE)
                 {

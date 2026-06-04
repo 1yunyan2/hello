@@ -52,7 +52,7 @@
 
 /* ── 闹钟响铃参数 ── */
 #define ALARM_RING_INTERVAL_MS 5000 ///< 闹钟响铃间隔（每 5 秒重复播报一次）
-#define ALARM_RING_MAX_COUNT 6      ///< 闹钟最大响铃次数（12次 × 5秒 = 60秒自动关闭）
+#define ALARM_RING_MAX_COUNT 3      // 时间超过这个次数还没关闭，就自动关闭（15秒）
 #define ALARM_RING_TIMEOUT_SEC 30   ///< 闹钟响铃超时（秒），超时自动关闭
 
 /* ── 天气拉取时间（宏定义，修改此处即可调整播报时段） ── */
@@ -63,38 +63,28 @@
 #define WEATHER_FETCH_TIMEOUT_MS 10000 ///< 天气 HTTP 请求超时（毫秒）
 
 /* ═══════════════════════════════════════════════════════════════════
- * 天气 API 条件编译开关
- *   0 = 和风天气（默认）
- *   1 = 心知天气
- * 切换方式：修改下面的宏值，重新编译即可
+ * 天气 API 切换开关
+ *   WEATHER_PROVIDER = 0 → 和风天气（免费版允许商用，每月 5 万次免费额度）
+ *   WEATHER_PROVIDER = 1 → 心知天气（免费版禁商用，仅原型/个人使用）
+ * 切换方式：只改下面这一个宏值，重新编译即可。
+ * 底层 gzip 解压 / Location ID 查询 / JSON 解析全部由
+ * managed_components/ningzixi__weather 组件完成，本层无需关心。
  * ═══════════════════════════════════════════════════════════════════ */
+#define WEATHER_PROVIDER 0 ///< 默认心知；改成 0 切换到和风
 
-#define WEATHER_API_KEY "SDmjR5pLP_1OT23gb" // 把你的心知天气KEY留着，供 reminder.c 使用即可
-#define WEATHER_DEFAULT_CITY "beijing"      ///< 心知直接用城市拼音/英文名
-
-// #define WEATHER_API_TYPE 1
-
-// /* ── 天气 API 配置 ── */
-// #if WEATHER_API_TYPE == 0
-// /* ---- 和风天气 ---- */
-// #define WEATHER_API_URL_FMT "https://nj6tuqw55f.re.qweatherapi.com/v7/weather/now?location=%s&key=%s"
-// #define WEATHER_API_KEY "8b3ac5056d6e454fb65a5ece41d2f62f"
-// #define WEATHER_DEFAULT_CITY "101010100" ///< 北京城市代码
-// #else
-// /* ---- 心知天气 ---- */
-// #define WEATHER_API_URL_FMT "https://api.seniverse.com/v3/weather/now.json?key=%s&location=%s&language=zh-Hans&unit=c"
-// //////////////////////////// https://api.seniverse.com/v3/weather/now.json?location=WX4FBXXFKE4F&key=SDmjR5pLP_1OT23gb&language=zh-Hans&unit=c
-// #define WEATHER_API_KEY "SDmjR5pLP_1OT23gb" ///< TODO: 填入心知天气 API Key
-// #define WEATHER_DEFAULT_CITY "beijing"      ///< 心知直接用城市拼音/英文名
-// #endif
-
-// /* ── IP 定位 API（通用） ── */
-// #define IP_LOCATION_API_URL "http://ip-api.com/json/?lang=zh-CN"
-
-// /* ── 城市搜索 API（仅和风需要，心知直接用城市名） ── */
-// #if WEATHER_API_TYPE == 0
-// #define WEATHER_GEO_API_URL_FMT "https://geoapi.qweather.com/v2/city/lookup?location=%s&key=%s"
-// #endif
+#if WEATHER_PROVIDER == 0
+/* ---- 和风天气 ---- */
+#define WEATHER_API_KEY "8b3ac5056d6e454fb65a5ece41d2f62f"
+/* 认证开发者专属域名（注意：不是免费版的 devapi.qweather.com）。
+ * 组件会用它同时拼天气查询和 GeoAPI 城市查询两个请求。 */
+#define WEATHER_API_HOST "nj6tuqw55f.re.qweatherapi.com"
+#define WEATHER_DEFAULT_CITY "北京" ///< 组件用中文城市名查 Location ID
+#else
+/* ---- 心知天气 ---- */
+#define WEATHER_API_KEY "SDmjR5pLP_1OT23gb"
+#define WEATHER_API_HOST NULL       ///< 心知不需要 host
+#define WEATHER_DEFAULT_CITY "北京" ///< 心知直接用城市名查询
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════
  * 2. 枚举定义

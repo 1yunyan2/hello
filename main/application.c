@@ -306,7 +306,7 @@ void application_init(void)
     if (bat_ret == ESP_OK)
     {
         bsp_battery_start_task(NULL); // 暂不接低电回调，UI 自身已带变色提示
-        bsp_battery_start_log_task(); // 新增：每 5s 打印一次电池电压/电量，便于调试
+        // bsp_battery_start_log_task(); // 新增：每 5s 打印一次电池电压/电量，便于调试
         xEventGroupSetBits(bsp_board->board_status, BATTERY_BIT);
         ESP_LOGI(TAG, "电池监控已启动");
     }
@@ -388,9 +388,9 @@ void application_init(void)
         ESP_LOGI(TAG, "触摸扫描任务创建完成");
     }
 
-    // /* ── 步骤 10.5: 无活动待机模块（依赖 LCD/唤醒词/舵机管理器均已就绪）──── */
-    // standby_init();
-    // PRINT_INTERNAL_HEAP;
+    /* ── 步骤 10.5: 无活动待机模块（依赖 LCD/唤醒词/舵机管理器均已就绪）──── */
+    standby_init();
+    PRINT_INTERNAL_HEAP;
 
     /* ── 步骤 7: 会话模块（WebSocket 预连接）─────────────────────────────── */
 
