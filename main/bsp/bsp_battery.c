@@ -120,6 +120,9 @@ typedef struct
     bool charging;        ///< 是否判定为正在充电（无充电脚，靠电压趋势推断）
     uint8_t rise_cnt;     ///< OCV 连续明显上升计数，达阈值判定为充电
     uint32_t last_ocv_mv; ///< 上一次用于趋势判定的 OCV，用于检测上升/下降
+
+    // ─── 低电关机状态 ───
+    uint8_t poweroff_hit; ///< OCV 连续低于关机阈值的命中计数，达阈值才真正关机
 } bsp_battery_ctx_t;
 
 static bsp_battery_ctx_t s_ctx = {0};
@@ -145,51 +148,38 @@ typedef struct
     uint8_t percent;
 } bat_curve_point_t;
 
+// 锂电池真实放电曲线（贴合 3.7V 软包电芯物理特性）：
+//   4.15V→3.80V 为「电压平台区」，端电压变化小但放出大部分容量，电量缓降（100%→62%）；
+//   3.80V→3.50V 为「中段」，电量稳步下降（62%→11%）；
+//   3.50V→3.30V 为「陡降区」，电压快速跳水，电量急掉到 0（陡）。
+//   末端锚点 3300mV=0%，与 BSP_BAT_POWEROFF_MV(3300) 低电关机点对齐——显示 0% 即关机。
 static const bat_curve_point_t s_curve[] = {
-    {4135, 100}, // 你的满电电压
-    {4100, 97},  // 第1分钟实测
-    {4081, 91},  // 实测：4.081V=91%
-    {4070, 90},  // 实测：4.070V=90%
-    {4055, 89},  // 实测：4.055V=89%
-    {4042, 88},  // 实测：4.042V=88%
-    {4033, 87},  // 实测：4.033V=87%
-    {4027, 86},  // 实测：4.027V=86%
-    {4016, 86},  // 实测：4.016V=86%
-    {4000, 85},  // 推算：4.000V=85%
-    {3990, 84},  // 3.990V=84% ✅
-    {3975, 83},
-    {3960, 82},
-    {3945, 81},
-    {3930, 80},
-    {3915, 79},
-    {3900, 78},
-    {3885, 77},
-    {3870, 76},
-    {3855, 75},
-    {3840, 74},
-    {3825, 73},
-    {3810, 72},
-    {3795, 71},
-    {3780, 70},
-    // 3.78V以下保持标准曲线形状（平台区特性一致）
-    {3750, 65},
-    {3725, 60},
-    {3700, 55},
-    {3675, 50},
-    {3650, 45},
-    {3625, 40},
-    {3600, 35},
-    {3575, 30},
-    {3550, 25},
-    {3525, 20},
-    {3500, 15},
-    {3475, 12},
-    {3450, 10},
-    {3425, 8},
-    {3400, 5},
-    {3350, 3},
-    {3300, 1},
-    {3000, 0},
+    {4150, 100}, // 满电
+    {4100, 95},  // ┐
+    {4050, 91},  // │ 满电平台区：端电压缓降，电量慢掉
+    {4000, 88},  // │
+    {3950, 83},  // │
+    {3900, 78},  // │
+    {3850, 71},  // │
+    {3800, 62},  // ┘ 平台尾
+    {3775, 57},  // ┐
+    {3750, 52},  // │ 中段：稳步下降
+    {3725, 47},  // │
+    {3700, 42},  // │
+    {3675, 37},  // │
+    {3650, 33},  // │
+    {3625, 28},  // │
+    {3600, 24},  // ┘
+    {3575, 20},  // ┐ 拐点
+    {3550, 17},  // ┘
+    {3525, 14},  // ┐
+    {3500, 11},  // │ 陡降区：电压跳水，电量急掉
+    {3475, 8},   // │
+    {3450, 6},   // │
+    {3425, 4},   // │
+    {3400, 3},   // │
+    {3350, 1},   // │
+    {3300, 0},   // ┘ 放空 / 关机点（对齐 BSP_BAT_POWEROFF_MV）
 };
 
 #define BAT_CURVE_LEN (sizeof(s_curve) / sizeof(s_curve[0]))
@@ -259,6 +249,46 @@ static void battery_nvs_save(uint8_t pct, uint32_t mv)
     nvs_close(h);
     if (err != ESP_OK)
         ESP_LOGW(TAG, "NVS 存档失败：%s", esp_err_to_name(err));
+}
+
+// ─── 低电软关机（GPIO18 → HK015T.1 OPT/IO1 软关机脚）──────────────────────────
+// 锂电池放空（OCV ≤ BSP_BAT_POWEROFF_MV）时，主动拉 GPIO18 的有效电平，命令
+// HK015T.1 自锁芯片切断主电源，效果等同用户长按 K1 关机（硬件断电，静态 1μA）。
+// 重新开机由用户按 K1（长按 3S）冷启动。本函数不返回——执行后系统很快断电。
+static void battery_power_off(void)
+{
+    ESP_LOGW(TAG, "🔌 电量耗尽（OCV≤%d mV），执行软关机：拉 GPIO%d → HK015T.1 断电",
+             BSP_BAT_POWEROFF_MV, BSP_OPT_OUT_PIN);
+
+    // 存档当前电量，下次开机不至于虚高（虽然此时已是 0%，仍保持一致性）
+    battery_nvs_save(0, s_ctx.ocv_mv);
+
+    // 配置 GPIO18 为推挽输出，先确保处于空闲电平，再拉到有效电平发出关机命令
+    gpio_config_t io_cfg = {
+        .pin_bit_mask = (1ULL << BSP_OPT_OUT_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_cfg);
+    gpio_set_level(BSP_OPT_OUT_PIN, BSP_PWR_OFF_IDLE_LEVEL);
+
+    // 给硬件留出建立时间，再拉到关机有效电平并保持。HK015T.1 收到信号后内部锁存断电，
+    // 无论它是电平触发还是脉冲触发，"拉到有效电平并保持"都成立——反正马上就断电了。
+    vTaskDelay(pdMS_TO_TICKS(50));
+    gpio_set_level(BSP_OPT_OUT_PIN, BSP_PWR_OFF_ACTIVE_LEVEL);
+
+    // 硬件断电前自旋等待（正常情况下数十 ms 内整板掉电，此循环不会真正跑满）
+    for (int i = 0; i < 200; i++)
+    {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        // 保险：持续重申有效电平，防止某些芯片要求电平维持
+        gpio_set_level(BSP_OPT_OUT_PIN, BSP_PWR_OFF_ACTIVE_LEVEL);
+    }
+
+    // 若 10s 后仍未断电（如调试时未接自锁电路 / 电平极性反了），告警提示
+    ESP_LOGE(TAG, "软关机信号已发出但系统未断电，请核对 BSP_PWR_OFF_ACTIVE_LEVEL 电平极性与硬件连线");
 }
 
 // ─── 内部：执行一次 ADC 多采样，去极值平均，返回真实电池电压（毫伏）───────────
@@ -552,6 +582,29 @@ static void battery_monitor_task(void *arg)
                 ESP_LOGI(TAG, "电压回升至 %lu mV，告警标志复位",
                          (unsigned long)s_ctx.filtered_mv);
             }
+
+            // ─── 低电自动关机判断 ───────────────────────────────────────────
+            // 用 OCV（已滤掉负载尖峰的开路电压估计）而非瞬时电压判断，要求连续多次
+            // 命中阈值才关机，杜绝舵机/扬声器瞬时压降导致误关。充电态下不触发。
+#if BSP_BAT_POWEROFF_ENABLE
+            if (!s_ctx.charging && s_ctx.ocv_mv <= BSP_BAT_POWEROFF_MV)
+            {
+                if (s_ctx.poweroff_hit < 0xFF)
+                    s_ctx.poweroff_hit++;
+                ESP_LOGW(TAG, "低电关机预警：OCV=%lu mV ≤ %d mV，连续命中 %u/%u",
+                         (unsigned long)s_ctx.ocv_mv, BSP_BAT_POWEROFF_MV,
+                         s_ctx.poweroff_hit, BSP_BAT_POWEROFF_HIT_CNT);
+                if (s_ctx.poweroff_hit >= BSP_BAT_POWEROFF_HIT_CNT)
+                {
+                    battery_power_off(); // 拉 GPIO18 软关机，不返回（系统断电）
+                }
+            }
+            else
+            {
+                // 电压回到阈值以上（或进入充电态）→ 清零命中计数，避免跨周期误累积
+                s_ctx.poweroff_hit = 0;
+            }
+#endif
         }
         else
         {

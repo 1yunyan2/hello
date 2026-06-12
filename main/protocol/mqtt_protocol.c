@@ -20,6 +20,7 @@
 // 舵机控制直接走 bsp/bsp_board.h 的 bsp_servo_move_smooth（绝对角度定位），无需 servo_manager.h
 #include "auth.h"
 #include "session/session.h" // session_debug_kill_ws() — MQTT 远程伪造 WS 断连测试
+#include "ui/standby.h"      // standby_notify_activity() — 远程舵机控制视为活动，刷新待机倒计时
 #include "object.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -207,7 +208,7 @@ static void heartbeat_task(void *arg)
             cJSON *root = cJSON_CreateObject();
             cJSON_AddStringToObject(root, "deviceId", device_id);
             // 电量百分比：复用 bsp_battery 模块（IIR 滤波 + 锂电放电曲线），未初始化时返回 0
-            cJSON_AddNumberToObject(root, "battery", bsp_battery_get_percent());
+            // cJSON_AddNumberToObject(root, "battery", bsp_battery_get_percent());
 
             // if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
             //     cJSON_AddNumberToObject(root, "wifi_signal", ap_info.rssi);
@@ -525,6 +526,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         else
                         {
                             ESP_LOGW(MQTT_TAG, "收到舵机指令: servo=%s(ch=%d) angle=%.1f", servo_name, channel, offset);
+                            // 远程控制舵机属于「真实的功能运行」，必须刷新待机倒计时，
+                            // 否则运动中途（bsp_servo_move_smooth 最长阻塞约 1.3s）若跨过 60s 空闲阈值，
+                            // 会被 enter_standby() 把头部强行归中，打断本次远程控制。
+                            // 在分发前打点：先刷计时再运动，确保整段运动都在「活动窗口」内。
+                            // 注意：MQTT 心跳/保活不会走到这里，故心跳天然不算活动，符合省电预期。
+                            standby_notify_activity();
                             float absolute_angle = 90.0f + offset; // 转换：0→90, +30→120, -30→60
                             // 直接调底层 bsp_servo_move_smooth：按绝对角度定位，自带软限位/平滑/去抖，停位即止。
                             // 不经 servo_manager_submit_angle —— 其内部"拆幅度+方向再回中"逻辑会导致到位后回弹、

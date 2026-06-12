@@ -76,20 +76,20 @@ void bsp_board_lcd_init(bsp_board_t *bsp_board)
     // ★ 使用独立 TIMER_1 + CHANNEL_3，与舵机的 TIMER_0/CH0-2 隔离（见 BUG-015）。
     // 初始占空比 0（背光关闭），避免屏幕在初始化过程中显示乱码。
     ledc_timer_config_t bk_timer_config = {
-        .speed_mode = BSP_LCD_BK_LEDC_MODE,       // 低速模式
-        .timer_num = BSP_LCD_BK_LEDC_TIMER,       // 独立定时器 TIMER_1
-        .duty_resolution = BSP_LCD_BK_LEDC_RES,   // 10 位分辨率（0~1023）
-        .freq_hz = BSP_LCD_BK_LEDC_FREQ_HZ,       // 5kHz
-        .clk_cfg = BSP_LCD_BK_LEDC_CLK,           // RC_FAST：与舵机时钟源统一，避免冲突
+        .speed_mode = BSP_LCD_BK_LEDC_MODE,     // 低速模式
+        .timer_num = BSP_LCD_BK_LEDC_TIMER,     // 独立定时器 TIMER_1
+        .duty_resolution = BSP_LCD_BK_LEDC_RES, // 10 位分辨率（0~1023）
+        .freq_hz = BSP_LCD_BK_LEDC_FREQ_HZ,     // 5kHz
+        .clk_cfg = BSP_LCD_BK_LEDC_CLK,         // RC_FAST：与舵机时钟源统一，避免冲突
     };
     ESP_ERROR_CHECK(ledc_timer_config(&bk_timer_config));
 
     ledc_channel_config_t bk_channel_config = {
-        .gpio_num = BSP_LCD_BK_PIN,               // 背光引脚 GPIO42
+        .gpio_num = BSP_LCD_BK_PIN, // 背光引脚 GPIO42
         .speed_mode = BSP_LCD_BK_LEDC_MODE,
-        .channel = BSP_LCD_BK_LEDC_CHANNEL,       // 独立通道 CHANNEL_3
-        .timer_sel = BSP_LCD_BK_LEDC_TIMER,       // 绑定到 TIMER_1
-        .duty = 0,                                // 初始占空比 0 = 背光关闭
+        .channel = BSP_LCD_BK_LEDC_CHANNEL, // 独立通道 CHANNEL_3
+        .timer_sel = BSP_LCD_BK_LEDC_TIMER, // 绑定到 TIMER_1
+        .duty = 0,                          // 初始占空比 0 = 背光关闭
         .hpoint = 0,
     };
     ESP_ERROR_CHECK(ledc_channel_config(&bk_channel_config));
@@ -116,10 +116,6 @@ void bsp_board_lcd_init(bsp_board_t *bsp_board)
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = BSP_LCD_DC_PIN, // DC 引脚（GPIO13）：高=数据，低=命令
         .cs_gpio_num = BSP_LCD_CS_PIN, // CS 引脚（GPIO10）：低电平选中 LCD
-        // SPI 时钟 20MHz：PCBA 板信号完整性比开发板差（更长走线 + 共地不理想 + 寄生电容），
-        // 在 40MHz 下偶发 "上电只有背光 / 白屏 / 卡 GIF 第一帧 / 重影" —— 日志正常但屏幕无显示，
-        // 是典型 SPI 命令丢包征兆（ST7789 没读到完整 init/cmd 序列）。
-        // 20MHz 在开发板已大量验证可流畅刷 GIF，先把时序余量留足，稳定后再尝试 30/40MHz。
         .pclk_hz = 40 * 1000 * 1000,
         .lcd_cmd_bits = 8,       // 命令字段位宽（ST7789 固定 8-bit）
         .lcd_param_bits = 8,     // 参数字段位宽（ST7789 固定 8-bit）
@@ -180,7 +176,7 @@ void bsp_board_lcd_on(bsp_board_t *bsp_board)
     // 先启用 ST7789 显示输出（DISPON 命令），再点亮背光
     // 顺序：控制器输出 → 背光点亮，避免背光亮时显示未就绪的画面
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(bsp_board->lcd_panel, true)); // 启用显示
-    bsp_lcd_bk_set_percent(BSP_LCD_BK_DEFAULT_PCT);                        // 点亮背光（默认 100%）
+    bsp_lcd_bk_set_percent(BSP_LCD_BK_DEFAULT_PCT);                         // 点亮背光（默认 100%）
 }
 
 /**
@@ -198,6 +194,6 @@ void bsp_board_lcd_on(bsp_board_t *bsp_board)
 void bsp_board_lcd_off(bsp_board_t *bsp_board)
 {
     // 先关背光（用户立即看不到画面），再关显示控制器
-    bsp_lcd_bk_set_percent(0);                                              // 关闭背光（PWM 占空比 0）
+    bsp_lcd_bk_set_percent(0);                                               // 关闭背光（PWM 占空比 0）
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(bsp_board->lcd_panel, false)); // 关闭显示
 }

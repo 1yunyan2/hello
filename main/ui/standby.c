@@ -14,6 +14,7 @@
 #include "bsp/servo_manager.h"
 #include "wake_word/custom_wake_word.h"
 #include "session/session.h"
+#include "ui/ui_port.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -86,6 +87,9 @@ static void enter_standby(void)
         return;
     ESP_LOGI(TAG, "无活动超过 %d ms，进入待机", STANDBY_LIGHT_TIMEOUT_MS);
     s_standby = true;
+    /* 进入待机前，把界面强制退回主界面：避免「已降亮度但仍卡在某菜单/闹钟编辑页」。
+     * 该函数内部自带 LVGL 锁，跨任务调用安全；已在主界面则直接返回。 */
+    ui_force_back_to_main();
     bsp_board_lcd_set_brightness(BSP_LCD_BK_STANDBY_PCT); // 背光降到 50%
     wake_word_stop();                                     // 关闭唤醒词监听（仅切 is_running）
 

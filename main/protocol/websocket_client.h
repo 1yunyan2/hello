@@ -98,6 +98,17 @@ void protocol_connect(protocol_t *protocol);
 void protocol_disconnect(protocol_t *protocol);
 
 /**
+ * @brief 带超时地断开 WebSocket 连接
+ * @param[in] protocol   实例句柄
+ * @param[in] timeout_ms 关闭握手最长等待时间（毫秒），超时即返回，避免无限阻塞
+ * @return 无
+ * @note 调用者：session.c -> session_reconnect_task()
+ *       用于 FIN/TLS 半关闭态下安全断开：底层 esp_websocket_client_close 接受 timeout，
+ *       超时后由后续 protocol_destroy 兜底强制释放。
+ */
+void protocol_disconnect_timeout(protocol_t *protocol, int timeout_ms);
+
+/**
  * @brief 查询 WebSocket 当前是否处于连接状态
  * @param[in] protocol 实例句柄
  * @return bool true表示在线，false表示离线

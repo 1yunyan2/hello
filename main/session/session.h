@@ -104,7 +104,24 @@ void session_init(const char *ws_uri);
  * @note 调用者：custom_wake_word.c → afe_fetch_task → user_callback
  * @note 线程安全：可从 AFE fetch 任务调用（CPU1），内部使用互斥锁保护
  */
-void session_on_wake_word(const char *display);
+
+/**
+ * @brief 唤醒词触发的处理结果
+ *
+ * 供调用方（wake_word_callback）区分本次唤醒命中实际走了哪条逻辑，
+ * 据此决定是否播放唤醒提示音：
+ *   - 只有 WAKE_NEW_SESSION（真·开启新会话）才播提示音；
+ *   - WAKE_INTERRUPT（打断 TTS）不播——打断是插话，播提示音会打断用户表达；
+ *   - WAKE_IGNORED（被忽略：LISTENING 中 / drain 收尾 / 启动失败）不播。
+ */
+typedef enum
+{
+    WAKE_IGNORED = 0,  ///< 本次唤醒被忽略，未开启会话也未打断
+    WAKE_NEW_SESSION,  ///< 开启了一轮新会话（含从 IDLE 启动、连麦等待期主动发起）→ 应播提示音
+    WAKE_INTERRUPT,    ///< 打断了正在播放的 TTS → 不播提示音
+} wake_result_t;
+
+wake_result_t session_on_wake_word(const char *display);
 
 /**
  * @brief 查询当前会话状态（线程安全只读访问）
@@ -114,3 +131,14 @@ void session_on_wake_word(const char *display);
  * @note 调用者：任意模块（只读查询），主要供调试或 UI 刷新使用
  */
 session_state_t session_get_state(void);
+
+/**
+ * @brief 【调试】主动断开 WebSocket 连接，用于测试断连重连逻辑
+ *
+ * 内部创建独立任务调用带超时的 protocol close 主动关闭 WS，
+ * 等效于服务端 FIN 断链，会触发 PROTOCOL_EVENT_DISCONNECTED → 退避重连。
+ * 必须异步执行：调用方常在 MQTT 事件回调上下文，直接 close 会阻塞事件循环。
+ *
+ * @note 调用者：mqtt_protocol.c 收到 {"type":"ws_kill"} 指令时；仅供联调测试。
+ */
+void session_debug_kill_ws(void);

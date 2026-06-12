@@ -612,6 +612,20 @@ void protocol_disconnect(protocol_t *protocol)
 }
 
 /**
+ * @brief 带超时地断开 WebSocket 连接（见 .h Doxygen 说明）
+ *
+ * esp_websocket_client_close 与 stop 的区别：close 会发送 WebSocket close 帧并
+ * 接受 timeout 参数，在 timeout 内未完成干净关闭也会返回，从而避免 stop 在
+ * FIN/TLS 半关闭态下无限阻塞 ws_reconn 任务。超时返回后调用方应继续 destroy 兜底。
+ *
+ * 调用者：session_reconnect_task（换句柄前的安全断开）
+ */
+void protocol_disconnect_timeout(protocol_t *protocol, int timeout_ms)
+{
+    esp_websocket_client_close(protocol->websocket_client, pdMS_TO_TICKS(timeout_ms));
+}
+
+/**
  * @brief 查询 WebSocket 连接状态
  *
  * @param protocol 协议实例指针

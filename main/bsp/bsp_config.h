@@ -216,7 +216,25 @@
 // 震动马达：提供触觉反馈（如唤醒、提醒）
 // 舵机（Servo）：控制机器人肢体姿态，范围通常 0~180°
 
-#define BSP_MOTOR_VIB_PIN 3   // 3 震动马达 PWM 引脚（触觉反馈）
+#define BSP_MOTOR_VIB_PIN 3 // 3 震动马达 PWM 引脚（触觉反馈）
+
+// ─── 震动马达 LEDC PWM 配置 ─────────────────────────────────────────────────
+// 马达从「GPIO 高低电平开关」升级为 LEDC PWM，用占空比调震动强度（震感更强可控）。
+// ★ 资源隔离（同 BUG-015 教训）：舵机占用 TIMER_0 + CH0/1/2，背光占用 TIMER_1 + CH3，
+//   马达必须用独立的 TIMER_2 + CH4，且时钟源强制 XTAL 与舵机/背光统一——
+//   ESP32-S3 同一 speed_mode 下所有 LEDC timer 共享时钟源，混用 APB/AUTO_CLK
+//   会触发 "timer clock conflict" 致舵机初始化失败。
+// ★ 极性：马达为低有效（OUT=0 通电）。LEDC 输出需反相——idle 输出高电平（断电），
+//   震动时占空比越大代表低电平时间越长 → 通电越久 → 震感越强。
+#define BSP_MOTOR_LEDC_TIMER LEDC_TIMER_2       ///< 马达独立定时器（避开舵机 T0、背光 T1）
+#define BSP_MOTOR_LEDC_CHANNEL LEDC_CHANNEL_4   ///< 马达独立通道（避开舵机 CH0-2、背光 CH3）
+#define BSP_MOTOR_LEDC_MODE LEDC_LOW_SPEED_MODE ///< 低速模式（与舵机/背光同模式）
+#define BSP_MOTOR_LEDC_CLK LEDC_USE_XTAL_CLK    ///< 时钟源强制 XTAL（40MHz），与舵机/背光统一
+#define BSP_MOTOR_LEDC_FREQ_HZ 5000             ///< 马达 PWM 频率 5kHz（同背光，无可闻噪声）
+#define BSP_MOTOR_LEDC_RES LEDC_TIMER_10_BIT    ///< 10 位分辨率（占空 0~1023，与背光/舵机一致）
+#define BSP_MOTOR_DUTY_MAX 1023                 ///< 10 位满占空
+#define BSP_MOTOR_DEFAULT_STRENGTH 100          ///< 触摸反馈默认震动强度（%）
+
 #define BSP_SERVO_R_ARM_PIN 4 // 4 右臂舵机 PWM 引脚
 #define BSP_SERVO_HEAD_PIN 14 // 14 头部舵机 PWM 引脚
 #define BSP_SERVO_L_ARM_PIN 9 // 9 左臂舵机 PWM 引脚
@@ -256,9 +274,9 @@
 #define BSP_BAT_VOLTAGE_RATIO_DEN (BSP_BAT_DIVIDER_R_LOW)
 
 // 电池电压阈值（毫伏），用于电量判断与低电告警
-#define BSP_BAT_VOLTAGE_MAX_MV 4200 ///< 锂电池满电电压（4.2V）
-#define BSP_BAT_VOLTAGE_MIN_MV 3000 ///< 锂电池放电截止电压（3.0V，再低会损伤电芯）
-#define BSP_BAT_VOLTAGE_LOW_MV 3300 ///< 低电量告警阈值（3.3V，剩余约 10%）
+#define BSP_BAT_VOLTAGE_MAX_MV 4150 ///< 锂电池满电电压（4.15V）
+#define BSP_BAT_VOLTAGE_MIN_MV 3250 ///< 锂电池放电截止电压（3.25V，再低会损伤电芯）
+#define BSP_BAT_VOLTAGE_LOW_MV 3400 ///< 低电量告警阈值（3.4V，
 
 // 采样行为参数（用户可按需修改）
 #define BSP_BAT_ADC_SAMPLE_TIMES 16    ///< 单次采集的 ADC 多次平均次数，越大噪声越小
@@ -289,3 +307,18 @@
 // 允许显示电量跟随OCV缓慢回升，而放电工作区仍保持单调递减锁防回弹。
 #define BSP_BAT_HIGH_VOLT_UNLOCK_MV 4000 ///< OCV≥此值(mV)进入满电区，放行电量回升（低于满电平台、高于正常放电工作区）
 #define BSP_BAT_HIGH_VOLT_RISE_STEP 1    ///< 满电区每采样周期最大回升步进（%），防止一次跳太多虚高
+
+// ─── 低电关机（GPIO18 → HK015T.1 OPT 软关机）─────────────────────────────────
+// 硬件：开关机由 HK015T.1 单键自锁芯片（U13）+ K1 长按 3S 实现真正断电（静态 1μA）。
+// GPIO18(BSP_OPT_OUT_PIN, OPT-OUT) 经 R29 接 HK015T.1 的 IO1，是 MCU 主动软关机的
+// 信号脚。原理图上 IO1 由 R26 100kΩ 下拉到 GND，故平时 GPIO18 输出低电平（保持工作），
+// MCU 拉高 GPIO18 即向芯片发出关机命令 → 翻转 Q4/Q3 切断主电源，效果等同用户长按 K1。
+// 重新开机由用户按 K1（长按 3S）冷启动，无需复位键。
+//
+// 触发策略：锂电池接近 3.3V 已近放空，为避免舵机/扬声器瞬时负载压降误关，要求滤波后
+// 的 OCV 连续多次（BSP_BAT_POWEROFF_HIT_CNT）低于阈值才执行关机。
+#define BSP_BAT_POWEROFF_ENABLE 1           ///< 1=启用低电自动关机，0=仅告警不关机（便于调试时关掉）
+#define BSP_BAT_POWEROFF_MV 3300            ///< 低电关机阈值（mV）：OCV≤此值即视为放空，对应 0% 电量
+#define BSP_BAT_POWEROFF_HIT_CNT 5          ///< 连续命中次数：OCV 连续这么多次低于阈值才真正关机，滤掉瞬时尖峰
+#define BSP_PWR_OFF_ACTIVE_LEVEL 1          ///< GPIO18 软关机有效电平：1=拉高关机（按原理图 R26 下拉判定），实测为反则改 0
+#define BSP_PWR_OFF_IDLE_LEVEL (!BSP_PWR_OFF_ACTIVE_LEVEL) ///< 正常工作时 GPIO18 的空闲电平（与有效电平相反）

@@ -30,7 +30,7 @@ static wl_handle_t s_wl_handle = WL_INVALID_HANDLE;
 
 // 擦除进度上报:esp_flash_erase_region 是单次原子操作(芯片擦除指令 0xC7),
 // 无法实时拿真实进度,只能按经验值线性估算百分比 —— 真擦完时会强制跳到 100%。
-#define ERASE_ESTIMATE_SEC 103 // 32MB W25Q 整片擦除典型耗时,按你板子实测调
+#define ERASE_ESTIMATE_SEC 35 // 32MB W25Q 整片擦除典型耗时,按你板子实测调
 static volatile bool s_erase_in_progress = false;
 static int64_t s_erase_start_us = 0;
 
@@ -175,7 +175,7 @@ void bsp_flash_init(void)
         .cs_id = 0,
         .cs_io_num = EXT_FLASH_CS,
         .io_mode = SPI_FLASH_SLOWRD,
-        .freq_mhz = 20,
+        .freq_mhz = 40,
     };
     // ESP_ERROR_CHECK(spi_bus_add_flash_device(&ext_flash, &device_config));
     // ESP_ERROR_CHECK(esp_flash_init(ext_flash));

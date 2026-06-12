@@ -1,6 +1,4 @@
-# ESP32-S3 N16R8 硬件配置
 # 16MB Flash + 8MB Octal PSRAM
-# 与主工程 Echo2 保持一致
 
 CONFIG_IDF_TARGET="esp32s3"
 
@@ -9,16 +7,13 @@ CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 
-# ─── 自定义分区表（含 model 分区供 esp-sr 模型加载，本 demo 暂未使用）─
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 
-# ─── 关闭 CPU1 IDLE 任务 WDT ─────────────────────────────────────────
-# afe_fetch + audio_feed 都在 CPU1 优先级 5 跑满，IDLE1 无法运行是正常行为
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
 
-# ─── PSRAM（Octal 8MB，80MHz）─────────────────────────────────────────────────
+# PSRAM (Octal 8MB, 80MHz)
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_TYPE_AUTO=y

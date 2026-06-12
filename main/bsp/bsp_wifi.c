@@ -2,9 +2,15 @@
 #include "protocol/mqtt_protocol.h"
 #include "protocol/auth.h"
 #include "esp_heap_caps.h"
+#include "freertos/timers.h" /* WiFi 断线去抖软件定时器 */
+#include "ui/ui_port.h" /* ui_show_unbinding(): 解绑前显示静态提示页，避免 GIF 卡冻帧 */
 // ─── 模块常量 ─────────────────────────────────────────────────────────────────
 #define CLEAR_WIFI_BUTTON_PIN GPIO_NUM_0 ///< 清除 WiFi 凭证的长按按键（Boot 按钮）
 #define MAX_RETRY_COUNT 5                ///< WiFi 断线后最大自动重连次数
+
+/// @brief WiFi 断线去抖时长（ms）：断线后等这么久仍未恢复，才通知上层断开 WS/MQTT。
+/// 绝大多数 WiFi 抖动在 1~2 秒内自愈，期间不重建协议层 → 避免内部 SRAM 碎片化。
+#define WIFI_DEBOUNCE_MS 1500
 
 static const char *TAG = "EchoPals";
 
@@ -14,6 +20,31 @@ static const char *TAG = "EchoPals";
 static bool s_is_provisioning = false;
 /// @brief 当前已重连次数（超过 MAX_RETRY_COUNT 后置位 WIFI_FAIL_BIT）
 static int s_retry_num = 0;
+
+/// @brief WiFi 断线去抖定时器（one-shot）：断线时启动，GOT_IP 时取消
+static TimerHandle_t s_wifi_debounce_timer = NULL;
+/// @brief 供去抖定时器回调访问的 bsp_board 指针（事件 handler 中保存）
+static bsp_board_t *s_debounce_board = NULL;
+
+// ─── wifi_debounce_timer_cb ──────────────────────────────────────────────────
+
+/**
+ * @brief WiFi 断线去抖定时器回调（真正"宣告网络不可用"的地方）
+ *
+ * 断线后 WIFI_DEBOUNCE_MS 内若 GOT_IP 恢复，本回调会被取消、永不执行；
+ * 只有断线持续超过去抖时长，才在此清除 WIFI_BIT，通知 WS/MQTT 等上层断开重连。
+ * 这样短暂抖动不会触发协议层 destroy/create，避免内部 SRAM 碎片累积。
+ *
+ * @param xTimer 定时器句柄（未使用，board 指针从模块静态变量取）
+ * @note 运行在 FreeRTOS Timer 服务任务上下文，禁止阻塞
+ */
+static void wifi_debounce_timer_cb(TimerHandle_t xTimer)
+{
+    (void)xTimer;
+    ESP_LOGW(TAG, "WiFi 断线持续超过 %d ms，确认掉线，通知上层断开", WIFI_DEBOUNCE_MS);
+    if (s_debounce_board)
+        xEventGroupClearBits(s_debounce_board->board_status, WIFI_BIT);
+}
 
 // ─── clear_wifi_and_restart ──────────────────────────────────────────────────
 
@@ -34,6 +65,13 @@ void clear_wifi_and_restart(void)
 {
     ESP_LOGW(TAG, "正在清除已保存的 WiFi 账号密码...");
     ESP_LOGW(TAG, "正在清除已保存的driver-token...");
+
+    // ── 先切到静态「正在重置」提示页，再动 flash ─────────────────────────────
+    // 必须在 NVS 擦除 / esp_wifi_restore【之前】调用：这些 flash 写操作会禁用
+    // flash cache，逐帧读 SPIFFS 的主界面 GIF 会卡在当前帧（像死机）。这里先把
+    // 画面换成纯静态文字并同步刷屏，后续 cache 被禁也不影响显示。
+    ui_show_unbinding();
+
     // ── 向 MQTT 发送重置通知（让服务端知道设备主动重置）─────────────────────
     // 注意：此时 WiFi 可能仍然连接，发送还能成功
     send_reset_notification();
@@ -377,9 +415,23 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
             }
         }
 
-        // 无论原因，断线时清除 WIFI_BIT（通知其他模块网络不可用，停止 WebSocket 操作）
-        if (bsp_board)
+        // ── 断线去抖：不立即清 WIFI_BIT ───────────────────────────────────────
+        // WiFi 几百毫秒的抖动通常会自愈。若每次抖动都立即清 WIFI_BIT，会连锁触发
+        // WS/MQTT 销毁重建（destroy/create），反复申请释放内部 SRAM 小结构 → 碎片化，
+        // 稳定后内存"回不到原值"。这里改为启动 WIFI_DEBOUNCE_MS 的 one-shot 定时器，
+        // 持续掉线超过该时长才真正清 WIFI_BIT；期间 GOT_IP 恢复则取消定时器（见下）。
+        s_debounce_board = bsp_board; // 供定时器回调使用
+        if (s_wifi_debounce_timer != NULL)
+        {
+            // 已在运行则重置计时；未运行则启动。xTimerStart 对已运行定时器等价于复位。
+            // 注意：处于 ISR 之外的事件任务上下文，使用普通（非 FromISR）API。
+            xTimerStart(s_wifi_debounce_timer, 0);
+        }
+        else if (bsp_board)
+        {
+            // 定时器尚未创建（理论上 wifi_main 已创建，此为兜底）：直接清位，保持旧行为
             xEventGroupClearBits(bsp_board->board_status, WIFI_BIT);
+        }
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
     {
@@ -389,6 +441,12 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
 
         // 连接成功，重置重连计数（下次断线时从 0 开始重新计数）
         s_retry_num = 0;
+
+        // ── 去抖：网络已恢复，取消"宣告掉线"定时器 ───────────────────────────
+        // 若本次断线在去抖窗口内恢复，定时器回调不会执行，WIFI_BIT 从未被清，
+        // WS/MQTT 也就不会经历销毁重建 → 从源头避免碎片。
+        if (s_wifi_debounce_timer != NULL)
+            xTimerStop(s_wifi_debounce_timer, 0);
 
         // 置位 WIFI_BIT，解除 bsp_board_wifi_main() 末尾的 xEventGroupWaitBits 阻塞
         if (bsp_board)
@@ -479,6 +537,21 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         IP_EVENT, IP_EVENT_STA_GOT_IP,
         &wifi_ip_event_handler, bsp_board, &instance_got_ip));
+
+    // ── 步骤 3.5：创建 WiFi 断线去抖定时器（one-shot，不自动重载）───────────
+    // 在注册事件之后、连接之前创建即可（断线事件触发时它已就绪）。
+    // 定时器对象由 FreeRTOS 在内部堆分配，体积很小，整个生命周期常驻不销毁。
+    if (s_wifi_debounce_timer == NULL)
+    {
+        s_wifi_debounce_timer = xTimerCreate(
+            "wifi_debounce",
+            pdMS_TO_TICKS(WIFI_DEBOUNCE_MS),
+            pdFALSE, // one-shot：触发一次后停止，不自动重载
+            NULL,
+            wifi_debounce_timer_cb);
+        if (s_wifi_debounce_timer == NULL)
+            ESP_LOGE(TAG, "WiFi 去抖定时器创建失败，将退化为断线立即通知上层");
+    }
 
     // ── 步骤 4：初始化 WiFi 驱动（使用默认配置，自动分配缓冲区）─────────────
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();

@@ -12,6 +12,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "bsp/bsp_config.h"
@@ -28,6 +29,24 @@ static const char *TAG = "BSP_TOUCH";
 #define TOUCH_EVENT_QUEUE_LEN 8
 static QueueHandle_t s_touch_event_queue = NULL;
 
+/* 最近一次翻页键（左/右耳）按压时长（毫秒），供跳一跳「长按蓄力」读取。
+ * 在 update_page_btn 松手算出 held 后写入，bsp_touch_last_page_hold_ms() 读取。 */
+static volatile uint32_t s_last_page_hold_ms = 0;
+
+uint32_t bsp_touch_last_page_hold_ms(void)
+{
+    return s_last_page_hold_ms;
+}
+
+/**
+ * @brief 查询翻页键当前实时按压时长（毫秒）
+ *
+ * 供跳一跳 engine_cb 每帧调用，驱动「按住期间小人/台子压扁 + 蓄力条实时增长」。
+ * 若当前没有翻页键被按住，返回 0。
+ *
+ * 实现：直接读 btn_prev_page / btn_next_page 的 is_pressed + press_start_ms，
+ * 与扫描任务共享内存，无锁（uint32_t 对齐读原子安全，最坏差一个扫描帧 ≈20ms）。
+ */
 // ── 公共时序参数 ──────────────────────────────────────────────────────────────
 #define BODY_PRESS_MIN_MS 200
 #define PAGE_SHORT_PRESS_MIN_MS 100
@@ -76,6 +95,18 @@ static touch_btn_t btn_prev_page = {.channel = BSP_TOUCH_PREV_PIN};
 static touch_btn_t btn_next_page = {.channel = BSP_TOUCH_NEXT_PIN};
 #endif
 
+/* 查询翻页键当前实时按压时长（毫秒）。供跳一跳 engine_cb 每帧驱动压扁动画。
+ * 放在 btn_prev_page / btn_next_page 声明之后，避免前向引用编译错误。 */
+uint32_t bsp_touch_page_held_ms(void)
+{
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if (btn_prev_page.is_pressed && btn_prev_page.press_start_ms > 0)
+        return now - btn_prev_page.press_start_ms;
+    if (btn_next_page.is_pressed && btn_next_page.press_start_ms > 0)
+        return now - btn_next_page.press_start_ms;
+    return 0;
+}
+
 static bool s_combo_ha_active = false;
 static uint8_t s_combo_ha_cnt = 0;
 static bool s_combo_hb_active = false;
@@ -115,26 +146,128 @@ static void send_touch_event(touch_event_t event)
 }
 
 /**
- * @brief 马达震动脉冲
- * 函数含义：控制震动马达产生一个30毫秒的震动脉冲，用于触觉反馈
+ * @brief 初始化震动马达 LEDC PWM 通道
+ *
+ * 马达由「GPIO 高低电平开关」升级为 LEDC PWM，用占空比调震动强度。
+ * 资源隔离见 BUG-015：独立 TIMER_2 + CH4，时钟源强制 XTAL 与舵机/背光统一，
+ * 否则同 speed_mode 共享时钟源会触发 "timer clock conflict" 致舵机初始化失败。
+ *
+ * 极性：马达低有效（OUT=0 通电）。LEDC duty 与输出电平的关系：
+ *   duty=0    → 输出恒「低」电平 → 低有效下 = 满功率通电（一直震！）
+ *   duty=MAX  → 输出恒「高」电平 → 低有效下 = 断电停止
+ * ★ 因此「停止」必须用 duty=MAX，不是 0。初始化时若写 duty=0 会上电狂震。
+ * 在 bsp_touch_init() 中替代原来的马达 GPIO 配置调用。
+ */
+static void bsp_motor_ledc_init(void)
+{
+    // 定时器：独立 TIMER_2，XTAL 时钟源，5kHz，10bit
+    ledc_timer_config_t motor_timer = {
+        .speed_mode = BSP_MOTOR_LEDC_MODE,
+        .timer_num = BSP_MOTOR_LEDC_TIMER,
+        .duty_resolution = BSP_MOTOR_LEDC_RES,
+        .freq_hz = BSP_MOTOR_LEDC_FREQ_HZ,
+        .clk_cfg = BSP_MOTOR_LEDC_CLK, // 强制 XTAL，与舵机/背光统一（BUG-015）
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&motor_timer));
+
+    // 通道：独立 CH4，绑定马达引脚。
+    // ★ 初始 duty=MAX（输出恒高电平），低有效下=断电=停止，避免上电狂震。
+    ledc_channel_config_t motor_channel = {
+        .speed_mode = BSP_MOTOR_LEDC_MODE,
+        .channel = BSP_MOTOR_LEDC_CHANNEL,
+        .timer_sel = BSP_MOTOR_LEDC_TIMER,
+        .gpio_num = BSP_MOTOR_VIB_PIN,
+        .duty = BSP_MOTOR_DUTY_MAX, // 初始停止（恒高电平 → 低有效断电）
+        .hpoint = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&motor_channel));
+}
+
+/**
+ * @brief 设置震动马达持续输出强度
+ * @param strength 震动强度百分比 0~100：0=停止，100=最强
+ *
+ * 低有效极性处理：strength 表示「通电占比」，但马达 OUT=0 才通电，
+ * 因此实际写入 LEDC 的占空 = 满占空 - 通电占空（反相）。
+ *   strength=0   → LEDC duty=MAX（恒高电平）→ 断电停止
+ *   strength=100 → LEDC duty=0（恒低电平）  → 满功率通电
+ */
+void bsp_motor_set(uint8_t strength)
+{
+    if (strength > 100)
+        strength = 100;
+
+    // 期望通电占空（正逻辑），再反相得到实际 LEDC 占空（低有效）
+    uint32_t on_duty = (uint32_t)BSP_MOTOR_DUTY_MAX * strength / 100;
+    uint32_t ledc_duty = BSP_MOTOR_DUTY_MAX - on_duty;
+
+    ledc_set_duty(BSP_MOTOR_LEDC_MODE, BSP_MOTOR_LEDC_CHANNEL, ledc_duty);
+    ledc_update_duty(BSP_MOTOR_LEDC_MODE, BSP_MOTOR_LEDC_CHANNEL);
+}
+
+/**
+ * @brief 震动马达带强度的单次脉冲
+ * @param strength 震动强度百分比 0~100
+ * @param ms       持续时长（毫秒），结束后自动停止
+ * @note 内部含 vTaskDelay 阻塞，仅可在任务上下文调用
+ */
+void bsp_motor_pulse_level(uint8_t strength, uint32_t ms)
+{
+    bsp_motor_set(strength);
+    vTaskDelay(pdMS_TO_TICKS(ms));
+    bsp_motor_set(0); // 停止
+}
+
+/**
+ * @brief 马达震动脉冲（默认强度，约 30ms）
+ * 函数含义：用 LEDC PWM 以默认强度震动 30ms，用于触摸/唤醒等触觉反馈
  */
 void bsp_motor_pulse(void)
 {
-    // API含义：设置GPIO引脚电平
-    // API参数含义：
-    //   BSP_MOTOR_VIB_PIN：GPIO引脚号
-    //   1：输出高电平（马达启动）
-    gpio_set_level(BSP_MOTOR_VIB_PIN, 0);
+    bsp_motor_pulse_level(BSP_MOTOR_DEFAULT_STRENGTH, 30);
+}
 
-    // API含义：FreeRTOS任务延时，单位为系统时钟节拍
-    // API参数含义：pdMS_TO_TICKS(30)：将30毫秒转换为系统时钟节拍数
-    vTaskDelay(pdMS_TO_TICKS(30));
+// ═══════════════════════════════════════════════════════════════════════════
+// 【震动 PWM 方波测试任务】—— 验证占空比可调 + 示波器观测方波
+//
+// 用法：在 application.c 里 xTaskCreate(motor_pwm_test_task, ...) 启动即可。
+// 行为：循环把占空比设成 0→25→50→75→100→(回0) 一档一档走，每档持续 3 秒，
+//       串口打印当前档位。用 bsp_motor_set() 持续输出（非脉冲），方便示波器
+//       Stop 抓波形。
+//
+// 示波器观测要点：
+//   - 想看到 5kHz 方波细节，时基拉到 ~50µs/格（一个周期 200µs）；
+//   - 占空比 0% 与 100% 是直流端点（恒高/恒低），不是方波，看到直线属正常；
+//   - 25/50/75% 才是真方波，占空比逐档变化肉眼可辨。
+// 测试完成后，把 application.c 里创建本任务的代码注释掉即可。
+// ═══════════════════════════════════════════════════════════════════════════
+void motor_pwm_test_task(void *pvParameters)
+{
+    (void)pvParameters;
 
-    // API含义：设置GPIO引脚电平
-    // API参数含义：
-    //   BSP_MOTOR_VIB_PIN：GPIO引脚号
-    //   0：输出低电平（马达停止）
-    gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
+    // 复用触摸初始化里的 LEDC 配置；若单独跑本测试（未启动 touch_scan_task），
+    // 需保证马达 LEDC 已初始化。这里直接调一次初始化，幂等无副作用。
+    bsp_motor_ledc_init();
+
+    // 待测占空比档位（%）
+    static const uint8_t test_levels[] = {0, 25, 50, 75, 100};
+    const int n = sizeof(test_levels) / sizeof(test_levels[0]);
+
+    ESP_LOGI(TAG, "═══ 震动 PWM 方波测试启动：每档持续 3 秒 ═══");
+
+    while (1)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            uint8_t lv = test_levels[i];
+            bsp_motor_set(lv); // 持续输出该占空比，便于示波器观测
+            ESP_LOGI(TAG, "震动占空比 = %u%%（%s）", lv,
+                     (lv == 0)     ? "停止/恒高直流"
+                     : (lv == 100) ? "满震/恒低直流"
+                                   : "PWM 方波");
+            vTaskDelay(pdMS_TO_TICKS(3000));
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -146,12 +279,8 @@ void bsp_touch_init(void)
 {
     s_touch_event_queue = xQueueCreate(TOUCH_EVENT_QUEUE_LEN, sizeof(touch_event_t));
 
-    gpio_config_t motor_conf = {
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = (1ULL << BSP_MOTOR_VIB_PIN),
-    };
-    gpio_config(&motor_conf);
-    gpio_set_level(BSP_MOTOR_VIB_PIN, 1); // 停止马达
+    // 震动马达：LEDC PWM 初始化（独立 T2/CH4，XTAL 时钟源，初始停止）
+    bsp_motor_ledc_init();
 
     // TTP223 OUT 引脚：输入 + 内部上拉（低有效，悬空时保持高电平不误触）
     gpio_config_t touch_conf = {
@@ -202,12 +331,8 @@ void bsp_touch_init(void)
 {
     s_touch_event_queue = xQueueCreate(TOUCH_EVENT_QUEUE_LEN, sizeof(touch_event_t));
 
-    gpio_config_t motor_conf = {
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = (1ULL << BSP_MOTOR_VIB_PIN),
-    };
-    gpio_config(&motor_conf);
-    gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
+    // 震动马达：LEDC PWM 初始化（独立 T2/CH4，XTAL 时钟源，初始停止）
+    bsp_motor_ledc_init();
 
     touch_pad_init();
     touch_pad_set_voltage(TOUCH_HVOLT_2V7, TOUCH_LVOLT_0V5, TOUCH_HVOLT_ATTEN_0V);
@@ -265,20 +390,22 @@ bool bsp_touch_get_event(touch_event_t *out_event)
     return xQueueReceive(s_touch_event_queue, out_event, 0) == pdTRUE;
 }
 
+/* 头部长按阈值：松手时超过此时长发 LONG_HEAD（退出/返回），否则发 SHORT_HEAD */
+#define HEAD_LONG_PRESS_MS 800
+
 /**
  * @brief 更新身体按键状态
- * 函数含义：处理头部/腹部/背部等身体触摸按键的状态机、消抖和事件发送
- * @param btn        参数含义：按键结构体指针
- * @param pressed    参数含义：当前是否检测到按下（原始状态）
- * @param in_combo   参数含义：是否处于组合按键状态（若是则忽略单键）
- * @param now_ms     参数含义：当前时间戳（毫秒）
- * @param name       参数含义：按键名称（用于日志）
- * @param short_evt  参数含义：短按事件类型
+ * @param btn        按键结构体指针
+ * @param pressed    当前是否检测到按下（原始状态）
+ * @param in_combo   是否处于组合按键状态（若是则忽略单键）
+ * @param now_ms     当前时间戳（毫秒）
+ * @param short_evt  短按事件类型
+ * @param long_evt   长按事件类型（TOUCH_EVENT_NONE 表示该键不支持长按）
  */
 static void update_body_btn(touch_btn_t *btn, bool pressed, bool in_combo,
-                            uint32_t now_ms, touch_event_t short_evt)
+                            uint32_t now_ms, touch_event_t short_evt, touch_event_t long_evt)
 {
-    // 如果处于组合按键状态或被其他按键占用，彻底重置状态并返回
+    // 组合键期间彻底重置，不产生单键事件
     if (in_combo)
     {
         btn->is_pressed = false;
@@ -288,39 +415,36 @@ static void update_body_btn(touch_btn_t *btn, bool pressed, bool in_combo,
         return;
     }
 
-    // 检测到按下
     if (pressed)
     {
-        btn->release_count = 0; // 清零释放计数器
+        btn->release_count = 0;
         if (!btn->is_pressed)
         {
-            btn->press_count++; // 按下计数器加1
-            // 连续检测到PRESS_DEBOUNCE次按下，确认是真按下
+            btn->press_count++;
             if (btn->press_count >= PRESS_DEBOUNCE)
             {
                 btn->is_pressed = true;
-                btn->press_start_ms = now_ms; // 记录按下开始时间
+                btn->press_start_ms = now_ms;
             }
         }
     }
-    // 检测到释放
     else
     {
-        btn->press_count = 0; // 清零按下计数器
+        btn->press_count = 0;
         if (btn->is_pressed)
         {
-            btn->release_count++; // 释放计数器加1
-            // 连续检测到RELEASE_DEBOUNCE次释放，确认是真释放
+            btn->release_count++;
             if (btn->release_count >= RELEASE_DEBOUNCE)
             {
-                // 计算按下持续时间
                 uint32_t held = now_ms - btn->press_start_ms;
-                // 如果按下时间超过身体按键阈值，发送短按事件
                 if (held >= BODY_PRESS_MIN_MS)
                 {
-                    send_touch_event(short_evt);
+                    /* 支持长按的键（头部）：按压超过阈值发长按事件，否则发短按 */
+                    if (long_evt != TOUCH_EVENT_NONE && held >= HEAD_LONG_PRESS_MS)
+                        send_touch_event(long_evt);
+                    else
+                        send_touch_event(short_evt);
                 }
-                // 重置按键状态
                 btn->is_pressed = false;
                 btn->press_start_ms = 0;
                 btn->release_count = 0;
@@ -344,7 +468,7 @@ static void update_body_btn(touch_btn_t *btn, bool pressed, bool in_combo,
 static void update_page_btn(touch_btn_t *btn, bool pressed_raw, bool blocked,
                             uint32_t now_ms,
                             touch_event_t short_evt, touch_event_t long_evt,
-                            uint32_t long_press_ms)
+                            uint32_t long_press_ms, bool game_mode)
 {
     // 只有未被阻塞时才认为是有效按下
     bool pressed = pressed_raw && !blocked;
@@ -377,16 +501,35 @@ static void update_page_btn(touch_btn_t *btn, bool pressed_raw, bool blocked,
                 touch_event_t evt = TOUCH_EVENT_NONE;
                 const char *kind = NULL;
 
-                // 判断是长按还是短按
-                if (held >= long_press_ms)
+                /* 记录本次按压时长，供跳一跳「长按蓄力」读取（任何视图都记，开销极小）*/
+                if (held >= PAGE_SHORT_PRESS_MIN_MS)
+                    s_last_page_hold_ms = held;
+
+                if (game_mode)
                 {
-                    evt = long_evt;
-                    kind = "长按";
+                    /* ── 游戏视图：长按耳不再触发「回主界面」，统一当作一次翻页键操作 ──
+                     * 跳一跳靠 bsp_touch_last_page_hold_ms() 读 held 决定蓄力大小，
+                     * 因此无论长短，只要超过最小按压阈值都发 short_evt（游戏自行解读时长）。
+                     * 这样既保留了「按住越久蓄力越大」，又不会在游戏里误触退出主界面。 */
+                    if (held >= PAGE_SHORT_PRESS_MIN_MS)
+                    {
+                        evt = short_evt;
+                        kind = "游戏蓄力";
+                    }
                 }
-                else if (held >= PAGE_SHORT_PRESS_MIN_MS)
+                else
                 {
-                    evt = short_evt;
-                    kind = "短按";
+                    // 非游戏视图：维持原长/短按判定逻辑
+                    if (held >= long_press_ms)
+                    {
+                        evt = long_evt;
+                        kind = "长按";
+                    }
+                    else if (held >= PAGE_SHORT_PRESS_MIN_MS)
+                    {
+                        evt = short_evt;
+                        kind = "短按";
+                    }
                 }
 
                 // 发送对应事件
@@ -394,6 +537,7 @@ static void update_page_btn(touch_btn_t *btn, bool pressed_raw, bool blocked,
                 {
                     send_touch_event(evt);
                 }
+                (void)kind;
 
                 // 重置按键状态
                 btn->is_pressed = false;
@@ -608,26 +752,64 @@ void touch_scan_task(void *pvParameters)
             s_combo_ab_cnt = 0;
         }
 
-        /* 身体单按钮：仅主界面启用（非主界面时 in_combo=true 跳过） */
-        bool body_enabled = (cur_view == UI_VIEW_MAIN);
+        /* 身体单按钮：所有视图均启用（头/腹/背在各层都有用途）：
+         *   - 主界面：头/腹/背触发情绪反馈
+         *   - 总设置/应用列表/游戏列表/功能页/游戏：头=确认、腹/背=返回
+         *   - 闹钟编辑：头=下一步/确认、腹/背=放弃退出
+         * 注意：组合键(头+腹等)仍仅主界面启用，见上方 body_combo_enabled，
+         *       因此非主界面单按头/腹/背不会被组合逻辑吞掉。 */
+        bool body_enabled = true;
         bool page_any_active = prev_raw || next_raw;
         if (page_any_active)
             s_page_active_ms = now_ms;
         // 翻页键松开后 100ms 内仍屏蔽身体键，等待电容耦合信号衰减
         bool page_blocking = page_any_active || ((now_ms - s_page_active_ms) < 100);
 
-        // 更新头部按键
+        /* ── 触觉震动反馈（按下边沿触发一次）──────────────────────────────
+         * 规则（按需求）：
+         *   1. 左/右耳（翻页键）任何视图按下 → 震动；
+         *   2. 头部在「非主界面」（功能盘/功能页/游戏/闹钟编辑）按下 → 震动；
+         *   3. 主界面（情绪界面 UI_VIEW_MAIN）的头/腹/背触摸 → 不震动。
+         * 边沿检测：此处各按键 is_pressed 仍是「上一帧」值（update_* 尚未执行），
+         * 配合本帧 *_raw / h 判断「松→按」上升沿，避免按住期间连续震动。
+         * 必须放在下面三个 update_body_btn / update_page_btn 之前，否则 is_pressed
+         * 已被置位，上升沿检测失效。
+         * 注意 bsp_motor_pulse() 内含 30ms 阻塞，仅按下瞬间触发一次，开销可接受。 */
+        {
+            // 头部震动适用视图：除主界面外的所有视图
+            bool head_vib_view = (cur_view != UI_VIEW_MAIN);
+            bool vib = false;
+
+            // 左/右耳：上升沿且未被互斥阻塞 → 任何视图都震
+            if (prev_raw && !prev_blocked && !btn_prev_page.is_pressed)
+                vib = true;
+            if (next_raw && !next_blocked && !btn_next_page.is_pressed)
+                vib = true;
+
+            // 头部：非主界面、上升沿、未被翻页屏蔽 → 震
+            if (head_vib_view && h && !page_blocking && !btn_head.is_pressed)
+                vib = true;
+
+            if (vib)
+                bsp_motor_pulse();
+        }
+
+        /* 头部：短按=情绪/游戏确认，长按≥800ms=退出/返回 */
         update_body_btn(&btn_head, h, combo_ha || combo_hb || !body_enabled || page_blocking, now_ms,
-                        TOUCH_EVENT_SHORT_HEAD);
+                        TOUCH_EVENT_SHORT_HEAD, TOUCH_EVENT_LONG_HEAD);
+        /* 腹/背：仅主界面情绪，不参与应用/游戏退出，无长按事件 */
         update_body_btn(&btn_abdomen, a, combo_ha || combo_ab || !body_enabled || page_blocking, now_ms,
-                        TOUCH_EVENT_SHORT_ABDOMEN);
+                        TOUCH_EVENT_SHORT_ABDOMEN, TOUCH_EVENT_NONE);
         update_body_btn(&btn_back, b, combo_hb || combo_ab || !body_enabled || page_blocking, now_ms,
-                        TOUCH_EVENT_SHORT_BACK);
+                        TOUCH_EVENT_SHORT_BACK, TOUCH_EVENT_NONE);
+
+        /* 游戏视图下启用「蓄力模式」：长按耳不发长按事件、改记按压时长供跳一跳读取 */
+        bool game_mode = (cur_view == UI_VIEW_GAME);
 
         update_page_btn(&btn_prev_page, prev_raw, prev_blocked, now_ms,
-                        TOUCH_EVENT_SHORT_PREV_PAGE, TOUCH_EVENT_LONG_PREV_PAGE, long_press_ms);
+                        TOUCH_EVENT_SHORT_PREV_PAGE, TOUCH_EVENT_LONG_PREV_PAGE, long_press_ms, game_mode);
         update_page_btn(&btn_next_page, next_raw, next_blocked, now_ms,
-                        TOUCH_EVENT_SHORT_NEXT_PAGE, TOUCH_EVENT_LONG_NEXT_PAGE, long_press_ms);
+                        TOUCH_EVENT_SHORT_NEXT_PAGE, TOUCH_EVENT_LONG_NEXT_PAGE, long_press_ms, game_mode);
 
         /* 占用方释放：当按键释放后，清除占用状态 */
         if (s_page_owner == PAGE_OWNER_PREV && !btn_prev_page.is_pressed && !prev_raw)

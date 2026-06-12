@@ -14,11 +14,14 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
-#include "bsp_config.h" // SERVO_SPEED_* 宏的唯一定义来源（避免与 bsp_servo.c 重复）
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h" // SemaphoreHandle_t（带完成通知的提交接口）
+#include "bsp_config.h"      // SERVO_SPEED_* 宏的唯一定义来源（避免与 bsp_servo.c 重复）
 
 // 幅度等级（对应具体角度偏差）
 typedef enum
 {
+    SERVO_AMPLITUDE_5 = 5,
     SERVO_AMPLITUDE_10 = 10,
     SERVO_AMPLITUDE_15 = 15,
     SERVO_AMPLITUDE_20 = 20,
@@ -49,6 +52,47 @@ typedef struct
     bool oscillate;               // true = 在两侧往返（如 left->right->left ...），false = 单次到位（并回中）
 } servo_request_t;
 
+// 单轴并行子动作：用于 servo_parallel_request_t，描述某一轴在一次并行动作中的参数。
+// count==0 表示该轴本次不参与（apply 时保持 90° 中位）。
+typedef struct
+{
+    servo_amplitude_t amplitude;  // 幅度：10/15/20/30（相对 90° 中位的偏摆角度）
+    servo_direction_t direction;  // 方向（NEUTRAL=不偏）
+    servo_speed_level_t speed_ms; // 速度档位（ms/度）
+    uint8_t count;                // 往返/重复次数；0 = 该轴不动
+    bool oscillate;               // true=两侧往返，false=单次到位回中
+} servo_axis_action_t;
+
+// 三轴并行动作请求：三轴【同时】运动（各自动作可不同，但在同一时间窗口内并行执行）。
+// 与 servo_request_t（单轴、串行入队）不同，本请求由 worker 调 bsp_servo_move_all_parallel
+// 实现真正的三轴同步，避免「头先动完、臂才开始」的轮流割裂感。
+typedef struct
+{
+    servo_axis_action_t head;  // 头部动作
+    servo_axis_action_t l_arm; // 左臂动作
+    servo_axis_action_t r_arm; // 右臂动作
+} servo_parallel_request_t;
+
+// 单轴【绝对角度】子动作：直接给出两个目标角（与情绪表 ActionStep_t 1:1，零转换误差）。
+// count==0 表示该轴本次不参与（执行时该轴保持 90° 中位）。
+typedef struct
+{
+    float angle_1;     // 前半段目标角度（度，0~180，bsp 内部软限位裁剪）
+    float angle_2;     // 后半段目标角度（度）；单向动作填 90.0f（归中）
+    uint32_t speed_ms; // step_ms（速度档位，值越大越慢）
+    uint8_t count;     // 循环次数；0 = 该轴不动（恒 90°）
+} servo_abs_axis_t;
+
+// 三轴【绝对角度】并行请求：三轴同时按 angle_1→angle_2 往返 count 次，末尾全轴归中。
+// 与 servo_parallel_request_t（幅度/方向语义）不同，本请求直接吃绝对角度，
+// 供 interaction 情绪动作复用（情绪表本就是绝对角度），避免幅度/方向换算误差。
+typedef struct
+{
+    servo_abs_axis_t head;
+    servo_abs_axis_t l_arm;
+    servo_abs_axis_t r_arm;
+} servo_abs_parallel_request_t;
+
 /**
  * @brief 初始化 servo_manager（创建队列 + worker task）
  * @return ESP_OK 成功，其他 esp_err 失败
@@ -66,6 +110,46 @@ void servo_manager_deinit(void);
  * @return ESP_OK 成功入队，ESP_ERR_NO_MEM/ESP_ERR_INVALID_ARG 等表示失败
  */
 esp_err_t servo_manager_submit_request(const servo_request_t *req);
+
+/**
+ * @brief 非阻塞提交【三轴并行】动作请求（入队后立即返回）
+ *
+ * 三轴在同一时间窗口内【同时】运动到各自目标（各轴动作可不同），
+ * 由 worker 调 bsp_servo_move_all_parallel 实现真正同步，
+ * 避免单轴串行入队造成的「头/左臂/右臂轮流动」割裂感。
+ *
+ * @param req 三轴并行请求（caller 保持其内存直到本函数返回）
+ * @return ESP_OK 成功入队，ESP_ERR_INVALID_STATE/ESP_ERR_NO_MEM 表示失败
+ */
+esp_err_t servo_manager_submit_parallel(const servo_parallel_request_t *req);
+
+/**
+ * @brief 非阻塞提交【绝对角度三轴并行】动作请求，可选完成通知。
+ *
+ * 三轴按各自 angle_1→angle_2 往返 count 次后全轴归中，worker 串行执行。
+ * 供 interaction 情绪动作使用（情绪表是绝对角度，零换算误差）。
+ *
+ * @param req      绝对角度三轴请求（caller 保持其内存直到本函数返回）
+ * @param done_sem 完成信号量：非 NULL 时，worker 执行完（含正常播完归中 或 被
+ *                 servo_manager_flush 打断归中）后 xSemaphoreGive 通知调用方；
+ *                 NULL 表示不通知（自动循环/待机用 NULL）。
+ * @return ESP_OK 成功入队
+ */
+esp_err_t servo_manager_submit_abs_parallel_notify(const servo_abs_parallel_request_t *req,
+                                                   SemaphoreHandle_t done_sem);
+
+/**
+ * @brief 清空舵机动作队列并打断当前正在执行的动作，舵机平滑归中 90° 停住。
+ *
+ * 行为：置中断标志 → xQueueReset 清掉所有未执行请求 → 正在执行的并行动作
+ * 在下一个循环边界 break 跳出 → worker 统一做一次平滑归中并清标志。
+ * 用于进功能盘 / 强制回主界面时立即停舵机（解决队列堆积导致的「还重复动多次」）。
+ *
+ * @note 非阻塞：仅置标志 + ResetQueue，归中由 worker 线程执行（避免双线程抢舵机）。
+ *       被打断的请求若带 done_sem，仍会被 give（防调用方永久阻塞）。
+ * @return ESP_OK
+ */
+esp_err_t servo_manager_flush(void);
 
 /**
  * @brief 用一个简单的 index（0..N-1）生成一个模式并入队执行。

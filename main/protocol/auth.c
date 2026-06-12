@@ -144,8 +144,7 @@ void auth_perform(auth_t *auth, const char *device_token)
 
     esp_err_t ret = ESP_FAIL;
     int status_code = 0;
-    const int max_retries = 2; // 最多重试 2 次（首次 + 1 次重试）
-
+    const int max_retries = 3; // 同步最多尝试 3 次（约 9 秒），失败后由后台 session_reconnect_task 指数退避无限重试
     for (int attempt = 0; attempt < max_retries; attempt++)
     {
         esp_http_client_config_t config = {
@@ -159,6 +158,7 @@ void auth_perform(auth_t *auth, const char *device_token)
         esp_http_client_set_header(client, "Content-Type", "application/json");
         esp_http_client_set_post_field(client, post_body, strlen(post_body));
 
+        ESP_LOGI(TAG, "Auth 第 %d/%d 次尝试...", attempt + 1, max_retries);
         ret = esp_http_client_perform(client);
         status_code = esp_http_client_get_status_code(client);
         esp_http_client_cleanup(client);
@@ -170,24 +170,24 @@ void auth_perform(auth_t *auth, const char *device_token)
             break;                     // 成功，跳出重试循环
         }
 
-        if (attempt == 0)
-        {
-            ESP_LOGW(TAG, "Auth 请求失败 (ret=%s, status=%d)，1 秒后重试...",
-                     esp_err_to_name(ret), status_code);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
+        ESP_LOGW(TAG, "Auth 第 %d 次失败 (ret=%s, status=%d)", attempt + 1,
+                 esp_err_to_name(ret), status_code);
+        if (attempt < max_retries - 1)
+            vTaskDelay(pdMS_TO_TICKS(2000)); // 每次重试间隔 2 秒
     }
     free(post_body);
 
     if (ret != ESP_OK)
     {
-        ESP_LOGW(TAG, "Auth 请求发送失败: %s（已重试 %d 次）", esp_err_to_name(ret), max_retries);
+        ESP_LOGW(TAG, "Auth 发送失败: %s（%d 次均失败），将由后台重连任务继续尝试",
+                 esp_err_to_name(ret), max_retries);
         s_server_reachable = false; // 服务器不可达，通知上层跳过后续连接
         return;
     }
     if (status_code != 200 && status_code != 201)
     {
-        ESP_LOGW(TAG, "Auth 请求失败，HTTP 状态码: %d", status_code);
+        ESP_LOGW(TAG, "Auth 失败，HTTP 状态码: %d（%d 次均失败），将由后台重连任务继续尝试",
+                 status_code, max_retries);
         s_server_reachable = false;
         return;
     }

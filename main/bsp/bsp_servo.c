@@ -16,6 +16,7 @@
 #include "bsp/bsp_board.h"
 #include "iot_servo.h"
 #include <math.h>
+#include <stdatomic.h>       // atomic_bool 打断标志（跨核安全）
 #include "freertos/semphr.h" // 互斥锁，保证多任务调用线程安全
 #include "bsp/bsp_config.h"
 // 注意：robot_emotion_t 唯一定义在 interaction.h，此处不重复定义。
@@ -33,6 +34,31 @@ static const char *TAG = "BSP_SERVO";
  *   - 在 bsp_board_servo_init() 内创建，bsp_servo_move_smooth() 内加/解锁。
  */
 static SemaphoreHandle_t s_ch_mutex[3] = {NULL, NULL, NULL};
+
+/**
+ * 舵机运动打断标志（atomic，跨核安全）。
+ * 上层（servo_manager_flush）置 true 请求立即中止正在进行的插值运动；
+ * bsp_servo_move_all_parallel / bsp_servo_move_smooth 的插值步循环每步检查，
+ * 为 true 则立即停在当前角度并退出（不再走完整个行程）。
+ * 由上层在「打断后、开始新动作前」清回 false（见 servo_manager worker）。
+ * 这样进功能盘 flush 时舵机最坏只滞后一个插值步（step_ms，几十 ms）即停。
+ */
+static atomic_bool s_servo_abort = ATOMIC_VAR_INIT(false);
+
+void bsp_servo_request_abort(void)
+{
+    atomic_store(&s_servo_abort, true);
+}
+
+void bsp_servo_clear_abort(void)
+{
+    atomic_store(&s_servo_abort, false);
+}
+
+bool bsp_servo_abort_requested(void)
+{
+    return atomic_load(&s_servo_abort);
+}
 
 // ==========================================
 // 1. 情绪/动作指令枚举 (对应你 Excel 表格的第一列)
@@ -346,8 +372,16 @@ void bsp_servo_move_all_parallel(float head_target, float larm_target, float rar
     }
 
     // 线性插值：每步同时写三轴，t 从 1/max_steps 到 1
+    bool aborted = false;
     for (int step = 1; step <= max_steps; step++)
     {
+        // 每步检查打断请求：进功能盘/强制回主 flush 时立即停在当前角度，
+        // 不再走完整个行程（把打断延迟从「一整轮动作」降到「一个 step」≈几十 ms）。
+        if (bsp_servo_abort_requested())
+        {
+            aborted = true;
+            break;
+        }
         float t = (float)step / (float)max_steps;
         iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_HEAD, h_cur + t * (h_safe - h_cur));
         iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_L_ARM, l_cur + t * (l_safe - l_cur));
@@ -355,10 +389,13 @@ void bsp_servo_move_all_parallel(float head_target, float larm_target, float rar
         vTaskDelay(pdMS_TO_TICKS(step_ms));
     }
 
-    // 兜底：精准落在目标位置
-    iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_HEAD, h_safe);
-    iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_L_ARM, l_safe);
-    iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_R_ARM, r_safe);
+    // 兜底：未被打断时精准落在目标位置（被打断则停在当前插值角度，不强制到位）
+    if (!aborted)
+    {
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_HEAD, h_safe);
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_L_ARM, l_safe);
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_R_ARM, r_safe);
+    }
 
     for (int i = 0; i < 3; i++)
         xSemaphoreGive(s_ch_mutex[i]);

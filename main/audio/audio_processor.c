@@ -105,6 +105,11 @@ static void audio_processor_play_task(void *arg)
     // 🟢 智能预缓冲状态机变量
     bool prebuffering = true;
     TickType_t buffer_start_tick = xTaskGetTickCount();
+    // 仅用于日志的"本轮预缓冲起点"。与开闸判据无关（开闸只看 bytes_waiting），
+    // 每次进入预缓冲阶段时刷新，使"耗时"反映本轮蓄水时长而非跨轮累计值。
+    // buffer_start_tick 刻意不在短句开闸后重置（防旧 tick 误开闸），
+    // 导致多轮对话中 wait_ms 累计跨轮时间，日志"耗时"会显示成 8~17 秒的荒谬值。
+    TickType_t prebuf_log_start_tick = xTaskGetTickCount();
     // 连续欠载计数器：连续 N 次从 dec_output 读不到数据才触发预缓冲重置，
     // 过滤解码器两帧之间的瞬间间隙（约 20ms），避免误触发"滴滴"电音。
     int underrun_count = 0;
@@ -125,8 +130,10 @@ static void audio_processor_play_task(void *arg)
             // 查询当前解码器输出了多少 PCM 数据准备播放
             vRingbufferGetInfo(audio_processor->dec_output, NULL, NULL, NULL, NULL, &bytes_waiting);
 
-            // 计算从开始蓄水到现在过了多久
+            // 计算从开始蓄水到现在过了多久（开闸判据 / 空窗期 delay 决策用，不改语义）
             uint32_t wait_ms = (xTaskGetTickCount() - buffer_start_tick) * portTICK_PERIOD_MS;
+            // 仅供日志显示的本轮蓄水时长，避免跨轮累计导致"耗时"虚高
+            uint32_t prebuf_ms = (xTaskGetTickCount() - prebuf_log_start_tick) * portTICK_PERIOD_MS;
 
             // 🚀 核心调优区：三分支开闸 / 蓄水 / 空窗期
             // 关键设计：开闸的唯一充分条件是 bytes_waiting > 0；
@@ -140,7 +147,7 @@ static void audio_processor_play_task(void *arg)
                 underrun_count = 0;
                 active_playback = true;
                 ESP_LOGI(TAG, "TTS 预缓冲完成 (数据:%d B, 耗时:%d ms)，开始流畅播放",
-                         bytes_waiting, (int)wait_ms);
+                         bytes_waiting, (int)prebuf_ms);
             }
             else if (wait_ms >= 600 && bytes_waiting > 0)
             {
@@ -149,7 +156,7 @@ static void audio_processor_play_task(void *arg)
                 underrun_count = 0;
                 active_playback = true;
                 ESP_LOGI(TAG, "TTS 预缓冲短句开闸 (数据:%d B, 耗时:%d ms)",
-                         bytes_waiting, (int)wait_ms);
+                         bytes_waiting, (int)prebuf_ms);
             }
             else
             {
@@ -208,7 +215,8 @@ static void audio_processor_play_task(void *arg)
             {
                 underrun_count = 0;
                 prebuffering = true;
-                buffer_start_tick = xTaskGetTickCount(); // 重置计时器，重新开始蓄水
+                buffer_start_tick = xTaskGetTickCount();    // 重置计时器，重新开始蓄水
+                prebuf_log_start_tick = xTaskGetTickCount(); // 同步刷新日志起点，反映本轮蓄水时长
                 // 仅在当前轮次 TTS 真正播过数据后才告警。
                 // active_playback 在预缓冲超时无数据退出时已置 false，
                 // 所以 TTS 结束后的 LISTENING 噪音循环不会再打印。
@@ -236,7 +244,9 @@ static void audio_processor_play_task(void *arg)
     }
 
     audio_processor->play_task_handle = NULL;
-    vTaskDelete(NULL);
+    // ★ 本任务栈由 xTaskCreatePinnedToCoreWithCaps(...SPIRAM) 分配，自删必须用 WithCaps，
+    //   否则 4KB SPIRAM 栈不会被 idle 回收 → 每轮会话泄漏。
+    vTaskDeleteWithCaps(NULL);
 }
 // ─── 公开 API：生命周期管理 ────────────────────────────────────────────────
 
@@ -282,16 +292,17 @@ audio_processor_t *audio_processor_create(void)
         !audio_processor->aec_ref_buf)
     {
         ESP_LOGE(TAG, "audio_processor_create: ringbuf alloc failed, rollback");
+        // ★ WithCaps 创建的 ringbuf 必须用 WithCaps 删除，回滚路径同样遵守，避免 caps 泄漏
         if (audio_processor->enc_input)
-            vRingbufferDelete(audio_processor->enc_input);
+            vRingbufferDeleteWithCaps(audio_processor->enc_input);
         if (audio_processor->enc_output)
-            vRingbufferDelete(audio_processor->enc_output);
+            vRingbufferDeleteWithCaps(audio_processor->enc_output);
         if (audio_processor->dec_input)
-            vRingbufferDelete(audio_processor->dec_input);
+            vRingbufferDeleteWithCaps(audio_processor->dec_input);
         if (audio_processor->dec_output)
-            vRingbufferDelete(audio_processor->dec_output);
+            vRingbufferDeleteWithCaps(audio_processor->dec_output);
         if (audio_processor->aec_ref_buf)
-            vRingbufferDelete(audio_processor->aec_ref_buf);
+            vRingbufferDeleteWithCaps(audio_processor->aec_ref_buf);
         audio_encoder_destroy(audio_processor->encoder);
         audio_decoder_destroy(audio_processor->decoder);
         free(audio_processor);
@@ -317,15 +328,20 @@ void audio_processor_destroy(audio_processor_t *audio_processor)
     if (audio_processor->play_task_handle != NULL)
     {
         ESP_LOGW("AUDIO_PROC", "play_task 超时未退出，强制终止以释放内存");
-        vTaskDelete(audio_processor->play_task_handle);
+        // ★ 栈在 SPIRAM caps 分配，强杀也必须用 WithCaps，否则 4KB 栈泄漏。
+        //   先存句柄、置 NULL、再删，防止与自删路径竞态二次释放。
+        TaskHandle_t h = audio_processor->play_task_handle;
         audio_processor->play_task_handle = NULL;
+        vTaskDeleteWithCaps(h);
     }
 
-    vRingbufferDelete(audio_processor->enc_input);
-    vRingbufferDelete(audio_processor->enc_output);
-    vRingbufferDelete(audio_processor->dec_input);
-    vRingbufferDelete(audio_processor->dec_output);
-    vRingbufferDelete(audio_processor->aec_ref_buf);
+    // ★ ringbuf 由 xRingbufferCreateWithCaps(...SPIRAM) 创建，必须用 WithCaps 版本删除，
+    //   否则 caps 分配的 SPIRAM（5 个共 ~224KB）不会被回收 → 每轮会话泄漏一整套缓冲。
+    vRingbufferDeleteWithCaps(audio_processor->enc_input);
+    vRingbufferDeleteWithCaps(audio_processor->enc_output);
+    vRingbufferDeleteWithCaps(audio_processor->dec_input);
+    vRingbufferDeleteWithCaps(audio_processor->dec_output);
+    vRingbufferDeleteWithCaps(audio_processor->aec_ref_buf);
 
     audio_encoder_destroy(audio_processor->encoder);
     audio_decoder_destroy(audio_processor->decoder);
