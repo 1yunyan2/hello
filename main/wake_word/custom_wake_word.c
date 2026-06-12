@@ -920,8 +920,20 @@ static void multinet_detect_task(void *arg)
                 }
                 else
                 {
+                    // overflow 主要发生在 is_running=false 期间（模型加载/唤醒成功后/
+                    // 更新命令词的过渡窗口）：此时 detect 被 if(!is_running)continue 跳过，
+                    // 但读取仍在继续，积累的是「模型没在工作时的废音频」，并非用户有效语音。
+                    // 因此整段清空才是正确处理——保留这段废数据反而会污染 is_running 恢复后的检测。
                     ESP_LOGW(TAG, "MultiNet buffer overflow，清空重来");
                     input_buffer_len = 0;
+                    // 【关键修复 BUG-019】拼接缓冲被丢弃时，MultiNet 内部 CTC beam 状态
+                    // 也必须同步重置。MultiNet 是累积式解码器：detect() 增量喂数据并在内部
+                    // 维护一组 beam 路径，仅在返回 DETECTED/TIMEOUT 时才 clean()。长时间连续
+                    // 说话从不触发唤醒词（一直 DETECTING），clean 永不调用 → beam 无限累积；
+                    // 若此处只清 input_buffer 不同步 clean()，解码器会带着与输入错位的脏 beam
+                    // 继续跑，最终 ctc_path_copy 拷贝到失效槽位 → memcpy 空指针越界崩溃。
+                    if (multinet_iface && multinet_model_data)
+                        multinet_iface->clean(multinet_model_data);
                 }
                 xSemaphoreGive(buffer_mutex);
             }
@@ -1075,9 +1087,15 @@ void wake_word_start(void)
     // 重置 AFE 内部 ringbuf，丢弃积压的旧音频数据
     if (s_afe_iface && s_afe_data)
         s_afe_iface->reset_buffer(s_afe_data); // 重要！重置 AFE 内部状态，确保旧数据不干扰新检测
-    // 确保恢复正常阈值（防止 TTS 被打断或异常关闭后阈值卡在 0.55）
     if (multinet_iface && multinet_model_data)
+    {
+        // 【修复 BUG-019】重置 MultiNet CTC 解码器状态，与清空 input_buffer 保持同步。
+        // 长对话里 session 每轮 TTS_START 都会调本函数重启引擎，若只清拼接缓冲不 clean()，
+        // 上一轮残留的 beam 状态会污染本轮检测，与 overflow 不同步叠加加速解码器越界崩溃。
+        multinet_iface->clean(multinet_model_data);
+        // 确保恢复正常阈值（防止 TTS 被打断或异常关闭后阈值卡在 0.55）
         multinet_iface->set_det_threshold(multinet_model_data, 0.18f);
+    }
     is_running = true;
     xSemaphoreGive(buffer_mutex);
 

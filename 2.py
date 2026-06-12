@@ -5,11 +5,11 @@ Project Echo 资源打包工具 v1.0
 
 把本地 assetsss/ 目录直接打成 32MB FAT 镜像 (storage.bin),布局与固件
   esp_vfs_fat_spiflash_mount_rw_wl("/S", "ext_storage", &cfg, ...)
-完全一致 (wear-leveling + sector 4096),写完直接给 burner.py 烧。
+完全一致 (wear-leveling + sector 4096),写完直接给 3.py 烧。
 
 使用流程:
-    python packer.py        ← 本脚本,assetsss/ → storage.bin
-    python burner.py        ← 把 storage.bin 烧到设备外挂 Flash
+    python 2.py        ← 本脚本,assetsss/ → storage.bin
+    python 3.py        ← 把 storage.bin 烧到设备外挂 Flash
     设备重启 → /S 挂载成功 → 代码可读 /S/gif/one.gif 等
 
 依赖: ESP-IDF v5.x 自带的 wl_fatfsgen.py
@@ -139,7 +139,7 @@ def main() -> int:
     if not (sig_ok and bpb_ok):
         print('\n⚠️ 镜像格式校验未通过,烧进去可能挂载失败')
         return 1
-    print(f'\n下一步: python burner.py')
+    print(f'\n下一步: python 3.py')
     return 0
 
 
