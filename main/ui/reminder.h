@@ -62,6 +62,14 @@
 #define WEATHER_EVENING_MINUTE 0       ///< 晚间天气播报 — 分钟
 #define WEATHER_FETCH_TIMEOUT_MS 10000 ///< 天气 HTTP 请求超时（毫秒）
 
+/* ── 白天天气自动拉取时间点（4个固定时间点，每4小时一次，以分钟总数表示）──
+ * 07:30 / 11:30 / 15:30 / 19:30，用 tm_hour*60+tm_min 直接比较
+ * 上电后额外立即拉取一次，不依赖这些时间点 */
+#define WEATHER_FETCH_MIN_0 (WEATHER_MORNING_HOUR * 60 + WEATHER_MORNING_MINUTE) ///< 07:30
+#define WEATHER_FETCH_MIN_1 (WEATHER_FETCH_MIN_0 + 4 * 60)                       ///< 11:30
+#define WEATHER_FETCH_MIN_2 (WEATHER_FETCH_MIN_0 + 8 * 60)                       ///< 15:30
+#define WEATHER_FETCH_MIN_3 (WEATHER_EVENING_HOUR * 60 + WEATHER_EVENING_MINUTE) ///< 19:30
+
 /* ═══════════════════════════════════════════════════════════════════
  * 天气 API 切换开关
  *   WEATHER_PROVIDER = 0 → 和风天气（免费版允许商用，每月 5 万次免费额度）

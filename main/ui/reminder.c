@@ -121,7 +121,9 @@ typedef struct
      * reminder_weather_config 写入时持锁，存在良性竞态（最多多/少播报一次） */
     bool weather_morning_done;
     bool weather_evening_done;
-    uint8_t last_weather_day;
+    /* 上次拉取的时间点（分钟总数，对应 WEATHER_FETCH_MIN_x），-1=从未拉取
+     * 每天4个固定时间点：07:30/11:30/15:30/19:30，上电额外立即拉取一次 */
+    int last_weather_fetch_min;
 
     uint8_t ringing_alarm_id;
     uint8_t ring_count;
@@ -736,19 +738,34 @@ static void poll_timer_callback(void *arg)
         }
     }
 
-    /* ── 天气数据拉取检查（每 4 小时自动拉取，无语音播报） ── */
+    /* ── 天气数据拉取检查（4个固定时间点：07:30/11:30/15:30/19:30，无语音播报）──
+     * 轮询精度 1 分钟，命中时间点且本轮未拉取则触发；上电后由
+     * reminder_weather_fetch_now() 立即拉取一次，不依赖此处。 */
     if (s_ctx.weather_cfg.schedule != WEATHER_SCHEDULE_DISABLED &&
         s_ctx.state == REMINDER_STATE_IDLE)
     {
-        int current_hour = now_tm.tm_hour;
-        /* 首次拉取 或 距上次拉取超过 4 小时 */
-        if (s_ctx.last_weather_day == 0 ||
-            (current_hour - s_ctx.last_weather_day + 24) % 24 >= 4)
+        static const int k_fetch_mins[] = {
+            WEATHER_FETCH_MIN_0, /* 07:30 */
+            WEATHER_FETCH_MIN_1, /* 11:30 */
+            WEATHER_FETCH_MIN_2, /* 15:30 */
+            WEATHER_FETCH_MIN_3, /* 19:30 */
+        };
+        int now_min = now_tm.tm_hour * 60 + now_tm.tm_min;
+        for (int i = 0; i < 4; i++)
         {
-            evt.type = REM_EVT_WEATHER_FETCH;
-            xQueueSend(s_ctx.evt_queue, &evt, 0);
-            s_ctx.last_weather_day = current_hour;
+            /* 当前分钟命中某个时间点，且该时间点今天还未拉取过 */
+            if (now_min == k_fetch_mins[i] &&
+                s_ctx.last_weather_fetch_min != k_fetch_mins[i])
+            {
+                evt.type = REM_EVT_WEATHER_FETCH;
+                xQueueSend(s_ctx.evt_queue, &evt, 0);
+                s_ctx.last_weather_fetch_min = k_fetch_mins[i];
+                break;
+            }
         }
+        /* 跨天重置（午夜 00:00 时清除上次记录，使次日照常触发） */
+        if (now_min == 0)
+            s_ctx.last_weather_fetch_min = -1;
     }
 }
 
