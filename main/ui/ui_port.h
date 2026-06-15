@@ -1,17 +1,23 @@
-#ifndef UI_PORT_H
-#define UI_PORT_H
+#pragma once
 #include <stdbool.h>
 #include <stdint.h>
 #include "ui/interaction.h" /* 引入触摸事件枚举touch_event_t */
 
 /* ═══════════════════════════════════════════════════════════════
  * 视图状态枚举
- * 含义：定义UI界面的3种核心显示状态，用于触摸事件的逻辑分发
+ * 含义：定义UI界面的核心显示状态，用于触摸事件的逻辑分发
+ *
+ * 层级关系（新版单层横向大图标功能盘）：
+ *   主界面 ─长按耳→ 功能盘(HOME) ─摸头→ 功能页(日历/闹钟/定时器/天气) 或 游戏(打地鼠)
+ *   功能盘：左右耳=横向切换图标(带果冻弹动)，头部=震动确认进入并锁定，
+ *           腹/背 或 长按耳=返回主界面；进入功能页后腹/背返回功能盘。
  * ═══════════════════════════════════════════════════════════════ */
 typedef enum
 {
     UI_VIEW_MAIN = 0,      // 主界面：显示时钟、触摸触发情绪反馈
-    UI_VIEW_FUNCTION_MENU, // 功能菜单界面：时间/闹钟/倒计时/天气4个功能页
+    UI_VIEW_HOME,          // 功能盘（单层）：横向大图标 日历/闹钟/定时器/天气/打地鼠
+    UI_VIEW_GAME,          // 具体游戏运行视图（由功能盘确认进入）
+    UI_VIEW_FUNCTION_MENU, // 功能页容器：时间/闹钟/倒计时/天气（由功能盘进入）
     UI_VIEW_ALARM_EDIT,    // 闹钟编辑界面：设置闹钟时间、重复模式
 } ui_view_t;
 
@@ -76,21 +82,56 @@ void ui_play_animation(const char *anim_id);
 void ui_function_menu_enter(void);
 
 /**
- * @brief 退出功能菜单，返回主界面
+ * @brief 退出功能菜单，返回上一层（应用列表）
  */
 void ui_function_menu_exit(void);
 
+/* ═══════════════════════════════════════════════════════════════
+ * 功能盘（单层横向大图标）导航接口
+ * ═══════════════════════════════════════════════════════════════ */
 /**
- * @brief 功能菜单向后翻页
- * 函数含义：切换到下一个功能页，循环切换
+ * @brief 进入功能盘界面（单层横向大图标）
+ * 函数含义：从主界面切换到功能盘，左右耳横向切换图标（带果冻弹动），
+ *           头部震动确认进入对应功能并锁定
+ * 调用时机：主界面长按左/右耳
  */
-void ui_page_next(void);
+void ui_home_enter(void);
 
 /**
- * @brief 功能菜单向前翻页
- * 函数含义：切换到上一个功能页，循环切换
+ * @brief 退出当前功能层，直接返回主界面
+ * 函数含义：无论当前处于设置/列表/功能页哪一层，统一回到主界面并恢复 GIF
+ * 调用时机：任意功能层长按左/右耳
  */
-void ui_page_prev(void);
+void ui_func_layer_exit_to_main(void);
+
+/**
+ * @brief 强制从任意视图（含闹钟编辑）返回主界面
+ * 函数含义：供待机模块在进入低功耗时调用，确保界面不卡在某菜单/编辑页
+ * 调用时机：standby 进入一级待机（enter_standby）时
+ */
+void ui_force_back_to_main(void);
+
+/**
+ * @brief 在功能菜单文字面板上显示「标题 + 正文」（带 LVGL 锁）
+ *
+ * 复用功能菜单共享面板（title + body 两个标签），供子模块（如 games.c）
+ * 渲染纯文字画面，避免子模块直接持有 LVGL 对象。
+ *
+ * @param title 顶部标题（可为 NULL，表示不改标题）
+ * @param body  居中正文（支持 \n 换行；可为 NULL）
+ */
+void ui_menu_show_text(const char *title, const char *body);
+
+/**
+ * @brief 显示「正在重置，请稍候…」解绑提示页
+ *
+ * 取消绑定/出厂重置会擦 NVS + esp_wifi_restore，期间 flash cache 被禁用，
+ * 逐帧读 SPIFFS 的主界面 GIF 会卡在当前帧（看着像死机）。本接口在动 flash
+ * 之前把画面切成一张纯静态文字提示并同步刷屏，避免冻帧。
+ *
+ * @note 必须在调用方真正擦除 NVS / 重启【之前】调用。
+ */
+void ui_show_unbinding(void);
 
 /* ═══════════════════════════════════════════════════════════════
  * 触摸事件分发接口（由 touch_scan_task 触摸扫描任务调用）
@@ -103,11 +144,25 @@ void ui_page_prev(void);
 void ui_dispatch_touch_event(touch_event_t event);
 
 /**
+ * @brief 请求把主界面 GIF 切到指定路径（情绪触发用，跨线程安全）
+ *
+ * 由 interaction 引擎播放情绪时调用，传入该情绪的 GIF 路径。可在任意线程调用：
+ * 只设 pending 标记并唤醒 LVGL 线程延迟 timer，真正的 lv_gif_set_src 在 LVGL
+ * 线程执行（BUG-010：lv_gif_set_src 必须在 LVGL 线程调）。仅在主界面生效。
+ * @param gif_path 目标 GIF 路径（NULL/空串忽略）
+ */
+void ui_request_emotion_gif(const char *gif_path);
+
+/**
+ * @brief 情绪播放完毕后恢复主界面自动随机 GIF + 舵机循环（跨线程安全）
+ *
+ * 由 interaction worker 在情绪播完、清 is_playing 标志后调用。仅设 pending 标记
+ * + 唤醒延迟 timer，真正切图在 LVGL 线程执行；内部判 s_view==MAIN，已进功能盘则不恢复。
+ */
+void ui_resume_main_gif_loop(void);
+
+/**
  * @brief 获取当前UI视图状态
  * @return 返回值含义：当前UI的视图枚举值ui_view_t
  */
 ui_view_t ui_get_current_view(void);
-
-static void time_page_render_text(void);
-
-#endif /* UI_PORT_H */

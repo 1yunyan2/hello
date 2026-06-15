@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>打地鼠 — 地鼠出洞预览（复刻固件坐标逻辑）</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#222; color:#ddd; font-family:"Microsoft YaHei",sans-serif; padding:20px; }
+  h2 { margin-bottom:12px; }
+  .desc { font-size:13px; line-height:1.7; color:#aaa; margin-bottom:16px; max-width:680px; }
+  .desc b { color:#fc6; }
+  .stage-wrap { display:flex; gap:24px; align-items:flex-start; flex-wrap:wrap; }
+  .screen {
+    position:relative; width:320px; height:240px;
+    border:2px solid #555; overflow:hidden;
+    background:
+      radial-gradient(ellipse 56px 22px at 85px 200px, #3a2410 0 60%, #5a3a1c 62%, transparent 70%),
+      radial-gradient(ellipse 56px 22px at 240px 200px, #3a2410 0 60%, #5a3a1c 62%, transparent 70%),
+      linear-gradient(#cfe0a0 0 60%, #c89b5a 60% 100%);
+  }
+  .groundline { position:absolute; left:0; right:0; border-top:1px dashed rgba(255,0,0,.5); pointer-events:none; }
+  .hole { position:absolute; overflow:hidden; outline:1px dashed rgba(0,200,255,.6); }
+  .mole {
+    position:absolute; width:100px; height:117px;
+    background:linear-gradient(#b07a48,#8a5a2c);
+    border-radius:46px 46px 30px 30px;
+    box-shadow:inset 0 -10px 12px rgba(0,0,0,.3);
+  }
+  .mole::before {
+    content:"\25CF  \25CF"; position:absolute; top:30px; left:0; right:0;
+    text-align:center; color:#000; font-size:14px; letter-spacing:18px;
+  }
+  .mole::after {
+    content:""; position:absolute; bottom:6px; left:30px; right:30px;
+    height:8px; background:#6b4520; border-radius:4px;
+  }
+  .panel { background:#2c2c2c; padding:16px; border-radius:8px; min-width:320px; }
+  .row { margin:10px 0; font-size:13px; }
+  .row label { display:inline-block; width:160px; }
+  .row input[type=range]{ width:120px; vertical-align:middle; }
+  .row .val { display:inline-block; width:42px; text-align:right; color:#fc6; }
+  button { background:#3a6; border:none; color:#fff; padding:8px 16px; border-radius:5px; cursor:pointer; margin-right:8px; }
+  button:hover { background:#4c8; }
+  .calc { font-family:monospace; font-size:12px; color:#8cf; margin-top:12px; line-height:1.6; white-space:pre; }
+  code { color:#fc6; }
+</style>
+</head>
+<body>
+<h2>打地鼠 — 地鼠出洞预览</h2>
+<div class="desc">
+  完全复刻固件坐标逻辑（容器裁剪 = <code>overflow:hidden</code>）：<br>
+  • 容器(<span style="color:#0cf">青虚线</span>)底边 = <b>HOLE_BOTTOM_Y</b>(地面线 <span style="color:#f66">红虚线</span>)，高 = WHACK_MOLE_H(117)，容器顶 = 底-高。<br>
+  • 地鼠相对容器顶部的 y = <b>mole_y</b>：=hide_y(117) 整只沉到容器底以下被裁→看不见；=show_y(0) 完整钻出。<br>
+  • 拖滑块调到满意，把对应宏值填回固件即可。
+</div>
+
+<div class="stage-wrap">
+  <div class="screen" id="screen">
+    <div class="groundline" id="gline"></div>
+    <div class="hole" id="holeL"><div class="mole" id="moleL"></div></div>
+    <div class="hole" id="holeR"><div class="mole" id="moleR"></div></div>
+  </div>
+
+  <div class="panel">
+    <div class="row"><label>HOLE_BOTTOM_Y(地面线)</label><input type="range" id="bottomY" min="150" max="240" value="218"><span class="val" id="bottomYv">218</span></div>
+    <div class="row"><label>容器高(WHACK_MOLE_H)</label><input type="range" id="moleH" min="60" max="160" value="117"><span class="val" id="moleHv">117</span></div>
+    <div class="row"><label>show_y(露出位置)</label><input type="range" id="showY" min="-40" max="117" value="0"><span class="val" id="showYv">0</span></div>
+    <div class="row"><label>左洞中心 x</label><input type="range" id="cxL" min="40" max="160" value="85"><span class="val" id="cxLv">85</span></div>
+    <div class="row"><label>左洞地鼠微调 dx</label><input type="range" id="dxL" min="-30" max="30" value="-6"><span class="val" id="dxLv">-6</span></div>
+    <div style="margin-top:14px">
+      <button id="btnHide">藏(hide_y)</button>
+      <button id="btnShow">露(show_y)</button>
+      <button id="btnAnim">&#9654; 出洞动画</button>
+    </div>
+    <div class="calc" id="calc"></div>
+  </div>
+</div>
+
+<script>
+const MOLE_W = 100;
+const HOLE_W = 118;
+const cxR = 240, dxR = 0;
+const el = id => document.getElementById(id);
+const holeL = el('holeL'), holeR = el('holeR');
+const moleL = el('moleL'), moleR = el('moleR');
+
+function layout(){
+  const bottomY = +el('bottomY').value;
+  const moleH   = +el('moleH').value;
+  const showY   = +el('showY').value;
+  const cxL     = +el('cxL').value;
+  const dxL     = +el('dxL').value;
+  const hideY   = moleH;
+  const topY    = bottomY - moleH;
+
+  el('bottomYv').textContent = bottomY;
+  el('moleHv').textContent = moleH;
+  el('showYv').textContent = showY;
+  el('cxLv').textContent = cxL;
+  el('dxLv').textContent = dxL;
+  el('gline').style.top = bottomY + 'px';
+
+  const groups = [[holeL,moleL,cxL,dxL],[holeR,moleR,cxR,dxR]];
+  for (const g of groups){
+    const hole=g[0], mole=g[1], cx=g[2], dx=g[3];
+    hole.style.left   = (cx - HOLE_W/2) + 'px';
+    hole.style.top    = topY + 'px';
+    hole.style.width  = HOLE_W + 'px';
+    hole.style.height = moleH + 'px';
+    mole.style.height = moleH + 'px';
+    mole.style.left   = ((HOLE_W - MOLE_W)/2 + dx) + 'px';
+    mole.style.top    = (mole.dataset.y !== undefined ? mole.dataset.y : hideY) + 'px';
+  }
+
+  el('calc').textContent =
+    '容器顶 topY  = bottomY - moleH = ' + bottomY + ' - ' + moleH + ' = ' + topY + '\n' +
+    'hide_y(藏)   = moleH = ' + hideY + '  (沉到容器底以下被裁)\n' +
+    'show_y(露)   = ' + showY + '\n' +
+    '露出地鼠顶 屏幕y = topY + show_y = ' + (topY + showY) + '\n' +
+    '露出地鼠底 屏幕y = topY + show_y + moleH = ' + (topY + showY + moleH);
+}
+
+function setY(y){
+  moleL.dataset.y = y; moleR.dataset.y = y;
+  moleL.style.top = y+'px'; moleR.style.top = y+'px';
+}
+
+el('btnHide').onclick = function(){ setY(+el('moleH').value); };
+el('btnShow').onclick = function(){ setY(+el('showY').value); };
+el('btnAnim').onclick = function(){
+  const hideY = +el('moleH').value, showY = +el('showY').value;
+  let y = hideY; setY(y);
+  const t = setInterval(function(){
+    y -= 8;
+    if (y <= showY){ y = showY; clearInterval(t); }
+    setY(y);
+  }, 40);
+};
+
+document.querySelectorAll('input[type=range]').forEach(function(r){ r.oninput = layout; });
+layout();
+setY(+el('moleH').value);
+</script>
+</body>
+</html>

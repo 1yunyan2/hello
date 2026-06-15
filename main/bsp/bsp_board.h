@@ -304,6 +304,22 @@ void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms);
  */
 void bsp_servo_move_all_parallel(float head_target, float larm_target, float rarm_target, uint32_t step_ms);
 
+/**
+ * @brief 请求中止正在进行的舵机插值运动（立即停在当前角度）
+ *
+ * 置打断标志，bsp_servo_move_all_parallel / bsp_servo_move_smooth 的插值步循环
+ * 每步检查，为真则立即停止（不走完整个行程）。供 servo_manager_flush 调用，
+ * 使进功能盘/强制回主时舵机最坏只滞后一个插值步（几十 ms）即停。
+ * @note 打断后须由上层调 bsp_servo_clear_abort() 清标志，否则后续运动会被立即中止。
+ */
+void bsp_servo_request_abort(void);
+
+/** @brief 清除舵机打断标志（上层在「打断后、开始新动作前」调用） */
+void bsp_servo_clear_abort(void);
+
+/** @brief 查询当前是否有舵机打断请求（true=已请求中止） */
+bool bsp_servo_abort_requested(void);
+
 // ─── 7. 触摸事件与接口 (整合自 bsp_touch.h) ───────────────────────────────
 
 /**
@@ -312,19 +328,20 @@ void bsp_servo_move_all_parallel(float head_target, float larm_target, float rar
 typedef enum
 {
     TOUCH_EVENT_NONE = 0,
-    // 单位置触摸（仅短按 1s，按住释放后才触发；参与组合时不触发）
-    TOUCH_EVENT_SHORT_HEAD,    // 1头部短按
-    TOUCH_EVENT_SHORT_ABDOMEN, // 2腹部短按
-    TOUCH_EVENT_SHORT_BACK,    // 3背部短按
-    // 双位置组合触摸
-    TOUCH_EVENT_COMBO_HEAD_ABDOMEN, // 4头部+腹部同时按
-    TOUCH_EVENT_COMBO_HEAD_BACK,    // 5头部+背部同时按
-    TOUCH_EVENT_COMBO_ABDOMEN_BACK, // 6腹部+背部同时按
-    // 翻页控制触摸（按住释放后触发：≥1s 翻页，≥3s 进入功能菜单）
-    TOUCH_EVENT_SHORT_PREV_PAGE, // 7前一页：短按
-    TOUCH_EVENT_SHORT_NEXT_PAGE, // 8后一页：短按
-    TOUCH_EVENT_LONG_PREV_PAGE,  // 9前一页：长按 → 进入功能菜单
-    TOUCH_EVENT_LONG_NEXT_PAGE   // 10后一页：长按 → 进入功能菜单
+    // 单位置触摸
+    TOUCH_EVENT_SHORT_HEAD,    // 1 头部短按（主界面情绪/游戏确认）
+    TOUCH_EVENT_LONG_HEAD,     // 2 头部长按（≥800ms）→ 各层通用退出/返回
+    TOUCH_EVENT_SHORT_ABDOMEN, // 3 腹部短按（仅主界面情绪，不参与应用/游戏）
+    TOUCH_EVENT_SHORT_BACK,    // 4 背部短按（仅主界面情绪，不参与应用/游戏）
+    // 双位置组合触摸（仅主界面）
+    TOUCH_EVENT_COMBO_HEAD_ABDOMEN, // 5 头部+腹部同时按
+    TOUCH_EVENT_COMBO_HEAD_BACK,    // 6 头部+背部同时按
+    TOUCH_EVENT_COMBO_ABDOMEN_BACK, // 7 腹部+背部同时按
+    // 翻页控制触摸
+    TOUCH_EVENT_SHORT_PREV_PAGE, // 8  前一页：短按
+    TOUCH_EVENT_SHORT_NEXT_PAGE, // 9  后一页：短按
+    TOUCH_EVENT_LONG_PREV_PAGE,  // 10 前一页：长按 → 进入功能菜单
+    TOUCH_EVENT_LONG_NEXT_PAGE   // 11 后一页：长按 → 进入功能菜单
 } touch_event_t;
 
 /**
@@ -341,22 +358,63 @@ void touch_scan_task(void *pvParameters);
 bool bsp_touch_get_event(touch_event_t *out_event);
 
 /**
- * @brief 震动马达单次脉冲（触觉反馈）
+ * @brief 获取最近一次翻页键（左/右耳）从按下到松手的按压时长（毫秒）
+ *
+ * 用途：跳一跳游戏的「长按蓄力」——按住越久跳得越远。
+ * 触摸层在松手判定那一刻已算出 held 时长（见 update_page_btn），
+ * 原本仅用于区分短按/长按后丢弃；此处把它保留导出，供游戏读取。
+ *
+ * 时序：每收到一个 SHORT_PREV/NEXT_PAGE 或 LONG_PREV/NEXT_PAGE 事件后，
+ *       立即调用本函数即可拿到该次按压的真实时长。值会被下一次按压覆盖。
+ *
+ * @return 最近一次翻页键按压时长（毫秒）；从未按过返回 0
+ */
+uint32_t bsp_touch_last_page_hold_ms(void);
+
+/**
+ * @brief 查询翻页键当前实时按压时长（毫秒）
+ *
+ * 供跳一跳 engine_cb 每帧驱动「按住期间小人/台子压扁 + 蓄力条实时增长」。
+ * 未按住任何翻页键时返回 0。
+ */
+uint32_t bsp_touch_page_held_ms(void);
+
+/**
+ * @brief 震动马达单次脉冲（触觉反馈，默认强度，约 30ms）
+ * @note 内部以 LEDC PWM 输出，强度由 BSP_MOTOR_DEFAULT_STRENGTH 决定
  */
 void bsp_motor_pulse(void);
+
+/**
+ * @brief 设置震动马达持续输出强度
+ * @param strength 震动强度百分比 0~100：0=停止，100=最强
+ * @note 通过 LEDC 占空比实现，数值越大震感越强；
+ *       调用后马达保持该强度持续震动，需自行调用 bsp_motor_set(0) 停止。
+ */
+void bsp_motor_set(uint8_t strength);
+
+/**
+ * @brief 震动马达带强度的单次脉冲
+ * @param strength 震动强度百分比 0~100
+ * @param ms       持续时长（毫秒），结束后自动停止
+ * @note 内部含 vTaskDelay 阻塞，仅可在任务上下文调用
+ */
+void bsp_motor_pulse_level(uint8_t strength, uint32_t ms);
+
+/**
+ * @brief 震动 PWM 方波测试任务（仅调试用）
+ *
+ * 循环把占空比设为 0→25→50→75→100，每档持续 3 秒，串口打印当前档位。
+ * 用 bsp_motor_set() 持续输出，便于示波器观测 5kHz PWM 方波（时基 ~50µs/格）。
+ * 在 application.c 里 xTaskCreate 启动；测试完成后注释掉创建代码即可。
+ */
+void motor_pwm_test_task(void *pvParameters);
 
 /**
  * @brief 初始化触摸控制器和震动马达（内部调用，无需手动执行）
  * @note 由 touch_scan_task() 内部自动调用
  */
 void bsp_touch_init(void);
-
-/**
- * @brief 扫描触摸控制器（内部调用，无需手动执行）
- * @note 由 touch_scan_task() 循环调用
- * @note 扫描结果将写入 bsp_touch_get_event() 的输出参数
- */
-void bsp_motor_pulse(void);
 
 void bsp_flash_init(void);
 

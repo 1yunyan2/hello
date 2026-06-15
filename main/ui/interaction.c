@@ -18,13 +18,26 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h" // 完成通知信号量
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "esp_heap_caps.h"
+#include <stdatomic.h> // atomic_bool 播放中标志（跨核安全）
 #include "bsp/bsp_board.h"
 #include "ui/ui_port.h"
 
 static const char *TAG = "INTERACTION";
+
+// ─── 情绪播放状态（供 ui_port 自动循环/触摸路由读取，跨核 atomic）──────────────
+// true = 正在执行某情绪动作。置位早于 GIF/震动，清位在动作完成（含归中）之后。
+static atomic_bool s_ia_playing = ATOMIC_VAR_INIT(false);
+// 情绪舵机动作完成信号量：worker 入队舵机请求带此 sem，servo_manager 执行完 give。
+static SemaphoreHandle_t s_ia_done_sem = NULL;
+
+bool interaction_is_playing(void)
+{
+    return atomic_load(&s_ia_playing);
+}
 
 // ─── Worker task 配置 ────────────────────────────────────────────────────────
 #define INTERACTION_QUEUE_LEN 8     ///< 最多缓存 4 个待执行情绪（超出时丢弃新请求）
@@ -57,13 +70,46 @@ typedef struct
 } ActionStep_t;
 
 /**
+ * @brief 单段震动步骤
+ *
+ * 一个情绪可挂一串 VibStep_t，按顺序逐段播放，实现「一个情绪/GIF 多个
+ * 强度时长各不相同的震动」。每段：先以 strength 强度震 on_ms，再静默 off_ms。
+ *   strength 0~100（LEDC 占空比，需中间值才是真 PWM 方波；0/100 为直流端点）
+ */
+typedef struct
+{
+    uint8_t strength;  ///< 该段震动强度 0~100
+    uint16_t on_ms;    ///< 该段震动时长（ms）
+    uint16_t off_ms;   ///< 该段结束后的静默间隔（ms），最后一段可填 0
+} VibStep_t;
+
+/* ── 命名震动序列（对应情绪队列表 D 列的 10 种震动类型）────────────────────
+ * 强度用中间占空比（真 PWM 方波，0/100 为直流端点）。这里是初版手感值，
+ * 烧录后用示波器/体感逐项微调 strength/on_ms/off_ms 即可，不必改结构。
+ * 多个情绪可复用同一序列（同震动类型）。 */
+static const VibStep_t vib_short2[]        = {{70, 50, 50}, {70, 50, 0}};                 // 短促震动 2 次
+static const VibStep_t vib_light1[]        = {{50, 60, 0}};                               // 轻微震动 1 次
+static const VibStep_t vib_light2[]        = {{50, 60, 60}, {50, 60, 0}};                 // 轻微震动 2 次
+static const VibStep_t vib_short_strong2[] = {{85, 50, 50}, {85, 50, 0}};                 // 短促强震动 2 次
+static const VibStep_t vib_strong2[]       = {{100, 90, 70}, {100, 90, 0}};               // 强震动 2 次
+static const VibStep_t vib_fast_cont[]     = {{80, 30, 25}, {80, 30, 25}, {80, 30, 25},   // 连续/快速连续震动
+                                              {80, 30, 25}, {80, 30, 0}};
+static const VibStep_t vib_slow_long1[]    = {{45, 400, 0}};                              // 缓慢长震动 1 次
+static const VibStep_t vib_soft_cont[]     = {{35, 500, 0}};                              // 持续轻柔震动
+static const VibStep_t vib_intermittent[]  = {{45, 40, 120}, {45, 40, 120},               // 轻微间断震动
+                                              {45, 40, 120}, {45, 40, 0}};
+/* 「无震动」用 vib_seq = NULL 表示，无需定义序列。 */
+
+/**
  * @brief 情绪矩阵行：情绪 ID → 全套硬件动作映射
  */
 typedef struct
 {
     robot_emotion_t emotion_id; ///< 情绪枚举 ID（查表键）
-    const char *screen_anim;    ///< 屏幕动画标识（传给 UI 层，预留）
-    uint8_t motor_mode;         ///< 震动马达模式 (0=无 1=轻1次 2=短促2次 3=连续 4=长1次)
+    const char *screen_anim;    ///< 屏幕动画标识（人类可读描述，仅日志用）
+    const char *gif_path;       ///< 该情绪的 GIF 路径（占位符，后续接外挂flash）；NULL=不切图
+    const VibStep_t *vib_seq;   ///< 震动序列（NULL=无震动）；按段顺序播放，与 GIF 大致同期
+    uint8_t vib_seq_len;        ///< 震动序列长度（段数）
     const char *audio_file;     ///< 音效文件名（传给音频层，预留）
     ActionStep_t head;          ///< 头部舵机（CH_HEAD）
     ActionStep_t left_arm;      ///< 左臂舵机（CH_L_ARM）
@@ -84,7 +130,9 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     {
         .emotion_id = EMO_HAPPY,
         .screen_anim = "anim_happy_stars",
-        .motor_mode = 2,
+        .gif_path = "S:/gif/one.gif", // 占位→one(活泼)；真GIF就绪后改为 happy.gif
+        .vib_seq = vib_short2, // 短促震动 2 次
+        .vib_seq_len = 2,
         .audio_file = "laugh_short.mp3",
         .head = {120.0f, 60.0f, SERVO_SPEED_FAST, 3},    // 左30→右30，快速×3
         .left_arm = {110.0f, 70.0f, SERVO_SPEED_MID, 2}, // 前20→后20，中速×2
@@ -96,7 +144,9 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     {
         .emotion_id = EMO_CURIOUS,
         .screen_anim = "anim_curious_q",
-        .motor_mode = 1,
+        .gif_path = "S:/gif/two.gif", // 占位→two(好奇)；真GIF就绪后改为 curious.gif
+        .vib_seq = vib_light1,
+        .vib_seq_len = 1,
         .audio_file = "doubt.mp3",
         .head = {115.0f, 65.0f, SERVO_SPEED_SLOW, 2},     // 左25→右25，慢×2
         .left_arm = {120.0f, 90.0f, SERVO_SPEED_SLOW, 1}, // 前30→归中，慢×1
@@ -108,7 +158,8 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     {
         .emotion_id = EMO_TSUNDERE,
         .screen_anim = "anim_tsundere",
-        .motor_mode = 0,
+        .gif_path = "S:/gif/two.gif", // 占位→two(好奇系)；真GIF就绪后改为 tsundere.gif
+        // 无震动：vib_seq 留空（NULL）
         .audio_file = "hmph.mp3",
         .head = {105.0f, 90.0f, SERVO_SPEED_VERY_SLOW, 1}, // 左15→归中，极慢×1
         .left_arm = {60.0f, 90.0f, SERVO_SPEED_FAST, 1},   // 后30→归中，快×1
@@ -120,7 +171,9 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     {
         .emotion_id = EMO_TICKLISH,
         .screen_anim = "anim_ticklish",
-        .motor_mode = 3,
+        .gif_path = "S:/gif/one.gif", // 占位→one(活泼)；真GIF就绪后改为 ticklish.gif
+        .vib_seq = vib_fast_cont, // 连续快速震动
+        .vib_seq_len = 5,
         .audio_file = "ticklish.mp3",
         .head = {105.0f, 75.0f, SERVO_SPEED_VERY_FAST, 5}, // 左15→右15，极快×5
         .left_arm = {115.0f, 65.0f, SERVO_SPEED_FAST, 3},  // 前25→后25，快×3
@@ -132,7 +185,9 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     {
         .emotion_id = EMO_SLEEPY,
         .screen_anim = "anim_sleepy",
-        .motor_mode = 0,
+        .gif_path = "S:/gif/four.gif", // 占位→four(犯困)；真GIF就绪后改为 sleepy.gif
+        .vib_seq = vib_slow_long1, // 缓慢长震动 1 次
+        .vib_seq_len = 1,
         .audio_file = "yawn.mp3",
         .head = {115.0f, 65.0f, SERVO_SPEED_VERY_SLOW, 1},    // 左25→右25，极慢×1
         .left_arm = {70.0f, 90.0f, SERVO_SPEED_VERY_SLOW, 1}, // 后20（下垂）→归中
@@ -144,7 +199,9 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     {
         .emotion_id = EMO_GRIEVED,
         .screen_anim = "anim_grieved",
-        .motor_mode = 0,
+        .gif_path = "S:/gif/four.gif", // 占位→four(低落)；真GIF就绪后改为 grieved.gif
+        .vib_seq = vib_intermittent, // 轻微间断震动
+        .vib_seq_len = 4,
         .audio_file = "sob.mp3",
         .head = {100.0f, 90.0f, SERVO_SPEED_SLOW, 1},    // 左10→归中，慢×1
         .left_arm = {65.0f, 90.0f, SERVO_SPEED_SLOW, 1}, // 后25→归中，慢×1
@@ -156,7 +213,9 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     {
         .emotion_id = EMO_COMFORTABLE,
         .screen_anim = "anim_comfortable",
-        .motor_mode = 1,
+        .gif_path = "S:/gif/three.gif", // 占位→three(舒缓)；真GIF就绪后改为 comfortable.gif
+        .vib_seq = vib_soft_cont, // 持续轻柔震动
+        .vib_seq_len = 1,
         .audio_file = "sigh_happy.mp3",
         .head = {105.0f, 75.0f, SERVO_SPEED_SLOW, 2},     // 左15→右15，慢×2
         .left_arm = {100.0f, 90.0f, SERVO_SPEED_SLOW, 1}, // 前10→归中，慢×1
@@ -168,7 +227,9 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     {
         .emotion_id = EMO_ACT_CUTE,
         .screen_anim = "anim_act_cute",
-        .motor_mode = 2,
+        .gif_path = "S:/gif/three.gif", // 占位→three(舒缓)；真GIF就绪后改为 act_cute.gif
+        .vib_seq = vib_light2, // 轻微震动 2 次
+        .vib_seq_len = 2,
         .audio_file = "cute.mp3",
         .head = {110.0f, 90.0f, SERVO_SPEED_MID, 2},     // 左20→归中，中速×2
         .left_arm = {120.0f, 90.0f, SERVO_SPEED_MID, 2}, // 前30→归中，中速×2
@@ -180,7 +241,9 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     {
         .emotion_id = EMO_ANGRY,
         .screen_anim = "anim_angry",
-        .motor_mode = 2,
+        .gif_path = "S:/gif/one.gif", // 占位→one(强烈)；真GIF就绪后改为 angry.gif
+        .vib_seq = vib_strong2, // 强震动 2 次
+        .vib_seq_len = 2,
         .audio_file = "angry.mp3",
         .head = {120.0f, 60.0f, SERVO_SPEED_FAST, 3},     // 左30→右30，快×3
         .left_arm = {125.0f, 70.0f, SERVO_SPEED_FAST, 2}, // 前35→后20，快×2
@@ -192,7 +255,9 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     {
         .emotion_id = EMO_SHY,
         .screen_anim = "anim_shy",
-        .motor_mode = 1,
+        .gif_path = "S:/gif/three.gif", // 占位→three(舒缓)；真GIF就绪后改为 shy.gif
+        .vib_seq = vib_light1, // 轻微震动 1 次
+        .vib_seq_len = 1,
         .audio_file = "shy.mp3",
         .head = {80.0f, 90.0f, SERVO_SPEED_SLOW, 1},      // 右10→归中，慢×1
         .left_arm = {105.0f, 90.0f, SERVO_SPEED_SLOW, 1}, // 前15→归中，慢×1
@@ -204,7 +269,9 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     {
         .emotion_id = EMO_SURPRISED,
         .screen_anim = "anim_surprised",
-        .motor_mode = 1,
+        .gif_path = "S:/gif/one.gif", // 占位→one(强烈)；真GIF就绪后改为 surprised.gif
+        .vib_seq = vib_short_strong2, // 短促强震动 2 次
+        .vib_seq_len = 2,
         .audio_file = "surprise.mp3",
         .head = {115.0f, 65.0f, SERVO_SPEED_FAST, 1},     // 左25→右25，快×1
         .left_arm = {125.0f, 90.0f, SERVO_SPEED_FAST, 1}, // 前35→归中，快×1
@@ -216,7 +283,9 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     {
         .emotion_id = EMO_SLUGGISH,
         .screen_anim = "anim_sluggish",
-        .motor_mode = 0,
+        .gif_path = "S:/gif/four.gif", // 占位→four(困倦)；真GIF就绪后改为 sluggish.gif
+        .vib_seq = vib_slow_long1, // 缓慢长震动 1 次
+        .vib_seq_len = 1,
         .audio_file = "lazy.mp3",
         .head = {100.0f, 80.0f, SERVO_SPEED_VERY_SLOW, 1},    // 左10→右10，极慢×1
         .left_arm = {75.0f, 90.0f, SERVO_SPEED_VERY_SLOW, 1}, // 后15→归中，极慢×1
@@ -228,7 +297,9 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     {
         .emotion_id = EMO_HEALING,
         .screen_anim = "anim_healing",
-        .motor_mode = 1,
+        .gif_path = "S:/gif/three.gif", // 占位→three(舒缓)；真GIF就绪后改为 healing.gif
+        .vib_seq = vib_soft_cont, // 持续轻柔震动
+        .vib_seq_len = 1,
         .audio_file = "healing.mp3",
         .head = {105.0f, 75.0f, SERVO_SPEED_SLOW, 2},     // 左15→右15，慢×2
         .left_arm = {100.0f, 90.0f, SERVO_SPEED_SLOW, 2}, // 前10→归中，慢×2
@@ -240,7 +311,9 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     {
         .emotion_id = EMO_EXCITED,
         .screen_anim = "anim_excited",
-        .motor_mode = 2,
+        .gif_path = "S:/gif/one.gif", // 占位→one(活泼)；真GIF就绪后改为 excited.gif
+        .vib_seq = vib_fast_cont, // 快速连续震动
+        .vib_seq_len = 5,
         .audio_file = "excited.mp3",
         .head = {120.0f, 60.0f, SERVO_SPEED_FAST, 4},     // 左30→右30，快×4
         .left_arm = {125.0f, 60.0f, SERVO_SPEED_FAST, 3}, // 前35→后30，快×3
@@ -251,7 +324,9 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     {
         .emotion_id = EMO_SHY_RUB,
         .screen_anim = "anim_shy_rub",
-        .motor_mode = 2,
+        .gif_path = "S:/gif/three.gif", // 占位→three(舒缓)；真GIF就绪后改为 shy_rub.gif
+        .vib_seq = vib_light2, // 轻微震动 2 次
+        .vib_seq_len = 2,
         .audio_file = "shy_rub.mp3",
         .head = {105.0f, 75.0f, SERVO_SPEED_VERY_SLOW, 4},
         .left_arm = {105.0f, 90.0f, SERVO_SPEED_SLOW, 1},
@@ -263,7 +338,9 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     {
         .emotion_id = EMO_COMFORTABLE_ROLL,
         .screen_anim = "anim_comfortable_roll",
-        .motor_mode = 1, // 当前代码无“持续轻柔”，暂以1代
+        .gif_path = "S:/gif/three.gif", // 占位→three(舒缓)；真GIF就绪后改为 comfortable_roll.gif
+        .vib_seq = vib_soft_cont, // 持续轻柔震动
+        .vib_seq_len = 1,
         .audio_file = "purr.mp3",
         .head = {120.0f, 60.0f, SERVO_SPEED_SLOW, 2},
         .left_arm = {70.0f, 100.0f, SERVO_SPEED_VERY_SLOW, 2},
@@ -275,7 +352,8 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     {
         .emotion_id = EMO_TSUNDERE_PET,
         .screen_anim = "anim_tsundere_pet",
-        .motor_mode = 0,
+        .gif_path = "S:/gif/two.gif", // 占位→two(好奇系)；真GIF就绪后改为 tsundere_pet.gif
+        // 无震动：vib_seq 留空（NULL）
         .audio_file = "hmph_pet.mp3",
         .head = {105.0f, 75.0f, SERVO_SPEED_VERY_SLOW, 3},
         .left_arm = {60.0f, 90.0f, SERVO_SPEED_FAST, 1},
@@ -287,7 +365,9 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     {
         .emotion_id = EMO_SLUGGISH_SIT,
         .screen_anim = "anim_sluggish_sit",
-        .motor_mode = 4,
+        .gif_path = "S:/gif/four.gif", // 占位→four(困倦)；真GIF就绪后改为 sluggish_sit.gif
+        .vib_seq = vib_slow_long1, // 缓慢长震动 1 次
+        .vib_seq_len = 1,
         .audio_file = "lazy_sit.mp3",
         .head = {100.0f, 80.0f, SERVO_SPEED_VERY_SLOW, 1},
         .left_arm = {100.0f, 90.0f, SERVO_SPEED_VERY_SLOW, 1},
@@ -299,7 +379,9 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     {
         .emotion_id = EMO_SURPRISED_HUG,
         .screen_anim = "anim_surprised_hug",
-        .motor_mode = 4, // 当前代码无“短促强震”，暂以4(长震)代
+        .gif_path = "S:/gif/one.gif", // 占位→one(强烈)；真GIF就绪后改为 surprised_hug.gif
+        .vib_seq = vib_short_strong2, // 短促强震动 2 次（惊喜系）
+        .vib_seq_len = 2,
         .audio_file = "hug_me.mp3",
         .head = {105.0f, 90.0f, SERVO_SPEED_FAST, 1},
         .left_arm = {125.0f, 90.0f, SERVO_SPEED_FAST, 1},
@@ -311,7 +393,9 @@ static const InteractionMatrix_t g_emotion_matrix[] = {
     {
         .emotion_id = EMO_TICKLISH_WIGGLE,
         .screen_anim = "anim_ticklish_wiggle",
-        .motor_mode = 3,
+        .gif_path = "S:/gif/one.gif", // 占位→one(活泼)；真GIF就绪后改为 ticklish_wiggle.gif
+        .vib_seq = vib_fast_cont, // 连续快速震动
+        .vib_seq_len = 5,
         .audio_file = "wiggle_laugh.mp3",
         .head = {110.0f, 70.0f, SERVO_SPEED_VERY_FAST, 5},
         .left_arm = {115.0f, 65.0f, SERVO_SPEED_FAST, 4},
@@ -369,52 +453,30 @@ static void play_square_wave_beep(void)
 // ==========================================
 
 /**
- * @brief 按模式触发震动马达脉冲
+ * @brief 播放一段震动序列（按段顺序：震 on_ms → 停 off_ms）
  *
- * @param mode  0=无  1=轻1次50ms  2=短促2次  3=连续3次  4=长震1次200ms
+ * 实现「一个情绪/GIF 可挂多个强度、时长各不相同的震动」。逐段执行，
+ * 不与 GIF 帧精确对齐，触发时一口气播完即可（与 GIF 大致同期）。
+ * 马达已升级 LEDC PWM（见 bsp_touch.c），强度即占空比；中间值才是真方波，
+ * 0/100 为直流端点。强度统一走 bsp_motor_pulse_level()，不直接操作 GPIO。
+ *
+ * @param seq  震动序列数组（NULL 表示无震动，直接返回）
+ * @param len  序列段数
  */
-static void trigger_vibration_motor(uint8_t mode)
+static void trigger_vibration_motor(const VibStep_t *seq, uint8_t len)
 {
-    if (mode == 0)
+    if (seq == NULL || len == 0)
         return;
 
-    if (mode == 1)
+    for (uint8_t i = 0; i < len; i++)
     {
-        // 轻微 1 次（50ms）
-        gpio_set_level(BSP_MOTOR_VIB_PIN, 0);
-        vTaskDelay(pdMS_TO_TICKS(50));
-        gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
-    }
-    else if (mode == 2)
-    {
-        // 短促 2 次（50ms × 2，间隔 50ms）
-        for (int i = 0; i < 2; i++)
-        {
-            gpio_set_level(BSP_MOTOR_VIB_PIN, 0);
-            vTaskDelay(pdMS_TO_TICKS(50));
-            gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
-            if (i < 1)
-                vTaskDelay(pdMS_TO_TICKS(50)); // 两次之间间隔
-        }
-    }
-    else if (mode == 3)
-    {
-        // 连续 3 次（30ms × 3，间隔 30ms）
-        for (int i = 0; i < 3; i++)
-        {
-            gpio_set_level(BSP_MOTOR_VIB_PIN, 0);
-            vTaskDelay(pdMS_TO_TICKS(30));
-            gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
-            if (i < 2)
-                vTaskDelay(pdMS_TO_TICKS(30));
-        }
-    }
-    else if (mode == 4)
-    {
-        // 长震 1 次（200ms）
-        gpio_set_level(BSP_MOTOR_VIB_PIN, 0);
-        vTaskDelay(pdMS_TO_TICKS(200));
-        gpio_set_level(BSP_MOTOR_VIB_PIN, 1);
+        // 本段震动：strength 强度持续 on_ms（on_ms=0 则跳过震动，只保留停顿）
+        if (seq[i].on_ms > 0)
+            bsp_motor_pulse_level(seq[i].strength, seq[i].on_ms);
+
+        // 段间静默间隔（最后一段若 off_ms=0 则不停顿，立即结束）
+        if (seq[i].off_ms > 0)
+            vTaskDelay(pdMS_TO_TICKS(seq[i].off_ms));
     }
 }
 
@@ -457,6 +519,21 @@ static void interaction_play_blocking(robot_emotion_t target_emotion)
 
     ESP_LOGI(TAG, ">>> 开始执行情绪动画: %d (%s) <<<", (int)target_emotion, cmd->screen_anim);
 
+    // ── 0. 置「情绪播放中」标志 + 清队（必须早于 GIF/震动/舵机）──────────────────
+    // 置位后：主界面自动 GIF 循环立刻让位（不切图、不入舵机请求），触摸路由屏蔽新情绪。
+    // ★ 必须 flush：从「触摸」到「worker 置此标志」有 50~150ms 延迟，期间自动循环已往
+    //   servo_manager 队列塞了 2~3 条旧舵机请求。标志只能拦「之后」的新入队，拦不掉
+    //   已堆积的旧请求。不清的话情绪舵机要排在旧请求后，表现为「GIF 已切、舵机还在做
+    //   上一个动作」（现象1）。flush 清队 + 打断当前 + 归中，让情绪舵机从干净状态起步。
+    atomic_store(&s_ia_playing, true);
+    servo_manager_flush();
+
+    // ── 2. 屏幕 GIF 切换（跨线程安全）─────────────────────────────────────────
+    // 本任务（ia_worker）栈在 SPIRAM，禁 cache 时不能直接调 lv_gif_set_src（BUG-010）。
+    // ui_request_emotion_gif 只设 pending 标记 + 唤醒 LVGL 线程的延迟 timer，由其
+    // 在 LVGL 线程真正切图，安全。gif_path 为 NULL 的情绪（如无 GIF）会被内部忽略。
+    ui_request_emotion_gif(cmd->gif_path);
+
     // ── 3. 音频播放（方波占位，真实文件接入后f替换）──────────────────────────
     // 注：lv_gif_set_src 会访问 SPIFFS（SPI flash），ia_worker 栈在 SPIRAM，
     //     禁用 cache 时 SPIRAM 不可访问，因此不能在此任务中调用屏幕动画。
@@ -465,37 +542,45 @@ static void interaction_play_blocking(robot_emotion_t target_emotion)
     // play_square_wave_beep(); // 播放方波占位音频
 
     // ── 4. 震动马达 ──────────────────────────────────────────────────────────
-    trigger_vibration_motor(cmd->motor_mode);
+    // 按情绪表配置的震动序列逐段播放（强度/时长/间隔每段独立；NULL=无震动）
+    trigger_vibration_motor(cmd->vib_seq, cmd->vib_seq_len);
 
-    // ── 5. 舵机三轴动作序列 ─────────────────────────────────────────────────
-    // 以三轴中循环次数最多的为外层循环次数，保证全轴都完整执行
-    uint8_t max_loop = cmd->head.count;
-    if (cmd->left_arm.count > max_loop)
-        max_loop = cmd->left_arm.count;
-    if (cmd->right_arm.count > max_loop)
-        max_loop = cmd->right_arm.count;
+    // ── 5. 舵机三轴动作序列（改为入队 servo_manager，统一执行体）───────────────
+    // 把整个情绪压成【一条】绝对角度并行请求，交给 servo_manager worker 执行：
+    //   - 三轴各 angle_1↔angle_2 往返 count 次，执行完由 worker 统一归中 90°；
+    //   - 带 s_ia_done_sem，执行完（正常 或 被 servo_manager_flush 打断）后 give；
+    //   - 统一执行体保证情绪/自动循环/待机互斥，且进功能盘 flush 能打断本动作。
+    // 情绪表 ActionStep_t 是绝对角度，1:1 填入绝对角度请求，无换算误差（plan R5）。
+    servo_abs_parallel_request_t preq = {
+        .head  = {cmd->head.angle_1, cmd->head.angle_2, cmd->head.speed, cmd->head.count},
+        .l_arm = {cmd->left_arm.angle_1, cmd->left_arm.angle_2, cmd->left_arm.speed, cmd->left_arm.count},
+        .r_arm = {cmd->right_arm.angle_1, cmd->right_arm.angle_2, cmd->right_arm.speed, cmd->right_arm.count},
+    };
 
-    for (uint8_t loop = 0; loop < max_loop; loop++)
+    // 清掉可能残留的旧 done 信号（防上一轮超时遗留导致本轮 take 立即返回）
+    xSemaphoreTake(s_ia_done_sem, 0);
+
+    if (servo_manager_submit_abs_parallel_notify(&preq, s_ia_done_sem) == ESP_OK)
     {
-        // 前半段：三轴同时运动到 angle_1（未参与的轴保持 90°）
-        bsp_servo_move_all_parallel(
-            (loop < cmd->head.count) ? cmd->head.angle_1 : 90.0f,
-            (loop < cmd->left_arm.count) ? cmd->left_arm.angle_1 : 90.0f,
-            (loop < cmd->right_arm.count) ? cmd->right_arm.angle_1 : 90.0f,
-            cmd->head.speed);
-
-        // 后半段：三轴同时运动到 angle_2
-        bsp_servo_move_all_parallel(
-            (loop < cmd->head.count) ? cmd->head.angle_2 : 90.0f,
-            (loop < cmd->left_arm.count) ? cmd->left_arm.angle_2 : 90.0f,
-            (loop < cmd->right_arm.count) ? cmd->right_arm.angle_2 : 90.0f,
-            cmd->head.speed);
+        // 阻塞等待舵机动作执行完毕（含归中）。10s 超时兜底：万一被 flush 清队
+        // 丢弃了请求导致 give 不发生，也不会永久卡死（plan R4）。
+        if (xSemaphoreTake(s_ia_done_sem, pdMS_TO_TICKS(10000)) != pdTRUE)
+            ESP_LOGW(TAG, "情绪舵机完成等待超时（可能被 flush 打断），继续");
+    }
+    else
+    {
+        ESP_LOGW(TAG, "情绪舵机请求入队失败（队列满？），跳过本次动作");
     }
 
-    // ── 6. 全轴同时归中（恢复待机姿态）──────────────────────────────────────
-    bsp_servo_move_all_parallel(90.0f, 90.0f, 90.0f, SERVO_SPEED_MID);
-
     ESP_LOGI(TAG, ">>> 情绪动作执行完毕: %d <<<", (int)target_emotion);
+
+    // ── 6. 清「情绪播放中」标志 + 恢复主界面自动 GIF 循环 ──────────────────────
+    // 先 flush 再清标志再恢复：清掉情绪期间可能残留的旧舵机请求（理论上已空，
+    // 但兜底防现象2「恢复后 GIF 切好几遍舵机才动」）。flush 必须在 ui_resume 之前——
+    // 否则会把 resume 刚入队的新舵机请求一起清掉。
+    servo_manager_flush();
+    atomic_store(&s_ia_playing, false);
+    ui_resume_main_gif_loop();
 }
 
 // ==========================================
@@ -540,6 +625,16 @@ esp_err_t interaction_manager_init(void)
     if (s_ia_queue == NULL)
     {
         ESP_LOGE(TAG, "创建 interaction 队列失败，内存不足!");
+        return ESP_ERR_NO_MEM;
+    }
+
+    // ── 创建舵机动作完成信号量（worker 等待 servo_manager 执行完毕用）──────────
+    s_ia_done_sem = xSemaphoreCreateBinary();
+    if (s_ia_done_sem == NULL)
+    {
+        ESP_LOGE(TAG, "创建 interaction 完成信号量失败，内存不足!");
+        vQueueDelete(s_ia_queue);
+        s_ia_queue = NULL;
         return ESP_ERR_NO_MEM;
     }
 

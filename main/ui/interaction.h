@@ -76,3 +76,15 @@ esp_err_t interaction_manager_init(void);
  * @note 若队列已满（连续触发超过 INTERACTION_QUEUE_LEN），新情绪将被丢弃并打印警告
  */
 void ui_interaction_play(robot_emotion_t target_emotion);
+
+/**
+ * @brief 查询当前是否正在播放某情绪动作（线程安全，跨核 atomic）
+ *
+ * 供主界面自动 GIF 循环（ui_port.c）与触摸路由读取：
+ *   - 自动循环：播放中暂停切图 + 暂停舵机入队，让位给情绪；
+ *   - 触摸路由：播放中屏蔽新的情绪触摸（丢弃，不排队不打断）。
+ * 标志在情绪动作开始（早于 GIF/震动）置位，动作完成（含归中）后清位。
+ *
+ * @return true=正在播放情绪，false=空闲
+ */
+bool interaction_is_playing(void);

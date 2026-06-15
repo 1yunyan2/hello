@@ -48,8 +48,8 @@ uint32_t bsp_touch_last_page_hold_ms(void)
  * 与扫描任务共享内存，无锁（uint32_t 对齐读原子安全，最坏差一个扫描帧 ≈20ms）。
  */
 // ── 公共时序参数 ──────────────────────────────────────────────────────────────
-#define BODY_PRESS_MIN_MS 200
-#define PAGE_SHORT_PRESS_MIN_MS 100
+#define BODY_PRESS_MIN_MS 10       // 身体键最短按压时长（ms），低于这个值的按压会被丢弃（防误触）
+#define PAGE_SHORT_PRESS_MIN_MS 10 // 翻页键短按最短时长（ms），低于这个值的按压会被丢弃（防误触）
 #define PAGE_LONG_PRESS_MS 1000
 #define PRESS_DEBOUNCE 2
 #define RELEASE_DEBOUNCE 3

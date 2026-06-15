@@ -35,6 +35,7 @@
 #include "ui/interaction.h"
 #include "ui/reminder.h"
 #include "ui/standby.h"
+#include "esp_lvgl_port.h"
 #define TAG "Application"
 
 /** @brief 打印当前内部 SRAM 剩余空间（追踪初始化内存消耗） */
@@ -219,14 +220,30 @@ static void servo_test_task(void *arg)
  */
 static void wake_word_callback(const char *wake_word_display)
 {
-    ESP_LOGW("WAKE_UP", "唤醒词触发: [%s]", wake_word_display);
+    standby_notify_activity(); // 唤醒命中视为活动，刷新待机倒计时（无论后续是否成会话都算用户活动）
 
-    standby_notify_activity(); // 唤醒命中视为活动，刷新待机倒计时
+    // 先交给 session 处理，由其返回值判定本次唤醒的真实语义。
+    // 注意：提示音必须在 session 判定之后才播——否则打断 TTS 时也会先播提示音，
+    //       造成"唤醒提示音 + 打断"两套逻辑同时触发（见 wake_result_t 说明）。
+    wake_result_t result = session_on_wake_word(wake_word_display);
 
-    // 播放 880Hz 提示音给用户听觉反馈
-    // play_wake_tone();
-
-    session_on_wake_word(wake_word_display);
+    switch (result)
+    {
+    case WAKE_NEW_SESSION:
+        // 真·开启新会话：给用户听觉反馈
+        ESP_LOGW("WAKE_UP", "唤醒词触发（开启新会话）: [%s]", wake_word_display);
+        // play_wake_tone(); // 播放 880Hz 提示音
+        break;
+    case WAKE_INTERRUPT:
+        // 打断 TTS：不播提示音，避免打断用户插话的连贯性
+        ESP_LOGW("WAKE_UP", "唤醒词触发（打断 TTS，不播提示音）: [%s]", wake_word_display);
+        break;
+    case WAKE_IGNORED:
+    default:
+        // 被忽略（LISTENING 中 / drain 收尾 / 启动失败）：不打扰用户
+        ESP_LOGW("WAKE_UP", "唤醒词触发（已忽略）: [%s]", wake_word_display);
+        break;
+    }
 }
 
 //
@@ -320,7 +337,11 @@ void application_init(void)
     ui_init();
     vTaskDelay(pdMS_TO_TICKS(100));
     PRINT_INTERNAL_HEAP;
-    bsp_board_lcd_on(bsp_board); // 临时上移到 ui_init 之前
+    if (lvgl_port_lock(1000))
+    {
+        bsp_board_lcd_on(bsp_board);
+        lvgl_port_unlock();
+    }
     // 提醒系统初始化（含 MOCK_TIME 模式下的系统时间设置）
     reminder_init(NULL); // NULL = 暂无 TTS 回调，后续接入 session 层时替换
     PRINT_INTERNAL_HEAP;
@@ -368,16 +389,22 @@ void application_init(void)
     //     tskNO_AFFINITY,
     //     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
-    // 6. 创建触摸扫描任务（栈分配在PSRAM，节省内部SRAM）
+    // 6. 创建触摸扫描任务
+    // ⚠ 栈必须在内部 SRAM，不能放 SPIRAM！
+    //    本任务承载整个 UI 跳转链（含游戏初始化），其中 game_whack 读写 NVS 高分会
+    //    触发 spi_flash_disable_interrupts_caches_and_other_cpu()，期间 cache 被禁用，
+    //    SPIRAM 栈不可访问 → esp_task_stack_is_sane_cache_disabled() 断言 panic（BUG-010 家族）。
+    //    实测进游戏路径栈高水位剩 5888B，即峰值用量仅 2304B，故 4096 足够（留 ~1.7× 余量）。
+    //    内部 SRAM 净增 4KB，换来彻底消除「触摸任务里碰 flash 必崩」隐患。
     ret = xTaskCreatePinnedToCoreWithCaps(
         touch_scan_task,
         "touch_scan",
-        8192,
+        4096,
         NULL,
         4, // 优先级略低于舵机和音频
         NULL,
         tskNO_AFFINITY,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 
     if (ret != pdPASS)
     {
@@ -388,9 +415,15 @@ void application_init(void)
         ESP_LOGI(TAG, "触摸扫描任务创建完成");
     }
 
+    /* ═══ 【震动 PWM 方波测试】临时调试任务 ═══════════════════════════════════
+     * 循环 0→25→50→75→100% 占空比，每档 3 秒，串口打印档位。
+     * 用示波器测 GPIO3（BSP_MOTOR_VIB_PIN），时基 ~50µs/格 可见 5kHz 方波。
+     * 测试完成后，删除/注释本段即可恢复正常逻辑。 */
+    // xTaskCreate(motor_pwm_test_task, "motor_pwm_test", 4096, NULL, 3, NULL);
+
     /* ── 步骤 10.5: 无活动待机模块（依赖 LCD/唤醒词/舵机管理器均已就绪）──── */
-    standby_init();
-    PRINT_INTERNAL_HEAP;
+    // standby_init();
+    // PRINT_INTERNAL_HEAP;
 
     /* ── 步骤 7: 会话模块（WebSocket 预连接）─────────────────────────────── */
 
@@ -420,5 +453,5 @@ void application_init(void)
     ESP_LOGI(TAG, "当前固件版本: %s", bsp_ota_get_current_version());
     bsp_ota_mark_valid();
 
-    ESP_LOGI(TAG, "application_init 1.0.4.1 完成，系统就绪");
+    ESP_LOGI(TAG, "后续版本使用变量");
 }
