@@ -52,7 +52,7 @@
 typedef enum
 {
     SESSION_IDLE,      ///< 待机状态：唤醒词监听中，WebSocket 预连接保持，无音频处理
-    SESSION_LISTENING, ///< 录音状态：麦克风 PCM → OPUS 编码 → WebSocket → 云端大模型
+    SESSION_LISTENING, ///< 监听状态：麦克风 PCM → OPUS 编码 → WebSocket → 云端大模型
     SESSION_PLAYING,   ///< 播放状态：云端 TTS → OPUS 解码 → 扬声器，唤醒词引擎同时监听打断
 } session_state_t;
 
@@ -116,9 +116,9 @@ void session_init(const char *ws_uri);
  */
 typedef enum
 {
-    WAKE_IGNORED = 0,  ///< 本次唤醒被忽略，未开启会话也未打断
-    WAKE_NEW_SESSION,  ///< 开启了一轮新会话（含从 IDLE 启动、连麦等待期主动发起）→ 应播提示音
-    WAKE_INTERRUPT,    ///< 打断了正在播放的 TTS → 不播提示音
+    WAKE_IGNORED = 0, ///< 本次唤醒被忽略，未开启会话也未打断
+    WAKE_NEW_SESSION, ///< 开启了一轮新会话（含从 IDLE 启动、连麦等待期主动发起）→ 应播提示音
+    WAKE_INTERRUPT,   ///< 打断了正在播放的 TTS → 不播提示音
 } wake_result_t;
 
 wake_result_t session_on_wake_word(const char *display);
