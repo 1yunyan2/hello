@@ -15,6 +15,15 @@ static const char *TAG = "BSP_CODEC";
 #define MAX_VOLUME 100
 #define MIN_VOLUME 0
 
+// ── 防爆音（Anti-Pop）软启动参数 ─────────────────────────────────────────────
+// 背景：本板 NS4150 功放的 CTRL 脚仅由 R13 上拉常开，MCU 无法控制功放开关，
+//       ES8311 上电（esp_codec_dev_open）时 VMID/DAC 的电压阶跃会被常开功放
+//       放大成"啵"的一声。软件侧只能用"静音→等稳→渐升音量"减轻 unmute 爆音。
+//       根治需硬件改版：PA_CTRL 接 MCU 空闲 GPIO（候选 GPIO19/20，若不走原生 USB）。
+#define BSP_CODEC_ANTIPOP_VMID_MS 200 // open 后等待 VMID/DAC 偏置稳定的时间（毫秒）
+#define BSP_CODEC_ANTIPOP_STEPS 5     // 音量渐升步数（0 → 目标音量分几步爬）
+#define BSP_CODEC_ANTIPOP_STEP_MS 50  // 每步之间的间隔（毫秒），总爬升时长 = 步数×间隔
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // 私有硬件初始化函数（仅在本文件内使用，外部不可见）
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -466,6 +475,13 @@ void audio_init(bsp_board_t *bsp_board)
     };
     ESP_ERROR_CHECK(esp_codec_dev_open(bsp_board->codec_dev, &sample_info));
 
+    // ── 步骤 2.5：防爆音第一步——open 后立即静音 ─────────────────────────────
+    // open() 内部给 ES8311 DAC 上电，此刻输出端正在产生偏置阶跃。立即把输出
+    // 音量压到 0，确保后续 unmute 不会在偏置未稳时叠加一次满音量跳变。
+    // 注意：此处直接调 esp_codec_dev_set_out_vol（不走 bsp_board_codec_set_volume），
+    //       避免把临时的 0 音量错误持久化到 NVS。
+    esp_codec_dev_set_out_vol(bsp_board->codec_dev, 0);
+
     // ── 步骤 3：设置麦克风增益（ADC PGA 增益，0~100，>50 饱和失真）──────────
     // 增益过小：语音信号弱，VAD 和 MultiNet 识别率下降（必须大声才能触发）
     // 增益过大>50：产生饱和失真，同样影响识别率
@@ -473,8 +489,7 @@ void audio_init(bsp_board_t *bsp_board)
     //        AGC 再做软件自适应补偿，无需大喊即可达到模型所需置信度
     esp_codec_dev_set_in_gain(bsp_board->codec_dev, 48);
 
-    // ── 步骤 4：设置扬声器音量（从 NVS 读回上次保存值，无则用默认 50）──────
-    // 通过统一接口 bsp_board_codec_set_volume() 设置，运行期 MQTT 指令也走同一接口。
+    // ── 步骤 4：读取目标音量（从 NVS 读回上次保存值，无则用默认 50）─────────
     // 此处读 NVS 决定初始值，避免初始化用默认值覆盖云端设过的音量（回环问题）。
     int init_volume = BSP_CODEC_DEFAULT_VOLUME;
     nvs_handle_t nvs;
@@ -487,9 +502,21 @@ void audio_init(bsp_board_t *bsp_board)
         }
         nvs_close(nvs);
     }
-    bsp_board_codec_set_volume(init_volume);
 
-    ESP_LOGI(TAG, "ES8311 初始化完成（增益=48, 音量=%d）", init_volume);
+    // ── 步骤 4.5：防爆音第二步——等偏置稳定后音量渐升到目标值 ────────────────
+    // 先等 VMID/DAC 偏置电压充电完成（阶跃已被静音挡住大半），再分多步小台阶
+    // 爬升音量，每步之间留间隔，把"咔哒"一声摊平成人耳不敏感的缓慢淡入。
+    // 渐升过程同样直接调 esp_codec_dev_set_out_vol，跳过 NVS 写入
+    //（目标值本来就读自 NVS，重复写回是无意义的 Flash 损耗）。
+    vTaskDelay(pdMS_TO_TICKS(BSP_CODEC_ANTIPOP_VMID_MS));
+    for (int step = 1; step <= BSP_CODEC_ANTIPOP_STEPS; step++)
+    {
+        int vol = init_volume * step / BSP_CODEC_ANTIPOP_STEPS; // 整数等分爬升
+        esp_codec_dev_set_out_vol(bsp_board->codec_dev, vol);
+        vTaskDelay(pdMS_TO_TICKS(BSP_CODEC_ANTIPOP_STEP_MS));
+    }
+
+    ESP_LOGI(TAG, "ES8311 初始化完成（增益=48, 音量=%d，防爆音软启动已生效）", init_volume);
 
     // ── 步骤 5：创建麦克风采集任务 ────────────────────────────────────────────
     // 任务立即开始从 I2S DMA 读取 PCM 数据并投喂给 AFE/MultiNet
