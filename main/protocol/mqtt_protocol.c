@@ -177,7 +177,9 @@ static void async_update_wakeword_task(void *pvParameters)
     UBaseType_t high_water_mark = uxTaskGetStackHighWaterMark(NULL);
     ESP_LOGW("WW_TASK", "栈剩余: %lu 字节", (uint32_t)high_water_mark);
     free(params);
-    vTaskDelete(NULL);
+    // ★ 本任务由 xTaskCreatePinnedToCoreWithCaps 创建（4KB INTERNAL 栈，heap_caps 单独分配），
+    //   自删必须用 vTaskDeleteWithCaps，否则栈+TCB 不会被 idle 回收 → 每次唤醒词更新泄漏 ~4KB 内部 SRAM
+    vTaskDeleteWithCaps(NULL);
 }
 
 // 后台心跳发送任务
@@ -239,40 +241,56 @@ static void heartbeat_task(void *arg)
  */
 static void mqtt_reconnect_task(void *arg)
 {
-    // 指数退避：5s → 10s → 20s → 40s → 60s（上限）
-    s_mqtt_reconnect_attempts++;
-    int shift = s_mqtt_reconnect_attempts - 1;
-    if (shift > 4)
-        shift = 4;
-    int delay_ms = MQTT_RECONNECT_BASE_DELAY_MS * (1 << shift);
-    if (delay_ms > 60000)
-        delay_ms = 60000;
+    // ★ BUG-023：esp_mqtt_client_stop 不能在 MQTT 事件回调（MQTT 任务自身上下文）里调用，
+    //   会报 "Client cannot be stopped from MQTT task" 且永远失败 → 内置 25s 自动重连一直活着，
+    //   退避策略形同虚设。改为在本任务（独立上下文）里执行 stop，这才是合法调用点。
+    esp_mqtt_client_stop(s_mqtt_client);
 
-    ESP_LOGW(MQTT_TAG, "MQTT 第 %d 次重连，%d 秒后执行...", s_mqtt_reconnect_attempts, delay_ms / 1000);
-    vTaskDelay(pdMS_TO_TICKS(delay_ms));
-
-    // ★ 检查服务器可达性：不可达时跳过本次重连，避免浪费内部 SRAM
-    if (!auth_is_server_reachable())
+    // ★ 客户端已真正停止后，不再有 DISCONNECTED 事件驱动重连，
+    //   因此"服务器不可达/内存不足"时不能直接退出任务（否则重连链路永久中断），
+    //   必须留在循环里继续退避等待，直到成功调用 start 为止。
+    while (1)
     {
-        ESP_LOGW(MQTT_TAG, "服务器不可达，跳过 MQTT 重连");
-        goto exit;
+        // 指数退避：5s → 10s → 20s → 40s → 60s（上限）
+        s_mqtt_reconnect_attempts++;
+        int shift = s_mqtt_reconnect_attempts - 1;
+        if (shift > 4)
+            shift = 4;
+        int delay_ms = MQTT_RECONNECT_BASE_DELAY_MS * (1 << shift);
+        if (delay_ms > 60000)
+            delay_ms = 60000;
+
+        ESP_LOGW(MQTT_TAG, "MQTT 第 %d 次重连，%d 秒后执行...", s_mqtt_reconnect_attempts, delay_ms / 1000);
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+
+        // ★ 检查服务器可达性：不可达时跳过本次，继续退避等待下一轮
+        if (!auth_is_server_reachable())
+        {
+            ESP_LOGW(MQTT_TAG, "服务器不可达，跳过 MQTT 重连");
+            continue;
+        }
+
+        // 内部 SRAM 不足时跳过本次，继续退避等待下一轮
+        size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (internal_free < 8192)
+        {
+            ESP_LOGW(MQTT_TAG, "[MEM] 内部 SRAM 仅剩 %d B，跳过 MQTT 重连", (int)internal_free);
+            continue;
+        }
+
+        ESP_LOGI(MQTT_TAG, "正在重连 MQTT...");
+        esp_mqtt_client_start(s_mqtt_client);
+        ESP_LOGW(MQTT_TAG, "MQTT 重连尝试完成");
+        // start 之后若连接再次失败，会触发 DISCONNECTED 事件重新创建本任务，
+        // 形成"stop → 退避 → start"的闭环，本轮任务使命完成，退出。
+        break;
     }
 
-    // 内部 SRAM 不足时跳过
-    size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (internal_free < 8192)
-    {
-        ESP_LOGW(MQTT_TAG, "[MEM] 内部 SRAM 仅剩 %d B，跳过 MQTT 重连", (int)internal_free);
-        goto exit;
-    }
-
-    ESP_LOGI(MQTT_TAG, "正在重连 MQTT...");
-    esp_mqtt_client_start(s_mqtt_client);
-    ESP_LOGW(MQTT_TAG, "MQTT 重连尝试完成");
-
-exit:
     s_mqtt_reconnect_handle = NULL;
-    vTaskDelete(NULL);
+    // ★ BUG-023 真凶：本任务由 xTaskCreatePinnedToCoreWithCaps 创建（3KB SPIRAM 栈 + 内部 TCB），
+    //   此前用普通 vTaskDelete(NULL) 自删导致栈/TCB 永不回收，
+    //   每轮重连泄漏 3072B SPIRAM + ~400B 内部 SRAM。必须用 WithCaps 版本。
+    vTaskDeleteWithCaps(NULL);
 }
 
 // MQTT 事件回调函数
@@ -560,8 +578,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGW(MQTT_TAG, "MQTT 已断开，启动退避重连...");
         s_mqtt_connected = false;
 
-        // ★ P3：停止 MQTT 默认自动重连，改为手动指数退避
-        esp_mqtt_client_stop(s_mqtt_client);
+        // ★ P3：停止 MQTT 默认自动重连，改为手动指数退避。
+        //   注意：esp_mqtt_client_stop 严禁在此处调用——本回调运行在 MQTT 任务自身上下文，
+        //   IDF 会拒绝并报 "Client cannot be stopped from MQTT task"（BUG-023）。
+        //   stop 已挪到 mqtt_reconnect_task 任务上下文中执行。
 
         // 创建退避重连任务（如果尚未在运行）
         if (s_mqtt_reconnect_handle == NULL)
