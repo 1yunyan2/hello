@@ -127,7 +127,11 @@ static struct
     int high_score; /* 当前难度历史最高分（进游戏时读 NVS）*/
 
     /* 倒计时 */
-    int cd_value; /* 3 → 2 → 1 → 0(GO) */
+    int cd_value; /* 3 → 2 → 1 → 0(GO)（旧数字倒计时，已弃用）*/
+
+    /* 时间条 */
+    uint32_t intro_t0; /* 开场动画起始 tick（时间条 3 秒耗空用）*/
+    uint32_t play_t0;  /* 正式开局起始 tick（时间条平滑倒计时用）*/
 
     /* 对局数据 */
     bool over;
@@ -136,8 +140,9 @@ static struct
     int escaped;   /* 未中掉（逃跑）数 */
     int misses;    /* 空敲次数 */
     int taps;      /* 总有效敲击数（命中+空敲），用于准确率 */
-    int elapsed_s; /* 已进行秒数，用于 10 秒加速 */
-    int time_left;
+    int elapsed_s;   /* 已进行秒数，用于 10 秒加速 */
+    int time_left;   /* 剩余秒（旧，仅 HUD 兼容用，结算判定已改用 time_left_ms）*/
+    int time_left_ms; /* 剩余毫秒：时间条/结算唯一真相，砸中 +1000，封顶 30000 */
 
     /* 单洞 */
     hole_state_t st[HOLE_COUNT];
@@ -151,10 +156,12 @@ static struct
 
 /* ── LVGL 对象 ── */
 static lv_obj_t *s_panel = NULL;
-static lv_obj_t *s_hud = NULL;    /* 游戏中顶部一行 HUD */
-static lv_obj_t *s_center = NULL; /* 居中大文字（难度选择/倒计时/结算共用）*/
-static lv_obj_t *s_hint = NULL;   /* 底部操作提示 */
-static lv_obj_t *s_dim = NULL;    /* 结算半透明遮罩（暗化背景）*/
+static lv_obj_t *s_hud = NULL;          /* 游戏中顶部一行 HUD */
+static lv_obj_t *s_center = NULL;       /* 居中大文字（难度选择/倒计时/结算共用）*/
+static lv_obj_t *s_hint = NULL;         /* 底部操作提示 */
+static lv_obj_t *s_dim = NULL;          /* 结算半透明遮罩（暗化背景）*/
+static lv_obj_t *s_timebar_bg = NULL;   /* 时间条轨道（底）*/
+static lv_obj_t *s_timebar_fill = NULL; /* 时间条填充（随剩余时间收缩）*/
 static lv_obj_t *s_hole[HOLE_COUNT];
 static lv_obj_t *s_mole[HOLE_COUNT];
 static lv_obj_t *s_hammer[HOLE_COUNT];
@@ -318,15 +325,57 @@ static void board_show_holes(void)
         if (s_hole[i])
             lv_obj_clear_flag(s_hole[i], LV_OBJ_FLAG_HIDDEN);
 }
-
+/**
+ * 刷新 HUD（分数/高分）。每帧调用（引擎回调）以保持分数更新及时。
+ * HUD 设计在时间条下方，避免与时间条重叠（尤其是时间条快没了时）。
+ */
 static void hud_refresh(void)
 {
+    /* 打地鼠所有文字已按需求注释掉，HUD 不再显示分数/高分文字
     if (s_hud == NULL)
         return;
     char buf[64];
-    snprintf(buf, sizeof(buf), "分数%d  高分%d  时间%d",
-             g.score, g.high_score, g.time_left);
+    snprintf(buf, sizeof(buf), "分数%d  高分%d", g.score, g.high_score);
     lv_label_set_text(s_hud, buf);
+    */
+}
+
+/* 设置时间条填充比例 ratio∈[0,1]：1=满，0=空。
+ * 同时按剩余比例切换颜色（正常绿 / 警告橙 / 危险红）。
+ * show=false 时整条隐藏（如难度/结算界面）。 */
+static void timebar_set(float ratio, bool show)
+{
+    if (s_timebar_bg == NULL || s_timebar_fill == NULL)
+        return;
+
+    if (!show)
+    {
+        lv_obj_add_flag(s_timebar_bg, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_timebar_fill, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_clear_flag(s_timebar_bg, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_timebar_fill, LV_OBJ_FLAG_HIDDEN);
+
+    if (ratio < 0.0f)
+        ratio = 0.0f;
+    if (ratio > 1.0f)
+        ratio = 1.0f;
+
+    /* 轨道总宽 = 屏宽 - 两侧边距；填充宽 = 轨道宽 × ratio */
+    int track_w = BSP_LCD_WIDTH - WHACK_TIMEBAR_MARGIN * 2;
+    int fill_w = (int)(track_w * ratio + 0.5f);
+    lv_obj_set_width(s_timebar_fill, fill_w);
+
+    /* 按剩余比例切换填充颜色 */
+    uint32_t color;
+    if (ratio <= 1.0f / 6.0f)
+        color = WHACK_TIMEBAR_DANGER_COLOR;
+    else if (ratio <= 1.0f / 3.0f)
+        color = WHACK_TIMEBAR_WARN_COLOR;
+    else
+        color = WHACK_TIMEBAR_OK_COLOR;
+    lv_obj_set_style_bg_color(s_timebar_fill, lv_color_hex(color), 0);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -337,6 +386,40 @@ static void engine_cb(lv_timer_t *t)
     (void)t;
     uint32_t now = lv_tick_get();
     bool dirty = false;
+
+    /* ── 时间条驱动（平滑，按 tick 而非整秒）── */
+    if (g.screen == WS_COUNTDOWN)
+    {
+        /* 开场动画：时间条 WHACK_INTRO_MS 内从满(1)线性耗到空(0)，
+         * 耗空瞬间回满并真正开打（见 enter_playing）。*/
+        uint32_t e = now - g.intro_t0;
+        if (e >= WHACK_INTRO_MS)
+        {
+            timebar_set(1.0f, true); /* 回满 */
+            enter_playing();         /* 回满即开打 */
+        }
+        else
+        {
+            float ratio = 1.0f - (float)e / (float)WHACK_INTRO_MS;
+            timebar_set(ratio, true);
+        }
+    }
+    else if (g.screen == WS_PLAYING && !g.over)
+    {
+        /* 正式倒计时：剩余毫秒 time_left_ms 为唯一真相，每帧递减 ENGINE_MS。
+         * 砸中地鼠会给 time_left_ms 加时间（见 try_hit），故时间条会回涨。*/
+        if (g.time_left_ms > ENGINE_MS)
+            g.time_left_ms -= ENGINE_MS;
+        else
+            g.time_left_ms = 0;
+
+        int total_ms = WHACK_GAME_SECONDS * 1000;
+        float ratio = (float)g.time_left_ms / (float)total_ms;
+        timebar_set(ratio, true);
+
+        if (g.time_left_ms == 0)
+            enter_result(); /* 时间耗尽，立即结算 */
+    }
 
     for (int i = 0; i < HOLE_COUNT; i++)
     {
@@ -454,8 +537,8 @@ static void clock_cb(lv_timer_t *t)
     if (g.screen != WS_PLAYING || g.over)
         return;
 
-    if (g.time_left > 0)
-        g.time_left--;
+    /* 剩余秒由 time_left_ms 换算（仅供日志/兼容，结算判定在引擎按 time_left_ms 走）*/
+    g.time_left = (g.time_left_ms + 999) / 1000;
     g.elapsed_s++;
 
     /* 每 10 秒提速：停留时间、出现间隔各乘 80%，带下限 */
@@ -473,9 +556,7 @@ static void clock_cb(lv_timer_t *t)
     }
 
     hud_refresh();
-
-    if (g.time_left <= 0)
-        enter_result(); /* 时间到，立即清场切结算 */
+    /* 倒计时结束判定已移到 engine_cb（按 time_left_ms），此处不再触发结算 */
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -503,6 +584,11 @@ static void try_hit(int hole)
         g.hits++;
         g.st[hole] = HOLE_HIT; /* 进 HIT 态即锁定，同一地鼠只计一次 */
         g.t0[hole] = lv_tick_get();
+
+        /* 砸中奖励时间：+1 秒，封顶满格（30s），时间条随之回涨 */
+        g.time_left_ms += WHACK_HIT_BONUS_MS;
+        if (g.time_left_ms > WHACK_GAME_SECONDS * 1000)
+            g.time_left_ms = WHACK_GAME_SECONDS * 1000;
 
         bsp_motor_pulse(); /* 命中震动 */
 
@@ -547,6 +633,7 @@ static void enter_select(void)
     g.screen = WS_SELECT;
     game_timers_stop(); /* 选择期间不跑对局定时器 */
     board_hide_all();
+    timebar_set(0.0f, false); /* 隐藏时间条 */
     if (s_hud)
         lv_obj_add_flag(s_hud, LV_OBJ_FLAG_HIDDEN);
     if (s_hint)
@@ -566,55 +653,20 @@ static void enter_select(void)
 }
 
 /* ═══════════════════════════════════════════════════════════════
- * 子界面：② 倒计时（3 → 2 → 1 → GO!）
+ * 子界面：② 开场动画（时间条 3 秒耗空 → 回满即开打）
+ *   原 3-2-1-GO 数字倒计时已移除，改用顶部时间条动画作为开场提示。
+ *   实际进度由 engine_cb 的 WS_COUNTDOWN 分支驱动（按 intro_t0 计算）。
  * ═══════════════════════════════════════════════════════════════ */
-static void countdown_render(void)
-{
-    if (s_center == NULL)
-        return;
-    char buf[16];
-    if (g.cd_value > 0)
-        snprintf(buf, sizeof(buf), "%d", g.cd_value);
-    else
-        snprintf(buf, sizeof(buf), "GO!");
-    lv_label_set_text(s_center, buf);
-    lv_obj_clear_flag(s_center, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void countdown_cb(lv_timer_t *t)
-{
-    (void)t;
-    g.cd_value--;
-    if (g.cd_value >= 0)
-    {
-        countdown_render(); /* 2、1、GO! */
-    }
-    else
-    {
-        /* GO! 显示一拍后真正开打 */
-        if (s_cd_tmr)
-        {
-            lv_timer_del(s_cd_tmr);
-            s_cd_tmr = NULL;
-        }
-        enter_playing();
-    }
-}
-
 static void enter_countdown(void)
 {
     g.screen = WS_COUNTDOWN;
     if (s_hint)
         lv_obj_add_flag(s_hint, LV_OBJ_FLAG_HIDDEN);
-    board_show_holes(); /* 提前露出地洞，营造氛围 */
-    g.cd_value = WHACK_COUNTDOWN_FROM;
-    countdown_render(); /* 先显示 3 */
-    if (s_cd_tmr)
-    {
-        lv_timer_del(s_cd_tmr);
-        s_cd_tmr = NULL;
-    }
-    s_cd_tmr = lv_timer_create(countdown_cb, WHACK_COUNTDOWN_STEP_MS, NULL);
+    if (s_center)
+        lv_obj_add_flag(s_center, LV_OBJ_FLAG_HIDDEN); /* 不再显示数字 */
+    board_show_holes();                                /* 提前露出地洞，营造氛围 */
+    g.intro_t0 = lv_tick_get();                        /* 开场动画计时起点 */
+    timebar_set(1.0f, true);                           /* 时间条从满开始耗 */
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -633,8 +685,9 @@ static void enter_playing(void)
     g.taps = 0;
     g.elapsed_s = 0;
     g.time_left = WHACK_GAME_SECONDS;
+    g.time_left_ms = WHACK_GAME_SECONDS * 1000; /* 时间条/结算唯一真相 */
 
-    /* 本局动态参数 = 当前难度基准 */
+    /* 本局动态参数 = 当前难度基准（本版本不分难度，g.diff 固定一般档）*/
     g.cur_life_ms = s_diff[g.diff].life_ms;
     g.cur_spawn_ms = s_diff[g.diff].spawn_ms;
     g.cur_rise_px = s_diff[g.diff].rise_px;
@@ -645,7 +698,7 @@ static void enter_playing(void)
     if (s_center)
         lv_obj_add_flag(s_center, LV_OBJ_FLAG_HIDDEN);
     if (s_hud)
-        lv_obj_clear_flag(s_hud, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_hud, LV_OBJ_FLAG_HIDDEN); /* HUD 文字已注释，始终隐藏 */
     hud_refresh();
 
     /* 启动对局定时器 */
@@ -680,6 +733,7 @@ static void enter_result(void)
     if (s_clock_tmr)
         lv_timer_pause(s_clock_tmr);
     board_hide_all();
+    timebar_set(0.0f, false); /* 结算隐藏时间条 */
 
     /* 高分刷新判定（刷新才写 NVS）*/
     bool refreshed = highscore_save_if_better(g.diff, g.score);
@@ -687,31 +741,37 @@ static void enter_result(void)
     /* 准确率 = 命中 / 总敲击 */
     int acc = (g.taps > 0) ? (g.hits * 100 / g.taps) : 0;
 
-    /* 显示半透明遮罩，压住地洞/地鼠，但在文字下方 */
+    /* 结算变暗遮罩已按需求注释掉（不再压暗背景）
     if (s_dim)
     {
         lv_obj_clear_flag(s_dim, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_move_to_index(s_dim, -2); /* 倒数第二层：文字最顶，遮罩次之 */
+        lv_obj_move_to_index(s_dim, -2);
     }
+    */
+    if (s_dim)
+        lv_obj_add_flag(s_dim, LV_OBJ_FLAG_HIDDEN); /* 保证遮罩隐藏 */
 
+    /* 结算文字已按需求注释掉（不显示任何文字）
     if (s_center)
     {
-        /* 字符集已补全，直接用 32px 大字体 */
         lv_obj_set_style_text_font(s_center, &font_cn_32, 0);
         lv_obj_set_width(s_center, BSP_LCD_WIDTH - 20);
         lv_label_set_long_mode(s_center, LV_LABEL_LONG_WRAP);
-
         char buf[160];
         snprintf(buf, sizeof(buf),
                  "时间到!\n得分 %d%s\n击中 %d  未中 %d\n空敲 %d  准确 %d%%",
-                 g.score,
-                 refreshed ? " (新纪录!)" : "",
+                 g.score, refreshed ? " (新纪录!)" : "",
                  g.hits, g.escaped, g.misses, acc);
         lv_label_set_text(s_center, buf);
-        lv_obj_move_foreground(s_center); /* 确保文字在遮罩上方 */
+        lv_obj_move_foreground(s_center);
         lv_obj_align(s_center, LV_ALIGN_CENTER, 0, 0);
         lv_obj_clear_flag(s_center, LV_OBJ_FLAG_HIDDEN);
     }
+    */
+    if (s_center)
+        lv_obj_add_flag(s_center, LV_OBJ_FLAG_HIDDEN); /* 结算不显示文字 */
+    (void)refreshed;
+    (void)acc;
     if (s_hud)
         lv_obj_add_flag(s_hud, LV_OBJ_FLAG_HIDDEN);
     if (s_hint)
@@ -778,7 +838,8 @@ static void build_panel(void)
     s_hud = lv_label_create(s_panel);
     lv_obj_set_style_text_font(s_hud, &font_cn_16, 0);
     lv_obj_set_style_text_color(s_hud, lv_color_hex(0x00C800), 0);
-    lv_obj_align(s_hud, LV_ALIGN_TOP_MID, 0, 8);
+    /* 下移到时间条(顶部, 高WHACK_TIMEBAR_H)下方，避免重叠 */
+    lv_obj_align(s_hud, LV_ALIGN_TOP_MID, 0, WHACK_TIMEBAR_MARGIN + WHACK_TIMEBAR_H + 4);
     lv_obj_add_flag(s_hud, LV_OBJ_FLAG_HIDDEN);
 
     /* ── 居中大文字（难度/倒计时/结算共用）── 用 32px 大字库，模仿赛车 ── */
@@ -806,6 +867,31 @@ static void build_panel(void)
     lv_obj_set_style_border_width(s_dim, 0, 0);
     lv_obj_clear_flag(s_dim, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_dim, LV_OBJ_FLAG_HIDDEN);
+
+    /* ── 时间条（顶部缓慢消失，剩余时间可视化）── */
+    int tb_w = BSP_LCD_WIDTH - WHACK_TIMEBAR_MARGIN * 2;
+    /* 轨道（底色）*/
+    s_timebar_bg = lv_obj_create(s_panel);
+    lv_obj_set_size(s_timebar_bg, tb_w, WHACK_TIMEBAR_H);
+    lv_obj_set_pos(s_timebar_bg, WHACK_TIMEBAR_MARGIN, WHACK_TIMEBAR_MARGIN);
+    lv_obj_set_style_bg_color(s_timebar_bg, lv_color_hex(WHACK_TIMEBAR_BG_COLOR), 0);
+    lv_obj_set_style_bg_opa(s_timebar_bg, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_timebar_bg, 0, 0);
+    lv_obj_set_style_radius(s_timebar_bg, WHACK_TIMEBAR_RADIUS, 0);
+    lv_obj_set_style_pad_all(s_timebar_bg, 0, 0);
+    lv_obj_clear_flag(s_timebar_bg, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_timebar_bg, LV_OBJ_FLAG_HIDDEN);
+    /* 填充（左对齐，宽度随剩余时间收缩）— 作为轨道的子对象，左端对齐 */
+    s_timebar_fill = lv_obj_create(s_timebar_bg);
+    lv_obj_set_size(s_timebar_fill, tb_w, WHACK_TIMEBAR_H);
+    lv_obj_align(s_timebar_fill, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_set_style_bg_color(s_timebar_fill, lv_color_hex(WHACK_TIMEBAR_OK_COLOR), 0);
+    lv_obj_set_style_bg_opa(s_timebar_fill, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_timebar_fill, 0, 0);
+    lv_obj_set_style_radius(s_timebar_fill, WHACK_TIMEBAR_RADIUS, 0);
+    lv_obj_set_style_pad_all(s_timebar_fill, 0, 0);
+    lv_obj_clear_flag(s_timebar_fill, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_timebar_fill, LV_OBJ_FLAG_HIDDEN);
 
     /* ── 两个地洞 + 地鼠 + 锤子 + 星星 ── */
     for (int i = 0; i < HOLE_COUNT; i++)
@@ -891,11 +977,12 @@ void whack_start(void)
     else
         lv_timer_resume(s_engine_tmr);
 
-    g.diff = DIFF_EASY; /* 默认停在简单档 */
-    enter_select();     /* 入口落到难度选择，而非直接开打 */
+    /* 本版本不分难度：固定一般档，跳过难度选择界面，进入即播放开场时间条动画 */
+    g.diff = DIFF_NORMAL;
+    enter_countdown(); /* 直接进开场动画（时间条耗空→回满→开打）*/
 
     lvgl_port_unlock();
-    ESP_LOGI(TAG, "打地鼠进入：难度选择界面");
+    ESP_LOGI(TAG, "打地鼠进入：开场时间条动画");
 }
 
 void whack_touch(touch_event_t event)
@@ -935,10 +1022,10 @@ void whack_touch(touch_event_t event)
             try_hit(1);
         break;
 
-    /* ── ④ 结算：头部重玩（回难度选择），其余忽略 ── */
+    /* ── ④ 结算：头部重玩（本版本不分难度，直接回开场动画重开），其余忽略 ── */
     case WS_RESULT:
         if (event == TOUCH_EVENT_SHORT_HEAD)
-            enter_select();
+            enter_countdown();
         break;
 
     default:
@@ -985,6 +1072,8 @@ void whack_stop(void)
     s_center = NULL;
     s_hint = NULL;
     s_dim = NULL;
+    s_timebar_bg = NULL;
+    s_timebar_fill = NULL;
     for (int i = 0; i < HOLE_COUNT; i++)
     {
         s_hole[i] = NULL;

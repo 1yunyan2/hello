@@ -120,11 +120,24 @@ extern const lv_image_dsc_t ds_bg;
 
 /* ── 命中表现 ── */
 #define WHACK_HIT_SHOW_MS 500    /* 被打后扁掉(ds1)停留时长：砸中→打扁停顿 0.5s→再下洞消失 */
+#define WHACK_HIT_BONUS_MS 1000  /* 砸中地鼠奖励时间：时间条 +1 秒（封顶满格 30s）*/
 #define WHACK_HAMMER_SHOW_MS 120 /* 锤子击打动作停留时长（每次敲击都显示，到时收回）*/
 
 /* ── 空敲惩罚 ── */
 #define WHACK_MISS_PENALTY 1 /* 敲到空洞扣 1 分（最低不低于 0）*/
 
-/* ── 倒计时 ── */
+/* ── 开场动画（时间条耗完→回满，替代旧 3-2-1-GO 数字倒计时）── */
+#define WHACK_INTRO_MS 3000 /* 开场：时间条从满 3 秒耗到空，随后回满即开打 */
+
+/* ── 时间条（顶部缓慢消失的剩余时间可视化）── */
+#define WHACK_TIMEBAR_H 16             /* 时间条高度 px */
+#define WHACK_TIMEBAR_MARGIN 8         /* 时间条距屏幕左右/顶部的边距 px */
+#define WHACK_TIMEBAR_RADIUS 8         /* 圆角半径 */
+#define WHACK_TIMEBAR_BG_COLOR 0x16213E   /* 轨道底色（深蓝）*/
+#define WHACK_TIMEBAR_OK_COLOR 0x00D466   /* 正常（绿）*/
+#define WHACK_TIMEBAR_WARN_COLOR 0xFFA502 /* 警告：剩余≤1/3（橙）*/
+#define WHACK_TIMEBAR_DANGER_COLOR 0xFF3B30 /* 危险：剩余≤1/6（红）*/
+
+/* 旧难度数字倒计时（已由时间条开场动画取代，保留宏以防引用）*/
 #define WHACK_COUNTDOWN_FROM 3       /* 3 → 2 → 1 → GO! */
 #define WHACK_COUNTDOWN_STEP_MS 1000 /* 每个数字停留毫秒 */

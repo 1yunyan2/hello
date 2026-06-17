@@ -82,25 +82,30 @@ typedef enum
 
 typedef struct
 {
-    lv_obj_t *cube;  /* 等轴测立方体（cube3d 控件）*/
+    lv_obj_t *cube;  /* JUMP_PLAT_USE_IMG=0 时是 cube3d 控件；=1 时复用为台子图片(lv_image)句柄 */
     int world_cx;    /* 世界坐标中心 x */
     int world_cy;    /* 世界坐标中心 y（台面顶边）*/
-    int w;           /* 台子宽度（= 立方体边长基准）*/
-    int style;       /* 样式索引（指向 s_plat_styles[]，决定顶面色）*/
-    int depth;       /* 立方体竖直厚度（随机，做扁/高台非对称外形）*/
-    uint8_t stripes; /* 侧面亮条带掩码（随机）*/
-    uint8_t pattern; /* 顶面/正面几何花纹类型（随机，0=无）*/
+    int w;           /* 台子宽度（图片模式=缩放目标宽；cube 模式=立方体边长基准）*/
+    int style;       /* 样式索引（指向 s_plat_styles[]，决定顶面色，仅 cube 模式）*/
+    int depth;       /* 立方体竖直厚度（随机，做扁/高台非对称外形，仅 cube 模式）*/
+    uint8_t stripes; /* 侧面亮条带掩码（随机，仅 cube 模式）*/
+    uint8_t pattern; /* 顶面/正面几何花纹类型（随机，0=无，仅 cube 模式）*/
+    uint8_t img_idx; /* 台子图片索引 0~JUMP_PLAT_IMG_COUNT-1（仅 JUMP_PLAT_USE_IMG=1）*/
     bool active;
     /* ── 从天而降入场动画 ── */
     int drop;      /* 当前竖直入场偏移（>0=在目标上方，渲染时 sy 减去它）*/
     int drop_vy;   /* 掉落速度（每帧px，向下加速）*/
     int bounce;    /* 触底回弹压扁余量（0~100，渲染时加到 squash）*/
     bool dropping; /* 入场动画进行中 */
+    /* ── 蓄力压扁台面下沉量（由 platform_render_one 写入，供棋子 sink 读取）── */
+    int squash_face_sink; /* 台面因压扁下沉的像素数（正值=下沉），图片模式专用 */
 } platform_t;
 
+#if !JUMP_PLAT_USE_IMG
 /* ── 立体台子样式表（顶面色；正面/右侧面由 cube3d 自动调暗生成）──
  * 后期“五六种不同大小/颜色”的台子，往这里加条目即可，渲染逻辑无需改动。
- * 大小由 cur_platform_w() 给宽度，这里只管颜色风格。*/
+ * 大小由 cur_platform_w() 给宽度，这里只管颜色风格。
+ * 仅 cube3d 自画模式用；图片台子模式(JUMP_PLAT_USE_IMG=1)不编译此表，避免 unused 报错。*/
 static const uint32_t s_plat_styles[JUMP_PLAT_STYLE_COUNT] = {
     0x8FBF8F, /* 灰绿（参考素材色）*/
     0x8FAFD4, /* 蓝灰 */
@@ -108,6 +113,7 @@ static const uint32_t s_plat_styles[JUMP_PLAT_STYLE_COUNT] = {
     0xB98FD4, /* 紫 */
     0xD48F9F, /* 暖红 */
 };
+#endif
 
 /* ── 全局状态 ── */
 static struct
@@ -145,6 +151,9 @@ static struct
     int fall_vy; /* 垂直掉落速度（每帧px，向下加速）*/
     int fall_vx; /* 水平速度（继承飞行末尾的每帧水平位移，继续往前飞）*/
     int fall_h;  /* 当前离地弧高余量（从飞行末尾 fly_h 继承，被重力逐帧吃掉）*/
+
+    /* 摄像机延迟：落台后先等 N 帧，避免视线在棋子落台瞬间就移走 */
+    int cam_delay_frames;
 } g;
 
 /* ── 蓄力光斑粒子 ──
@@ -285,6 +294,24 @@ static inline int plat_w_to_edge(int w)
     return e < 8 ? 8 : e;
 }
 
+/* 台子「可站立顶面」的半宽（世界坐标）——落台判定用此，而非整图半宽。
+ * p->w 是整张台子图缩放后的宽度；真正能落脚的只有顶面那块菱形/方块，
+ * 占整图宽的 JUMP_PLAT_IMG_FACE_W_PCT_TABLE[img_idx]%。
+ * 图片模式按该表收窄；cube 模式顶面≈整宽，直接用半宽。*/
+static int plat_face_half_w(const platform_t *p)
+{
+#if JUMP_PLAT_USE_IMG
+    static const int pct_tbl[JUMP_PLAT_IMG_COUNT] = JUMP_PLAT_IMG_FACE_W_PCT_TABLE;
+    int idx = p->img_idx;
+    if (idx < 0 || idx >= JUMP_PLAT_IMG_COUNT)
+        idx = 0;
+    int face_w = p->w * pct_tbl[idx] / 100;
+    return face_w / 2;
+#else
+    return p->w / 2;
+#endif
+}
+
 /* ══════════════════════════════════════════════════
  * 台子渲染（squash_pct 0~100：蓄力时立方体竖直方向压扁）
  *   立方体「顶面中心」对齐世界坐标 (world_cx, world_cy)（小人脚踩顶面）。
@@ -298,6 +325,76 @@ static void platform_render_one(int idx, int squash_pct)
             lv_obj_add_flag(p->cube, LV_OBJ_FLAG_HIDDEN);
         return;
     }
+    /* 顶面中心对齐屏幕 (sx, sy)（小人脚踩顶面）。入场掉落时整体上移 drop。*/
+    int sx = wx_to_sx(p->world_cx);
+    int sy = wy_to_sy(p->world_cy) - p->drop; /* drop>0=在目标上方，往下落 */
+
+#if JUMP_PLAT_USE_IMG
+    /* ── 图片台子：等比缩放 x + 蓄力压扁 y + 底部固定 + 各图独立台面偏移 ──
+     *
+     * 蓄力压扁：scale_y < scale_x，台子纵向压扁，底部固定（顶面向下移）。
+     * LVGL scale 以图片中心为锚，压扁后底边会上移 (sh_normal-sh)/2，
+     * 通过 bottom_fix 向下补偿，实现底部固定效果。
+     * 台面随顶面下沉 face_sink px，棋子脚底跟随同量下沉（squeeze = 从上往下压）。
+     *
+     * 各图台面偏移：每张台子图形状不同，台面 Y 在 face_y_table[] 独立配置。
+     * LVGL scale 以图片中心为锚，set_pos 是缩放前左上角：
+     *   target_face_sy = pos_y + raw_h/2 - sh/2 + face_in_scaled
+     *   → pos_y = target_face_sy - raw_h/2 + sh/2 - face_in_scaled
+     */
+    static const lv_image_dsc_t *const imgs[JUMP_PLAT_IMG_COUNT] = {
+        &jt1, &jt3, &jt4, &jt5, &jt6, &jt7};
+    /* 每张台子图台面顶边在原图中的 Y 偏移（各图形状高度不同，须独立配置）*/
+    static const int face_y_table[JUMP_PLAT_IMG_COUNT] = JUMP_PLAT_IMG_FACE_Y_TABLE;
+    int pic = p->img_idx;
+    if (pic < 0 || pic >= JUMP_PLAT_IMG_COUNT)
+        pic = 0;
+    lv_image_set_src(p->cube, imgs[pic]);
+
+    /* 等比缩放：宽度对齐台宽，高度同比 */
+    int sx_scale = p->w * 256 / JUMP_PLAT_IMG_W;
+    if (sx_scale < 16)
+        sx_scale = 16;
+
+    /* 蓄力时台子竖向压扁，与棋子同比映射（squash_pct 0~100）*/
+    int sy_scale = sx_scale;
+    if (squash_pct > 0)
+    {
+        int sq_ratio = 100 - (int)((100 - JUMP_PLAYER_SQUASH_RATIO) * squash_pct / 100);
+        sy_scale = sx_scale * sq_ratio / 100;
+        if (sy_scale < 16)
+            sy_scale = 16;
+    }
+    lv_image_set_scale_x(p->cube, sx_scale);
+    lv_image_set_scale_y(p->cube, sy_scale);
+
+    int raw_w = JUMP_PLAT_IMG_W, raw_h = JUMP_PLAT_IMG_H;
+    int sh_full = raw_h * sx_scale / 256; /* 无压扁时缩放高度 */
+    int sh = raw_h * sy_scale / 256;      /* 压扁后缩放高度 */
+
+    /* 各图台面偏移（按当前压扁缩放算）*/
+    int face_in = face_y_table[pic] * sy_scale / 256;
+    int face_in_full = face_y_table[pic] * sx_scale / 256;
+    int bounce_offset = p->bounce;
+
+    /* 底部固定定位 + 台面顶边对齐世界 y(=棋子脚底)：
+     *
+     * 关键修复：world_cy 是「台面顶边」的世界 y，棋子脚底也渲染在 wy_to_sy(world_cy)=sy。
+     * LVGL scale 绕图片中心进行，缩放后台面顶边（距图片中心 sh_full/2 - face_in_full 处）
+     * 落在 pos_y + raw_h/2 - sh_full/2 + face_in_full。
+     * 旧公式 pos_y = sy - face_in_full 让台面顶边落在 sy + (raw_h - sh_full)/2，
+     * 即台面比脚底低 (raw_h - sh_full)/2 px —— 台子越缩小该值越大，棋子整体悬空在台面上方。
+     * 现在把基准 pos_y 补偿到「未压扁时台面顶边 == sy」：
+     *   pos_y0 = sy - raw_h/2 + sh_full/2 - face_in_full
+     * 再叠加底部固定的压扁补偿 (sh_full - sh)/2（顶面随蓄力下压、底边不动）。
+     * 验证(未压扁 sh=sh_full)：顶边 = pos_y + raw_h/2 - sh_full/2 + face_in_full = sy ✓ */
+    int pos_x = sx - raw_w / 2;
+    int pos_y = (sy + bounce_offset) - raw_h / 2 + sh_full / 2 - face_in_full + (sh_full - sh) / 2;
+    lv_obj_set_pos(p->cube, pos_x, pos_y);
+
+    /* 台面实际下沉量 = (sh_full-sh) + (face_in - face_in_full)，棋子跟随同量下沉 */
+    p->squash_face_sink = (sh_full - sh) + (face_in - face_in_full);
+#else
     int edge = plat_w_to_edge(p->w);
     cube3d_set_geometry(p->cube, edge);
     cube3d_set_depth(p->cube, p->depth); /* 非对称厚度 */
@@ -310,11 +407,8 @@ static void platform_render_one(int idx, int squash_pct)
     if (sq > 100)
         sq = 100;
     cube3d_set_squash(p->cube, sq);
-
-    /* 顶面中心对齐屏幕 (sx, sy)（小人脚踩顶面）。入场掉落时整体上移 drop。*/
-    int sx = wx_to_sx(p->world_cx);
-    int sy = wy_to_sy(p->world_cy) - p->drop; /* drop>0=在目标上方，往下落 */
     cube3d_place(p->cube, sx, sy);
+#endif
 
     lv_obj_clear_flag(p->cube, LV_OBJ_FLAG_HIDDEN);
 }
@@ -346,12 +440,21 @@ static bool platforms_drop_update(void)
             { /* 触底：归位 + 触发回弹压扁 */
                 p->drop = 0;
                 p->bounce = JUMP_DROP_BOUNCE;
+#if JUMP_PLAT_USE_IMG
+                /* 图片模式 bounce = 下移 px；入场触底抖动封顶 JUMP_LAND_BOUNCE（轻弹）*/
+                if (p->bounce > JUMP_LAND_BOUNCE)
+                    p->bounce = JUMP_LAND_BOUNCE;
+#endif
             }
         }
         else if (p->bounce > 0)
         {
             /* 回弹：压扁量逐帧衰减到 0 */
+#if JUMP_PLAT_USE_IMG
+            p->bounce -= JUMP_LAND_BOUNCE_DECAY; /* 图片台子用更柔的衰减（落台/入场统一）*/
+#else
             p->bounce -= JUMP_DROP_BOUNCE_DECAY;
+#endif
             if (p->bounce <= 0)
             {
                 p->bounce = 0;
@@ -527,6 +630,18 @@ static void plat_no_drop(platform_t *p)
     p->dropping = false;
 }
 
+#if JUMP_PLAT_USE_IMG
+/* 棋子落台：给这张台注入一次「被踩下压」，随后由 platforms_drop_update 逐帧回弹。
+ * 复用 bounce 通道（drop=0 直接进回弹阶段），衰减用 JUMP_LAND_BOUNCE_DECAY。*/
+static void plat_land_bounce(platform_t *p)
+{
+    p->drop = 0;
+    p->drop_vy = 0;
+    p->bounce = JUMP_LAND_BOUNCE; /* 图片模式：下移 px 数；棋子同步偏移 */
+    p->dropping = true;           /* 标记动画中，使 platforms_drop_update 处理其回弹 */
+}
+#endif
+
 static void gen_platform(platform_t *dst, const platform_t *ref)
 {
     dst->w = cur_platform_w();
@@ -538,6 +653,15 @@ static void gen_platform(platform_t *dst, const platform_t *ref)
         gap = min_gap;
     dst->world_cx = ref->world_cx + gap;
     dst->world_cy = ref->world_cy + rand_gap_y(ref->world_cy);
+#if JUMP_PLAT_USE_IMG
+    /* 图片台子：从 jt1~jt7 随机选一张，避开与上一台相同（连续不重复）*/
+    {
+        int idx = (int)(esp_random() % JUMP_PLAT_IMG_COUNT);
+        if (idx == ref->img_idx)
+            idx = (idx + 1) % JUMP_PLAT_IMG_COUNT;
+        dst->img_idx = (uint8_t)idx;
+    }
+#else
     /* 随机一种立体台子样式（避开与参考台同色，区分更明显）*/
     int s = (int)(esp_random() % JUMP_PLAT_STYLE_COUNT);
     if (s == ref->style)
@@ -555,6 +679,7 @@ static void gen_platform(platform_t *dst, const platform_t *ref)
     dst->pattern = (esp_random() % 10 < 6)
                        ? (uint8_t)(1 + esp_random() % CUBE3D_PATTERN_MAX)
                        : 0;
+#endif
     dst->active = true;
     plat_start_drop(dst); /* 新台子从天而降入场 */
 }
@@ -564,10 +689,11 @@ static void platforms_init(void)
     g.plats[0].world_cx = JUMP_START_X;
     g.plats[0].world_cy = JUMP_TOP_Y;
     g.plats[0].w = cur_platform_w();
-    g.plats[0].style = 0;                            /* 起始台固定第0种样式 */
-    g.plats[0].depth = plat_w_to_edge(g.plats[0].w); /* 起始台正常厚度 */
-    g.plats[0].stripes = 0;                          /* 起始台无条带，干净 */
-    g.plats[0].pattern = 0;                          /* 起始台无花纹，干净 */
+    g.plats[0].style = 0;                            /* 起始台固定第0种样式（cube 模式）*/
+    g.plats[0].depth = plat_w_to_edge(g.plats[0].w); /* 起始台正常厚度（cube 模式）*/
+    g.plats[0].stripes = 0;                          /* 起始台无条带，干净（cube 模式）*/
+    g.plats[0].pattern = 0;                          /* 起始台无花纹，干净（cube 模式）*/
+    g.plats[0].img_idx = 0;                          /* 起始台固定第0张图（图片模式）*/
     g.plats[0].active = true;
     plat_no_drop(&g.plats[0]); /* 起始台直接就位，不掉落 */
 
@@ -661,13 +787,22 @@ static void engine_cb(lv_timer_t *t)
     if (g.screen != JS_PLAYING)
         return;
 
-    /* 每帧推进台子「从天而降」入场动画。只重渲染正在掉落的台子，
-     * 不碰 slot0（避免覆盖蓄力时的当前台压扁）。独立于 phase。*/
+    /* 每帧推进台子入场/回弹动画，独立于 phase。
+     * 图片模式下 slot0 有落台 bounce 时，棋子也跟随台面下移（视觉同步）。*/
     if (platforms_drop_update())
     {
         for (int i = 0; i < PLAT_COUNT; i++)
+        {
             if (g.plats[i].dropping || g.plats[i].drop > 0 || g.plats[i].bounce > 0)
+            {
                 platform_render_one(i, 0);
+#if JUMP_PLAT_USE_IMG
+                /* slot0 有落台回弹时，棋子脚底跟随台面下移（bounce px）*/
+                if (i == 0 && g.phase == PH_CAM && g.plats[0].bounce > 0)
+                    player_render(0, 0, g.plats[0].bounce);
+#endif
+            }
+        }
     }
 
     switch (g.phase)
@@ -678,20 +813,33 @@ static void engine_cb(lv_timer_t *t)
         uint32_t held = bsp_touch_page_held_ms();
         if (held == 0)
         {
-            player_render(0, 0, 0); /* 不压扁 */
+#if JUMP_PLAT_USE_IMG
+            player_render(0, 0, g.plats[0].bounce); /* 有残余落台回弹时棋子跟随 */
+#else
+            player_render(0, 0, 0);
+#endif
             platform_render_one(0, 0);
             sparks_hide(); /* 未蓄力：无光斑 */
         }
         else
         {
-            uint32_t c = held < JUMP_HOLD_MIN_MS ? JUMP_HOLD_MIN_MS : (held > JUMP_HOLD_MAX_MS ? JUMP_HOLD_MAX_MS : held);
-            int pct = (int)((c - JUMP_HOLD_MIN_MS) * 100u /
-                            (JUMP_HOLD_MAX_MS - JUMP_HOLD_MIN_MS));
-            /* 台子顶面下沉量 = 当前台厚度 × 压扁百分比；人物脚底跟着下沉，保持相连 */
+            /* 蓄力百分比从按下瞬间就开始计算（0~100%对应 0~JUMP_HOLD_MAX_MS），
+             * 不再等到 JUMP_HOLD_MIN_MS 才开始，棋子/台子立即响应压扁。*/
+            uint32_t clamped = held > JUMP_HOLD_MAX_MS ? JUMP_HOLD_MAX_MS : held;
+            int pct = (int)(clamped * 100u / JUMP_HOLD_MAX_MS);
+#if JUMP_PLAT_USE_IMG
+            /* 图片台子：先渲染台子（写入 squash_face_sink），再让棋子 sink 跟随台面下沉。
+             * 台子底部固定、顶面向下压；台面下沉多少，棋子脚底就跟着沉多少。*/
+            platform_render_one(0, pct);
+            int sink = g.plats[0].squash_face_sink;
+            player_render(pct, 0, sink);
+            sparks_update(pct, sink);
+#else
             int sink = g.plats[0].depth * pct / 100;
-            player_render(pct, 0, sink); /* 蓄力越满压得越扁，且随台下沉 */
-            platform_render_one(0, pct); /* 立方体台子同步压扁 */
-            sparks_update(pct, sink);    /* 蓄力光斑跟随棋子聚拢 */
+            player_render(pct, 0, sink);
+            platform_render_one(0, pct);
+            sparks_update(pct, sink);
+#endif
         }
         break;
     }
@@ -720,9 +868,12 @@ static void engine_cb(lv_timer_t *t)
             break; /* 仍在飞 */
 
         /* ── 到达终点，判定落点 ── */
-        /* 落点判定：小人最终世界x是否落在next台宽度内 */
-        int nl = g.plats[1].world_cx - g.plats[1].w / 2;
-        int nr = g.plats[1].world_cx + g.plats[1].w / 2;
+        /* 落点判定：小人最终世界 x 是否落在 next 台「可站立顶面」内。
+         * 关键修复：用 plat_face_half_w（顶面半宽）而非整图半宽 w/2，
+         * 否则棋子落在台子透明边/侧壁斜面上也算成功（视觉上悬空在台面外）。*/
+        int half = plat_face_half_w(&g.plats[1]);
+        int nl = g.plats[1].world_cx - half;
+        int nr = g.plats[1].world_cx + half;
         /* 视觉飞行终点即判定点（二者已统一，不再单独重算）*/
         int actual_wx = g.player_wx;
 
@@ -742,14 +893,20 @@ static void engine_cb(lv_timer_t *t)
              * 故 actual_wx 仍在新 plats[0] 台面范围内。y 对齐新当前台顶面。*/
             g.player_wx = actual_wx;
             g.player_wy = g.plats[0].world_cy;
-            /* 保险：玩家落上的台子强制结束入场动画，确保脚下台子绝不压扁/回弹
-             * （即使该台进场动画恰好没播完，落上去也立即归位）*/
+            /* 保险：玩家落上的台子强制结束入场动画（清掉残留掉落状态），随后再注入落台回弹 */
             plat_no_drop(&g.plats[0]);
+#if JUMP_PLAT_USE_IMG
+            /* 棋子落上台子：台子被踩一下下压再回弹（图片模式专属手感）。
+             * platforms_drop_update 每帧独立推进其回弹，PH_CAM 期间自然播完。*/
+            plat_land_bounce(&g.plats[0]);
+#endif
 
             hud_refresh();
-            /* 落台后不做着陆压扁（压扁只在蓄力时）：直接进摄像机平滑阶段，人物保持正常。*/
+            /* 落台后先等 JUMP_CAM_DELAY_FRAMES 帧，让玩家看清落点，再开始视线平移 */
+            g.cam_delay_frames = JUMP_CAM_DELAY_FRAMES;
             g.phase = PH_CAM;
             player_render(0, 0, 0);
+            platform_render_one(0, 0); /* 立即渲染一帧体现下压起始 */
             ESP_LOGI(TAG, "落台成功 score=%d", g.score);
         }
         else
@@ -771,6 +928,20 @@ static void engine_cb(lv_timer_t *t)
 
     /* 摄像机平滑滑动 */
     case PH_CAM:
+    {
+#if JUMP_PLAT_USE_IMG
+        /* 图片模式：棋子跟随 slot0 落台回弹偏移（bounce = 下移px，随台子逐帧归零）*/
+        int cam_sink = g.plats[0].bounce;
+#else
+        int cam_sink = 0;
+#endif
+        /* 延迟阶段：棋子在落点静止，台子回弹动画播放，玩家看清落点 */
+        if (g.cam_delay_frames > 0)
+        {
+            g.cam_delay_frames--;
+            player_render(0, 0, cam_sink);
+            break;
+        }
         if (g.cam_smooth_frames > 0)
         {
             /* 每帧向目标前进 1/remaining 步（匀减速感）*/
@@ -778,7 +949,7 @@ static void engine_cb(lv_timer_t *t)
             g.cam_y += (g.cam_target_y - g.cam_y + g.cam_smooth_frames - 1) / g.cam_smooth_frames;
             g.cam_smooth_frames--;
             platforms_render_all();
-            player_render(0, 0, 0);
+            player_render(0, 0, cam_sink);
         }
         if (g.cam_smooth_frames <= 0)
         {
@@ -786,10 +957,11 @@ static void engine_cb(lv_timer_t *t)
             g.cam_x = g.cam_target_x;
             g.cam_y = g.cam_target_y;
             platforms_render_all();
-            player_render(0, 0, 0);
+            player_render(0, 0, cam_sink);
             g.phase = PH_IDLE;
         }
         break;
+    }
 
     /* 掉落出屏（连续抛物线：水平继续飞 + 弧高消退 + 重力加速下坠）*/
     case PH_FALL:
@@ -861,6 +1033,7 @@ static void enter_playing(void)
     g.phase = PH_IDLE;
     g.score = 0;
     g.high_score = highscore_load(); /* 高分三难度共享 */
+    g.cam_delay_frames = 0;
 
     platforms_init();
     g.player_wx = g.plats[0].world_cx;
@@ -952,27 +1125,35 @@ static void build_panel(void)
     }
 #endif
 
-    /* 三个等轴测立方体台子（cube3d 控件，先创建=在小人之下）。*/
+    /* 三个台子对象（先创建=在小人之下）。cube 字段两模式复用。*/
     for (int i = 0; i < PLAT_COUNT; i++)
     {
+#if JUMP_PLAT_USE_IMG
+        /* 图片台子：lv_image，src/scale/pos 在 platform_render_one 里按帧设置 */
+        lv_obj_t *plat = lv_image_create(s_panel);
+        lv_image_set_antialias(plat, true);
+        lv_obj_clear_flag(plat, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(plat, LV_OBJ_FLAG_HIDDEN);
+        g.plats[i].cube = plat;
+        g.plats[i].img_idx = 0;
+#else
         lv_obj_t *cube = cube3d_create(s_panel);
         cube3d_set_geometry(cube, plat_w_to_edge(s_diff[DIFF_EASY].pw));
         cube3d_set_top_color(cube, s_plat_styles[0]);
         lv_obj_add_flag(cube, LV_OBJ_FLAG_HIDDEN);
-
         g.plats[i].cube = cube;
         g.plats[i].style = 0;
+#endif
         g.plats[i].active = false;
     }
 
     /* （人物影子已按用户反馈去掉，s_player_shadow 保持 NULL，相关代码均 NULL 守卫）*/
 
-    /* 小人：图片 j1（带 alpha），最后创建=在最上层。等比缩放在 player_render 里按需设置。*/
+    /* 小人：图片 jp（8.png，彩色带 alpha），最后创建=在最上层。等比缩放在 player_render 里按需设置。
+     * 注意：8.png 本身有色，不再做黑色 recolor（旧 j4 才需涂黑），否则棋子会变黑块。*/
     s_player = lv_image_create(s_panel);
     lv_image_set_src(s_player, &JUMP_PLAYER_IMG);
     lv_image_set_antialias(s_player, true);
-    lv_obj_set_style_image_recolor(s_player, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_image_recolor_opa(s_player, LV_OPA_COVER, 0);
     lv_obj_clear_flag(s_player, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_player, LV_OBJ_FLAG_HIDDEN);
 
@@ -1022,7 +1203,7 @@ void jump_start(void)
     if (!s_engine_tmr)
         s_engine_tmr = lv_timer_create(engine_cb, JUMP_ENGINE_MS, NULL);
     g.diff = DIFF_EASY;
-    enter_select();
+    enter_playing();
     lvgl_port_unlock();
     ESP_LOGI(TAG, "跳一跳启动");
 }
@@ -1033,16 +1214,6 @@ void jump_touch(touch_event_t event)
         return;
     switch (g.screen)
     {
-    case JS_SELECT:
-        if (event == TOUCH_EVENT_SHORT_PREV_PAGE)
-            g.diff = g.diff == DIFF_EASY ? DIFF_HARD : (jump_diff_t)(g.diff - 1);
-        else if (event == TOUCH_EVENT_SHORT_NEXT_PAGE)
-            g.diff = g.diff == DIFF_HARD ? DIFF_EASY : (jump_diff_t)(g.diff + 1);
-        else if (event == TOUCH_EVENT_SHORT_HEAD)
-            enter_playing();
-        if (g.screen == JS_SELECT)
-            select_render();
-        break;
     case JS_PLAYING:
         if (g.phase == PH_IDLE &&
             (event == TOUCH_EVENT_SHORT_PREV_PAGE ||
@@ -1051,7 +1222,7 @@ void jump_touch(touch_event_t event)
         break;
     case JS_RESULT:
         if (event == TOUCH_EVENT_SHORT_HEAD)
-            enter_select();
+            enter_playing();
         break;
     default:
         break;
