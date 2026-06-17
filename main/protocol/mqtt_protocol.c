@@ -23,6 +23,7 @@
 #include "ui/standby.h"      // standby_notify_activity() — 远程舵机控制视为活动，刷新待机倒计时
 #include "object.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h" // esp_timer_get_time() — ota-status 时间戳
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -293,6 +294,64 @@ static void mqtt_reconnect_task(void *arg)
     vTaskDeleteWithCaps(NULL);
 }
 
+// ─── OTA 进度上报 ─────────────────────────────────────────────────────────
+/**
+ * @brief OTA 进度回调：把状态发布到 echopal/device/{id}/ota-status
+ *
+ * 由 bsp_ota 在其下载任务上下文中调用（非 MQTT 事件回调栈，publish 安全）。
+ * 节流已在 bsp_ota 内部完成，本函数只负责构建 JSON 并发布。
+ * 状态口径：下载+校验全过程统一上报 upgrading（带进度），整个过程只发 upgrading/success/failed。
+ *
+ * @param status   OTA 状态
+ * @param progress 进度 0~100
+ * @param version  目标版本号
+ */
+static void ota_progress_publish(bsp_ota_status_t status, int progress,
+                                 const char *version, const char *err_msg)
+{
+    if (s_mqtt_client == NULL || !s_mqtt_connected)
+        return;
+
+    const char *status_str;
+    switch (status)
+    {
+    case BSP_OTA_UPGRADING:
+        status_str = "upgrading";
+        break;
+    case BSP_OTA_SUCCESS:
+        status_str = "success";
+        break;
+    case BSP_OTA_FAILED:
+        status_str = "failed";
+        break;
+    default:
+        return; // 未知状态不上报
+    }
+
+    char device_id[16];
+    get_short_device_id(device_id, sizeof(device_id));
+    char topic[64];
+    snprintf(topic, sizeof(topic), "echopal/device/%s/ota-status", device_id);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "status", status_str);
+    cJSON_AddNumberToObject(root, "progress", progress);
+    cJSON_AddStringToObject(root, "version", version ? version : "");
+    // 失败时填中文原因，其余状态留空字符串
+    cJSON_AddStringToObject(root, "errorMsg", err_msg ? err_msg : "");
+    // 注：设备未必已 SNTP 对时，此处用开机相对毫秒数占位；后端通常以服务端收包时间为准
+    cJSON_AddNumberToObject(root, "timestamp", (double)(esp_timer_get_time() / 1000));
+
+    char *json_str = cJSON_PrintUnformatted(root);
+    if (json_str != NULL)
+    {
+        int msg_id = esp_mqtt_client_publish(s_mqtt_client, topic, json_str, 0, 1, 0);
+        ESP_LOGI(MQTT_TAG, "OTA 状态已上报 (msg_id=%d): %s", msg_id, json_str);
+        free(json_str);
+    }
+    cJSON_Delete(root);
+}
+
 // MQTT 事件回调函数
 /**
  * @brief MQTT客户端事件处理回调
@@ -330,6 +389,16 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         snprintf(topic, sizeof(topic), "echopal/device/%s/command", dev_id);
         esp_mqtt_client_subscribe(client, topic, 0);
         ESP_LOGI(MQTT_TAG, "正在监听此主题: %s", topic);
+
+        // ★ OTA success 补发：若上一轮升级成功并已重启，此刻 MQTT 才真正连上，
+        //   读取 NVS 待上报标记补发 success，再清除（QoS1 幂等，重连重发后端去重）
+        char ota_succ_ver[32];
+        if (bsp_ota_take_pending_success(ota_succ_ver, sizeof(ota_succ_ver)))
+        {
+            ESP_LOGI(MQTT_TAG, "检测到 OTA 升级成功标记，补发 success: %s", ota_succ_ver);
+            ota_progress_publish(BSP_OTA_SUCCESS, 100, ota_succ_ver, NULL);
+            bsp_ota_clear_pending_success();
+        }
         break;
     }
 
@@ -449,18 +518,30 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 else if (cJSON_IsString(type_item) && strcmp(type_item->valuestring, "ota") == 0)
                 {
                     // ★ OTA 升级指令处理
-                    // JSON 格式: {"type":"ota","url":"http://.../firmware.bin","version":"1.0.1"}
+                    // JSON 格式: {"type":"ota","url":"https://.../firmware.bin",
+                    //             "version":"1.2.3","sha256":"ab12...","size":1048576}
                     // bsp_ota_trigger 内部创建独立异步任务，不阻塞 MQTT 事件循环
                     cJSON *url_item = cJSON_GetObjectItem(root, "url");
                     cJSON *ver_item = cJSON_GetObjectItem(root, "version");
+                    cJSON *sha_item = cJSON_GetObjectItem(root, "sha256");
+                    cJSON *sz_item = cJSON_GetObjectItem(root, "size");
                     if (cJSON_IsString(url_item) && url_item->valuestring)
                     {
-                        const char *ver = (cJSON_IsString(ver_item) && ver_item->valuestring)
-                                              ? ver_item->valuestring
-                                              : "unknown";
-                        ESP_LOGW(MQTT_TAG, "收到 OTA 指令: url=%s version=%s",
-                                 url_item->valuestring, ver);
-                        esp_err_t ota_err = bsp_ota_trigger(url_item->valuestring, ver);
+                        // bsp_ota_trigger 会在返回前把各字段拷进任务私有堆参数，
+                        // 因此这里直接引用 cJSON 内部字符串，返回后 cJSON_Delete 仍安全
+                        bsp_ota_req_t req = {
+                            .url = url_item->valuestring,
+                            .version = (cJSON_IsString(ver_item) && ver_item->valuestring)
+                                           ? ver_item->valuestring
+                                           : "unknown",
+                            .sha256 = (cJSON_IsString(sha_item) && sha_item->valuestring)
+                                          ? sha_item->valuestring
+                                          : NULL,
+                            .size = cJSON_IsNumber(sz_item) ? (uint32_t)sz_item->valuedouble : 0,
+                        };
+                        ESP_LOGW(MQTT_TAG, "收到 OTA 指令: url=%s version=%s size=%u",
+                                 req.url, req.version, (unsigned)req.size);
+                        esp_err_t ota_err = bsp_ota_trigger(&req);
                         if (ota_err != ESP_OK)
                         {
                             ESP_LOGE(MQTT_TAG, "OTA 触发失败: %s", esp_err_to_name(ota_err));
@@ -622,6 +703,8 @@ void protocol_mqtt_start(void)
     };
     s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    // 注册 OTA 进度回调，使 bsp_ota 下载过程中能把进度发布到 ota-status 主题
+    bsp_ota_register_progress_cb(ota_progress_publish);
     esp_mqtt_client_start(s_mqtt_client);
     ESP_LOGI(MQTT_TAG, "MQTT 客户端正在启动...");
     /* 心跳任务栈分配在 SPIRAM，节省内部 SRAM */

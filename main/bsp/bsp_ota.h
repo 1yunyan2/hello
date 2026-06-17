@@ -24,6 +24,58 @@
  */
 
 #include "esp_err.h"
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+/**
+ * @brief OTA 进度状态枚举（对应后端 ota-status 主题的 status 字段）
+ *
+ * 时序：UPGRADING（更新中，progress 0~100，含下载+校验全过程）
+ *     → SUCCESS（新固件重启、MQTT 重连成功后补发）
+ * 任一环节出错则上报 FAILED（带中文 errorMsg），设备不重启、旧固件继续运行。
+ */
+typedef enum
+{
+    BSP_OTA_UPGRADING = 0, ///< 更新中（progress 有效，下载+校验全过程统一为此状态）
+    BSP_OTA_SUCCESS,       ///< 升级成功（重启后补发）
+    BSP_OTA_FAILED,        ///< 失败（带 errorMsg 上报，设备不重启）
+} bsp_ota_status_t;
+
+/**
+ * @brief OTA 进度回调函数类型
+ *
+ * 在 ota_task 任务上下文中被调用（非 MQTT 事件回调栈，publish 安全）。
+ * 实现方（mqtt_protocol）负责把状态发布到 echopal/device/{id}/ota-status。
+ *
+ * @param status   当前状态
+ * @param progress 更新进度 0~100（UPGRADING 有效；SUCCESS 传 100；FAILED 传 0）
+ * @param version  目标固件版本号
+ * @param err_msg  失败原因（仅 FAILED 时有意义，中文描述；其余状态传 NULL）
+ */
+typedef void (*bsp_ota_progress_cb_t)(bsp_ota_status_t status, int progress,
+                                      const char *version, const char *err_msg);
+
+/**
+ * @brief OTA 触发参数（由后端 command 指令解析而来）
+ *
+ * 注意：各指针通常指向 cJSON 内部字符串，bsp_ota_trigger 会在返回前
+ *       把内容拷进任务私有堆参数，因此调用方返回后即可安全删除 cJSON。
+ */
+typedef struct
+{
+    const char *url;     ///< 固件下载地址（http:// 或 https://）
+    const char *version; ///< 新固件版本号（语义化版本，如 "1.2.3"）
+    const char *sha256;  ///< 固件 SHA256（64 位十六进制字符串）；为 NULL 则跳过校验
+    uint32_t size;       ///< 固件字节数（progress 分母）；为 0 时退化用已下载长度估算
+} bsp_ota_req_t;
+
+/**
+ * @brief 注册 OTA 进度回调（在 protocol_mqtt_start 中调用一次即可）
+ *
+ * @param cb 进度回调；传 NULL 可注销
+ */
+void bsp_ota_register_progress_cb(bsp_ota_progress_cb_t cb);
 
 /**
  * @brief 触发 OTA 升级（异步，不阻塞调用方）
@@ -34,14 +86,31 @@
  * 内部流程：
  *   1. 版本号比较：若 version <= 当前版本，直接返回 ESP_ERR_INVALID_VERSION
  *   2. 写入 NVS pending_ver / pending_url（断电恢复用）
- *   3. 调用 esp_https_ota() 下载到 ota_1 分区
- *   4. 下载成功后延迟 3 秒 → esp_restart()
+ *   3. 分步下载（esp_https_ota_begin/perform）到备用分区，过程中回调 UPGRADING 进度
+ *   4. 回读备用分区计算 SHA256 与 req->sha256 比对，不一致则丢弃、不重启
+ *   5. 校验通过 → 回调 UPGRADING(100) → NVS 记录"待上报 success" → 延迟 3 秒 → esp_restart()
  *
- * @param url     固件下载地址（http:// 或 https://）
- * @param version 新固件版本号（语义化版本，如 "1.2.3"）
- * @return        ESP_OK 任务创建成功；ESP_ERR_INVALID_ARG / NO_MEM / INVALID_VERSION / FAIL
+ * @param req 触发参数（见 bsp_ota_req_t）
+ * @return    ESP_OK 任务创建成功；ESP_ERR_INVALID_ARG / NO_MEM / INVALID_VERSION / FAIL
  */
-esp_err_t bsp_ota_trigger(const char *url, const char *version);
+esp_err_t bsp_ota_trigger(const bsp_ota_req_t *req);
+
+/**
+ * @brief 取出"升级成功待上报"标记（新固件重启后调用）
+ *
+ * 若上一轮升级成功并已重启，本函数返回 true 并把目标版本号写入 out_version；
+ * 调用方据此向后端补发 success，随后应调用 bsp_ota_clear_pending_success()。
+ *
+ * @param out_version 输出缓冲区（建议 ≥32 字节）
+ * @param out_size    缓冲区大小
+ * @return true 存在待上报标记；false 无
+ */
+bool bsp_ota_take_pending_success(char *out_version, size_t out_size);
+
+/**
+ * @brief 清除"升级成功待上报"标记（success 上报成功后调用）
+ */
+void bsp_ota_clear_pending_success(void);
 
 /**
  * @brief 标记当前固件为有效（必须在 application_init 末尾调用）
