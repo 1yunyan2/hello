@@ -232,7 +232,7 @@ static void wake_word_callback(const char *wake_word_display)
     case WAKE_NEW_SESSION:
         // 真·开启新会话：给用户听觉反馈
         ESP_LOGW("WAKE_UP", "唤醒词触发（开启新会话）: [%s]", wake_word_display);
-        // play_wake_tone(); // 播放 880Hz 提示音
+        play_wake_tone(); // 播放 880Hz 提示音
         break;
     case WAKE_INTERRUPT:
         // 打断 TTS：不播提示音，避免打断用户插话的连贯性
@@ -427,8 +427,8 @@ void application_init(void)
 
     /* ── 步骤 7: 会话模块（WebSocket 预连接）─────────────────────────────── */
 
-    session_init("ws://122.224.191.2:4888/ws/omni");
-    // session_init(" ws://122.224.191.2:4888/ws/voice");
+    // session_init("ws://122.224.191.2:4888/ws/omni");
+    session_init("wss://ai.strailine-space.com/ws/omni");
 
     // PRINT_INTERNAL_HEAP;
 

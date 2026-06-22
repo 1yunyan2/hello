@@ -109,7 +109,7 @@ static void menu_clear_func_pages(void);        // 隐藏所有功能页专属�
 #define UI_MAIN_GIF_RANDOM 0          // 主界面 GIF 是否随机（1=随机，0=顺序）。
 #define UI_MENU_IDLE_TIMEOUT_MS 30000 /* 主屏幕顶部状态栏（时间 / WiFi / 电量）总开关：1=显示，0=关闭。 \
                                        * 关闭后既不创建标签也不启动刷新定时器，相关回调内均有 NULL 早退保护，安全。 */
-#define UI_SHOW_STATUS_BAR 1
+#define UI_SHOW_STATUS_BAR 0 /* 关闭顶部状态栏（时间/WiFi/电量全部不显示）*/
 
 /* ── 触摸调节步进 & 上限宏 ──
  * 修改此处统一控制所有触摸步进和上限值 */

@@ -518,7 +518,7 @@ protocol_t *protocol_create(const char *url, const char *token)
     esp_websocket_client_config_t websocket_cfg = {
         .uri = url,
         .headers = headers,
-        // .crt_bundle_attach = esp_crt_bundle_attach, // HTTPS 根证书校验（wss:// 需要）
+        .crt_bundle_attach = esp_crt_bundle_attach, // wss:// 根证书校验
         .network_timeout_ms = 3000,     // 网络超时 3 秒（缩短让连接失败更快触发重试）
         .disable_auto_reconnect = true, // 禁用自动重连，由 session 层控制退避策略
         // ★ Ping 保活说明：

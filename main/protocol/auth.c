@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file auth.c
  * @brief 设备认证模块实现 — 用 deviceToken 换取 accessToken
  *
@@ -11,6 +11,7 @@
 #include "auth.h"
 #include "object.h"
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "cJSON.h"
 #include "nvs.h"
@@ -148,11 +149,12 @@ void auth_perform(auth_t *auth, const char *device_token)
     for (int attempt = 0; attempt < max_retries; attempt++)
     {
         esp_http_client_config_t config = {
-            .url = AUTH_LOGIN_URL,
+            .url = AUTH_LOGIN_URL, // 认证 API 地址
             .method = HTTP_METHOD_POST,
             .event_handler = auth_http_event_handler,
             .user_data = wrapper,
             .timeout_ms = 3000, // 3秒超时，与 WebSocket 网络超时一致，服务器不可达时快速失败
+            .crt_bundle_attach = esp_crt_bundle_attach, // HTTPS 根证书校验
         };
         esp_http_client_handle_t client = esp_http_client_init(&config);
         esp_http_client_set_header(client, "Content-Type", "application/json");

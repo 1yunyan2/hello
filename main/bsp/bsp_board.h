@@ -31,9 +31,8 @@
 #include <nvs_flash.h>
 #include <esp_wifi.h>
 #include <esp_event.h>
-/* 配网协议已从 Unified Provisioning 迁移到 BluFi（见 main/blufi/）。
- * 原 #include <wifi_provisioning/manager.h> / <scheme_ble.h> 不再需要。
- * BluFi 的 API 头文件在 bsp_wifi.c 内按需引入，避免污染全局头。 */
+#include <wifi_provisioning/manager.h>
+#include <wifi_provisioning/scheme_ble.h>
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "cJSON.h"
