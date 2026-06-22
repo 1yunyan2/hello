@@ -7,8 +7,9 @@
  *   - 摄像机 (cam_x, cam_y)，屏幕坐标 = 世界坐标 - 摄像机偏移
  *   - 屏幕中心锚点：小人始终在 (JUMP_START_X, JUMP_START_Y) 附近
  *
- * 台子池：3个槽位 [0]=cur [1]=next [2]=prenext
- *   每次落台后：[0]←[1]←[2]，[2]生成新台，旧[0]的obj复用给新[2]
+ * 台子池：5个槽位 [0]=cur [1]=next [2]=prenext [3]=prev [4]=prevprev
+ *   每次落台后：[4]←[3]←旧[0]，[0]←[1]←[2]，[2]生成新台
+ *   旧cur不立即回收：先入prev槽随相机滑出屏幕，滚到prevprev出屏后才把obj复用给新[2]
  *
  * 摄像机：落台成功后平滑滑动到新位置（JUMP_CAM_SMOOTH_FRAMES帧）
  *
@@ -78,7 +79,10 @@ typedef enum
 } jump_phase_t;
 
 /* ── 台子（世界坐标，双轴）── */
-#define PLAT_COUNT 3 /* cur(0) + next(1) + prenext(2) */
+/* 5 槽位：游戏槽 cur(0)+next(1)+prenext(2)，离场槽 prev(3)+prevprev(4)。
+ * 离场槽保留刚跳离的台子对象，使其随相机平移自然滑出屏幕（不再瞬间消失）；
+ * 待其滚到 prevprev(4) 已彻底出屏后，下一次 advance 再回收该对象给新 prenext。*/
+#define PLAT_COUNT 5 /* cur(0) next(1) prenext(2) prev(3) prevprev(4) */
 
 typedef struct
 {
@@ -93,10 +97,19 @@ typedef struct
     uint8_t img_idx; /* 台子图片索引 0~JUMP_PLAT_IMG_COUNT-1（仅 JUMP_PLAT_USE_IMG=1）*/
     bool active;
     /* ── 从天而降入场动画 ── */
-    int drop;      /* 当前竖直入场偏移（>0=在目标上方，渲染时 sy 减去它）*/
-    int drop_vy;   /* 掉落速度（每帧px，向下加速）*/
-    int bounce;    /* 触底回弹压扁余量（0~100，渲染时加到 squash）*/
-    bool dropping; /* 入场动画进行中 */
+    int drop;          /* 当前竖直入场偏移（>0=在目标上方，渲染时 sy 减去它）*/
+    int drop_vy;       /* 掉落速度（每帧px，向下加速）*/
+    int bounce;        /* 触底回弹压扁余量（0~100，渲染时加到 squash）*/
+    bool dropping;     /* 入场动画进行中 */
+    bool drop_pending; /* 已生成但尚未起跌：台子多生成在屏幕右侧外，先挂起，
+                        * 等它随相机滚入视野右缘再触发 plat_start_drop，
+                        * 玩家才能亲眼看到从天而降，而非屏外掉完才滑进来 */
+    /* ── 棋子落台「压扁→回弹原高度」动画（JUMP_LAND_USE_SQUASH=1 时启用）──
+     * 落台时台子顶面压扁下沉（底部锁死），棋子脚底跟随，随后回弹到 land_sq=0（台面原高度）。
+     * 与整体下坠 bounce（整体下移 px）并存，由宏 JUMP_LAND_USE_SQUASH 二选一，旧逻辑完整保留。*/
+    int land_sq;         /* 当前落台压扁百分比 0~JUMP_LAND_SQUASH_PCT */
+    uint8_t land_phase;  /* 0=压扁上升阶段 1=回弹下降阶段 */
+    bool land_squashing; /* 落台压扁回弹动画进行中 */
     /* ── 蓄力压扁台面下沉量（由 platform_render_one 写入，供棋子 sink 读取）── */
     int squash_face_sink; /* 台面因压扁下沉的像素数（正值=下沉），图片模式专用 */
 } platform_t;
@@ -146,6 +159,11 @@ static struct
     int fly_step;    /* 当前步 0~fly_steps */
     int fly_steps;   /* 总步数 = fly_dist_px / FLY_STEP_PX */
     int fly_start_wx, fly_start_wy;
+    /* 飞行位置定点累积（×256），避免每帧重新整除导致 ±1px 截断抖动 */
+    int fly_wx256;   /* player_wx 的定点值（实际 wx = fly_wx256 >> 8）*/
+    int fly_wy256;   /* player_wy 的定点值 */
+    int fly_step256_x; /* 每帧 wx 步进量（×256）*/
+    int fly_step256_y; /* 每帧 wy 步进量（×256）*/
 
     /* 掉落（落空时继承飞行末态，做连续抛物线，而非垂直撞墙）*/
     int fall_vy; /* 垂直掉落速度（每帧px，向下加速）*/
@@ -154,6 +172,10 @@ static struct
 
     /* 摄像机延迟：落台后先等 N 帧，避免视线在棋子落台瞬间就移走 */
     int cam_delay_frames;
+
+    /* ── 随机台子变体调度（锁死出现频率，见 jump_sprites.h JUMP_VARIANT_*）── */
+    int plat_gen_seq;       /* 已生成台子计数（含初始预生成），用于热身判定 */
+    int variant_gap_normal; /* 距上一张变体台已经过的「正常台」数量（冷却计数）*/
 } g;
 
 /* ── 蓄力光斑粒子 ──
@@ -232,8 +254,9 @@ static void hud_refresh(void)
 
 static int cur_platform_w(void)
 {
-    int w = s_diff[g.diff].pw - g.score * JUMP_PW_SHRINK_PER_SCORE;
-    return w < JUMP_PW_MIN ? JUMP_PW_MIN : w;
+    /* 台宽固定为当前难度基础宽，不再随分数缩小。
+     * 「小台子」变化由 gen_platform 的随机变体逻辑负责，且受冷却频率锁死。*/
+    return s_diff[g.diff].pw;
 }
 
 static int rand_gap_x(void)
@@ -469,11 +492,12 @@ static bool platforms_drop_update(void)
     return any;
 }
 
-/* 按「当前所站台宽的 1/3」算人物等比缩放，下限 JUMP_PLAYER_MIN_W px。
- * 返回 LVGL scale（256=原尺寸）。台子大棋子大、台子小棋子保底不至于看不清。*/
+/* 按「难度基础台宽的 2/5」算人物等比缩放，下限 JUMP_PLAYER_MIN_W px。
+ * 返回 LVGL scale（256=原尺寸）。基准用固定基础台宽 s_diff[].pw（而非当前台实际宽
+ * g.plats[0].w），故棋子尺寸恒定，不再随小台子/变体台一起缩小放大。*/
 static int player_base_scale(void)
 {
-    int target_w = g.plats[0].w / 3; /* 目标棋子宽 = 台宽 1/3 */
+    int target_w = s_diff[g.diff].pw * 2 / 5; /* 目标棋子宽 = 基础台宽 2/5（恒定）*/
     if (target_w < JUMP_PLAYER_MIN_W)
         target_w = JUMP_PLAYER_MIN_W;               /* 下限 */
     int scale = target_w * 256 / JUMP_PLAYER_IMG_W; /* 反算 scale */
@@ -619,6 +643,7 @@ static void plat_start_drop(platform_t *p)
     p->drop_vy = 0;
     p->bounce = 0;
     p->dropping = true;
+    p->drop_pending = false; /* 已真正起跌，清除挂起标记 */
 }
 
 /* 台子无入场动画（直接就位，如起始台）*/
@@ -628,11 +653,71 @@ static void plat_no_drop(platform_t *p)
     p->drop_vy = 0;
     p->bounce = 0;
     p->dropping = false;
+    p->drop_pending = false;
+}
+
+/* 台子「挂起入场」：生成后先不掉落（此时多在屏幕右侧外），
+ * 待 platforms_drop_trigger 检测到它滚入视野右缘才真正起跌，
+ * 这样玩家能看到台子从天而降，而非在屏外掉完后才滑进来。
+ * 挂起期间 drop=0、dropping=false：渲染为「落定态」，但因尚在屏外故不可见。*/
+static void plat_pend_drop(platform_t *p)
+{
+    p->drop = 0;
+    p->drop_vy = 0;
+    p->bounce = 0;
+    p->dropping = false;
+    p->drop_pending = true;
 }
 
 #if JUMP_PLAT_USE_IMG
-/* 棋子落台：给这张台注入一次「被踩下压」，随后由 platforms_drop_update 逐帧回弹。
- * 复用 bounce 通道（drop=0 直接进回弹阶段），衰减用 JUMP_LAND_BOUNCE_DECAY。*/
+#if JUMP_LAND_USE_SQUASH
+/* 棋子落台（压扁回弹版）：触发台子「顶面压扁→回弹到原高度」动画（底部锁死）。
+ * 由 PH_CAM 每帧 land_squash_step / land_squash_render_slot0 推进，
+ * 压扁到峰值后回弹到 land_sq=0，台子恢复台面原高度。*/
+static void plat_land_squash(platform_t *p)
+{
+    p->land_sq = 0;
+    p->land_phase = 0;
+    p->land_squashing = true;
+}
+
+/* 推进 slot0 落台压扁回弹状态机一帧（仅更新状态，不渲染）。
+ * 阶段0：land_sq 升到 JUMP_LAND_SQUASH_PCT（压扁）；阶段1：降回 0（回弹到原高度）。*/
+static void land_squash_step(platform_t *p)
+{
+    if (!p->land_squashing)
+        return;
+    if (p->land_phase == 0)
+    {
+        p->land_sq += JUMP_LAND_SQUASH_RISE;
+        if (p->land_sq >= JUMP_LAND_SQUASH_PCT)
+        {
+            p->land_sq = JUMP_LAND_SQUASH_PCT;
+            p->land_phase = 1;
+        }
+    }
+    else
+    {
+        p->land_sq -= JUMP_LAND_SQUASH_FALL;
+        if (p->land_sq <= 0)
+        {
+            p->land_sq = 0;
+            p->land_squashing = false;
+        }
+    }
+}
+
+/* 按当前 land_sq 渲染 slot0 台子（顶面压扁、底部锁死），
+ * 返回棋子脚底应跟随的顶面下沉量 px（land_sq=0 时返回 0，台面原高度）。*/
+static int land_squash_render_slot0(void)
+{
+    platform_render_one(0, g.plats[0].land_sq); /* 写入 squash_face_sink */
+    return g.plats[0].land_sq > 0 ? g.plats[0].squash_face_sink : 0;
+}
+#else
+/* 棋子落台（整体下坠版，旧逻辑）：给这张台注入一次「被踩下压」，
+ * 随后由 platforms_drop_update 逐帧回弹。复用 bounce 通道（drop=0 直接进回弹阶段），
+ * 衰减用 JUMP_LAND_BOUNCE_DECAY。*/
 static void plat_land_bounce(platform_t *p)
 {
     p->drop = 0;
@@ -641,16 +726,65 @@ static void plat_land_bounce(platform_t *p)
     p->dropping = true;           /* 标记动画中，使 platforms_drop_update 处理其回弹 */
 }
 #endif
+#endif
 
 static void gen_platform(platform_t *dst, const platform_t *ref)
 {
     dst->w = cur_platform_w();
-    /* 水平间距：随机 gap，但钳到「安全最小中心距」防止台子重叠。
-     * 立方体投影宽≈台宽，两台不重叠要求 中心距 ≥ (ref->w + dst->w)/2 + 缝隙。*/
     int gap = rand_gap_x();
+
+    /* ── 随机台子变体调度（小台子 / 远台子，频率被严格锁死）──
+     * 1) 热身：前 JUMP_VARIANT_WARMUP 张一律正常台。
+     * 2) 冷却：距上一张变体台不足 JUMP_VARIANT_COOLDOWN 张正常台时绝不出变体。
+     * 3) 触发：冷却满足后按 JUMP_VARIANT_TRIGGER_PCT 概率出变体。
+     * 4) 类型：出变体时小台/远台各 50%。*/
+    g.plat_gen_seq++;
+    bool make_variant = false;
+    if (g.plat_gen_seq > JUMP_VARIANT_WARMUP &&
+        g.variant_gap_normal >= JUMP_VARIANT_COOLDOWN &&
+        (int)(esp_random() % 100) < JUMP_VARIANT_TRIGGER_PCT)
+    {
+        make_variant = true;
+    }
+
+    if (make_variant)
+    {
+        g.variant_gap_normal = 0; /* 重置冷却：本张是变体台 */
+        if (esp_random() & 1)
+        {
+            /* 小台子：宽缩到基础宽的 SMALL_MIN%~SMALL_MAX%，落脚面更窄 */
+            int lo = JUMP_VARIANT_SMALL_MIN_PCT, hi = JUMP_VARIANT_SMALL_MAX_PCT;
+            int pct = lo + (int)(esp_random() % (uint32_t)(hi - lo + 1));
+            dst->w = dst->w * pct / 100;
+            if (dst->w < JUMP_PW_MIN)
+                dst->w = JUMP_PW_MIN;
+        }
+        else
+        {
+            /* 远台子：在常规间距上额外拉远 FAR_EXTRA_MIN~MAX px（下方再钳到可达上限）*/
+            int lo = JUMP_VARIANT_FAR_EXTRA_MIN, hi = JUMP_VARIANT_FAR_EXTRA_MAX;
+            gap += lo + (int)(esp_random() % (uint32_t)(hi - lo + 1));
+        }
+    }
+    else
+    {
+        g.variant_gap_normal++; /* 本张是正常台，冷却计数 +1 */
+    }
+
+    /* 水平间距钳到「安全最小中心距」防止台子重叠。
+     * 立方体投影宽≈台宽，两台不重叠要求 中心距 ≥ (ref->w + dst->w)/2 + 缝隙。*/
     int min_gap = (ref->w + dst->w) / 2 + JUMP_PLAT_MIN_SPACING;
     if (gap < min_gap)
         gap = min_gap;
+    /* 水平间距钳到「可达上限」：即便下方 Y 偏移取到 ±JUMP_GAP_Y_MAX，
+     * 直线距离也不超过蓄力能跳的最大值 JUMP_DIST_MAX_PX（留 4px 余量），
+     * 保证每张台子（含远台子）都一定跳得到，不会出现必死局。*/
+    int reach_max = isqrt(JUMP_DIST_MAX_PX * JUMP_DIST_MAX_PX -
+                          JUMP_GAP_Y_MAX * JUMP_GAP_Y_MAX) -
+                    4;
+    if (gap > reach_max)
+        gap = reach_max;
+
     dst->world_cx = ref->world_cx + gap;
     dst->world_cy = ref->world_cy + rand_gap_y(ref->world_cy);
 #if JUMP_PLAT_USE_IMG
@@ -681,11 +815,15 @@ static void gen_platform(platform_t *dst, const platform_t *ref)
                        : 0;
 #endif
     dst->active = true;
-    plat_start_drop(dst); /* 新台子从天而降入场 */
+    plat_pend_drop(dst); /* 新台子先挂起，滚入视野右缘再从天而降（见 platforms_drop_trigger）*/
 }
 
 static void platforms_init(void)
 {
+    /* 变体调度计数清零：新一局从热身期重新开始 */
+    g.plat_gen_seq = 0;
+    g.variant_gap_normal = 0;
+
     g.plats[0].world_cx = JUMP_START_X;
     g.plats[0].world_cy = JUMP_TOP_Y;
     g.plats[0].w = cur_platform_w();
@@ -700,6 +838,16 @@ static void platforms_init(void)
     gen_platform(&g.plats[1], &g.plats[0]);
     gen_platform(&g.plats[2], &g.plats[1]);
 
+    /* 离场槽 prev(3)/prevprev(4) 开局无内容：置非激活并清掉残留动画状态。
+     * 其 cube 仍保留 build_panel 创建的对象备用；不重置 active 会让上一局残留的
+     * 离场台子在新局左侧诡异显示（platform_render_one 只对 active 台子绘制）。*/
+    for (int i = 3; i < PLAT_COUNT; i++)
+    {
+        g.plats[i].active = false;
+        g.plats[i].dropping = false;
+        g.plats[i].drop_pending = false;
+    }
+
     /* 摄像机归零：cur台在 (JUMP_START_X, JUMP_TOP_Y) */
     g.cam_x = g.cam_y = 0;
     g.cam_target_x = g.cam_target_y = 0;
@@ -710,14 +858,21 @@ static void platforms_init(void)
 
 static void platforms_advance(void)
 {
-    /* 旧cur(plats[0])的obj/side将复用为新prenext */
-    lv_obj_t *reuse_cube = g.plats[0].cube;
+    /* 离场台子回收时机：只回收已滚到 prevprev(4)、彻底出屏的那张台子的对象。
+     * 旧cur(plats[0])刚跳离，不能立刻回收——否则它会瞬间消失。改为：
+     *   prevprev(4) ← prev(3) ← 旧cur(0)，被挤出 prevprev 的旧对象才复用给新 prenext。
+     * 这样旧cur保留对象，随相机平移自然向左滑出屏幕（"跟随视觉移动，逐渐离场"）。*/
+    lv_obj_t *reuse_cube = g.plats[4].cube; /* prevprev 已出屏，其对象可安全复用 */
+
+    /* 离场槽滚动：旧 prev → prevprev，旧 cur → prev（均保留各自 cube 继续渲染）*/
+    g.plats[4] = g.plats[3];
+    g.plats[3] = g.plats[0];
 
     /* 数据滚动：[0]←[1]←[2] */
     g.plats[0] = g.plats[1];
     g.plats[1] = g.plats[2];
 
-    /* 生成新prenext，复用旧cur的立方体对象 */
+    /* 生成新prenext，复用「已出屏的旧 prevprev」立方体对象 */
     gen_platform(&g.plats[2], &g.plats[1]);
     g.plats[2].cube = reuse_cube;
 
@@ -770,12 +925,33 @@ static void do_jump(uint32_t held_ms)
         g.fly_steps = 1;
     g.fly_start_wx = g.player_wx;
     g.fly_start_wy = g.player_wy;
+    /* 定点累积初始值：从起跳位置开始，每帧匀速步进，消除整除截断抖动 */
+    g.fly_wx256 = g.player_wx * 256;
+    g.fly_wy256 = g.player_wy * 256;
+    g.fly_step256_x = g.fly_total_x * 256 / g.fly_steps;
+    g.fly_step256_y = g.fly_total_y * 256 / g.fly_steps;
     g.phase = PH_FLY;
 
     platform_render_one(0, 0); /* 恢复台子压扁 */
     sparks_hide();             /* 起跳：收起蓄力光斑 */
     bsp_motor_pulse();
     ESP_LOGI(TAG, "起跳 dist=%d target(%d,%d)", dist, tx, ty);
+}
+
+/* 扫描「挂起入场」的台子：一旦其随相机滚入屏幕右侧（左缘越过屏幕右边界、
+ * 出现任一可见部分）就触发从天而降。这样台子总在玩家眼前砸下，
+ * 而不是在屏外掉完后才滑进视野。判定用台子半宽 w/2（图片缩放后实际宽≈w）。*/
+static void platforms_drop_trigger(void)
+{
+    for (int i = 0; i < PLAT_COUNT; i++)
+    {
+        platform_t *p = &g.plats[i];
+        if (!p->active || !p->drop_pending)
+            continue;
+        int sx = wx_to_sx(p->world_cx);
+        if (sx - p->w / 2 <= BSP_LCD_WIDTH) /* 左缘已进入可视区 */
+            plat_start_drop(p);
+    }
 }
 
 /* ══════════════════════════════════════════════════
@@ -787,6 +963,9 @@ static void engine_cb(lv_timer_t *t)
     if (g.screen != JS_PLAYING)
         return;
 
+    /* 先触发已滚入视野的挂起台子起跌，再推进掉落动画（同帧即可见其从高空落下）。*/
+    platforms_drop_trigger();
+
     /* 每帧推进台子入场/回弹动画，独立于 phase。
      * 图片模式下 slot0 有落台 bounce 时，棋子也跟随台面下移（视觉同步）。*/
     if (platforms_drop_update())
@@ -796,8 +975,9 @@ static void engine_cb(lv_timer_t *t)
             if (g.plats[i].dropping || g.plats[i].drop > 0 || g.plats[i].bounce > 0)
             {
                 platform_render_one(i, 0);
-#if JUMP_PLAT_USE_IMG
-                /* slot0 有落台回弹时，棋子脚底跟随台面下移（bounce px）*/
+#if JUMP_PLAT_USE_IMG && !JUMP_LAND_USE_SQUASH
+                /* slot0 有落台回弹时，棋子脚底跟随台面下移（bounce px）。
+                 * 仅整体下坠版需要；压扁回弹版在 PH_CAM 内统一驱动棋子跟随。*/
                 if (i == 0 && g.phase == PH_CAM && g.plats[0].bounce > 0)
                     player_render(0, 0, g.plats[0].bounce);
 #endif
@@ -855,9 +1035,17 @@ static void engine_cb(lv_timer_t *t)
         int num = g.fly_step * 256 / g.fly_steps; /* t*256 定点数 */
         int t256 = num;
 
-        /* 位置：线性插值 */
-        g.player_wx = g.fly_start_wx + g.fly_total_x * g.fly_step / g.fly_steps;
-        g.player_wy = g.fly_start_wy + g.fly_total_y * g.fly_step / g.fly_steps;
+        /* 位置：定点累积步进，避免每帧重新整除导致 ±1px 截断抖动 */
+        g.fly_wx256 += g.fly_step256_x;
+        g.fly_wy256 += g.fly_step256_y;
+        g.player_wx = g.fly_wx256 >> 8;
+        g.player_wy = g.fly_wy256 >> 8;
+        /* 最后一步强制对齐终点，消除定点累积的尾部误差 */
+        if (g.fly_step >= g.fly_steps)
+        {
+            g.player_wx = g.fly_start_wx + g.fly_total_x;
+            g.player_wy = g.fly_start_wy + g.fly_total_y;
+        }
 
         /* 弧高：h = apex * 4 * t * (1-t) */
         int fly_h = g.fly_apex * 4 * t256 * (256 - t256) / (256 * 256);
@@ -896,9 +1084,15 @@ static void engine_cb(lv_timer_t *t)
             /* 保险：玩家落上的台子强制结束入场动画（清掉残留掉落状态），随后再注入落台回弹 */
             plat_no_drop(&g.plats[0]);
 #if JUMP_PLAT_USE_IMG
-            /* 棋子落上台子：台子被踩一下下压再回弹（图片模式专属手感）。
+#if JUMP_LAND_USE_SQUASH
+            /* 棋子落上台子：台子顶面压扁→回弹到原高度（底部锁死）。
+             * PH_CAM 每帧 land_squash_step/render 推进，回弹结束后才回 PH_IDLE。*/
+            plat_land_squash(&g.plats[0]);
+#else
+            /* 棋子落上台子：台子整体被踩一下下压再回弹（旧逻辑，图片模式专属手感）。
              * platforms_drop_update 每帧独立推进其回弹，PH_CAM 期间自然播完。*/
             plat_land_bounce(&g.plats[0]);
+#endif
 #endif
 
             hud_refresh();
@@ -929,8 +1123,45 @@ static void engine_cb(lv_timer_t *t)
     /* 摄像机平滑滑动 */
     case PH_CAM:
     {
+#if JUMP_PLAT_USE_IMG && JUMP_LAND_USE_SQUASH
+        /* 压扁回弹版：先推进 slot0 压扁回弹状态机一帧（仅状态，渲染在各分支内）。
+         * 棋子脚底跟随台面下沉量 cam_sink（由 land_squash_render_slot0 返回）。*/
+        land_squash_step(&g.plats[0]);
+        int cam_sink = 0;
+        /* 延迟阶段：棋子在落点，台子压扁回弹动画播放，玩家看清落点 */
+        if (g.cam_delay_frames > 0)
+        {
+            g.cam_delay_frames--;
+            cam_sink = land_squash_render_slot0();
+            player_render(0, 0, cam_sink);
+            break;
+        }
+        if (g.cam_smooth_frames > 0)
+        {
+            /* 每帧向目标前进 1/remaining 步（匀减速感）*/
+            g.cam_x += (g.cam_target_x - g.cam_x + g.cam_smooth_frames - 1) / g.cam_smooth_frames;
+            g.cam_y += (g.cam_target_y - g.cam_y + g.cam_smooth_frames - 1) / g.cam_smooth_frames;
+            g.cam_smooth_frames--;
+            platforms_render_all();                /* 先按相机渲染全部（slot0 squash=0）*/
+            cam_sink = land_squash_render_slot0(); /* 再叠加 slot0 压扁，覆盖其渲染 */
+            player_render(0, 0, cam_sink);
+        }
+        if (g.cam_smooth_frames <= 0)
+        {
+            /* 对齐到精确目标，消除累积误差 */
+            g.cam_x = g.cam_target_x;
+            g.cam_y = g.cam_target_y;
+            platforms_render_all();
+            cam_sink = land_squash_render_slot0();
+            player_render(0, 0, cam_sink);
+            /* 相机到位后，仅当压扁回弹也播完才回 IDLE（否则停在 CAM 继续播完回弹）*/
+            if (!g.plats[0].land_squashing)
+                g.phase = PH_IDLE;
+        }
+        break;
+#else
+        /* 整体下坠版（旧逻辑）：棋子跟随 slot0 落台回弹偏移（bounce = 下移px，随台子逐帧归零）*/
 #if JUMP_PLAT_USE_IMG
-        /* 图片模式：棋子跟随 slot0 落台回弹偏移（bounce = 下移px，随台子逐帧归零）*/
         int cam_sink = g.plats[0].bounce;
 #else
         int cam_sink = 0;
@@ -961,6 +1192,7 @@ static void engine_cb(lv_timer_t *t)
             g.phase = PH_IDLE;
         }
         break;
+#endif
     }
 
     /* 掉落出屏（连续抛物线：水平继续飞 + 弧高消退 + 重力加速下坠）*/

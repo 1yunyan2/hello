@@ -68,6 +68,17 @@ extern const lv_image_dsc_t jt1, jt3, jt4, jt5, jt6, jt7;
  * 蓄力时台子同步下压，棋子随台面下沉（sink = bounce_pct * max_sink）。*/
 #define JUMP_LAND_BOUNCE 12      /* 落台初始下移量 px（轻微压感）*/
 #define JUMP_LAND_BOUNCE_DECAY 1 /* 每帧衰减 px（约 12 帧弹回）*/
+/* ── 落台手感二选一开关 ──
+ * 0 = 整体下坠：台子+棋子整体下移 JUMP_LAND_BOUNCE px 再线性弹回（旧逻辑，bounce 字段）。
+ * 1 = 压扁回弹：复用蓄力 squash（顶面下沉、底部锁死），棋子脚底跟随，压一下再回弹到台面原高度。
+ * 两套代码均保留，改这一个宏即可切换。*/
+#define JUMP_LAND_USE_SQUASH 1
+/* 压扁回弹参数（仅 JUMP_LAND_USE_SQUASH=1 生效）：
+ * 落台瞬间台子顶面压扁到 PCT%（对应顶面最大下沉 PCT% × JUMP_PLAT_IMG_SQUASH_MAX_PX），
+ * 再以 FALL/帧 回弹到 0（台面原高度）。RISE 越大压得越快，FALL 越小弹回越慢、越 Q 弹。*/
+#define JUMP_LAND_SQUASH_PCT 30  /* 落台压扁峰值百分比 0~100（想压更狠就调大）*/
+#define JUMP_LAND_SQUASH_RISE 12 /* 压扁阶段每帧上升百分比 */
+#define JUMP_LAND_SQUASH_FALL 4  /* 回弹阶段每帧下降百分比 */
 /* 图片台子蓄力最大下沉量 px（台子随棋子蓄力同步下压，0~100%对应0~此值）*/
 #define JUMP_PLAT_IMG_SQUASH_MAX_PX 8
 #endif
@@ -104,9 +115,25 @@ extern const lv_image_dsc_t jt1, jt3, jt4, jt5, jt6, jt7;
 #define JUMP_GAP_MIN_HARD 90
 #define JUMP_GAP_MAX_HARD 180
 
-/* 越往后台子越小：每得 1 分台宽缩 2px（原 1px，放大初始值后加快递减），下限 26 */
-#define JUMP_PW_SHRINK_PER_SCORE 2
+/* 台宽下限（小台子变体也不会窄于此值，保证还能落脚）*/
 #define JUMP_PW_MIN 26
+
+/* ── 随机台子变体（不随分数递增，且锁死出现频率）──
+ * 台宽不再「越往后越小」；改为：绝大多数台子是「正常台」，
+ * 少数台子变成「小台子」或「远台子」，且出现频率被严格锁死：
+ *   1) 开局前 WARMUP 张一律正常台（热身，让玩家先上手）；
+ *   2) 热身后，距上一张变体台「不足 COOLDOWN 张正常台」时绝不出变体
+ *      （保证两张变体台之间「最少」间隔 COOLDOWN 张正常台，绝不连续）；
+ *   3) 冷却满足后，每张台按 TRIGGER_PCT 概率决定是否变体
+ *      （所以实际间隔 ≥ COOLDOWN，且平均更稀疏）；
+ *   4) 触发变体时在「小台子 / 远台子」之间各 50% 随机选。*/
+#define JUMP_VARIANT_WARMUP 10        /* 开局前 N 张强制正常台 */
+#define JUMP_VARIANT_COOLDOWN 3       /* 两张变体台之间「最少」间隔 N 张正常台 */
+#define JUMP_VARIANT_TRIGGER_PCT 50   /* 冷却满足后，每张台出现变体的百分比概率 */
+#define JUMP_VARIANT_SMALL_MIN_PCT 72 /* 小台子宽 = 基础宽的 72%~（约缩小 1/4）*/
+#define JUMP_VARIANT_SMALL_MAX_PCT 80 /* ~80% */
+#define JUMP_VARIANT_FAR_EXTRA_MIN 25 /* 远台子在常规间距上额外拉远 25~ px */
+#define JUMP_VARIANT_FAR_EXTRA_MAX 45 /* ~45 px（最终仍被「可达上限」钳制，保证跳得到）*/
 
 /* 相邻台子之间的最小可见缝隙 px（中心距 ≥ 两台半宽和 + 此值，防止台子重叠）*/
 #define JUMP_PLAT_MIN_SPACING 18
