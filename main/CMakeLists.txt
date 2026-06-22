@@ -57,6 +57,8 @@ idf_component_register(SRCS
 "bsp/bsp_battery.c"
 "bsp/bsp_ota.c"
 "test_wifi_time.c"
+"blufi/blufi_init.c"
+"blufi/blufi_security.c"
 INCLUDE_DIRS "."
 )
 # 注：main 组件默认会包含所有公共组件（包括 esp_adc），无需显式 PRIV_REQUIRES。
