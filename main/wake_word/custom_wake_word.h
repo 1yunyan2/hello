@@ -180,6 +180,15 @@ void custom_wake_word_feed(const int16_t *data, size_t len);
 void wake_word_stop(void);
 
 /**
+ * @brief 彻底挂起 AFE feed（解绑/重启前调用，不可逆）
+ *
+ * 将 s_afe_data 置 NULL，使 custom_wake_word_feed 在入口处直接 return，
+ * 阻止 AEC FFT 与 LVGL 刷屏/DMA 并发导致 LoadProhibited 崩溃。
+ * 仅在 clear_wifi_and_restart() 流程中调用，重启后自动恢复。
+ */
+void wake_word_suspend_feed(void);
+
+/**
  * @brief 恢复 MultiNet 命令词检测监听
  *
  * 设置 is_running = true，afe_fetch_task 恢复 MultiNet detect 检测循环。

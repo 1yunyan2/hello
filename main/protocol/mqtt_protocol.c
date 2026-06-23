@@ -508,9 +508,14 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     ESP_LOGW(MQTT_TAG, "收到云端解绑指令，启动异步解绑任务...");
                     // ★ 必须用异步任务：clear_wifi_and_restart() 内部做 MQTT publish + NVS 写 + esp_restart，
                     //   不能在 MQTT 事件回调中直接执行，否则会与 MQTT 内部锁死锁
+                    // 栈 8192：clear_wifi_and_restart() 内会跑 ui_show_unbinding()
+                    // (LVGL lv_refr_now + DMA 刷屏，大量 memcpy 像素) + 在线 MQTT/TLS
+                    // publish + flash 擦写，3072 会栈溢出(StoreProhibited 0x1D，memcpy
+                    // 写非法地址 0xffffffc0)。本任务为一次性临时任务，跑完即 esp_restart，
+                    // 不占常驻内部 SRAM 水位。
                     BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(
                         async_unbind_task, "async_unbind",
-                        3072, NULL, 5, NULL,
+                        8192, NULL, 5, NULL,
                         tskNO_AFFINITY, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
                     if (ret != pdPASS)
                         ESP_LOGE(MQTT_TAG, "内存不足，无法创建解绑任务！");

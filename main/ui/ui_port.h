@@ -1,6 +1,8 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>   /* snprintf：QRCODE_MAKE_CONTENT 宏展开时需要 */
+#include <string.h>  /* strlen：调用方传给 lv_qrcode_update 时需要 */
 #include "ui/interaction.h" /* 引入触摸事件枚举touch_event_t */
 
 /* ═══════════════════════════════════════════════════════════════
@@ -121,6 +123,37 @@ void ui_force_back_to_main(void);
  * @param body  居中正文（支持 \n 换行；可为 NULL）
  */
 void ui_menu_show_text(const char *title, const char *body);
+
+/* ═══════════════════════════════════════════════════════════════
+ * 配网二维码内容格式宏
+ *   QRCODE_FORMAT_RAW  (默认) : 裸设备 ID，如 "EchoPals-8C6BF8"
+ *   QRCODE_FORMAT_URL         : URL 协议格式，如 "echopals://provision?id=EchoPals-8C6BF8"
+ * 二选一，默认 RAW；如需 URL 格式，在编译时定义 QRCODE_FORMAT_URL 宏即可。
+ * ═══════════════════════════════════════════════════════════════ */
+#if defined(QRCODE_FORMAT_URL)
+#define QRCODE_MAKE_CONTENT(id, buf, bufsz) \
+    snprintf((buf), (bufsz), "echopals://provision?id=%s", (id))
+#else
+/* 默认：裸 ID */
+#define QRCODE_MAKE_CONTENT(id, buf, bufsz) \
+    snprintf((buf), (bufsz), "%s", (id))
+#endif
+
+/**
+ * @brief 显示配网二维码（未配网时调用）
+ *
+ * 用设备 ID（蓝牙广播名，如 "EchoPals-8C6BF8"）生成二维码并显示到屏幕。
+ * 二维码内容格式由 QRCODE_FORMAT_URL / QRCODE_FORMAT_RAW 宏控制（默认裸 ID）。
+ * 配网完成后调用 ui_hide_qrcode() 撤销。
+ *
+ * @param device_id 设备 ID 字符串，不能为 NULL
+ */
+void ui_show_qrcode(const char *device_id);
+
+/**
+ * @brief 隐藏配网二维码，恢复主界面
+ */
+void ui_hide_qrcode(void);
 
 /**
  * @brief 显示「正在重置，请稍候…」解绑提示页

@@ -156,6 +156,11 @@ typedef enum
 lv_display_t *lvgl_disp = NULL;
 static lv_obj_t *gif_obj = NULL;
 
+/* LVGL/屏幕是否已初始化完成。供其他任务（如按键重置）在调用 lvgl_port_lock 前判断，
+ * 避免在 LVGL 未就绪时（如 WiFi 还在重连、UI 尚未起来）触发 lvgl_port_lock 的 assert。
+ * 在 lvgl_port_init() 成功后置 true。 */
+static bool s_lvgl_ready = false;
+
 /* ── 主界面 GIF 自动循环状态(均在 LVGL 线程读写,无需加锁/原子)──
  *   s_gif_cur_index   : 当前正在播放的 GIF 表索引;-1 表示尚未开始
  *   s_gif_pending_idx : 待切换到的索引;-1 表示当前无待切换(防重复排队)
@@ -777,6 +782,7 @@ static esp_err_t app_lvgl_init(void)
     esp_err_t err = lvgl_port_init(&lvgl_cfg);
     if (err != ESP_OK)
         return err;
+    s_lvgl_ready = true; // 标记 LVGL 已就绪：此后 lvgl_port_lock 才合法（见 ui_is_ready）
     PRINT_MEM_INFO(TAG, "lvgl_port 8KB INTERNAL 任务栈分配后");
 
     // ── LVGL 显示配置（内部 SRAM 单缓冲 PARTIAL 模式）─────────────────────────
@@ -2255,8 +2261,89 @@ void ui_menu_show_text(const char *title, const char *body)
  *
  * @note 必须在调用方真正擦除 NVS / 重启【之前】调用，否则 cache 已禁用、刷不上屏。
  */
+/* ═══════════════════════════════════════════════════════════════
+ * 配网二维码
+ * ═══════════════════════════════════════════════════════════════ */
+static lv_obj_t *s_qr_screen = NULL; /* 独立全屏覆盖层，配网期间遮住主界面 */
+
+void ui_show_qrcode(const char *device_id)
+{
+    if (!device_id || device_id[0] == '\0')
+    {
+        ESP_LOGW(TAG, "ui_show_qrcode: device_id 为空，跳过");
+        return;
+    }
+
+    /* 把设备 ID 按宏规则转成二维码内容 */
+    char qr_content[128];
+    QRCODE_MAKE_CONTENT(device_id, qr_content, sizeof(qr_content));
+    ESP_LOGI(TAG, "生成配网二维码，内容: %s", qr_content);
+
+    if (!lvgl_port_lock(500))
+        return;
+
+    /* 创建全屏黑色覆盖层（覆盖主界面，不销毁它） */
+    s_qr_screen = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(s_qr_screen, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_pos(s_qr_screen, 0, 0);
+    lv_obj_set_style_bg_color(s_qr_screen, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_qr_screen, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_qr_screen, 0, 0);
+    lv_obj_set_style_pad_all(s_qr_screen, 0, 0);
+    lv_obj_clear_flag(s_qr_screen, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 二维码尺寸：取屏幕短边的 60%，居中偏上 */
+    int scr_w = lv_display_get_horizontal_resolution(NULL);
+    int scr_h = lv_display_get_vertical_resolution(NULL);
+    int qr_size = (scr_w < scr_h ? scr_w : scr_h) * 6 / 10;
+
+    lv_obj_t *qr = lv_qrcode_create(s_qr_screen);
+    lv_qrcode_set_size(qr, qr_size);
+    lv_qrcode_set_dark_color(qr, lv_color_black());
+    lv_qrcode_set_light_color(qr, lv_color_white());
+    lv_obj_align(qr, LV_ALIGN_CENTER, 0, -(scr_h / 10)); /* 稍微向上偏，留出下方文字 */
+    lv_qrcode_update(qr, qr_content, (uint32_t)strlen(qr_content));
+
+    /* 提示文字：显示设备 ID，方便用户核对 */
+    lv_obj_t *label = lv_label_create(s_qr_screen);
+    lv_label_set_text_fmt(label, "扫码配网\n%s", device_id);
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(label, scr_w - 20);
+    lv_obj_align(label, LV_ALIGN_BOTTOM_MID, 0, -12);
+
+    lv_refr_now(NULL);
+    lvgl_port_unlock();
+}
+
+void ui_hide_qrcode(void)
+{
+    if (!lvgl_port_lock(500))
+        return;
+
+    if (s_qr_screen != NULL)
+    {
+        lv_obj_delete(s_qr_screen);
+        s_qr_screen = NULL;
+        lv_refr_now(NULL);
+        ESP_LOGI(TAG, "配网二维码已隐藏");
+    }
+
+    lvgl_port_unlock();
+}
+
 void ui_show_unbinding(void)
 {
+    /* LVGL 未就绪（如 WiFi 还在重连、屏幕尚未初始化）时直接返回：
+     * 否则 lvgl_port_lock 会因 lvgl_mux 为空而 assert→abort，导致设备在清除
+     * WiFi 凭证之前就重启（表现为「按键和 RST 一样只重启、密码没清掉」）。 */
+    if (!s_lvgl_ready)
+    {
+        ESP_LOGW(TAG, "LVGL 未就绪，跳过解绑提示页（不影响后续 WiFi 凭证清除）");
+        return;
+    }
+
     /* 超时给足 1s：此刻系统正准备重启，宁可多等也要确保提示能刷上屏 */
     if (!lvgl_port_lock(1000))
         return;

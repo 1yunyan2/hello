@@ -58,6 +58,7 @@ static int s_afe_feed_chunksize = 0;                 // AFE feed 每次需要的
 static int s_afe_fetch_chunksize = 0;                // AFE fetch 每次输出的采样点数
 
 static volatile bool is_running = false;             // 引擎运行标志（volatile：可能在中断/任务间读写）// 供 custom_wake_word_feed 和 afe_fetch_task 访问
+static volatile bool s_feed_suspended = false;       // 解绑/重启前置位，使 feed 直接 return，避免 AEC+DMA 并发崩溃
 static wake_word_detected_cb_t user_callback = NULL; // 用户注册的触发回调
 static SemaphoreHandle_t buffer_mutex = NULL;        // 保护 input_buffer 的互斥锁
 
@@ -1011,8 +1012,8 @@ static void multinet_detect_task(void *arg)
  */
 void custom_wake_word_feed(const int16_t *data, size_t len)
 {
-    // AFE 未就绪时直接返回
-    if (s_afe_data == NULL)
+    // AFE 未就绪或已被解绑流程挂起时直接返回（s_feed_suspended 由 wake_word_suspend_feed 置位）
+    if (s_afe_data == NULL || s_feed_suspended)
         return;
 
     // ── AEC "MR" 模式：交织麦克风 + 参考信号后送 AFE ───────────────────────
@@ -1058,6 +1059,14 @@ void wake_word_stop(void)
     input_buffer_len = 0;
     is_running = false;
     xSemaphoreGive(buffer_mutex);
+}
+
+// 解绑/重启前调用：将 s_afe_data 置 NULL，使 custom_wake_word_feed 立即
+// 在入口处 return，彻底停止 AFE feed 调用链，避免 AEC FFT 与 LVGL 刷屏并发崩溃。
+// 此操作不可逆（重启前调用，无需恢复）。
+void wake_word_suspend_feed(void)
+{
+    s_afe_data = NULL;
 }
 
 // ─── 公开 API：恢复引擎监听 ─────────────────────────────────────────────

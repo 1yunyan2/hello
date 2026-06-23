@@ -3,7 +3,16 @@
 #include "protocol/auth.h"
 #include "esp_heap_caps.h"
 #include "freertos/timers.h" /* WiFi 断线去抖软件定时器 */
-#include "ui/ui_port.h" /* ui_show_unbinding(): 解绑前显示静态提示页，避免 GIF 卡冻帧 */
+#include "ui/ui_port.h"      /* ui_show_unbinding(): 解绑前显示静态提示页，避免 GIF 卡冻帧 */
+
+/* ── BluFi 配网相关（替代原 Unified Provisioning）─────────────────────────── */
+#include "esp_blufi_api.h"        /* BluFi 事件枚举、回调结构、send 接口 */
+#include "esp_blufi.h"            /* esp_blufi_adv_start/stop、profile 等 */
+#include "blufi/blufi_security.h" /* 工程内拷贝：安全协商 + NimBLE 主机管理 */
+#include "esp_mac.h"              /* esp_read_mac（蓝牙名派生）*/
+#if CONFIG_BT_NIMBLE_ENABLED
+#include "services/gap/ble_svc_gap.h" /* ble_svc_gap_device_name_set */
+#endif
 // ─── 模块常量 ─────────────────────────────────────────────────────────────────
 #define CLEAR_WIFI_BUTTON_PIN GPIO_NUM_0 ///< 清除 WiFi 凭证的长按按键（Boot 按钮）
 #define MAX_RETRY_COUNT 5                ///< WiFi 断线后最大自动重连次数
@@ -25,6 +34,18 @@ static int s_retry_num = 0;
 static TimerHandle_t s_wifi_debounce_timer = NULL;
 /// @brief 供去抖定时器回调访问的 bsp_board 指针（事件 handler 中保存）
 static bsp_board_t *s_debounce_board = NULL;
+
+// ─── BluFi 配网状态变量 ────────────────────────────────────────────────────────
+/// @brief 当前 BLE（GATT）是否已连接（手机已连上设备蓝牙）
+static bool s_blufi_ble_connected = false;
+/// @brief 供 BluFi 回调访问的 bsp_board 指针（wifi_main 中保存）
+static bsp_board_t *s_blufi_board = NULL;
+/// @brief BluFi 收到并下发给 esp_wifi 的 STA 配置（SSID/密码暂存）
+static wifi_config_t s_blufi_sta_config = {0};
+/// @brief 是否有待回传的 WiFi 列表请求（GET_WIFI_LIST 非阻塞扫描标志）：
+/// 回调里启动非阻塞扫描时置 true，SCAN_DONE 事件回传后清 false。
+/// 用于区分"配网请求的扫描"与其它来源的扫描，避免误回传。
+static bool s_blufi_wifi_list_pending = false;
 
 // ─── wifi_debounce_timer_cb ──────────────────────────────────────────────────
 
@@ -131,6 +152,21 @@ void clear_wifi_and_restart(void)
  * @note 调用者：bsp_board_wifi_main() 通过 xTaskCreatePinnedToCoreWithCaps() 创建
  * @note 运行核心：CPU0，栈 4096 字节（SPIRAM 分配）
  */
+/**
+ * @brief 按键重置一次性任务：在 8192B 大栈上执行 clear_wifi_and_restart()
+ *
+ * btn_task 自身栈仅 3072B，不足以承载 ui_show_unbinding() 的 LVGL 刷屏。
+ * 这里用独立大栈任务跑清除+重启逻辑，跑完即 esp_restart（不返回）。
+ *
+ * @param pv 未使用
+ */
+static void btn_reset_task(void *pv)
+{
+    (void)pv;
+    clear_wifi_and_restart(); // 内部最终 esp_restart()，不会返回
+    vTaskDelete(NULL);        // 兜底：理论上不可达
+}
+
 static void button_monitor_task(void *pvParameters)
 {
     // ── 步骤 1：配置 GPIO0 为输入模式（内部上拉，轮询检测）─────────────────
@@ -155,8 +191,16 @@ static void button_monitor_task(void *pvParameters)
             press_count++;
             if (press_count >= 300) // 300 × 10ms = 3 秒持续按压
             {
-                // 前置检查：确保配网管理器已初始化，避免过早调用导致崩溃
-                clear_wifi_and_restart(); // 触发清除和重启（不会返回）
+                // 不能在本任务（btn_task 栈仅 3072B）直接调用 clear_wifi_and_restart()：
+                // 其内部 ui_show_unbinding() 在 LVGL 就绪时会跑 lv_refr_now + DMA 刷屏
+                // （大量 memcpy 像素），3072B 栈会溢出（StoreProhibited 0x1D），
+                // 与 mqtt_protocol.c 云端解绑路径同坑。改用一次性 8192B 任务执行。
+                // 该任务内部最终 esp_restart，跑完即销毁，不占常驻内部 SRAM 水位。
+                xTaskCreatePinnedToCoreWithCaps(
+                    btn_reset_task, "btn_reset",
+                    8192, NULL, 5, NULL,
+                    tskNO_AFFINITY, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                vTaskDelete(NULL); // btn_task 使命完成自删（清除+重启在 btn_reset 任务里完成）
             }
         }
         else
@@ -170,86 +214,70 @@ static void button_monitor_task(void *pvParameters)
     }
 }
 
-// ─── custom_prov_data_handler ────────────────────────────────────────────────
+// ─── blufi_save_token_from_json ──────────────────────────────────────────────
 
 /**
- * @brief BLE 配网自定义数据端点回调（接收 App 下发的 device Token）
+ * @brief 解析手机下发的 JSON 并把 device Token 写入 NVS（BluFi 自定义数据帧用）
  *
- * 在 BLE 配网过程中，App 除了推送 WiFi SSID/密码外，还会通过自定义端点
- * "custom-data" 下发设备绑定 Token（deviceToken）。本函数处理该数据：
- *   1. 解析 JSON：{"token": "xxxxxx"}
- *   2. 提取 token 字段，写入 NVS（命名空间 "net_config"，键 "ws_token"）
- *   3. 调用 wifi_prov_mgr_stop_provisioning() 结束配网流程
- *   4. 返回固定 JSON 响应 {"status":"OK"}
+ * 迁移说明：本函数从原 Unified Provisioning 的 custom_prov_data_handler 抽取而来，
+ * token 的解析与持久化逻辑保持完全一致（命名空间 "net_config"、键 "ws_token"），
+ * 确保 session.c 读取端无需任何改动。区别仅在于数据来源：
+ *   - 原来：BLE 配网框架的 "custom-data" 端点回调
+ *   - 现在：BluFi 的 ESP_BLUFI_EVENT_RECV_CUSTOM_DATA 回调
  *
- * @param session_id 当前 BLE 配网会话 ID（调试用）
- * @param inbuf      App 发来的原始数据（JSON 字符串）
- * @param inlen      原始数据长度（字节）
- * @param outbuf     响应数据指针（由此函数分配，框架负责释放）
- * @param outlen     响应数据长度
- * @param priv_data  私有数据（未使用）
- * @return ESP_OK 处理成功（即使 token 解析失败也返回 OK，附带响应体）
+ * @param data 手机发来的原始字节（期望是 JSON 字符串 {"token":"xxx"}）
+ * @param len  原始数据长度（字节）
+ * @return ESP_OK 写入成功；其他为失败（失败仅记日志，不影响 WiFi 配网主流程）
  *
- * @note 调用者：BLE 配网框架（wifi_prov_mgr_endpoint_register 注册后自动调用）
- * @note 线程安全：由配网框架在单独任务中调用，需注意 NVS 并发写入
+ * @note token 与 WiFi 凭证的到达没有严格先后，本函数与 WiFi 连接解耦：
+ *       收到即独立落 NVS，避免竞态（计划「风险与注意点」第四条）。
+ * @note 线程安全：在 BluFi/NimBLE 任务上下文调用，注意 NVS 并发写入。
  */
-static esp_err_t custom_prov_data_handler(uint32_t session_id,
-                                          const uint8_t *inbuf,
-                                          ssize_t inlen,
-                                          uint8_t **outbuf,
-                                          ssize_t *outlen,
-                                          void *priv_data)
+static esp_err_t blufi_save_token_from_json(const uint8_t *data, int len)
 {
-    ESP_LOGI(TAG, "自定义端点回调触发！session_id: %lu, 收到数据长度: %d",
-             session_id, (int)inlen);
-
     // ── 步骤 1：基础数据校验（防止空指针和超大输入）─────────────────────────
-    if (inbuf == NULL || inlen <= 0 || inlen >= 2048)
+    if (data == NULL || len <= 0 || len >= 2048)
     {
-        ESP_LOGE(TAG, "收到无效数据，长度异常: %d", (int)inlen);
-        goto send_response; // 跳到响应部分，返回 OK 但不做任何操作
+        ESP_LOGE(TAG, "收到无效自定义数据，长度异常: %d", len);
+        return ESP_ERR_INVALID_ARG;
     }
 
     // ── 步骤 2：安全拷贝输入数据（添加 \0 结尾，防止字符串越界）─────────────
-    char *safe_str = calloc(1, inlen + 1); // calloc 自动清零（包含 \0 结尾）
+    char *safe_str = calloc(1, len + 1); // calloc 自动清零（包含 \0 结尾）
     if (!safe_str)
     {
-        ESP_LOGE(TAG, "内存分配失败，无法处理配网数据");
-        goto send_response;
+        ESP_LOGE(TAG, "内存分配失败，无法处理 token 数据");
+        return ESP_ERR_NO_MEM;
     }
-    memcpy(safe_str, inbuf, inlen);
-    ESP_LOGI(TAG, "收到原始配网数据: %s", safe_str);
+    memcpy(safe_str, data, len);
+    ESP_LOGI(TAG, "收到 BluFi 自定义数据: %s", safe_str);
 
     // ── 步骤 3：JSON 解析，提取 token 字段 ────────────────────────────────────
+    esp_err_t result = ESP_FAIL;
     cJSON *root = cJSON_Parse(safe_str);
     if (!root)
     {
         ESP_LOGE(TAG, "JSON 解析失败，数据不是合法 JSON 格式");
         free(safe_str);
-        goto send_response;
+        return ESP_FAIL;
     }
 
     cJSON *token_item = cJSON_GetObjectItem(root, "token");
     if (!cJSON_IsString(token_item) || token_item->valuestring == NULL)
     {
         ESP_LOGE(TAG, "JSON 中未找到 'token' 字段，或 token 不是字符串类型");
-        cJSON_Delete(root);
-        free(safe_str);
-        goto send_response;
+        goto cleanup;
     }
 
     ESP_LOGI(TAG, "成功提取 Token: %.20s...", token_item->valuestring);
 
-    // ── 步骤 4：将 Token 写入 NVS 持久化 ──────────────────────────────────────
-    // 命名空间 "net_config"，键 "ws_token"（session.c 读取时使用键 "device_token"）
+    // ── 步骤 4：将 Token 写入 NVS 持久化（键名与读取端 session.c 严格一致）──
     nvs_handle_t h;
     esp_err_t err = nvs_open("net_config", NVS_READWRITE, &h);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "NVS 打开失败（net_config）: %s", esp_err_to_name(err));
-        cJSON_Delete(root);
-        free(safe_str);
-        goto send_response;
+        goto cleanup;
     }
 
     err = nvs_set_str(h, "ws_token", token_item->valuestring);
@@ -257,9 +285,7 @@ static esp_err_t custom_prov_data_handler(uint32_t session_id,
     {
         ESP_LOGE(TAG, "Token 写入 NVS 失败: %s", esp_err_to_name(err));
         nvs_close(h);
-        cJSON_Delete(root);
-        free(safe_str);
-        goto send_response;
+        goto cleanup;
     }
 
     err = nvs_commit(h); // 将写入缓冲区刷入 Flash（掉电不丢失）
@@ -267,101 +293,187 @@ static esp_err_t custom_prov_data_handler(uint32_t session_id,
     {
         ESP_LOGE(TAG, "NVS commit 失败: %s", esp_err_to_name(err));
         nvs_close(h);
-        cJSON_Delete(root);
-        free(safe_str);
-        goto send_response;
+        goto cleanup;
     }
 
     nvs_close(h);
     ESP_LOGI(TAG, "Token 已永久写入 NVS！");
+    result = ESP_OK;
 
-    // ── 步骤 5：Token 保存成功后，主动停止配网广播 ────────────────────────────
-    // wifi_prov_mgr_disable_auto_stop(3000) 保证本函数返回（App 收到 {status:OK} 响应）
-    // 之后 3000ms 才真正断开 BLE，避免原先"App 显示配网失败"的竞态问题。
-    // 不调此函数 → PROV_DONE_BIT 永远不置位 → bsp_board_wifi_main 阻塞 120s 后强制重启，
-    // session_init / audio_init 等后续所有初始化永远不执行（偶发"写 NVS 成功后卡死"根因）。
-    wifi_prov_mgr_stop_provisioning();
-
-    // ── 步骤 6：释放资源 ───────────────────────────────────────────────────────
+cleanup:
     cJSON_Delete(root);
     free(safe_str);
-
-    // ── 步骤 7：构造并返回响应 ────────────────────────────────────────────────
-send_response:
-    // 固定响应体：{"status":"OK"}，告知 App 已收到数据（无论成功失败）
-    const char response[] = "{\"status\":\"OK\"}";
-    *outbuf = (uint8_t *)strdup(response); // 由框架在发送后 free
-    if (*outbuf == NULL)
-        return ESP_ERR_NO_MEM;
-    *outlen = strlen(response);
-    return ESP_OK;
+    return result;
 }
 
-// ─── prov_event_handler ──────────────────────────────────────────────────────
+// ─── blufi_event_callback ────────────────────────────────────────────────────
 
 /**
- * @brief BLE 配网事件处理（5 种配网生命周期事件）
+ * @brief BluFi 配网事件回调（取代原 prov_event_handler）
  *
- * 处理 BLE 配网管理器产生的事件，维护配网状态变量，
- * 在配网结束时置位 PROV_DONE_BIT 解除 bsp_board_wifi_main() 的阻塞等待。
+ * BluFi 把配网全过程拆成若干事件回调（手机连蓝牙、收到 SSID/密码、请求连 AP、
+ * 收到自定义数据等）。本回调维护配网状态、把收到的凭证下发给 esp_wifi、
+ * 落地 device token，并在适当时机向手机回报 WiFi 连接结果。
  *
- * @param arg        用户参数（bsp_board_t* 指针，用于置位事件组）
- * @param event_base 事件基类（WIFI_PROV_EVENT）
- * @param event_id   具体事件 ID
- * @param event_data 事件相关数据（各事件含义不同，本函数未使用）
+ * 与原 Unified Provisioning 的对应关系：
+ *   - WIFI_PROV_START      → ESP_BLUFI_EVENT_INIT_FINISH（这里启动广播）
+ *   - custom-data 端点回调 → ESP_BLUFI_EVENT_RECV_CUSTOM_DATA（落 token）
+ *   - WIFI_PROV_CRED_RECV  → ESP_BLUFI_EVENT_RECV_STA_SSID/PASSWD
+ *   - WIFI_PROV_END        → 由 IP_EVENT_STA_GOT_IP 置 PROV_DONE_BIT（见 wifi_ip_event_handler）
+ *
+ * @param event BluFi 事件类型
+ * @param param 事件参数（按 event 取对应联合体成员）
  * @return void
  *
- * @note 调用者：esp_event 框架（esp_event_handler_instance_register 注册）
- * @note 线程安全：事件回调在 esp_event 任务中执行，禁止在回调中阻塞
+ * @note 调用者：BluFi 协议栈（esp_blufi_register_callbacks 注册后自动调用）
+ * @note 线程安全：在 BluFi/NimBLE 任务上下文执行，禁止阻塞；不要在此释放蓝牙
+ *       自身（蓝牙释放放在 bsp_board_wifi_main 主流程，见 BUG-023 教训）。
  */
-static void prov_event_handler(void *arg, esp_event_base_t event_base,
-                               int32_t event_id, void *event_data)
+static void blufi_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *param)
 {
-    if (event_base == WIFI_PROV_EVENT)
+    switch (event)
     {
-        switch (event_id)
+    case ESP_BLUFI_EVENT_INIT_FINISH:
+        // BluFi 协议栈就绪，开始 BLE 广播，手机可扫描到设备
+        ESP_LOGI(TAG, "BluFi 初始化完成，开始 BLE 广播，等待手机配网...");
+        s_is_provisioning = true; // 标记配网进行中，禁止断线自动重连
+        esp_blufi_adv_start();
+        break;
+
+    case ESP_BLUFI_EVENT_DEINIT_FINISH:
+        ESP_LOGI(TAG, "BluFi 反初始化完成");
+        break;
+
+    case ESP_BLUFI_EVENT_BLE_CONNECT:
+        // 手机已连上设备蓝牙（GATT 连接建立）→ 停广播 + 初始化安全协商
+        ESP_LOGI(TAG, "手机已连接蓝牙，开始安全协商");
+        s_blufi_ble_connected = true;
+        esp_blufi_adv_stop();
+        blufi_security_init();
+        break;
+
+    case ESP_BLUFI_EVENT_BLE_DISCONNECT:
+        // 手机断开蓝牙 → 释放安全上下文。是否重新广播取决于配网是否已成功：
+        //   · 配网未成功就断开（手机退出/超时）→ 重新广播，等待下次连接配网
+        //   · 配网已成功后断开（正常收尾）→ 主流程此刻正在释放蓝牙（NimBLE deinit），
+        //     此时再调 esp_blufi_adv_start() 会撞上正在关闭的协议栈，报
+        //     "error setting advertisement data; rc=30"（BLE_HS_EINVAL）。
+        //   用 WIFI_BIT 是否已置位（=已拿到 IP=配网成功）来区分这两种场景。
+        // 修改日期 6/22：原代码无条件重新广播，导致配网成功收尾时产生无害但刺眼的 rc=30 报错。
+        s_blufi_ble_connected = false;
+        blufi_security_deinit();
+        if (s_blufi_board && bsp_board_check_status(s_blufi_board, WIFI_BIT, 0))
         {
-        case WIFI_PROV_START:
-            // 配网广播已启动，App 可以扫描到设备蓝牙信号
-            ESP_LOGI(TAG, "BLE 配网启动，请打开 App 扫描并配网");
-            s_is_provisioning = true; // 标记配网进行中，禁止断线自动重连
-
-            break;
-
-        case WIFI_PROV_CRED_RECV:
-            // App 已发来 WiFi SSID 和密码，管理器正在验证连接
-            ESP_LOGI(TAG, "收到 WiFi 账号密码，正在验证连接...");
-            break;
-
-        case WIFI_PROV_CRED_SUCCESS:
-            // WiFi 密码验证成功，已获取到 IP
-            ESP_LOGI(TAG, "WiFi 密码正确，连接成功！");
-            s_is_provisioning = false; // 退出配网保护，允许后续断线自动重连
-            break;
-
-        case WIFI_PROV_CRED_FAIL:
-            // WiFi 密码错误（SSID 不存在或密码错误）
-            // 不在此处手动调用 esp_wifi_connect()，由配网状态机控制后续流程
-            ESP_LOGE(TAG, "WiFi 密码错误！请重新配网");
-            break;
-
-        case WIFI_PROV_END:
+            // 配网已成功，蓝牙即将被主流程释放，不再广播（避免 rc=30）
+            ESP_LOGI(TAG, "配网已成功，手机断开蓝牙（正常收尾），不再广播");
+        }
+        else
         {
-            // 配网流程彻底结束（成功配网或超时），无论哪种情况都解除阻塞
-            ESP_LOGI(TAG, "BLE 配网流程结束");
-            bsp_board_t *board = (bsp_board_t *)arg;
-            if (board)
+            // 配网尚未完成，重新广播等待下一次连接
+            ESP_LOGW(TAG, "配网未完成，手机断开蓝牙，重新广播等待下次连接");
+            esp_blufi_adv_start();
+        }
+        break;
+
+    case ESP_BLUFI_EVENT_SET_WIFI_OPMODE:
+        // 手机要求设备进入某种 WiFi 模式（配网时通常是 STA）
+        ESP_LOGI(TAG, "BluFi 设置 WiFi 模式: %d", param->wifi_mode.op_mode);
+        esp_wifi_set_mode(param->wifi_mode.op_mode);
+        break;
+
+    case ESP_BLUFI_EVENT_RECV_STA_SSID:
+        // 收到家庭 WiFi 的 SSID（暂存到 s_blufi_sta_config，等密码到齐再连）
+        if (param->sta_ssid.ssid_len >= sizeof(s_blufi_sta_config.sta.ssid))
+        {
+            esp_blufi_send_error_info(ESP_BLUFI_DATA_FORMAT_ERROR);
+            ESP_LOGE(TAG, "SSID 过长，非法");
+            break;
+        }
+        memset(s_blufi_sta_config.sta.ssid, 0, sizeof(s_blufi_sta_config.sta.ssid));
+        memcpy(s_blufi_sta_config.sta.ssid, param->sta_ssid.ssid, param->sta_ssid.ssid_len);
+        esp_wifi_set_config(WIFI_IF_STA, &s_blufi_sta_config);
+        ESP_LOGI(TAG, "收到 WiFi SSID: %s", s_blufi_sta_config.sta.ssid);
+        break;
+
+    case ESP_BLUFI_EVENT_RECV_STA_PASSWD:
+        // 收到家庭 WiFi 的密码
+        if (param->sta_passwd.passwd_len >= sizeof(s_blufi_sta_config.sta.password))
+        {
+            esp_blufi_send_error_info(ESP_BLUFI_DATA_FORMAT_ERROR);
+            ESP_LOGE(TAG, "WiFi 密码过长，非法");
+            break;
+        }
+        memset(s_blufi_sta_config.sta.password, 0, sizeof(s_blufi_sta_config.sta.password));
+        memcpy(s_blufi_sta_config.sta.password, param->sta_passwd.passwd, param->sta_passwd.passwd_len);
+        esp_wifi_set_config(WIFI_IF_STA, &s_blufi_sta_config);
+        ESP_LOGI(TAG, "收到 WiFi 密码（长度 %d）", param->sta_passwd.passwd_len);
+        break;
+
+    case ESP_BLUFI_EVENT_REQ_CONNECT_TO_AP:
+        // 手机下发完凭证，请求设备连接 AP
+        ESP_LOGI(TAG, "BluFi 请求连接 WiFi，开始连接...");
+        s_is_provisioning = false; // 解除配网保护，允许 wifi_ip_event_handler 正常重连
+        esp_wifi_disconnect();     // 先断开（若之前已连过），确保触发连接回调
+        esp_wifi_connect();
+        break;
+
+    case ESP_BLUFI_EVENT_REQ_DISCONNECT_FROM_AP:
+        ESP_LOGI(TAG, "BluFi 请求断开 WiFi");
+        esp_wifi_disconnect();
+        break;
+
+    case ESP_BLUFI_EVENT_REPORT_ERROR:
+        ESP_LOGE(TAG, "BluFi 报告错误，错误码 %d", param->report_error.state);
+        esp_blufi_send_error_info(param->report_error.state);
+        break;
+
+    case ESP_BLUFI_EVENT_GET_WIFI_LIST:
+        // ── 手机请求设备扫描周边 WiFi 列表（小程序"获取 WiFi 列表"会用到）─────
+        // 说明：EspBlufi App 手动输入 SSID，不触发此事件，故对 App 零影响；微信小程序
+        //       等客户端通常先让设备扫描 AP 列表返回供用户选择，不实现会一直卡"获取中..."。
+        // 非阻塞：此处只启动扫描后立即返回，不堵塞 NimBLE 回调线程；扫描完成由
+        //         wifi_ip_event_handler 的 WIFI_EVENT_SCAN_DONE 分支取结果并回传。
+        // 修改日期 6/22：新增，解决小程序配网"获取 WiFi 列表"一直转圈的问题。
+        ESP_LOGI(TAG, "BluFi 请求扫描 WiFi 列表，启动非阻塞扫描...");
+        s_blufi_wifi_list_pending = true; // 标记：本次扫描完成后需回传给手机
+        {
+            wifi_scan_config_t scan_config = {0}; // 全 0：扫描所有 SSID/全信道
+            esp_err_t scan_ret = esp_wifi_scan_start(&scan_config, false /* 非阻塞 */);
+            if (scan_ret != ESP_OK)
             {
-                // 置位 PROV_DONE_BIT，解除 bsp_board_wifi_main() 中的
-                // xEventGroupWaitBits(PROV_DONE_BIT) 阻塞
-                xEventGroupSetBits(board->board_status, PROV_DONE_BIT);
+                ESP_LOGE(TAG, "WiFi 扫描启动失败: %s", esp_err_to_name(scan_ret));
+                s_blufi_wifi_list_pending = false;
+                esp_blufi_send_error_info(ESP_BLUFI_DATA_FORMAT_ERROR);
             }
-            break;
         }
+        break;
 
-        default:
-            break;
-        }
+    case ESP_BLUFI_EVENT_GET_WIFI_STATUS:
+    {
+        // 手机查询当前 WiFi 状态，回报连接结果（手机据此显示成功/失败）
+        wifi_mode_t mode;
+        esp_wifi_get_mode(&mode);
+        if (bsp_board_check_status(s_blufi_board, WIFI_BIT, 0))
+            esp_blufi_send_wifi_conn_report(mode, ESP_BLUFI_STA_CONN_SUCCESS, 0, NULL);
+        else
+            esp_blufi_send_wifi_conn_report(mode, ESP_BLUFI_STA_CONN_FAIL, 0, NULL);
+        break;
+    }
+
+    case ESP_BLUFI_EVENT_RECV_SLAVE_DISCONNECT_BLE:
+        ESP_LOGI(TAG, "BluFi 请求关闭 GATT 连接");
+        esp_blufi_disconnect();
+        break;
+
+    case ESP_BLUFI_EVENT_RECV_CUSTOM_DATA:
+        // 手机通过自定义数据帧下发 device token（取代原 custom-data 端点）
+        ESP_LOGI(TAG, "收到 BluFi 自定义数据，长度 %" PRIu32, param->custom_data.data_len);
+        blufi_save_token_from_json(param->custom_data.data, (int)param->custom_data.data_len);
+        break;
+
+    default:
+        // 其余事件（WiFi 列表扫描、SoftAP 配置、证书等）本项目不使用，忽略
+        break;
     }
 }
 
@@ -393,6 +505,55 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
     {
         // ── STA 模式已启动，立即尝试连接（使用 NVS 中已存储的 SSID/密码）────
         esp_wifi_connect();
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE)
+    {
+        // ── 非阻塞 WiFi 扫描完成：取结果回传给手机（BluFi GET_WIFI_LIST 的下半段）──
+        // 说明：BluFi 回调 ESP_BLUFI_EVENT_GET_WIFI_LIST 里只非阻塞启动了扫描并立即返回
+        //       （不阻塞 NimBLE 回调线程）；扫描真正完成后由本事件取 AP 列表并发回手机。
+        //       仅在配网请求扫描时(s_blufi_wifi_list_pending)才回传，避免误把其它扫描结果发出。
+        // 修改日期 6/22：新增，配合非阻塞 GET_WIFI_LIST，解决小程序"获取 WiFi 列表"转圈。
+        if (!s_blufi_wifi_list_pending)
+            return;                          // 非配网触发的扫描，忽略
+        s_blufi_wifi_list_pending = false;
+
+        uint16_t ap_count = 0;
+        esp_wifi_scan_get_ap_num(&ap_count);
+        if (ap_count == 0)
+        {
+            ESP_LOGW(TAG, "未扫描到任何 WiFi，回传空列表");
+            esp_blufi_send_wifi_list(0, NULL);
+            return;
+        }
+
+        wifi_ap_record_t *ap_list = malloc(sizeof(wifi_ap_record_t) * ap_count);
+        if (ap_list == NULL)
+        {
+            ESP_LOGE(TAG, "WiFi 列表内存分配失败");
+            esp_wifi_clear_ap_list(); // 释放驱动内部缓存，避免泄漏
+            esp_blufi_send_error_info(ESP_BLUFI_DATA_FORMAT_ERROR);
+            return;
+        }
+        esp_wifi_scan_get_ap_records(&ap_count, ap_list);
+
+        esp_blufi_ap_record_t *blufi_list = malloc(sizeof(esp_blufi_ap_record_t) * ap_count);
+        if (blufi_list == NULL)
+        {
+            ESP_LOGE(TAG, "BluFi 列表内存分配失败");
+            free(ap_list);
+            esp_blufi_send_error_info(ESP_BLUFI_DATA_FORMAT_ERROR);
+            return;
+        }
+        for (int i = 0; i < ap_count; i++)
+        {
+            blufi_list[i].rssi = ap_list[i].rssi;
+            memcpy(blufi_list[i].ssid, ap_list[i].ssid, sizeof(ap_list[i].ssid));
+        }
+
+        esp_blufi_send_wifi_list(ap_count, blufi_list);
+        ESP_LOGI(TAG, "已回传 %u 个 WiFi 给手机", ap_count);
+        free(ap_list);
+        free(blufi_list);
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
@@ -451,6 +612,19 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
         // 置位 WIFI_BIT，解除 bsp_board_wifi_main() 末尾的 xEventGroupWaitBits 阻塞
         if (bsp_board)
             xEventGroupSetBits(bsp_board->board_status, WIFI_BIT);
+
+        // ── BluFi 配网期：拿到 IP 即视为配网成功 ─────────────────────────────
+        // BluFi 没有 Unified Provisioning 的 WIFI_PROV_END 事件，改由「拿到 IP」
+        // 作为配网结束信号：① 向手机回报连接成功（手机 App 显示配网成功）；
+        // ② 置 PROV_DONE_BIT 解除 bsp_board_wifi_main 的配网等待，触发蓝牙释放。
+        if (s_blufi_ble_connected)
+        {
+            wifi_mode_t mode;
+            esp_wifi_get_mode(&mode);
+            esp_blufi_send_wifi_conn_report(mode, ESP_BLUFI_STA_CONN_SUCCESS, 0, NULL);
+        }
+        if (bsp_board)
+            xEventGroupSetBits(bsp_board->board_status, PROV_DONE_BIT);
     }
 }
 
@@ -476,29 +650,56 @@ int bsp_wifi_get_rssi(void)
     return 0; // 未连接或读取失败
 }
 
+// ─── BluFi 回调注册表 + 已配网判断 ───────────────────────────────────────────
+
+/// @brief BluFi 回调集合：事件处理 + 安全协商（DH/AES/CRC，来自 blufi_security.c）
+static esp_blufi_callbacks_t s_blufi_callbacks = {
+    .event_cb = blufi_event_callback,
+    .negotiate_data_handler = blufi_dh_negotiate_data_handler,
+    .encrypt_func = blufi_aes_encrypt,
+    .decrypt_func = blufi_aes_decrypt,
+    .checksum_func = blufi_crc_checksum,
+};
+
+/**
+ * @brief 判断设备是否已配网（NVS 中是否存有可用的 WiFi SSID）
+ *
+ * BluFi 不像 wifi_prov_mgr 提供 is_provisioned() 接口，这里改为直接读取
+ * esp_wifi 持久化在 NVS 的 STA 配置：只要 ssid 非空即视为已配网。
+ *
+ * @return true 已配网（NVS 有 SSID）；false 未配网（需走 BluFi 配网流程）
+ * @note 必须在 esp_wifi_init() 之后调用（否则读不到 NVS 配置）。
+ */
+static bool wifi_is_provisioned(void)
+{
+    wifi_config_t cfg = {0};
+    if (esp_wifi_get_config(WIFI_IF_STA, &cfg) != ESP_OK)
+        return false;
+    return cfg.sta.ssid[0] != '\0'; // SSID 非空 = 已存过凭证
+}
+
 // ─── bsp_board_wifi_main ─────────────────────────────────────────────────────
 
 /**
  * @brief WiFi 完整初始化入口（阻塞直至网络就绪或彻底失败）
  *
- * 完整流程：
+ * 完整流程（已从 Unified Provisioning 迁移到 BluFi）：
  *   1. 前置检查（NVS_BIT 必须已置位）
  *   2. 初始化 TCP/IP 协议栈和默认事件循环
- *   3. 注册 WiFi/IP/配网 三类事件监听
- *   4. 初始化 WiFi 驱动（WIFI_INIT_CONFIG_DEFAULT）
- *   5. 初始化 BLE 配网管理器
- *   6a. NVS 无凭证 → BLE 配网广播，等待 App 配网（120s 超时）
- *   6b. NVS 有凭证 → 直接 STA 连接
+ *   3. 注册 WiFi/IP 两类事件监听（配网事件改由 BluFi 回调处理）
+ *   4. 初始化 WiFi 驱动并设为 STA 模式
+ *   5. 启动按键监控任务 + 打印设备标识
+ *   6a. NVS 无凭证 → 启动 BluFi（BLE）配网，等待手机配网（120s 超时），结束后释放蓝牙
+ *   6b. NVS 有凭证 → 直接 esp_wifi_start() 连接（不开蓝牙）
  *   7. 最终阻塞等待 WIFI_BIT 或 WIFI_FAIL_BIT
  *   8. WIFI_FAIL_BIT → 等待 30s 后重启
  *
  * @param bsp_board BSP 实例指针（通过 board_status 管理状态位）
  * @return void（阻塞直到网络就绪；WIFI_FAIL_BIT 时触发重启不返回）
  *
- * @note 调用者：application.c → application_init()（步骤 5）
+ * @note 调用者：application.c → application_init()（步骤 5），签名未变。
  * @note 前置条件：NVS_BIT 已置位（bsp_board_nvs_init() 已完成）
- * @note 此函数是阻塞的，可能等待数十秒（配网超时 120s）
- * @note BLE 配网密码：固定 "abcd1234"（生产建议改为 MAC 派生动态密码）
+ * @note 配网安全：BluFi 用 DH 密钥协商替代原固定 PoP 密码 "abcd1234"。
  */
 void bsp_board_wifi_main(bsp_board_t *bsp_board)
 {
@@ -508,6 +709,7 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
         ESP_LOGE(TAG, "NVS 未初始化，无法启动 WiFi");
         return;
     }
+    s_blufi_board = bsp_board; // 供 BluFi 回调访问状态事件组
 
     // ── 步骤 1：初始化 TCP/IP 协议栈 ─────────────────────────────────────────
     ESP_ERROR_CHECK(esp_netif_init());
@@ -520,27 +722,20 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
     // 创建默认 WiFi STA 网络接口（分配 IP、DNS、路由等网络信息）
     esp_netif_create_default_wifi_sta();
 
-    // ── 步骤 3：注册三类事件监听 ─────────────────────────────────────────────
-    esp_event_handler_instance_t instance_any_id, instance_got_ip, prov_end_instance;
-
-    // 监听 BLE 配网事件（WIFI_PROV_EVENT：START/CRED_RECV/SUCCESS/FAIL/END）
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_PROV_EVENT, ESP_EVENT_ANY_ID,
-        &prov_event_handler, bsp_board, &prov_end_instance));
+    // ── 步骤 3：注册 WiFi / IP 事件监听（配网事件由 BluFi 回调处理，不再注册 WIFI_PROV_EVENT）──
+    esp_event_handler_instance_t instance_any_id, instance_got_ip;
 
     // 监听 WiFi 事件（STA_START 和 STA_DISCONNECTED）
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID,
         &wifi_ip_event_handler, bsp_board, &instance_any_id));
 
-    // 监听 IP 获取事件（STA_GOT_IP）→ 置位 WIFI_BIT
+    // 监听 IP 获取事件（STA_GOT_IP）→ 置位 WIFI_BIT + 配网期置 PROV_DONE_BIT
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         IP_EVENT, IP_EVENT_STA_GOT_IP,
         &wifi_ip_event_handler, bsp_board, &instance_got_ip));
 
     // ── 步骤 3.5：创建 WiFi 断线去抖定时器（one-shot，不自动重载）───────────
-    // 在注册事件之后、连接之前创建即可（断线事件触发时它已就绪）。
-    // 定时器对象由 FreeRTOS 在内部堆分配，体积很小，整个生命周期常驻不销毁。
     if (s_wifi_debounce_timer == NULL)
     {
         s_wifi_debounce_timer = xTimerCreate(
@@ -553,26 +748,13 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
             ESP_LOGE(TAG, "WiFi 去抖定时器创建失败，将退化为断线立即通知上层");
     }
 
-    // ── 步骤 4：初始化 WiFi 驱动（使用默认配置，自动分配缓冲区）─────────────
+    // ── 步骤 4：初始化 WiFi 驱动并设为 STA 模式 ──────────────────────────────
+    // BluFi 配网与已配网直连都基于 STA：配网时手机把家庭 WiFi 凭证下发到 STA。
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
-    // ── 步骤 5：初始化 BLE 配网管理器 ────────────────────────────────────────
-    // scheme_ble：使用蓝牙 BLE 作为配网传输通道
-    // FREE_BTDM：配网结束后自动释放 BLE 基带内存（约 60KB），回收给系统使用
-    wifi_prov_mgr_config_t config = {
-        .scheme = wifi_prov_scheme_ble,
-        .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM,
-    };
-    ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
-
-    // ── 步骤 6：启动按键监控任务（GPIO0 长按 3s 触发 WiFi 重置）─────────────
-    // xTaskCreatePinnedToCoreWithCaps(
-    //     button_monitor_task, "btn_task",
-    //     4096, NULL, 5, NULL,
-    //     0,                  // CPU0
-    //     MALLOC_CAP_SPIRAM); // 栈分配在外部 SPIRAM（节省内部 SRAM）
-
+    // ── 步骤 5：启动按键监控任务（GPIO0 长按 3s 触发 WiFi 重置）─────────────
     // button_monitor_task 会调用 nvs_erase_key/nvs_set_str/nvs_commit（Flash 操作），
     // Flash 操作占用 SPI 总线期间 CPU 需访问任务栈，栈必须在内部 SRAM，否则 WDT 复位。
     xTaskCreatePinnedToCoreWithCaps(
@@ -582,51 +764,56 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
     ESP_LOGI(TAG, "[内存] btn_task 创建后 → 内部SRAM剩余: %u B，PSRAM剩余: %u B",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    // ── 步骤 6.5：打印设备唯一标识（不依赖联网，方便离线排查） ─────────────
+
+    // ── 步骤 5.5：生成 MAC 派生蓝牙名 + 打印设备唯一标识 ─────────────────────
+    uint8_t mac[6];
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+    char service_name[18];
+    snprintf(service_name, sizeof(service_name),
+             "EchoPals-%02X%02X%02X", mac[3], mac[4], mac[5]);
+    ESP_LOGI(TAG, "🆔 DeviceID: %02X%02X%02X | MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+             mac[3], mac[4], mac[5], mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    // ── 步骤 6：检查是否已配网（读 NVS STA 配置的 SSID 是否非空）─────────────
+    if (!wifi_is_provisioned())
     {
-        uint8_t _mac[6];
-        esp_wifi_get_mac(WIFI_IF_STA, _mac);
-        ESP_LOGI(TAG, "🆔 DeviceID: %02X%02X%02X | MAC: %02X:%02X:%02X:%02X:%02X:%02X",
-                 _mac[3], _mac[4], _mac[5],
-                 _mac[0], _mac[1], _mac[2], _mac[3], _mac[4], _mac[5]);
-    }
+        // ════ 未配网分支：启动 BluFi（BLE）配网，等待手机配网 ════════════════
+        ESP_LOGI(TAG, "设备未配网，启动 BluFi 配网...");
+        ESP_LOGI(TAG, "📱 配网入口 → 蓝牙名: %s（用 EspBlufi App 或小程序扫描）", service_name);
 
-    // ── 步骤 7：检查是否已配网 ───────────────────────────────────────────────
-    bool provisioned = false;
-    ESP_ERROR_CHECK(wifi_prov_mgr_is_provisioned(&provisioned));
+        // 有屏幕时：生成二维码显示在 LCD 上，方便用户扫码定位设备
+        // 无屏幕时（裸板）：仅靠蓝牙广播，串口打印设备 ID 供调试核对
+#if CONFIG_BSP_HAS_DISPLAY
+        ui_show_qrcode(service_name);
+#endif
 
-    if (!provisioned)
-    {
-        // ════ 未配网分支：启动 BLE 广播，等待 App 配网 ════════════════════════
-        ESP_LOGI(TAG, "设备未配网，启动 BLE 配网广播...");
+        // 启动 WiFi 驱动（配网期需要 STA 就绪以便后续 connect）
+        ESP_ERROR_CHECK(esp_wifi_start());
 
-        // 读取 MAC 地址后三字节，生成唯一蓝牙服务名（格式：EchoPals-AABBCC）
-        // 确保多台设备同时配网时不冲突
-        uint8_t mac[6];
-        ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, mac));
-        char service_name[16];
-        snprintf(service_name, sizeof(service_name),
-                 "EchoPals-%02X%02X%02X", mac[3], mac[4], mac[5]);
-        ESP_LOGE(TAG, "设备 MAC: %02x:%02x:%02x:%02x:%02x:%02x",
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        // 拉起 BT 控制器（NimBLE 下由该接口初始化 BLE 控制器）
+#if CONFIG_BT_CONTROLLER_ENABLED || !CONFIG_BT_NIMBLE_ENABLED
+        esp_err_t bt_err = esp_blufi_controller_init();
+        if (bt_err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "BT 控制器初始化失败: %s，跳过配网直接重启", esp_err_to_name(bt_err));
+            esp_restart();
+        }
+#endif
+        // 注册 BluFi 回调 + 启动 NimBLE 主机（INIT_FINISH 回调里会 adv_start）
+        esp_err_t blufi_err = esp_blufi_host_and_cb_init(&s_blufi_callbacks);
+        if (blufi_err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "BluFi 初始化失败: %s，重启", esp_err_to_name(blufi_err));
+            esp_restart();
+        }
 
-        const char *security_key = "abcd1234"; // PoP（Proof of Possession）密码
+        // 设置 MAC 派生蓝牙名（覆盖 blufi_init.c 的兜底默认名）
+#if CONFIG_BT_NIMBLE_ENABLED
+        ble_svc_gap_device_name_set(service_name);
+#endif
+        ESP_LOGI(TAG, "BluFi 配网就绪 → 蓝牙名: %s（手机用 EspBlufi / 微信小程序配网）", service_name);
 
-        // 创建自定义数据端点（用于 App 下发 device Token，与 WiFi 凭证分开传输）
-        ESP_ERROR_CHECK(wifi_prov_mgr_endpoint_create("custom-data"));
-        wifi_prov_mgr_disable_auto_stop(3000); // 禁用自动停止（3000ms 延迟）
-
-        // 启动 BLE 广播（SECURITY_1 = 带 PoP 校验，防止未授权配网）
-        ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(
-            WIFI_PROV_SECURITY_1, security_key, service_name, NULL));
-
-        // 注册自定义端点处理函数（接收 App 下发的 Token）
-        ESP_ERROR_CHECK(wifi_prov_mgr_endpoint_register(
-            "custom-data", custom_prov_data_handler, NULL));
-
-        ESP_LOGI(TAG, "BLE 广播启动 → 蓝牙名: %s, 配网密码: %s", service_name, security_key);
-
-        // 阻塞等待 App 完成配网（PROV_DONE_BIT 由 prov_event_handler 置位）
+        // 阻塞等待配网完成（PROV_DONE_BIT 由 wifi_ip_event_handler 在 GOT_IP 时置位）
         // 超时 120 秒：防止设备永远卡在配网模式
         EventBits_t wait_bits = xEventGroupWaitBits(
             bsp_board->board_status, PROV_DONE_BIT,
@@ -634,27 +821,35 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
 
         if (!(wait_bits & PROV_DONE_BIT))
         {
-            // 配网超时（用户 120 秒内未完成配网），强制退出并重启
             ESP_LOGE(TAG, "配网超时（120 秒），强制重启设备");
-            wifi_prov_mgr_deinit();
-
             s_is_provisioning = false;
             esp_restart();
         }
 
-        // 配网流程结束，释放 BLE 基带内存（配网管理器内部调用 FREE_BTDM 释放蓝牙）
-        wifi_prov_mgr_deinit();
+        // 配网成功后撤掉二维码（有屏幕时）
+#if CONFIG_BSP_HAS_DISPLAY
+        ui_hide_qrcode();
+#endif
+
+        // ── 配网成功：立即释放蓝牙（BluFi profile + NimBLE 主机 + 控制器）─────
+        // 用户要求"无论 App 还是小程序配网成功，蓝牙都释放"，与原 FREE_BTDM 思路一致。
+        // 释放放在主流程（非 BluFi 回调内），避免在回调里 deinit 自身（见 BUG-023）。
+        ESP_LOGI(TAG, "[内存] 释放蓝牙前 → 内部SRAM: %u B，PSRAM: %u B",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        esp_blufi_host_deinit();
+#if CONFIG_BT_CONTROLLER_ENABLED || !CONFIG_BT_NIMBLE_ENABLED
+        esp_blufi_controller_deinit();
+#endif
+        ESP_LOGI(TAG, "[内存] 释放蓝牙后 → 内部SRAM: %u B，PSRAM: %u B",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     }
     else
     {
-        // ════ 已配网分支：直接 STA 模式连接（跳过 BLE 广播）══════════════════
+        // ════ 已配网分支：直接 STA 连接（不开蓝牙，省内存）══════════════════
         ESP_LOGI(TAG, "设备已配网，直接连接 WiFi...");
-
-        // 无需配网管理器，立即释放（节省约 60KB 内存）
-        wifi_prov_mgr_deinit();
-
-        // 设置 STA 模式并启动 WiFi 驱动（触发 WIFI_EVENT_STA_START → esp_wifi_connect()）
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        // 启动 WiFi 驱动（触发 WIFI_EVENT_STA_START → esp_wifi_connect()）
         ESP_ERROR_CHECK(esp_wifi_start());
     }
 
