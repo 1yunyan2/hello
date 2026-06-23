@@ -34,10 +34,15 @@
 #include "services/gatt/ble_svc_gatt.h"
 #include "console/console.h"
 
-/// 兜底蓝牙名（实际名由 bsp_wifi.c 用 MAC 派生后覆盖设置）
-#ifndef BLUFI_DEVICE_NAME
-#define BLUFI_DEVICE_NAME "EchoPals"
-#endif
+/// 蓝牙设备名，由 bsp_wifi.c 在 esp_blufi_host_and_cb_init 前调用 blufi_set_device_name() 设置
+static char s_ble_device_name[32] = "EchoPals";
+
+void blufi_set_device_name(const char *name)
+{
+    if (name) {
+        snprintf(s_ble_device_name, sizeof(s_ble_device_name), "%s", name);
+    }
+}
 
 void ble_store_config_init(void);
 
@@ -48,6 +53,7 @@ static void blufi_on_reset(int reason)
 
 static void blufi_on_sync(void)
 {
+    ble_svc_gap_device_name_set(s_ble_device_name); // 同步完成后设置名字再广播
     esp_blufi_profile_init();
 }
 

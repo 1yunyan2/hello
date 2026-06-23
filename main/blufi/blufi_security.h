@@ -50,3 +50,5 @@ esp_err_t esp_blufi_host_deinit(void);
 esp_err_t esp_blufi_controller_init(void);
 /// 反初始化 BT 控制器（配网结束后释放 ~110KB 蓝牙内存）
 esp_err_t esp_blufi_controller_deinit(void);
+/// 设置蓝牙广播名，必须在 esp_blufi_host_and_cb_init 之前调用
+void blufi_set_device_name(const char *name);

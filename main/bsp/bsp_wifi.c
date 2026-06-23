@@ -799,18 +799,15 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
             esp_restart();
         }
 #endif
-        // 注册 BluFi 回调 + 启动 NimBLE 主机（INIT_FINISH 回调里会 adv_start）
+        // 设置 MAC 派生蓝牙名（必须在 host_and_cb_init 之前，sync 回调里才能用正确的名字广播）
+        blufi_set_device_name(service_name);
+        // 注册 BluFi 回调 + 启动 NimBLE 主机（sync 回调里会设名字并 adv_start）
         esp_err_t blufi_err = esp_blufi_host_and_cb_init(&s_blufi_callbacks);
         if (blufi_err != ESP_OK)
         {
             ESP_LOGE(TAG, "BluFi 初始化失败: %s，重启", esp_err_to_name(blufi_err));
             esp_restart();
         }
-
-        // 设置 MAC 派生蓝牙名（覆盖 blufi_init.c 的兜底默认名）
-#if CONFIG_BT_NIMBLE_ENABLED
-        ble_svc_gap_device_name_set(service_name);
-#endif
         ESP_LOGI(TAG, "BluFi 配网就绪 → 蓝牙名: %s（手机用 EspBlufi / 微信小程序配网）", service_name);
 
         // 阻塞等待配网完成（PROV_DONE_BIT 由 wifi_ip_event_handler 在 GOT_IP 时置位）
