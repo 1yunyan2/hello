@@ -213,9 +213,12 @@ typedef struct
 typedef struct
 {
     char city_name[32]; ///< 城市名（如"杭州"）
-    char temp[8];       ///< 当前温度（如"25"）
+    char temp[8];       ///< 当前温度整数（如"24"，不含单位）
     char text[32];      ///< 天气状况（如"晴"、"多云"）
-    // char humidity[8];   ///< 湿度百分比（如"60"）
+    char humidity[8];   ///< 相对湿度整数百分比（如"91"，不含 %）
+    char precip[8];     ///< 当前小时累计降水量（mm，如"0.5"，不含单位）
+    char feels[8];      ///< 体感温度整数（如"26"，不含单位）
+    char wind[24];      ///< 风向+风力（如"西北风2级"）
     bool valid; ///< 数据是否有效（true=已获取成功）
 } weather_data_t;
 

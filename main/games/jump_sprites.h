@@ -151,14 +151,26 @@ extern const lv_image_dsc_t jt1, jt3, jt4, jt5, jt6, jt7;
 #define JUMP_APEX_RATIO 40 /* 弧顶高 = 直线距离 × 40% */
 #define JUMP_FLY_STEP_PX 9 /* 每帧沿飞行方向推进 px（值越大跳越快；6→8 比半速快约1/3）*/
 
+/* ── 摔倒判定（PH_TOPPLE）：踩到台缘但落脚面不够，先站稳再朝台外倾倒 ── */
+/* 棋子「有效落脚半宽」= 缩放后图片半宽 × 此百分比。占比越大越易判摔倒（更难）。*/
+#define JUMP_FOOT_W_PCT 50      /* 落脚面占棋子图宽的百分比（50%）*/
+/* 摔倒区间边界：棋子中心超出台缘的量 overshoot 落在 (0, 脚底半宽×此倍率/100) 算摔倒；
+ * 超过则重心彻底出台缘，走完全坠落 PH_FALL。倍率>100 可放大「摔倒」出现概率。*/
+#define JUMP_TOPPLE_RANGE_PCT 100 /* 摔倒区上界 = 脚底半宽 × 100% */
+#define JUMP_TOPPLE_HOLD_FRAMES 6 /* 倾倒前「站稳一瞬」停顿帧数（约0.2s @30fps）*/
+#define JUMP_TOPPLE_MAX_ANG 800   /* 最大倾倒角（0.1°单位，800=80°，接近趴下）*/
+#define JUMP_TOPPLE_ANG_STEP 80   /* 每帧倾倒角增量（0.1°单位，80=8°/帧）*/
+
 /* ── 摄像机平滑（落台后滑动）── */
 #define JUMP_CAM_SMOOTH_FRAMES 12 /* 平滑帧数，约0.4s @30fps */
 
 /* ── 台子从天而降入场动画 ── */
 #define JUMP_DROP_HEIGHT 90      /* 入场起始离目标的高度 px（从这么高掉下来）*/
 #define JUMP_DROP_GRAVITY 3      /* 掉落重力加速度（每帧 drop_vy += 此值）*/
+#define JUMP_DROP_INIT_VY 10     /* 掉落初始速度（暂时注释停用，恢复无初速）*/
 #define JUMP_DROP_BOUNCE 45      /* 触底回弹初始压扁量（0~100，越大弹得越狠）*/
 #define JUMP_DROP_BOUNCE_DECAY 8 /* 回弹压扁每帧衰减量（回弹消退速度）*/
+#define JUMP_DROP_BOUNCE_COEF 30 /* 图片模式弹起版：触底反弹速度保留系数 %（越大弹得越高，25%≈轻弹一下）*/
 
 /* ── 掉落 ── */
 #define JUMP_FALL_STEP_PX 10

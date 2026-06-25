@@ -28,6 +28,15 @@ static wl_handle_t s_wl_handle = WL_INVALID_HANDLE;
 #define USJ_RX_BUF_SIZE (16 * 1024)
 #define USJ_TX_BUF_SIZE (4 * 1024)
 
+// ── 强制烧录窗口 ──
+// 已烧录成品板挂载必成功、会零延迟跳过产线，导致无法再重烧外挂资源。
+// 为此在「挂载之前」开一个短窗口监听 PC 命令：窗口内 3.py 发来 START/DUMP
+// 就强制进产线重烧/提取；没命令则窗口结束、继续正常挂载启动。
+// 用法：电脑先跑 3.py（它会等设备），再按板子 RST，窗口内即可握手重烧。
+// 设为 0 可彻底关闭本窗口、恢复纯零延迟启动（届时已烧板将无法再重烧）。
+// 取 3s 是为给 PC 端 3.py（连接后约 1.5s 才开始读）留足握手余量。
+#define BURN_FORCE_WINDOW_MS 3000
+
 // 擦除进度上报:esp_flash_erase_region 是单次原子操作(芯片擦除指令 0xC7),
 // 无法实时拿真实进度,只能按经验值线性估算百分比 —— 真擦完时会强制跳到 100%。
 #define ERASE_ESTIMATE_SEC 35 // 32MB W25Q 整片擦除典型耗时,按你板子实测调
@@ -236,6 +245,53 @@ void bsp_flash_init(void)
                                                     ESP_PARTITION_SUBTYPE_DATA_FAT,
                                                     &fat_partition));
 
+    // --- 步骤 2.5: 强制烧录窗口（挂载前先开短窗口监听 PC 命令）---
+    // 见顶部 BURN_FORCE_WINDOW_MS 说明。窗口内收到 START/DUMP 即强制进产线，
+    // 跳过挂载（产线本就要整盘擦写，无需先挂载）。无命令则结束、继续正常挂载。
+    // 此阶段不安装 USJ 驱动，用默认 secondary console 读 stdin（与下方产线一致）。
+    int force_mode = 0; // 0:不强制 1:烧录 2:提取
+#if BURN_FORCE_WINDOW_MS > 0
+    {
+        char fcmd[32];
+        int fwait = 0;
+        while (fwait < BURN_FORCE_WINDOW_MS)
+        {
+            if (fwait % 500 == 0)
+            {
+                printf("\nESP32_READY_CMD_WAIT\n"); // 3.py 握手锚点，勿删
+                printf("NEED_BURN\n");
+                fflush(stdout);
+            }
+            memset(fcmd, 0, sizeof(fcmd));
+            int len = 0;
+            while (len < (int)(sizeof(fcmd) - 1))
+            {
+                int c = fgetc(stdin);
+                if (c == EOF)
+                    break;
+                fcmd[len++] = (char)c;
+            }
+            if (len > 0)
+            {
+                if (strstr(fcmd, "START"))
+                {
+                    force_mode = 1;
+                    break;
+                }
+                else if (strstr(fcmd, "DUMP"))
+                {
+                    force_mode = 2;
+                    break;
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+            fwait += 10;
+        }
+        if (force_mode)
+            ESP_LOGW(TAG, "收到 PC 命令，强制进入产线模式 (mode=%d)", force_mode);
+    }
+#endif
+
     const esp_vfs_fat_mount_config_t mount_config = {
         // ⚠️ 必须为 false：true 会在任何挂载错误时静默格式化整盘，
         //    用户上传的 GIF/audio 资源会无声丢失。失败时改走下面的
@@ -243,24 +299,29 @@ void bsp_flash_init(void)
         .format_if_mount_failed = false,
         .max_files = 5,
         .allocation_unit_size = 4096};
-    esp_err_t mount_ret = esp_vfs_fat_spiflash_mount_rw_wl("/S", "ext_storage", &mount_config, &s_wl_handle);
-    if (mount_ret == ESP_OK)
+    esp_err_t mount_ret = ESP_FAIL;
+    if (force_mode == 0) // 未被强制烧录时才尝试正常挂载
     {
-        // 成品板：挂载成功，直接返回继续正常启动，零延迟，不进产线窗口
-        ESP_LOGI(TAG, "外部 Flash 正常挂载到 /S");
-        return;
+        mount_ret = esp_vfs_fat_spiflash_mount_rw_wl("/S", "ext_storage", &mount_config, &s_wl_handle);
+        if (mount_ret == ESP_OK)
+        {
+            // 成品板：挂载成功，直接返回继续正常启动，不进产线
+            ESP_LOGI(TAG, "外部 Flash 正常挂载到 /S");
+            return;
+        }
     }
 
-    // --- 步骤 3: 挂载失败 → 进入产线监听（新板/烧坏的板才会走到这里） ---
+    // --- 步骤 3: 强制烧录 或 挂载失败 → 进入产线监听 ---
     // 此阶段不安装 USJ 驱动，用默认 secondary console 读写，
     // 避免 USJ ISR 干扰后续 I2C 总线时序（BUG: ES8311 NACK）。
     // 不 abort、不重启：保持监听，让 burner.py 在任意时刻插入都能握手接管。
-    ESP_LOGW(TAG, "挂载失败 (0x%x)，无有效镜像，进入产线模式等待烧录...", mount_ret);
+    if (force_mode == 0)
+        ESP_LOGW(TAG, "挂载失败 (0x%x)，无有效镜像，进入产线模式等待烧录...", mount_ret);
     ESP_LOGI(TAG, "📢 产线模式开启！发送 'START' 烧录，发送 'DUMP' 提取...");
 
     char cmd[32] = {0};
     uint32_t wait_ms = 0;
-    int mode = 0; // 0: 正常模式, 1: 烧录模式, 2: 提取模式
+    int mode = force_mode; // 0:继续监听 1:烧录 2:提取（强制时直接带入，跳过监听循环）
 
     // 旧逻辑这里是 10 秒超时窗口；现在挂载已确认失败、没有可启动的文件系统，
     // 故改为持续监听（死循环里轮询命令字），等 burner 随时接管。

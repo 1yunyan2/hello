@@ -131,7 +131,7 @@
  * Echo2 正式板（有屏幕）：保持 CONFIG_BSP_HAS_DISPLAY 1
  * 裸开发板（无屏幕）    ：注释掉下面这行，LCD/UI/二维码代码自动剔除
  * ─────────────────────────────────────────────────────────────────────────── */
-// #define CONFIG_BSP_HAS_DISPLAY 1
+#define CONFIG_BSP_HAS_DISPLAY 1
 
 /**
  * @file bsp_config.h

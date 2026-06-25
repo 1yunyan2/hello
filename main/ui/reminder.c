@@ -505,15 +505,27 @@ static esp_err_t weather_fetch_and_notify(void)
     }
 
     xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
-    // 更新温度
-    snprintf(s_ctx.weather_data.temp, sizeof(s_ctx.weather_data.temp), "%.1f", info->temperature);
+    // 更新温度（取整，UI 大号显示"24°"无需小数）
+    snprintf(s_ctx.weather_data.temp, sizeof(s_ctx.weather_data.temp), "%.0f", info->temperature);
     // 更新描述
     if (info->weather)
     {
         strncpy(s_ctx.weather_data.text, info->weather, sizeof(s_ctx.weather_data.text) - 1);
+        s_ctx.weather_data.text[sizeof(s_ctx.weather_data.text) - 1] = '\0';
     }
-    // 心知免费版无湿度，设为固定值或 "--"
-    // strncpy(s_ctx.weather_data.humidity, "--", sizeof(s_ctx.weather_data.humidity) - 1);
+    // 更新湿度（整数百分比，如"91"）
+    snprintf(s_ctx.weather_data.humidity, sizeof(s_ctx.weather_data.humidity), "%.0f", info->humidity);
+    // 更新降水量（保留 1 位小数，单位 mm；不下雨时和风返回 0.0 属正常）
+    snprintf(s_ctx.weather_data.precip, sizeof(s_ctx.weather_data.precip), "%.1f", info->precip);
+    // 更新体感温度（取整，如"26"）
+    snprintf(s_ctx.weather_data.feels, sizeof(s_ctx.weather_data.feels), "%.0f", info->feels_like);
+    // 更新风向+风力（和风 wind_dir 已含"风"字，如"西北风"；拼成"西北风2级"）
+    if (info->wind_dir && info->wind_scale)
+        snprintf(s_ctx.weather_data.wind, sizeof(s_ctx.weather_data.wind), "%s%s级", info->wind_dir, info->wind_scale);
+    else if (info->wind_dir)
+        snprintf(s_ctx.weather_data.wind, sizeof(s_ctx.weather_data.wind), "%s", info->wind_dir);
+    else
+        s_ctx.weather_data.wind[0] = '\0';
 
     s_ctx.weather_data.valid = true;
     xSemaphoreGive(s_ctx.mutex);

@@ -269,6 +269,14 @@ static lv_obj_t *s_alarm_repeat_lbl = NULL;
 static lv_obj_t *s_alarm_status_lbl = NULL;
 static lv_obj_t *s_alarm_hint_lbl = NULL;
 
+/* 天气页 UI 对象（参考图上半部风格：左大号温度 + 右天气/体感/风 + 底部湿度/降水量） */
+static lv_obj_t *s_wx_city_lbl = NULL;  ///< 城市名（左上）
+static lv_obj_t *s_wx_temp_lbl = NULL;  ///< 大号温度数字"24"（montserrat_48）
+static lv_obj_t *s_wx_deg_lbl = NULL;   ///< 小号度数符号"°"（font_cn_16，贴温度右上）
+static lv_obj_t *s_wx_text_lbl = NULL;  ///< 天气现象"小雨"
+static lv_obj_t *s_wx_feels_lbl = NULL; ///< "体感26°  西北风2级"
+static lv_obj_t *s_wx_stats_lbl = NULL; ///< "湿度91%    降水量0.5mm"
+
 /* 闹钟编辑 UI 对象 */
 static lv_obj_t *s_edit_panel = NULL;
 static lv_obj_t *s_edit_hour_lbl = NULL;
@@ -1243,6 +1251,130 @@ static void alarm_page_hide(void)
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ * 天气展示页（参考图上半部风格，纯文字，背景由外部叠加）
+ *
+ *   杭州                         ← 左上城市
+ *    ⎡24⎤°  小雨                 ← montserrat_48 大号数字 + 小号° + 天气
+ *           体感26°  西北风2级    ← font_cn_16 灰字
+ *   ───────────────────────────
+ *   湿度91%      降水量0.5mm      ← 底部统计行
+ *
+ * 数据全部来自和风 /v7/weather/now，无额外接口。
+ * ═══════════════════════════════════════════════════════════════ */
+static void weather_page_create(void)
+{
+    if (s_wx_temp_lbl)
+        return;
+
+    /* 城市名（左上角） */
+    s_wx_city_lbl = lv_label_create(s_menu_panel);
+    lv_obj_set_style_text_font(s_wx_city_lbl, &font_cn_16, 0);
+    lv_obj_set_style_text_color(s_wx_city_lbl, lv_color_white(), 0);
+    lv_obj_align(s_wx_city_lbl, LV_ALIGN_TOP_LEFT, 0, 2);
+
+    /* 大号温度数字（montserrat_48，仅数字） */
+    s_wx_temp_lbl = lv_label_create(s_menu_panel);
+    lv_obj_set_style_text_font(s_wx_temp_lbl, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(s_wx_temp_lbl, lv_color_white(), 0);
+    lv_obj_align(s_wx_temp_lbl, LV_ALIGN_TOP_LEFT, 4, 36);
+
+    /* 小号度数符号（font_cn_16，贴大号数字右上） */
+    s_wx_deg_lbl = lv_label_create(s_menu_panel);
+    lv_obj_set_style_text_font(s_wx_deg_lbl, &font_cn_16, 0);
+    lv_obj_set_style_text_color(s_wx_deg_lbl, lv_color_white(), 0);
+    lv_label_set_text(s_wx_deg_lbl, "\xC2\xB0");
+    /* x 偏移在 rebuild 里按数字宽度动态对齐 */
+
+    /* 天气现象（大号数字右侧，上行） */
+    s_wx_text_lbl = lv_label_create(s_menu_panel);
+    lv_obj_set_style_text_font(s_wx_text_lbl, &font_cn_16, 0);
+    lv_obj_set_style_text_color(s_wx_text_lbl, lv_color_white(), 0);
+    lv_obj_align(s_wx_text_lbl, LV_ALIGN_TOP_LEFT, 96, 44);
+
+    /* 体感 + 风（大号数字右侧，下行，灰字） */
+    s_wx_feels_lbl = lv_label_create(s_menu_panel);
+    lv_obj_set_style_text_font(s_wx_feels_lbl, &font_cn_16, 0);
+    lv_obj_set_style_text_color(s_wx_feels_lbl, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_align(s_wx_feels_lbl, LV_ALIGN_TOP_LEFT, 96, 66);
+
+    /* 底部统计行：湿度 + 降水量 */
+    s_wx_stats_lbl = lv_label_create(s_menu_panel);
+    lv_obj_set_style_text_font(s_wx_stats_lbl, &font_cn_16, 0);
+    lv_obj_set_style_text_color(s_wx_stats_lbl, lv_color_hex(0x88CCFF), 0);
+    lv_obj_align(s_wx_stats_lbl, LV_ALIGN_BOTTOM_LEFT, 4, -18);
+}
+
+static void weather_page_rebuild(void)
+{
+    if (!s_wx_temp_lbl)
+        return;
+
+    weather_data_t wd;
+    reminder_get_weather_data(&wd);
+
+    char buf[64];
+
+    /* 城市 */
+    lv_label_set_text(s_wx_city_lbl, wd.city_name[0] ? wd.city_name : "定位中");
+
+    if (wd.valid)
+    {
+        /* 大号温度数字 + 紧贴右上的小号° */
+        lv_label_set_text(s_wx_temp_lbl, wd.temp);
+        lv_obj_update_layout(s_wx_temp_lbl); /* 先刷新宽度再对齐° */
+        lv_coord_t tw = lv_obj_get_width(s_wx_temp_lbl);
+        lv_obj_align(s_wx_deg_lbl, LV_ALIGN_TOP_LEFT, 4 + tw + 2, 36);
+        lv_obj_clear_flag(s_wx_deg_lbl, LV_OBJ_FLAG_HIDDEN);
+
+        lv_label_set_text(s_wx_text_lbl, wd.text);
+
+        snprintf(buf, sizeof(buf), "体感%s\xC2\xB0  %s", wd.feels, wd.wind);
+        lv_label_set_text(s_wx_feels_lbl, buf);
+
+        snprintf(buf, sizeof(buf), "湿度%s%%      降水量%smm", wd.humidity, wd.precip);
+        lv_label_set_text(s_wx_stats_lbl, buf);
+    }
+    else
+    {
+        lv_label_set_text(s_wx_temp_lbl, "--");
+        lv_obj_add_flag(s_wx_deg_lbl, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(s_wx_text_lbl, "等待天气数据");
+        lv_label_set_text(s_wx_feels_lbl, "");
+        lv_label_set_text(s_wx_stats_lbl, "湿度--%      降水量--mm");
+    }
+}
+
+static void weather_page_show(void)
+{
+    weather_page_create();
+    /* 进入页面触发一次拉取（异步，本次先用上次缓存渲染） */
+    reminder_weather_fetch_now();
+    weather_page_rebuild();
+    lv_obj_clear_flag(s_wx_city_lbl, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_wx_temp_lbl, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_wx_text_lbl, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_wx_feels_lbl, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_wx_stats_lbl, LV_OBJ_FLAG_HIDDEN);
+    /* s_wx_deg_lbl 的显隐由 rebuild 按数据有效性决定 */
+}
+
+static void weather_page_hide(void)
+{
+    if (s_wx_city_lbl)
+        lv_obj_add_flag(s_wx_city_lbl, LV_OBJ_FLAG_HIDDEN);
+    if (s_wx_temp_lbl)
+        lv_obj_add_flag(s_wx_temp_lbl, LV_OBJ_FLAG_HIDDEN);
+    if (s_wx_deg_lbl)
+        lv_obj_add_flag(s_wx_deg_lbl, LV_OBJ_FLAG_HIDDEN);
+    if (s_wx_text_lbl)
+        lv_obj_add_flag(s_wx_text_lbl, LV_OBJ_FLAG_HIDDEN);
+    if (s_wx_feels_lbl)
+        lv_obj_add_flag(s_wx_feels_lbl, LV_OBJ_FLAG_HIDDEN);
+    if (s_wx_stats_lbl)
+        lv_obj_add_flag(s_wx_stats_lbl, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * 闹钟编辑界面（4步：时 → 分 → 重复 → 开关）
  * ═══════════════════════════════════════════════════════════════ */
 static void alarm_edit_create(void)
@@ -1829,6 +1961,7 @@ static void render_fn_page(fn_page_t page)
 
     alarm_page_hide();
     countdown_page_hide();
+    weather_page_hide();
 
     /* 进入功能页时隐藏功能盘的大图标（避免残留遮挡） */
     if (s_home_icon)
@@ -1864,42 +1997,10 @@ static void render_fn_page(fn_page_t page)
         break;
 
     case FN_PAGE_WEATHER:
-    {
-        /* 进入天气页面时触发一次数据拉取（异步，下次进入时刷新） */
-        reminder_weather_fetch_now();
-
-        weather_data_t wd;
-        reminder_get_weather_data(&wd);
-
-        char buf[128];
-        if (wd.valid)
-        {
-            snprintf(buf, sizeof(buf),
-                     "%s\n\n"
-                     "温度:  %s%sC\n"
-                     "天气:  %s\n",
-                     //  "湿度:  %s%%",
-                     wd.city_name,
-                     wd.temp, "\xC2\xB0",
-                     wd.text
-                     //  wd.humidity
-            );
-        }
-        else
-        {
-            snprintf(buf, sizeof(buf),
-                     "%s\n\n"
-                     "温度:  --%sC\n"
-                     "天气:  --\n"
-                     //  "湿度:  --\n\n"
-                     "等待天气数据...",
-                     wd.city_name[0] ? wd.city_name : "定位中",
-                     "\xC2\xB0");
-        }
-        lv_label_set_text(s_menu_body, buf);
-        lv_obj_clear_flag(s_menu_body, LV_OBJ_FLAG_HIDDEN);
+        /* 天气页改用专属多 label 布局（参考图上半部风格），隐藏共享文字 label */
+        lv_obj_add_flag(s_menu_body, LV_OBJ_FLAG_HIDDEN);
+        weather_page_show();
         break;
-    }
 
     case FN_PAGE_COUNTDOWN:
         lv_obj_add_flag(s_menu_body, LV_OBJ_FLAG_HIDDEN);

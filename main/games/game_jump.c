@@ -75,7 +75,8 @@ typedef enum
     PH_FLY,
     PH_LAND,
     PH_CAM,
-    PH_FALL
+    PH_FALL,
+    PH_TOPPLE /* 踩到台子边缘但落脚面不够 → 先站稳一瞬再朝台外倾倒掉落（失败）*/
 } jump_phase_t;
 
 /* ── 台子（世界坐标，双轴）── */
@@ -160,8 +161,8 @@ static struct
     int fly_steps;   /* 总步数 = fly_dist_px / FLY_STEP_PX */
     int fly_start_wx, fly_start_wy;
     /* 飞行位置定点累积（×256），避免每帧重新整除导致 ±1px 截断抖动 */
-    int fly_wx256;   /* player_wx 的定点值（实际 wx = fly_wx256 >> 8）*/
-    int fly_wy256;   /* player_wy 的定点值 */
+    int fly_wx256;     /* player_wx 的定点值（实际 wx = fly_wx256 >> 8）*/
+    int fly_wy256;     /* player_wy 的定点值 */
     int fly_step256_x; /* 每帧 wx 步进量（×256）*/
     int fly_step256_y; /* 每帧 wy 步进量（×256）*/
 
@@ -169,6 +170,12 @@ static struct
     int fall_vy; /* 垂直掉落速度（每帧px，向下加速）*/
     int fall_vx; /* 水平速度（继承飞行末尾的每帧水平位移，继续往前飞）*/
     int fall_h;  /* 当前离地弧高余量（从飞行末尾 fly_h 继承，被重力逐帧吃掉）*/
+
+    /* ── 摔倒（PH_TOPPLE）：踩到台缘但落脚面不够，先站稳一瞬再朝台外倾倒掉落 ── */
+    int topple_dir;   /* 倾倒方向：+1=向右倒（落点偏台右），-1=向左倒 */
+    int topple_ang;   /* 当前倾倒角度（0.1°为单位×10，即 0~JUMP_TOPPLE_MAX_ANG）*/
+    int topple_hold;  /* 站稳停顿剩余帧数（>0 时人物不动，仅展示「站上去了」）*/
+    int topple_pivot_wx; /* 倾倒支点（脚底）世界 x，固定在台缘处，旋转绕此点 */
 
     /* 摄像机延迟：落台后先等 N 帧，避免视线在棋子落台瞬间就移走 */
     int cam_delay_frames;
@@ -204,6 +211,8 @@ static lv_timer_t *s_engine_tmr = NULL;
 static void enter_select(void);
 static void enter_playing(void);
 static void enter_result(void);
+static void trigger_next_drop(void); /* 触发下一块目标台从天而降（开局/镜头停稳后调用）*/
+static int player_base_scale(void);  /* 棋子等比缩放基准，plat_foot_half_w 提前用到 */
 
 /* ══════════════════════════════════════════════════
  * NVS
@@ -335,6 +344,17 @@ static int plat_face_half_w(const platform_t *p)
 #endif
 }
 
+/* 棋子「有效落脚半宽」（世界坐标）——摔倒判定用。
+ * = 当前棋子缩放后图片半宽 × JUMP_FOOT_W_PCT%。棋子脚不是整张图那么宽，
+ * 故按落脚比例收窄，作为「重心是否还压在台面上」的判定半径。*/
+static int plat_foot_half_w(void)
+{
+    int scale = player_base_scale();             /* 256=原尺寸 */
+    int player_w = JUMP_PLAYER_IMG_W * scale / 256; /* 缩放后图片宽 */
+    int foot_w = player_w * JUMP_FOOT_W_PCT / 100;  /* 有效落脚宽 */
+    return foot_w / 2;
+}
+
 /* ══════════════════════════════════════════════════
  * 台子渲染（squash_pct 0~100：蓄力时立方体竖直方向压扁）
  *   立方体「顶面中心」对齐世界坐标 (world_cx, world_cy)（小人脚踩顶面）。
@@ -343,6 +363,15 @@ static void platform_render_one(int idx, int squash_pct)
 {
     platform_t *p = &g.plats[idx];
     if (!p->cube || !p->active)
+    {
+        if (p->cube)
+            lv_obj_add_flag(p->cube, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    /* 「挂起入场」台子（drop_pending=true）尚未被触发从天而降：保持隐藏、完全不可见。
+     * 否则其 drop=0 会被渲染成「落定态」在屏内闪现，并与落台动画同帧浮动（见修复计划）。
+     * 待 trigger_next_drop 把它转为 dropping=true 后，drop_pending 清零，本判断自然放行。*/
+    if (p->drop_pending)
     {
         if (p->cube)
             lv_obj_add_flag(p->cube, LV_OBJ_FLAG_HIDDEN);
@@ -442,8 +471,80 @@ static void platforms_render_all(void)
         platform_render_one(i, 0);
 }
 
-/* 每帧推进「从天而降」入场动画：掉落→触底→回弹压扁消退。
- * 返回是否有任一台子在动画中（用于决定是否需要重渲染）。*/
+#if 1 /* ── 启用：图片模式向上弹起版本 ── */
+/* 每帧推进「从天而降」入场动画。
+ * 图片模式：下落→触底→向上弹起一次→落定（物理弹跳，无下坠/压扁）。
+ *   drop>0=台子在目标上方；触底时 drop_vy 反向×弹力系数使台子弹起；
+ *   drop 回升到0时落定（弹力太小则直接落定，避免无限微颤）。
+ * cube模式：下落→触底→压扁回弹消退（原有逻辑）。
+ * 返回是否有任一台子在动画中。*/
+static bool platforms_drop_update(void)
+{
+    bool any = false;
+    for (int i = 0; i < PLAT_COUNT; i++)
+    {
+        platform_t *p = &g.plats[i];
+        if (!p->active || !p->dropping)
+            continue;
+        any = true;
+
+#if JUMP_PLAT_USE_IMG
+        /* 重力始终向下：vy 每帧增大，drop 每帧减去 vy（drop 减小=台子向下落）*/
+        p->drop_vy += JUMP_DROP_GRAVITY;
+        p->drop -= p->drop_vy;
+
+        if (p->drop <= 0 && p->drop_vy > 0)
+        {
+            /* 触底（drop穿过0且速度向下）：反弹，速度反向并衰减 */
+            p->drop = 0;
+            p->drop_vy = -(p->drop_vy * JUMP_DROP_BOUNCE_COEF / 100);
+            /* 弹力不足以弹起（<3px/帧）则直接落定，避免无限微颤 */
+            if (p->drop_vy > -3)
+            {
+                p->drop_vy = 0;
+                p->dropping = false;
+            }
+        }
+        else if (p->drop <= 0 && p->drop_vy <= 0)
+        {
+            /* 弹起后回落到0：落定 */
+            p->drop = 0;
+            p->drop_vy = 0;
+            p->dropping = false;
+        }
+#else
+        if (p->drop > 0)
+        {
+            /* cube模式下落：重力加速 */
+            p->drop_vy += JUMP_DROP_GRAVITY;
+            p->drop -= p->drop_vy;
+            if (p->drop <= 0)
+            {
+                p->drop = 0;
+                p->bounce = JUMP_DROP_BOUNCE;
+            }
+        }
+        else if (p->bounce > 0)
+        {
+            p->bounce -= JUMP_DROP_BOUNCE_DECAY;
+            if (p->bounce <= 0)
+            {
+                p->bounce = 0;
+                p->dropping = false;
+            }
+        }
+        else
+        {
+            p->dropping = false;
+        }
+#endif
+    }
+    return any;
+}
+#endif /* ── 注释段结束 ── */
+
+#if 0 /* ── 已注释：更改之前的原始版本（掉落→触底→回弹压扁消退），暂时停用 ── */
+/* 返回是否有任一台子在动画中（用于决定是否需要重渲染）。*/
 static bool platforms_drop_update(void)
 {
     bool any = false;
@@ -491,6 +592,7 @@ static bool platforms_drop_update(void)
     }
     return any;
 }
+#endif /* ── 原始版本注释段结束 ── */
 
 /* 按「难度基础台宽的 2/5」算人物等比缩放，下限 JUMP_PLAYER_MIN_W px。
  * 返回 LVGL scale（256=原尺寸）。基准用固定基础台宽 s_diff[].pw（而非当前台实际宽
@@ -542,8 +644,39 @@ static void player_render(int squash_pct, int fly_h, int foot_sink)
     int pos_x = sx - raw_w / 2;                /* 中心对齐 player x */
     int pos_y = img_top - (raw_h - img_h) / 2; /* 让缩放后底边落在 img_top+img_h */
 
+    lv_image_set_rotation(s_player, 0);                /* 清除摔倒残留旋转，正常态恒为竖直 */
+    lv_image_set_pivot(s_player, raw_w / 2, raw_h / 2); /* 复位支点到图片中心：正常缩放公式按绕中心算，
+                                                          摔倒后 pivot 残留在脚底会导致缩放后整体偏位 */
     lv_image_set_scale_x(s_player, scale_x);
     lv_image_set_scale_y(s_player, scale_y);
+    lv_obj_set_pos(s_player, pos_x, pos_y);
+    lv_obj_clear_flag(s_player, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* 摔倒专用渲染：棋子绕「脚底」旋转 ang_deci（0.1°单位），向 dir（+1右/-1左）倾倒，
+ * 同时整体随 fall_h 下坠。与 player_render 区别仅在：设置 pivot 到脚底 + set_rotation。
+ * 旋转方向：dir>0 顺时针（图像向右倒），LVGL rotation 正值=顺时针（0.1°单位）。*/
+static void player_render_topple(int ang_deci, int dir, int fall_h)
+{
+    if (!s_player)
+        return;
+    int base = player_base_scale();
+    int img_h = JUMP_PLAYER_IMG_H * base / 256;
+
+    int sx = wx_to_sx(g.topple_pivot_wx);          /* 支点=脚底所在台缘 x（固定不动）*/
+    int foot_sy = wy_to_sy(g.player_wy) - fall_h;  /* 脚底屏幕 y，下坠时随 player_wy 走 */
+    int img_top = foot_sy - img_h;
+
+    int raw_w = JUMP_PLAYER_IMG_W, raw_h = JUMP_PLAYER_IMG_H;
+    int pos_x = sx - raw_w / 2;
+    int pos_y = img_top - (raw_h - img_h) / 2;
+
+    /* pivot 用「缩放前原图坐标」：脚底中点 = (raw_w/2, raw_h)。
+     * LVGL 绕此点做缩放+旋转，故脚底锚定不动，头部向外倒。*/
+    lv_image_set_pivot(s_player, raw_w / 2, raw_h);
+    lv_image_set_scale_x(s_player, base);
+    lv_image_set_scale_y(s_player, base);
+    lv_image_set_rotation(s_player, dir > 0 ? ang_deci : -ang_deci);
     lv_obj_set_pos(s_player, pos_x, pos_y);
     lv_obj_clear_flag(s_player, LV_OBJ_FLAG_HIDDEN);
 }
@@ -640,10 +773,10 @@ static void sparks_update(int pct, int sink)
 static void plat_start_drop(platform_t *p)
 {
     p->drop = JUMP_DROP_HEIGHT;
-    p->drop_vy = 0;
+    p->drop_vy = 0; /* 给初速让台子一开始就快速下落 */
     p->bounce = 0;
     p->dropping = true;
-    p->drop_pending = false; /* 已真正起跌，清除挂起标记 */
+    p->drop_pending = false;
 }
 
 /* 台子无入场动画（直接就位，如起始台）*/
@@ -656,14 +789,13 @@ static void plat_no_drop(platform_t *p)
     p->drop_pending = false;
 }
 
-/* 台子「挂起入场」：生成后先不掉落（此时多在屏幕右侧外），
- * 待 platforms_drop_trigger 检测到它滚入视野右缘才真正起跌，
- * 这样玩家能看到台子从天而降，而非在屏外掉完后才滑进来。
- * 挂起期间 drop=0、dropping=false：渲染为「落定态」，但因尚在屏外故不可见。*/
+/* 台子「挂起入场」：生成后先不掉落，标记 drop_pending=true。
+ * 待它滚动成「下一块目标台」(plats[1]) 且镜头停稳后，由 trigger_next_drop 触发从天而降。
+ * 挂起期间 drop_pending=true：platform_render_one 强制隐藏，完全不可见（不再屏内闪现）。*/
 static void plat_pend_drop(platform_t *p)
 {
     p->drop = 0;
-    p->drop_vy = 0;
+    p->drop_vy = JUMP_DROP_INIT_VY; // 掉落初速度
     p->bounce = 0;
     p->dropping = false;
     p->drop_pending = true;
@@ -815,7 +947,7 @@ static void gen_platform(platform_t *dst, const platform_t *ref)
                        : 0;
 #endif
     dst->active = true;
-    plat_pend_drop(dst); /* 新台子先挂起，滚入视野右缘再从天而降（见 platforms_drop_trigger）*/
+    plat_pend_drop(dst); /* 新台子先挂起隐藏，待滚成下一块目标台、镜头停稳后才从天而降（见 trigger_next_drop）*/
 }
 
 static void platforms_init(void)
@@ -854,6 +986,11 @@ static void platforms_init(void)
     g.cam_smooth_frames = 0;
 
     platforms_render_all();
+
+    /* 开局：让第二块(plats[1])从天而降落定；第三块(plats[2])保持挂起隐藏，
+     * 初始界面只见两块。第二块落定后玩家方可起跳（见 do_jump 的 dropping 保护）。
+     * 若想开局第二块直接静止落定，把下面改成 plat_no_drop(&g.plats[1]) 即可。*/
+    trigger_next_drop();
 }
 
 static void platforms_advance(void)
@@ -876,9 +1013,14 @@ static void platforms_advance(void)
     gen_platform(&g.plats[2], &g.plats[1]);
     g.plats[2].cube = reuse_cube;
 
-    /* 摄像机目标：让新cur台对齐屏幕锚点 */
+    /* 摄像机目标：只水平跟随，垂直方向锁定（cam_target_y 恒为 0）。
+     * 原因：台子世界 Y 已被 rand_gap_y() 钳在 [40, LCD_HEIGHT-60] 屏内范围，
+     * 不会飞出屏幕，本不需要相机 Y 跟随。若 cam_target_y 跟随落点台高度，
+     * 每跳镜头竖直方向大幅起伏，会把「其它台子（含落点台后一张）」整体上下拖动，
+     * 视觉上就是「落地时后方台子也跟着上浮/下沉」的 bug。锁定 Y 后，
+     * 落地只剩落点台自身的压扁动画在动，其余台子竖直完全静止。*/
     g.cam_target_x = g.plats[0].world_cx - JUMP_START_X;
-    g.cam_target_y = g.plats[0].world_cy - JUMP_TOP_Y;
+    g.cam_target_y = 0;
     g.cam_smooth_frames = JUMP_CAM_SMOOTH_FRAMES;
 
     platforms_render_all();
@@ -895,6 +1037,11 @@ static void platforms_advance(void)
 static void do_jump(uint32_t held_ms)
 {
     if (g.phase != PH_IDLE)
+        return;
+
+    /* 手感保护：下一块目标台(plats[1])还在从天而降未落定时，不允许起跳，
+     * 否则会对着尚在空中的台子做落点判定。等它落定(dropping=false)再跳。*/
+    if (g.plats[1].dropping)
         return;
 
     int dist = hold_to_dist(held_ms);
@@ -938,20 +1085,16 @@ static void do_jump(uint32_t held_ms)
     ESP_LOGI(TAG, "起跳 dist=%d target(%d,%d)", dist, tx, ty);
 }
 
-/* 扫描「挂起入场」的台子：一旦其随相机滚入屏幕右侧（左缘越过屏幕右边界、
- * 出现任一可见部分）就触发从天而降。这样台子总在玩家眼前砸下，
- * 而不是在屏外掉完后才滑进视野。判定用台子半宽 w/2（图片缩放后实际宽≈w）。*/
-static void platforms_drop_trigger(void)
+/* 触发「下一块目标台」(plats[1]) 从天而降。
+ * 只针对 plats[1]、一次一块，且仅在「开局」与「镜头平移结束」两个时点调用：
+ *   - 旧做法是每帧扫描「进屏即触发」，但落台后镜头还没动时第三块就已在屏内，
+ *     会被立刻触发从天而降，和落台压扁同帧 → 后方台子同步浮动（已修复，见计划）。
+ *   - 现在改为只在镜头停稳后给下一块目标台触发，保证落台/平移全程后方零浮动。
+ * plats[2]（再下一块）保持挂起隐藏，待它滚动成新 plats[1] 后才会被触发。*/
+static void trigger_next_drop(void)
 {
-    for (int i = 0; i < PLAT_COUNT; i++)
-    {
-        platform_t *p = &g.plats[i];
-        if (!p->active || !p->drop_pending)
-            continue;
-        int sx = wx_to_sx(p->world_cx);
-        if (sx - p->w / 2 <= BSP_LCD_WIDTH) /* 左缘已进入可视区 */
-            plat_start_drop(p);
-    }
+    if (g.plats[1].active && g.plats[1].drop_pending)
+        plat_start_drop(&g.plats[1]);
 }
 
 /* ══════════════════════════════════════════════════
@@ -963,8 +1106,8 @@ static void engine_cb(lv_timer_t *t)
     if (g.screen != JS_PLAYING)
         return;
 
-    /* 先触发已滚入视野的挂起台子起跌，再推进掉落动画（同帧即可见其从高空落下）。*/
-    platforms_drop_trigger();
+    /* 注意：不再每帧扫描触发挂起台子（旧 platforms_drop_trigger 会在落台瞬间误触发
+     * 第三块从天而降，与落台同帧浮动）。改由 trigger_next_drop 在开局/镜头停稳后调用。*/
 
     /* 每帧推进台子入场/回弹动画，独立于 phase。
      * 图片模式下 slot0 有落台 bounce 时，棋子也跟随台面下移（视觉同步）。*/
@@ -1065,9 +1208,29 @@ static void engine_cb(lv_timer_t *t)
         /* 视觉飞行终点即判定点（二者已统一，不再单独重算）*/
         int actual_wx = g.player_wx;
 
-        ESP_LOGI(TAG, "判定 actual_wx=%d next[%d,%d]", actual_wx, nl, nr);
+        /* 摔倒判定：棋子中心超出台缘多少（overshoot>0 才有出台风险）。
+         * overshoot<=0          → 重心在台面内，稳稳站住（成功）
+         * 0<overshoot<脚底半宽×倍率 → 踩到台缘但落脚面撑不住 → 摔倒（失败）
+         * overshoot>=该上界      → 重心彻底出台缘 → 完全没站住，直接坠落（失败）*/
+        int overshoot = 0;
+        int topple_dir = 0;
+        if (actual_wx > nr)
+        {
+            overshoot = actual_wx - nr;
+            topple_dir = +1; /* 落点偏台右，向右倒 */
+        }
+        else if (actual_wx < nl)
+        {
+            overshoot = nl - actual_wx;
+            topple_dir = -1; /* 落点偏台左，向左倒 */
+        }
+        int foot_half = plat_foot_half_w();
+        int topple_limit = foot_half * JUMP_TOPPLE_RANGE_PCT / 100; /* 摔倒区上界 */
 
-        if (actual_wx >= nl && actual_wx <= nr)
+        ESP_LOGI(TAG, "判定 actual_wx=%d next[%d,%d] overshoot=%d foot_half=%d",
+                 actual_wx, nl, nr, overshoot, foot_half);
+
+        if (overshoot <= 0)
         {
             /* 落台成功：小人世界坐标对齐next台 */
             g.player_wx = actual_wx;
@@ -1103,6 +1266,26 @@ static void engine_cb(lv_timer_t *t)
             platform_render_one(0, 0); /* 立即渲染一帧体现下压起始 */
             ESP_LOGI(TAG, "落台成功 score=%d", g.score);
         }
+        else if (overshoot < topple_limit)
+        {
+            /* ── 摔倒：棋子踩到台缘，重心仍在台面内但落脚面撑不住 ──
+             * 先在落点站稳一瞬（topple_hold 帧），再绕脚底朝台外侧倾倒掉落。
+             * 关键：绝不调 platforms_advance()，台子数据保持不变，倾倒支点才对得上台缘。
+             * 支点固定在「靠近台心一侧的台缘」：向右倒→脚踩右缘(nr)，向左倒→脚踩左缘(nl)。*/
+            g.player_wx = actual_wx;
+            g.player_wy = g.plats[1].world_cy;     /* 脚底高度=台面，先站上去 */
+            g.topple_dir = topple_dir;
+            g.topple_pivot_wx = (topple_dir > 0) ? nr : nl; /* 脚底支点=所踩台缘 */
+            g.topple_ang = 0;
+            g.topple_hold = JUMP_TOPPLE_HOLD_FRAMES;
+            g.fall_vy = 0;
+            g.fall_h = 0;
+            g.phase = PH_TOPPLE;
+            highscore_save_if_better(g.score);
+            /* 站稳第一帧：竖直渲染在落点（尚未倾倒）*/
+            player_render(0, 0, 0);
+            ESP_LOGI(TAG, "摔倒 wx=%d dir=%d pivot=%d", actual_wx, topple_dir, g.topple_pivot_wx);
+        }
         else
         {
             /* 落空：从飞行末态平滑接力掉落（连续抛物线，不再瞬间垂直撞墙）。
@@ -1128,10 +1311,14 @@ static void engine_cb(lv_timer_t *t)
          * 棋子脚底跟随台面下沉量 cam_sink（由 land_squash_render_slot0 返回）。*/
         land_squash_step(&g.plats[0]);
         int cam_sink = 0;
-        /* 延迟阶段：棋子在落点，台子压扁回弹动画播放，玩家看清落点 */
+        /* 延迟阶段：棋子在落点，台子压扁回弹动画播放，玩家看清落点。
+         * 必须先 platforms_render_all() 把所有台子按 squash=0 重渲一遍，
+         * 否则其它台子会卡在上一帧 land_squash_render_slot0 留下的 scale_y 压扁状态，
+         * 出现「其它台子也跟着压扁」的 bug（slot0 之后再叠加压扁覆盖）。*/
         if (g.cam_delay_frames > 0)
         {
             g.cam_delay_frames--;
+            platforms_render_all();
             cam_sink = land_squash_render_slot0();
             player_render(0, 0, cam_sink);
             break;
@@ -1145,6 +1332,10 @@ static void engine_cb(lv_timer_t *t)
             platforms_render_all();                /* 先按相机渲染全部（slot0 squash=0）*/
             cam_sink = land_squash_render_slot0(); /* 再叠加 slot0 压扁，覆盖其渲染 */
             player_render(0, 0, cam_sink);
+            /* 诊断[平移帧]：cam_y 是否真锁住=0？台子3(slot1)屏幕y 是否随帧动？*/
+            ESP_LOGW(TAG, "PAN camX=%d camY=%d tgtY=%d | s1_py=%d s1_wy=%d",
+                     g.cam_x, g.cam_y, g.cam_target_y,
+                     (int)lv_obj_get_y(g.plats[1].cube), g.plats[1].world_cy);
         }
         if (g.cam_smooth_frames <= 0)
         {
@@ -1156,7 +1347,11 @@ static void engine_cb(lv_timer_t *t)
             player_render(0, 0, cam_sink);
             /* 相机到位后，仅当压扁回弹也播完才回 IDLE（否则停在 CAM 继续播完回弹）*/
             if (!g.plats[0].land_squashing)
+            {
                 g.phase = PH_IDLE;
+                /* 镜头停稳：此刻才让下一块目标台(plats[1])从天而降，避免与落台同帧浮动 */
+                trigger_next_drop();
+            }
         }
         break;
 #else
@@ -1190,6 +1385,8 @@ static void engine_cb(lv_timer_t *t)
             platforms_render_all();
             player_render(0, 0, cam_sink);
             g.phase = PH_IDLE;
+            /* 镜头停稳：此刻才让下一块目标台(plats[1])从天而降，避免与落台同帧浮动 */
+            trigger_next_drop();
         }
         break;
 #endif
@@ -1216,6 +1413,43 @@ static void engine_cb(lv_timer_t *t)
             h = 0;
         }
         player_render(0, h, 0); /* h 作为离地高度，保持弧线连续 */
+        if (wy_to_sy(g.player_wy) >= BSP_LCD_HEIGHT + JUMP_PLAYER_H * 2)
+            enter_result();
+        break;
+    }
+
+    /* 摔倒：踩到台缘但落脚面不够 → 先站稳一瞬，再绕脚底朝台外倾倒并下坠（失败）*/
+    case PH_TOPPLE:
+    {
+        /* 阶段A：站稳停顿——人物竖直站在落点，仅展示「站上去了」 */
+        if (g.topple_hold > 0)
+        {
+            g.topple_hold--;
+            player_render(0, 0, 0);
+            break;
+        }
+
+        /* 阶段B：绕脚底倾倒 + 整体下坠 */
+        if (g.topple_ang < JUMP_TOPPLE_MAX_ANG)
+        {
+            /* 仍在倾倒：角度逐帧增大；倒过一半后开始重力下坠（失去支撑滑落台缘）*/
+            g.topple_ang += JUMP_TOPPLE_ANG_STEP;
+            if (g.topple_ang > JUMP_TOPPLE_MAX_ANG)
+                g.topple_ang = JUMP_TOPPLE_MAX_ANG;
+            if (g.topple_ang > JUMP_TOPPLE_MAX_ANG / 2)
+            {
+                g.fall_vy += 2;
+                g.player_wy += g.fall_vy;
+            }
+        }
+        else
+        {
+            /* 倾倒到位（已趴下）：纯重力坠落，沿倾倒方向略微外移 */
+            g.fall_vy += 3;
+            g.player_wy += g.fall_vy;
+            g.topple_pivot_wx += g.topple_dir * 2; /* 脱离台缘后沿倾倒方向外滑 */
+        }
+        player_render_topple(g.topple_ang, g.topple_dir, 0);
         if (wy_to_sy(g.player_wy) >= BSP_LCD_HEIGHT + JUMP_PLAYER_H * 2)
             enter_result();
         break;
