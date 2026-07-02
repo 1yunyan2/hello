@@ -322,6 +322,88 @@ void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms)
 }
 
 // ==========================================
+// API: 舵机低功耗休眠 / 恢复（供二级待机 standby 使用）
+// ==========================================
+
+/**
+ * @brief 让三轴舵机进入低功耗休眠（停止 PWM 输出，失去保持力矩）
+ *
+ * 二级（深度）待机省电用：对 CH_HEAD/CH_L_ARM/CH_R_ARM 三路舵机的 LEDC 通道
+ * 逐个 ledc_stop()，停止 PWM 脉冲输出。舵机收不到脉冲后会松开保持力矩，
+ * 静态电流（尤其堵转/抖动）随之下降，这是舵机省电的主要来源。
+ *
+ * 设计要点（务必遵守，否则会连累其它外设）：
+ *   - 只 stop 舵机自己的三个通道（LEDC_CHANNEL_0/1/2），idle_level=0（引脚拉低）。
+ *   - ★绝不触碰共享的 LEDC_TIMER_0 本身：停 timer 会让背光(T1)/马达(T2) 之外
+ *     依赖同 speed_mode 时钟的逻辑出问题；停单通道是安全的（参见 BUG-015 教训）。
+ *   - 不删除 servo_manager 的 worker 任务/队列：恢复时毫秒级即可，避免任务重建坑。
+ *
+ * @note 与 bsp_servo_resume() 配对使用；幂等（未就绪直接返回）。
+ * @note 调用本函数后，bsp_servo_move_smooth 仍可被调用并自动重新输出（write_angle
+ *       内部会重置 duty），但语义上应先 resume 再运动，保持状态清晰。
+ */
+void bsp_servo_idle(void)
+{
+    bsp_board_t *board = bsp_board_get_instance();
+    if (board == NULL || !board->servo_initialized)
+        return; // 未就绪：无需停止
+
+    // 逐通道加锁后停 PWM，避免与正在进行的插值运动写入竞争（与 move_smooth 同锁）。
+    const uint8_t chs[3] = {CH_HEAD, CH_L_ARM, CH_R_ARM};
+    for (int i = 0; i < 3; i++)
+    {
+        uint8_t ch = chs[i];
+        if (s_ch_mutex[ch] == NULL)
+            continue;
+        xSemaphoreTake(s_ch_mutex[ch], portMAX_DELAY);
+        // idle_level=0：停止后引脚保持低电平（舵机失力，不抽搐）。只动通道，不动 timer。
+        ledc_stop(LEDC_LOW_SPEED_MODE, ch, 0);
+        xSemaphoreGive(s_ch_mutex[ch]);
+    }
+    ESP_LOGI(TAG, "舵机已进入低功耗休眠（三路 PWM 已停止）");
+}
+
+/**
+ * @brief 从低功耗休眠恢复舵机，并缓慢归中（与 bsp_servo_idle 配对）
+ *
+ * 唤醒（退出二级待机）时调用：重新让三路 LEDC 通道输出 90° 对应的 PWM 脉冲。
+ * iot_servo_write_angle 内部会重新 set_duty + update_duty，自动恢复被 ledc_stop
+ * 关掉的通道输出，无需重建 LEDC 配置。
+ *
+ * 采用慢速归中（SERVO_SPEED_SLOW），避免舵机从“失力松弛位置”猛地跳回 90° 抽搐。
+ *
+ * @note 幂等：未就绪直接返回。内部走 bsp_servo_move_smooth（自带每通道锁）。
+ */
+void bsp_servo_resume(void)
+{
+    bsp_board_t *board = bsp_board_get_instance();
+    if (board == NULL || !board->servo_initialized)
+        return;
+
+    // 步骤 1：先直接写一次 90° 重启 PWM 输出。
+    // ★必要性：通道被 ledc_stop 后，bsp_servo_move_smooth 的“读当前角度→死区过滤”
+    //   逻辑可能因读到异常/恰好≈90 而直接跳过，导致 PWM 没被重新点亮。这里加锁后
+    //   用 iot_servo_write_angle 强制重置 duty，确保三路 PWM 真正恢复输出。
+    const uint8_t chs[3] = {CH_HEAD, CH_L_ARM, CH_R_ARM};
+    for (int i = 0; i < 3; i++)
+    {
+        uint8_t ch = chs[i];
+        if (s_ch_mutex[ch] == NULL)
+            continue;
+        xSemaphoreTake(s_ch_mutex[ch], portMAX_DELAY);
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, ch, 90.0f);
+        xSemaphoreGive(s_ch_mutex[ch]);
+    }
+
+    // 步骤 2：再走一次慢速归中做对齐（此时已在 90° 附近，move_smooth 多为死区直接返回，
+    //         保留此步是为了与其它路径“运动后归中”的习惯一致，且无副作用）。
+    bsp_servo_move_smooth(CH_HEAD, 90.0f, SERVO_SPEED_SLOW);
+    bsp_servo_move_smooth(CH_L_ARM, 90.0f, SERVO_SPEED_SLOW);
+    bsp_servo_move_smooth(CH_R_ARM, 90.0f, SERVO_SPEED_SLOW);
+    ESP_LOGI(TAG, "舵机已从低功耗休眠恢复并归中");
+}
+
+// ==========================================
 // API: 三轴同时平滑运动（真正并行）
 // ==========================================
 

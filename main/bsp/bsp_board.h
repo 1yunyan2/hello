@@ -320,6 +320,22 @@ void bsp_servo_clear_abort(void);
 /** @brief 查询当前是否有舵机打断请求（true=已请求中止） */
 bool bsp_servo_abort_requested(void);
 
+/**
+ * @brief 舵机进入低功耗休眠：停止三路 PWM 输出（供二级待机省电）
+ *
+ * 对 CH_HEAD/CH_L_ARM/CH_R_ARM 三路 LEDC 通道 ledc_stop，舵机失去保持力矩，
+ * 静态电流下降。只动通道不动共享 timer，不影响背光/马达；不删 worker 任务，
+ * 恢复为毫秒级。与 bsp_servo_resume() 配对，幂等。
+ */
+void bsp_servo_idle(void);
+
+/**
+ * @brief 从低功耗休眠恢复舵机并慢速归中（与 bsp_servo_idle 配对）
+ *
+ * 重新点亮三路 PWM 输出（写 90°）并缓慢归中，避免从失力位置猛跳抽搐。幂等。
+ */
+void bsp_servo_resume(void);
+
 // ─── 7. 触摸事件与接口 (整合自 bsp_touch.h) ───────────────────────────────
 
 /**

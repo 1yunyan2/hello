@@ -43,9 +43,9 @@ typedef struct
     req_kind_t kind; // 请求类型
     union
     {
-        servo_request_t single;                // kind==REQ_KIND_SINGLE 时有效
-        servo_parallel_request_t parallel;     // kind==REQ_KIND_PARALLEL 时有效
-        servo_abs_parallel_request_t abs_par;  // kind==REQ_KIND_ABS_PARALLEL 时有效
+        servo_request_t single;               // kind==REQ_KIND_SINGLE 时有效
+        servo_parallel_request_t parallel;    // kind==REQ_KIND_PARALLEL 时有效
+        servo_abs_parallel_request_t abs_par; // kind==REQ_KIND_ABS_PARALLEL 时有效
     } u;
     SemaphoreHandle_t done; // 非 NULL：执行完毕后 give 通知调用方（完成等待用）
 } internal_req_t;
@@ -389,10 +389,10 @@ esp_err_t servo_manager_flush(void)
 {
     if (!s_inited)
         return ESP_ERR_INVALID_STATE;
-    atomic_store(&s_flush_req, true);  // 通知 servo_exec 外层循环在轮边界跳出
-    bsp_servo_request_abort();          // ★ 通知 bsp 插值步循环立即停（几十 ms 内），不等整轮
-    xQueueReset(s_queue);               // 清掉所有未执行请求
-    ESP_LOGI(TAG, "servo flush：清队 + 立即打断当前插值，舵机归中");
+    atomic_store(&s_flush_req, true); // 通知 servo_exec 外层循环在轮边界跳出
+    bsp_servo_request_abort();        // ★ 通知 bsp 插值步循环立即停（几十 ms 内），不等整轮
+    xQueueReset(s_queue);             // 清掉所有未执行请求
+    // ESP_LOGI(TAG, "servo flush：清队 + 立即打断当前插值，舵机归中");
     return ESP_OK;
 }
 
