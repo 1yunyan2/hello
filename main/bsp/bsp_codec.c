@@ -104,11 +104,11 @@ static void bsp_board_codec_i2s_init(bsp_board_t *bsp_board,
 
         // GPIO 引脚映射（对应 bsp_config.h 中的引脚定义）
         .gpio_cfg = {
-            .mclk = BSP_CODEC_MCLK_PIN, // GPIO17：主时钟，ES8311 内部 PLL 参考源
-            .bclk = BSP_CODEC_BCLK_PIN, // GPIO9：位时钟，每个采样位一个脉冲
-            .ws = BSP_CODEC_WS_PIN,     // GPIO5：字选择/帧同步，16kHz = 16000次/秒切换
-            .dout = BSP_CODEC_DOUT_PIN, // GPIO6：播放数据（ESP32→ES8311→扬声器）
-            .din = BSP_CODEC_DIN_PIN,   // GPIO4：录音数据（麦克风→ES8311→ESP32）
+            .mclk = BSP_CODEC_MCLK_PIN, // GPIO8：主时钟，ES8311 内部 PLL 参考源
+            .bclk = BSP_CODEC_BCLK_PIN, // GPIO46：位时钟，每个采样位一个脉冲
+            .ws = BSP_CODEC_WS_PIN,     // GPIO7：字选择/帧同步，16kHz = 16000次/秒切换
+            .dout = BSP_CODEC_DOUT_PIN, // GPIO15：播放数据（ESP32→ES8311→扬声器）
+            .din = BSP_CODEC_DIN_PIN,   // GPIO6：录音数据（麦克风→ES8311→ESP32）
         },
     };
 
@@ -308,32 +308,32 @@ void audio_feed_task(void *arg)
     ESP_LOGI(TAG, "音频采集任务启动 (AFE feed chunk=%d samples, %d bytes)",
              (int)chunk_size, (int)(chunk_size * sizeof(int16_t)));
 
-    // // [PCBA 诊断] 每 ~3s 统计一次 PCM 峰值/RMS，用于判断麦克风信号是否正常
-    // // peak<100/rms<30 → 信号几乎没进来（硬件层）；peak 200~1000 → 增益不足；peak>5000 → 信号 OK，问题在 AFE
-    // uint32_t diag_iter = 0;
-    // int32_t diag_peak = 0;
-    // uint64_t diag_sumsq = 0;
-    // uint32_t diag_samples = 0;
-    // const uint32_t DIAG_PRINT_EVERY = 16000 / 512 * 3; // 约 3 秒
+    // [PCBA 诊断] 每 ~3s 统计一次 PCM 峰值/RMS，用于判断麦克风信号是否正常
+    // peak<100/rms<30 → 信号几乎没进来（硬件层）；peak 200~1000 → 增益不足；peak>5000 → 信号 OK，问题在 AFE
+    uint32_t diag_iter = 0;
+    int32_t diag_peak = 0;
+    uint64_t diag_sumsq = 0;
+    uint32_t diag_samples = 0;
+    const uint32_t DIAG_PRINT_EVERY = 16000 / 512 * 3; // 约 3 秒
 
-    // // [PCBA 诊断·自检] 启动时人为塞已知值，验证统计代码本身没问题
-    // // 期望输出 peak=12345 rms≈8731（√((12345²+1000²+...)/8)的近似）
-    // {
-    //     int16_t test_buf[8] = {12345, -1000, 500, -500, 200, -200, 0, 0};
-    //     int32_t t_peak = 0;
-    //     uint64_t t_sumsq = 0;
-    //     for (int i = 0; i < 8; ++i)
-    //     {
-    //         int32_t v = test_buf[i];
-    //         int32_t av = v < 0 ? -v : v;
-    //         if (av > t_peak)
-    //             t_peak = av;
-    //         t_sumsq += (uint64_t)(v * v);
-    //     }
-    //     uint32_t t_rms = (uint32_t)sqrt((double)t_sumsq / 8);
-    //     ESP_LOGW(TAG, "[PCM自检] 统计逻辑测试 peak=%ld rms=%lu (期望 peak=12345 rms≈4387) — 好的",
-    //              (long)t_peak, (unsigned long)t_rms);
-    // }
+    // [PCBA 诊断·自检] 启动时人为塞已知值，验证统计代码本身没问题
+    // 期望输出 peak=12345 rms≈8731（√((12345²+1000²+...)/8)的近似）
+    {
+        int16_t test_buf[8] = {12345, -1000, 500, -500, 200, -200, 0, 0};
+        int32_t t_peak = 0;
+        uint64_t t_sumsq = 0;
+        for (int i = 0; i < 8; ++i)
+        {
+            int32_t v = test_buf[i];
+            int32_t av = v < 0 ? -v : v;
+            if (av > t_peak)
+                t_peak = av;
+            t_sumsq += (uint64_t)(v * v);
+        }
+        uint32_t t_rms = (uint32_t)sqrt((double)t_sumsq / 8);
+        ESP_LOGW(TAG, "[PCM自检] 统计逻辑测试 peak=%ld rms=%lu (期望 peak=12345 rms≈4387) — 好的",
+                 (long)t_peak, (unsigned long)t_rms);
+    }
 
     // ── 步骤 3：主采集循环（永不退出）───────────────────────────────────────
     while (1)
@@ -349,29 +349,29 @@ void audio_feed_task(void *arg)
 
         if (ret == ESP_OK)
         {
-            // // [PCBA 诊断] 累计本帧的峰值和平方和
-            // for (size_t i = 0; i < chunk_size; ++i)
-            // {
-            //     int32_t v = buffer[i];
-            //     int32_t av = v < 0 ? -v : v;
-            //     if (av > diag_peak)
-            //         diag_peak = av;
-            //     diag_sumsq += (uint64_t)(v * v);
-            // }
-            // diag_samples += chunk_size;
-            // if (++diag_iter >= DIAG_PRINT_EVERY)
-            // {
-            //     uint32_t rms = diag_samples ? (uint32_t)sqrt((double)diag_sumsq / diag_samples) : 0;
-            //     // 同步打印 buffer 前 8 个原始采样的十六进制，证明读到的字节真是 0x00 而不是统计 bug
-            //     ESP_LOGI(TAG, "[PCM诊断] peak=%ld rms=%lu samples=%lu | 原始bytes[0..7]=%04X %04X %04X %04X %04X %04X %04X %04X",
-            //              (long)diag_peak, (unsigned long)rms, (unsigned long)diag_samples,
-            //              (uint16_t)buffer[0], (uint16_t)buffer[1], (uint16_t)buffer[2], (uint16_t)buffer[3],
-            //              (uint16_t)buffer[4], (uint16_t)buffer[5], (uint16_t)buffer[6], (uint16_t)buffer[7]);
-            //     diag_iter = 0;
-            //     diag_peak = 0;
-            //     diag_sumsq = 0;
-            //     diag_samples = 0;
-            // }
+            // [PCBA 诊断] 累计本帧的峰值和平方和
+            for (size_t i = 0; i < chunk_size; ++i)
+            {
+                int32_t v = buffer[i];
+                int32_t av = v < 0 ? -v : v;
+                if (av > diag_peak)
+                    diag_peak = av;
+                diag_sumsq += (uint64_t)(v * v);
+            }
+            diag_samples += chunk_size;
+            if (++diag_iter >= DIAG_PRINT_EVERY)
+            {
+                uint32_t rms = diag_samples ? (uint32_t)sqrt((double)diag_sumsq / diag_samples) : 0;
+                // 同步打印 buffer 前 8 个原始采样的十六进制，证明读到的字节真是 0x00 而不是统计 bug
+                ESP_LOGI(TAG, "[PCM诊断] peak=%ld rms=%lu samples=%lu | 原始bytes[0..7]=%04X %04X %04X %04X %04X %04X %04X %04X",
+                         (long)diag_peak, (unsigned long)rms, (unsigned long)diag_samples,
+                         (uint16_t)buffer[0], (uint16_t)buffer[1], (uint16_t)buffer[2], (uint16_t)buffer[3],
+                         (uint16_t)buffer[4], (uint16_t)buffer[5], (uint16_t)buffer[6], (uint16_t)buffer[7]);
+                diag_iter = 0;
+                diag_peak = 0;
+                diag_sumsq = 0;
+                diag_samples = 0;
+            }
 
             // 将原始 PCM 投喂给 AFE + MultiNet 引擎
             // 内部流程：AFE.feed() → AFE.fetch()（降噪）→ PCM钩子 + MultiNet检测
@@ -507,7 +507,7 @@ void audio_init(bsp_board_t *bsp_board)
     // 先等 VMID/DAC 偏置电压充电完成（阶跃已被静音挡住大半），再分多步小台阶
     // 爬升音量，每步之间留间隔，把"咔哒"一声摊平成人耳不敏感的缓慢淡入。
     // 渐升过程同样直接调 esp_codec_dev_set_out_vol，跳过 NVS 写入
-    //（目标值本来就读自 NVS，重复写回是无意义的 Flash 损耗）。
+    // （目标值本来就读自 NVS，重复写回是无意义的 Flash 损耗）。
     vTaskDelay(pdMS_TO_TICKS(BSP_CODEC_ANTIPOP_VMID_MS));
     for (int step = 1; step <= BSP_CODEC_ANTIPOP_STEPS; step++)
     {

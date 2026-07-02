@@ -86,11 +86,11 @@ static void bsp_board_codec_i2s_init(bsp_board_t *bsp_board,
 
         // GPIO 引脚映射（对应 bsp_config.h 中的引脚定义）
         .gpio_cfg = {
-            .mclk = BSP_CODEC_MCLK_PIN, // GPIO17：主时钟，ES8311 内部 PLL 参考源
-            .bclk = BSP_CODEC_BCLK_PIN, // GPIO9：位时钟，每个采样位一个脉冲
-            .ws = BSP_CODEC_WS_PIN,     // GPIO5：字选择/帧同步，16kHz = 16000次/秒切换
-            .dout = BSP_CODEC_DOUT_PIN, // GPIO6：播放数据（ESP32→ES8311→扬声器）
-            .din = BSP_CODEC_DIN_PIN,   // GPIO4：录音数据（麦克风→ES8311→ESP32）
+            .mclk = BSP_CODEC_MCLK_PIN, // GPIO8：主时钟，ES8311 内部 PLL 参考源
+            .bclk = BSP_CODEC_BCLK_PIN, // GPIO46：位时钟，每个采样位一个脉冲
+            .ws = BSP_CODEC_WS_PIN,     // GPIO7：字选择/帧同步，16kHz = 16000次/秒切换
+            .dout = BSP_CODEC_DOUT_PIN, // GPIO15：播放数据（ESP32→ES8311→扬声器）
+            .din = BSP_CODEC_DIN_PIN,   // GPIO6：录音数据（麦克风→ES8311→ESP32）
         },
     };
 
