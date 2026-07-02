@@ -577,8 +577,8 @@ static void try_hit(int hole)
     hammer_set_visual(hole, true);
     g.hammer_t0[hole] = lv_tick_get(); /* 记录锤子出现时刻，供引擎收回 */
 
-    /* 仅 RISING/UP 可击中；HIT/FALLING 已计过分或正在消失 → 视为空敲 */
-    if (g.st[hole] == HOLE_UP || g.st[hole] == HOLE_RISING)
+    /* 仅 UP（完全出洞到达最高点）可击中；RISING/HIT/FALLING 均视为空敲 */
+    if (g.st[hole] == HOLE_UP)
     {
         g.score++;
         g.hits++;

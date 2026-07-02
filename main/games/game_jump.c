@@ -172,9 +172,9 @@ static struct
     int fall_h;  /* 当前离地弧高余量（从飞行末尾 fly_h 继承，被重力逐帧吃掉）*/
 
     /* ── 摔倒（PH_TOPPLE）：踩到台缘但落脚面不够，先站稳一瞬再朝台外倾倒掉落 ── */
-    int topple_dir;   /* 倾倒方向：+1=向右倒（落点偏台右），-1=向左倒 */
-    int topple_ang;   /* 当前倾倒角度（0.1°为单位×10，即 0~JUMP_TOPPLE_MAX_ANG）*/
-    int topple_hold;  /* 站稳停顿剩余帧数（>0 时人物不动，仅展示「站上去了」）*/
+    int topple_dir;      /* 倾倒方向：+1=向右倒（落点偏台右），-1=向左倒 */
+    int topple_ang;      /* 当前倾倒角度（0.1°为单位×10，即 0~JUMP_TOPPLE_MAX_ANG）*/
+    int topple_hold;     /* 站稳停顿剩余帧数（>0 时人物不动，仅展示「站上去了」）*/
     int topple_pivot_wx; /* 倾倒支点（脚底）世界 x，固定在台缘处，旋转绕此点 */
 
     /* 摄像机延迟：落台后先等 N 帧，避免视线在棋子落台瞬间就移走 */
@@ -349,7 +349,7 @@ static int plat_face_half_w(const platform_t *p)
  * 故按落脚比例收窄，作为「重心是否还压在台面上」的判定半径。*/
 static int plat_foot_half_w(void)
 {
-    int scale = player_base_scale();             /* 256=原尺寸 */
+    int scale = player_base_scale();                /* 256=原尺寸 */
     int player_w = JUMP_PLAYER_IMG_W * scale / 256; /* 缩放后图片宽 */
     int foot_w = player_w * JUMP_FOOT_W_PCT / 100;  /* 有效落脚宽 */
     return foot_w / 2;
@@ -644,7 +644,7 @@ static void player_render(int squash_pct, int fly_h, int foot_sink)
     int pos_x = sx - raw_w / 2;                /* 中心对齐 player x */
     int pos_y = img_top - (raw_h - img_h) / 2; /* 让缩放后底边落在 img_top+img_h */
 
-    lv_image_set_rotation(s_player, 0);                /* 清除摔倒残留旋转，正常态恒为竖直 */
+    lv_image_set_rotation(s_player, 0);                 /* 清除摔倒残留旋转，正常态恒为竖直 */
     lv_image_set_pivot(s_player, raw_w / 2, raw_h / 2); /* 复位支点到图片中心：正常缩放公式按绕中心算，
                                                           摔倒后 pivot 残留在脚底会导致缩放后整体偏位 */
     lv_image_set_scale_x(s_player, scale_x);
@@ -663,8 +663,8 @@ static void player_render_topple(int ang_deci, int dir, int fall_h)
     int base = player_base_scale();
     int img_h = JUMP_PLAYER_IMG_H * base / 256;
 
-    int sx = wx_to_sx(g.topple_pivot_wx);          /* 支点=脚底所在台缘 x（固定不动）*/
-    int foot_sy = wy_to_sy(g.player_wy) - fall_h;  /* 脚底屏幕 y，下坠时随 player_wy 走 */
+    int sx = wx_to_sx(g.topple_pivot_wx);         /* 支点=脚底所在台缘 x（固定不动）*/
+    int foot_sy = wy_to_sy(g.player_wy) - fall_h; /* 脚底屏幕 y，下坠时随 player_wy 走 */
     int img_top = foot_sy - img_h;
 
     int raw_w = JUMP_PLAYER_IMG_W, raw_h = JUMP_PLAYER_IMG_H;
@@ -1273,7 +1273,7 @@ static void engine_cb(lv_timer_t *t)
              * 关键：绝不调 platforms_advance()，台子数据保持不变，倾倒支点才对得上台缘。
              * 支点固定在「靠近台心一侧的台缘」：向右倒→脚踩右缘(nr)，向左倒→脚踩左缘(nl)。*/
             g.player_wx = actual_wx;
-            g.player_wy = g.plats[1].world_cy;     /* 脚底高度=台面，先站上去 */
+            g.player_wy = g.plats[1].world_cy; /* 脚底高度=台面，先站上去 */
             g.topple_dir = topple_dir;
             g.topple_pivot_wx = (topple_dir > 0) ? nr : nl; /* 脚底支点=所踩台缘 */
             g.topple_ang = 0;
@@ -1332,10 +1332,10 @@ static void engine_cb(lv_timer_t *t)
             platforms_render_all();                /* 先按相机渲染全部（slot0 squash=0）*/
             cam_sink = land_squash_render_slot0(); /* 再叠加 slot0 压扁，覆盖其渲染 */
             player_render(0, 0, cam_sink);
-            /* 诊断[平移帧]：cam_y 是否真锁住=0？台子3(slot1)屏幕y 是否随帧动？*/
-            ESP_LOGW(TAG, "PAN camX=%d camY=%d tgtY=%d | s1_py=%d s1_wy=%d",
-                     g.cam_x, g.cam_y, g.cam_target_y,
-                     (int)lv_obj_get_y(g.plats[1].cube), g.plats[1].world_cy);
+            //! 诊断[平移帧]：cam_y 是否真锁住=0？台子3(slot1)屏幕y 是否随帧动？*/
+            // ESP_LOGW(TAG, "PAN camX=%d camY=%d tgtY=%d | s1_py=%d s1_wy=%d",
+            //          g.cam_x, g.cam_y, g.cam_target_y,
+            //          (int)lv_obj_get_y(g.plats[1].cube), g.plats[1].world_cy);
         }
         if (g.cam_smooth_frames <= 0)
         {

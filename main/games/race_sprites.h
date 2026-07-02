@@ -2,118 +2,122 @@
 
 /**
  * @file race_sprites.h
- * @brief 赛车（Racing）游戏素材接口 + 玩法参数
+ * @brief 赛车（Racing）游戏素材接口 + 玩法参数（三车道·透视版）
  *
- * 横向赛道：320×240 横屏，上下两条车道，敌车从右向左跑。
+ * 素材分两处放（按大小分流，和原来 s1/s2~s5 同套路）：
+ *   c1~c6 障碍 + c7 玩家 = C 数组编进 app（c1.c~c7.c）——小图，且要实时缩放，
+ *     必须放内存：LVGL 缩放需要完整内存位图，外挂文件图边读边解码无法缩放
+ *     （会渲染成彩色条纹），所以障碍/玩家一律进固件。
+ *   c8 背景（320×240，大）= 留外挂 Flash "S:/img/c8.bin"，不缩放、只整屏铺底，
+ *     文件图不缩放可正常显示；放外挂避免撑爆 app 分区。
  *
- * 素材映射（全部 RGB565A8 格式，定义在 s1.c~s5.c）：
- *   s1 = 背景路面（320×240 全屏）
- *   s2 = 玩家车（40×30）
- *   s3/s4/s5 = 敌方车（40×30 / 40×30 / 40×27，随机选用，颜色不同更好看）
+ * 透视模型（详见 game_race.c 顶部注释）：
+ *   障碍物用进度 t(0=远端消失点附近 → 1000=近端屏幕底缘) 驱动，
+ *   每帧 t 增加，同时插值 {纵向 y、车道横向 x、缩放}，模拟近大远小。
+ *   关键常量取自 c8 背景实测（屏幕坐标，320×240）。
  *
- * 后续替换真实素材时，只需重转 s1.c~s5.c（保持变量名 s1~s5 不变），
- * 并据实更新下方尺寸常量即可。
- *
- * LVGL 图片转换器: https://lvgl.io/tools/imageconverter
- * 设置: Color format = LV_COLOR_FORMAT_RGB565A8, Output = C array
+ * 改图后：c1~c7 改了重新 idf.py build（C 数组随固件烧）；c8 改了才需重打包烧外挂。
+ * 注意：读 c8 需 LVGL 线程上下文（race_* 接口已加锁，安全）。
  */
 
 #include "lvgl.h"
 
-/* ═══════════════════════════════════════════════════════════════
- * 背景来源开关（仅针对全屏背景 s1，编译期二选一）
- *
- * s1 是 320×240 RGB565A8（≈225KB），编进 app 会撑爆分区，所以单独做开关；
- * 车辆 s2~s5 很小（40×30，几 KB），始终用图片，正常编进 app。
- *
- *   RACE_BG_USE_IMG = 0（默认）：
- *     背景用 LVGL 画色块（深灰路面 + 上下两侧绿化带），零 flash 占用。
- *     当前用于验证游戏逻辑——不必准备背景大图，固件不会超分区。
- *
- *   RACE_BG_USE_IMG = 1：
- *     背景用图片 s1（编进 app）。注意此时需保证分区放得下，
- *     或把 s1 改放外挂 flash 用路径加载（见下方 RACE_IMG_BG）。
- * ═══════════════════════════════════════════════════════════════ */
-/* 背景 s1 已改为从外挂 flash 读 "S:/img/s1.bin"（见 game_race.c），
- * 不再编进 app、不再需要 s1 符号，故这里不再 extern s1。
- * 默认开启图片背景（=1）：背景从 flash 加载，不占 app 分区。 */
-#ifndef RACE_BG_USE_IMG
-#define RACE_BG_USE_IMG 1
-#endif
+/* ── 障碍 + 玩家素材（C 数组，编进 app，定义在 c1.c~c7.c）── */
+extern const lv_image_dsc_t c1; /* 48×35  红黑✕方块 */
+extern const lv_image_dsc_t c2; /* 60×36  金属滚轴 */
+extern const lv_image_dsc_t c3; /* 88×45  ⚠警告地板 */
+extern const lv_image_dsc_t c4; /* 41×20  黑色矮栏 */
+extern const lv_image_dsc_t c5; /* 134×63 双塔激光门 */
+extern const lv_image_dsc_t c6; /* 44×39  红黑刺球 */
+extern const lv_image_dsc_t c7; /* 78×115 玩家（机器人）*/
 
-/* 车辆素材：始终用图片，体积小，正常编进 app（定义在 s2.c~s5.c）。
- * 当前为临时占位尺寸（40×30 / 40×27），后续替换真实素材时保持变量名不变。 */
-extern const lv_image_dsc_t s2; /* 玩家车 40×30 */
-extern const lv_image_dsc_t s3; /* 敌车 A 40×30 */
-extern const lv_image_dsc_t s4; /* 敌车 B 40×30 */
-extern const lv_image_dsc_t s5; /* 敌车 C 40×27 */
+/* ── 背景素材路径（外挂 Flash，挂载点 S:，不缩放只铺底）── */
+#define RACE_IMG_C8 "S:/img/c8.bin" /* 320×240 背景（三车道透视）*/
 
-/* ── 素材尺寸（与实际图片一致，用于布局/碰撞计算，不放大）── */
-#define RACE_CAR_W 40 /* 车宽（玩家/敌车统一按 40 计算碰撞框）*/
-#define RACE_CAR_H 30 /* 车高（按 s2 的 30；s5 略矮 27，不影响矩形碰撞）*/
+#define RACE_OBST_COUNT 6 /* 障碍物种类数 c1~c6 */
 
 /* ═══════════════════════════════════════════════════════════════
- * 布局参数（320×240 横屏，竖向赛道 —— 敌车从上往下落）
- *   屏幕宽 320、高 240；左右两条车道竖向排开。
- *   车原始尺寸 40×30；左车道 x=80、右车道 x=200，分隔线居中 x=160。
- *   玩家车固定贴底部，敌车从顶部屏外进入向下移动。
+ * 三车道（透视）
  * ═══════════════════════════════════════════════════════════════ */
-#define RACE_LANE_LEFT_X   80  /* 左车道：车左上角 x（车中心 ≈100）*/
-#define RACE_LANE_RIGHT_X  200 /* 右车道：车左上角 x（车中心 ≈220）*/
-#define RACE_DIVIDER_X     160 /* 中间白色竖向分隔虚线的 x（两车道正中）*/
+#define LANE_LEFT 0
+#define LANE_MID 1
+#define LANE_RIGHT 2
+#define LANE_COUNT 3
 
-#define RACE_PLAYER_Y      200 /* 玩家车固定 y（贴底部，车高30→底缘230）*/
-#define RACE_ENEMY_SPAWN_Y (-RACE_CAR_H) /* 敌车进入 y（顶部屏外起点）*/
-#define RACE_ENEMY_GONE_Y  BSP_LCD_HEIGHT /* 敌车移到此 y(=240)算躲过 +1 分 */
+/* ── 一点透视·直线车道（中心对称，消失点在屏幕中心 x≈160）──
+ * 障碍进度 t：0=远端(门洞 y=RACE_FAR_Y) → 1000=近端(底缘 y=RACE_NEAR_Y)。
+ * 三条平行车道投影到屏幕 = 收束于中心消失点的直线：中道垂直恒 160，左右对称斜线。
+ * 每条道「远端/近端」两点线性插值（直线，绝不拐弧），配合二次速度+缩放+淡入。
+ * 全部宏定义，改这里即可微调；坐标提取自正拍原图 c8（320×240 基准）。*/
+#define RACE_FAR_Y 70   /* 远端 y：三道在门洞处仍可分辨的高度 */
+#define RACE_NEAR_Y 240 /* 近端 y：屏幕底缘 */
 
-/* 注：赛车无时间限制，撞车才结束；速度随时间持续加快，无 RACE_GAME_SECONDS。*/
+/* 三条车道中心 x：远端(门洞处) / 近端(底缘处)。中道恒 160；左右对称。
+ * 远端越靠近 160=越收拢；近端 L 越小/R 越大=底部越张开。改这 6 个数即可贴合白线。*/
+#define RACE_FAR_L_X 145
+#define RACE_NEAR_L_X 38
+#define RACE_FAR_R_X 177
+#define RACE_NEAR_R_X 288
+#define RACE_FAR_M_X 160
+#define RACE_NEAR_M_X 160
+
+/* 缩放：远端 = 近端尺寸 × RACE_FAR_SCALE/1000，近端 = 1.0×（各障碍 s_obst_near_scale）。
+ * ★「由小变大」的关键★ 数值越小，障碍远处越小、变大越夸张（当前 0.12×→1.0×）。*/
+#define RACE_FAR_SCALE 80
+
+/* 门洞淡入：t<RACE_FADE_T 时透明度 0→255（消除门洞处凭空蹦出）。*/
+#define RACE_FADE_T 150
+
+/* 碰撞判定线：障碍中心屏幕 y 越过此值时与玩家比对车道（≈玩家身体所在深度）。*/
+#define RACE_COLLIDE_Y 200
 
 /* ═══════════════════════════════════════════════════════════════
- * 玩法参数（全部宏化，方便统一调参）
- *
- * 三档难度（简单 / 一般 / 困难）决定两件事：
- *   - 敌车基准速度 SPEED_*：每帧（ENGINE_MS=50ms）左移像素，越大越快
- *   - 敌车生成间隔 SPAWN_MS_*：两辆敌车之间的等待，越短越密集
- * 数值为「档位基准」，运行中再叠加「10 秒加速」（同打地鼠）。
- *
- * 速度换算：起点 x=320 → 终点 x=-40，总行程 360px。
- *   speed=6px/帧 × 20fps = 120px/s → 360/120 ≈ 3.0s 跑完一趟。
- *   speed=16px/帧 → 360/320 ≈ 1.1s 跑完一趟（最难时）。
+ * 玩家（固定贴底，3 车道横切）
  * ═══════════════════════════════════════════════════════════════ */
+/* 玩家三车道中心 x：与碰撞判定线 RACE_COLLIDE_Y 处的车道中心对齐，
+ * 改为 {80,160,240} 让棋子在各车道内居中，不贴屏幕边缘。*/
+#define RACE_PLAYER_LANE_L 40
+#define RACE_PLAYER_LANE_M 160
+#define RACE_PLAYER_LANE_R 285
+#define RACE_PLAYER_W 78  /* c7 原始宽 */
+#define RACE_PLAYER_H 115 /* c7 原始高 */
+/* 玩家缩放（LVGL scale 单位：256=1.0×）; 200 ≈ 0.78× → 显示宽≈61px 高≈90px */
+#define RACE_PLAYER_SCALE 230
+/* 缩放后高 ≈ 90px，顶边 y 使下 1/5(≈18px) 落屏外：240-90+18=168 */
+#define RACE_PLAYER_TOP_Y 157
 
-/* ── 难度档：简单 ── */
-#define RACE_SPEED_EASY      6   /* 敌车 6px/帧（约 3s 过屏）*/
-#define RACE_SPAWN_MS_EASY   1300 /* 生成间隔 1.3s */
+/* ═══════════════════════════════════════════════════════════════
+ * 玩法参数（全部宏化）
+ *
+ * 速度单位 = 每帧(ENGINE_MS=50ms, 20fps) 的 t 增量(千分比)。
+ *   1000 / speed ≈ 障碍物从远跑到近所需帧数；÷20 ≈ 秒数。
+ *   speed=18 → 约 56 帧 ≈ 2.8s 过屏；speed=34 → 约 30 帧 ≈ 1.5s。
+ * 运行中再叠加「每 10 秒加速」。
+ * ═══════════════════════════════════════════════════════════════ */
+#define RACE_SPEED_EASY 18
+#define RACE_SPAWN_MS_EASY 1300
 
-/* ── 难度档：一般 ── */
-#define RACE_SPEED_NORMAL    9   /* 敌车 9px/帧（约 2s 过屏）*/
-#define RACE_SPAWN_MS_NORMAL 1000 /* 生成间隔 1.0s */
+#define RACE_SPEED_NORMAL 26
+#define RACE_SPAWN_MS_NORMAL 1000
 
-/* ── 难度档：困难 ── */
-#define RACE_SPEED_HARD      12  /* 敌车 12px/帧（约 1.5s 过屏）*/
-#define RACE_SPAWN_MS_HARD   700  /* 生成间隔 0.7s */
+#define RACE_SPEED_HARD 34
+#define RACE_SPAWN_MS_HARD 750
 
-/* ── 动态加速：每 10 秒，速度 +量、生成间隔 ×百分比（同打地鼠思路）── */
-#define RACE_ACCEL_EVERY_S   10 /* 每 10 秒提速一次 */
-#define RACE_ACCEL_SPEED_ADD 2  /* 每次速度 +2px/帧 */
-#define RACE_ACCEL_SPAWN_PCT 80 /* 每次生成间隔取原值 80% */
-#define RACE_SPEED_MAX       16 /* 敌车速度上限（约 1.1s 过屏）*/
-#define RACE_SPAWN_MS_MIN    450 /* 生成间隔下限，防止挤成一团 */
+/* 动态加速（同打地鼠思路）：每 10 秒，速度 +量(带上限)、生成间隔 ×百分比(带下限)。*/
+#define RACE_ACCEL_EVERY_S 10
+#define RACE_ACCEL_SPEED_ADD 4
+#define RACE_ACCEL_SPAWN_PCT 80
+#define RACE_SPEED_MAX 60
+#define RACE_SPAWN_MS_MIN 450
 
-/* ── 敌车对象池 ── */
-#define RACE_MAX_ENEMIES     3  /* 同屏最多 3 辆敌车（预分配复用）*/
+/* 障碍物对象池：同屏最多 3 个（预分配复用）。*/
+#define RACE_MAX_ENEMIES 3
+/* 防叠：某车道若已有 t<此值(刚出生)的障碍，则本拍不在该车道再生成，
+ * 同时保证不会三道同时被堵死（至少留一条逃生道）。*/
+#define RACE_SPAWN_SAFE_T 220
 
-/* ── 触摸防误触 ── */
-#define RACE_TOUCH_COOLDOWN_MS 200 /* 换道后 200ms 内不再响应，防连跳 */
+#define RACE_TOUCH_COOLDOWN_MS 180 /* 换道防误触冷却 */
+#define RACE_FLASH_MS 200          /* 撞车红屏闪烁时长 */
 
-/* ── 碰撞闪烁 ── */
-#define RACE_FLASH_MS        200 /* 碰撞后红屏闪烁时长（ms）*/
-
-/* ── 分隔虚线滚动 ── */
-#define RACE_DASH_LEN        24 /* 虚线段长（px）*/
-#define RACE_DASH_GAP        20 /* 虚线段间隔（px）*/
-#define RACE_DASH_SPEED_DIV  2  /* 虚线滚动速度 = 敌车速度 / 该值（越快越带感）*/
-
-/* ── 倒计时 ── */
-#define RACE_COUNTDOWN_FROM    3   /* 3 → 2 → 1 → GO! */
-#define RACE_COUNTDOWN_STEP_MS 700 /* 每个数字停留毫秒 */
+#define RACE_COUNTDOWN_FROM 3
+#define RACE_COUNTDOWN_STEP_MS 700
