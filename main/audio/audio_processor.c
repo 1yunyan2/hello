@@ -45,7 +45,7 @@
 // 历史 12288（~200 帧）在 SILK NSQ 尖峰 + ws_sender 网络抖动时仍会打满丢帧，
 // 扩到 32KB 吸收 CPU0 拥堵时的编码追赶脉冲，同时保留 start 握手期的积压余量。
 #define ENC_OUTPUT_BUF_SIZE 32768
-#define DEC_INPUT_BUF_SIZE 16384  //! 原为5120 解码器输入（OPUS 帧）：云端下发的音频缓冲,
+#define DEC_INPUT_BUF_SIZE 32768  //! 原为5120 解码器输入（OPUS 帧）：云端下发的音频缓冲,
 #define DEC_OUTPUT_BUF_SIZE 40960 // 解码器输出（PCM 播放）：~1.28s 缓冲，保证播放流畅
 // AEC 参考缓冲区：play_task 写入 I2S 时同步推送一份副本，audio_feed_task 读取后
 // 作为 AFE AEC 算法的参考信号（从麦克风中消除扬声器回声）。
@@ -215,7 +215,7 @@ static void audio_processor_play_task(void *arg)
             {
                 underrun_count = 0;
                 prebuffering = true;
-                buffer_start_tick = xTaskGetTickCount();    // 重置计时器，重新开始蓄水
+                buffer_start_tick = xTaskGetTickCount();     // 重置计时器，重新开始蓄水
                 prebuf_log_start_tick = xTaskGetTickCount(); // 同步刷新日志起点，反映本轮蓄水时长
                 // 仅在当前轮次 TTS 真正播过数据后才告警。
                 // active_playback 在预缓冲超时无数据退出时已置 false，
@@ -675,6 +675,21 @@ bool audio_processor_is_playing(audio_processor_t *audio_processor)
         vRingbufferGetInfo(audio_processor->dec_output, NULL, NULL, NULL, NULL, &dec_out_pending);
 
     return dec_out_pending > 0;
+
+    //   size_t dec_in_pending = 0;  // 解码器输入侧（未解码 OPUS 帧）积压
+    // size_t dec_out_pending = 0; // 解码器输出侧（已解码 PCM 数据）积压
+
+    // /* vRingbufferGetInfo 第 6 个参数返回当前已写入未读出的字节数（items_waiting）。
+    //  * 必须同时查 dec_input + dec_output（BUG-013）：仅查 dec_output 时，
+    //  * 若收尾阶段解码偶发被 CPU 抢占而短暂跟不上，dec_output 可能在 dec_input
+    //  * 还压着未解码帧时先见底 → 误判"播完" → 提前切 LISTENING → 残音被当成下一轮输入。
+    //  * dec_input 缓冲越大该窗口越大，故两侧都为空才算真正播完。 */
+    // if (audio_processor->dec_input != NULL)
+    //     vRingbufferGetInfo(audio_processor->dec_input, NULL, NULL, NULL, NULL, &dec_in_pending);
+    // if (audio_processor->dec_output != NULL)
+    //     vRingbufferGetInfo(audio_processor->dec_output, NULL, NULL, NULL, NULL, &dec_out_pending);
+
+    // return (dec_in_pending + dec_out_pending) > 0;
 }
 
 void audio_processor_unmute_output(audio_processor_t *audio_processor)

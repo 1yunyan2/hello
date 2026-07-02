@@ -138,6 +138,14 @@ void audio_decoder_task(void *arg)
 
         if (ret != ESP_OK)
         {
+            // 限频告警：解码失败会静默丢帧，是"一句话中卡顿"的隐藏来源之一。
+            // 每秒最多打 1 行，防止解码连续失败时刷屏挤占串口/CPU。
+            static TickType_t s_last_dec_err_log = 0;
+            if (xTaskGetTickCount() - s_last_dec_err_log > pdMS_TO_TICKS(1000))
+            {
+                s_last_dec_err_log = xTaskGetTickCount();
+                ESP_LOGW(TAG, "OPUS 解码失败 (ret=%d)，丢弃本帧（卡顿来源之一）", ret);
+            }
 
             // 🌟 救命修复 2：解码失败时，必须延时释放 CPU，喂看门狗！
             // 防止程序瞬间进入死循环吃满 CPU，解决喇叭兹拉声和 AFE 溢出问题
