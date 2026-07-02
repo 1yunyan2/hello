@@ -589,7 +589,7 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
         audio_processor_unmute_output(s_processor);
         // 重启唤醒词引擎，TTS 期间可以检测打断唤醒词
         // 当前阈值 0.18f：与 LISTENING 一致；如出现 AEC 残留误触可上调至 0.40~0.55
-        wake_word_set_det_threshold(0.18f);
+        wake_word_set_det_threshold(0.3f);
         wake_word_start();
         break;
 
