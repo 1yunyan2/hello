@@ -131,7 +131,7 @@
  * Echo2 正式板（有屏幕）：保持 CONFIG_BSP_HAS_DISPLAY 1
  * 裸开发板（无屏幕）    ：注释掉下面这行，LCD/UI/二维码代码自动剔除
  * ─────────────────────────────────────────────────────────────────────────── */
-#define CONFIG_BSP_HAS_DISPLAY 1
+#define CONFIG_BSP_HAS_DISPLAY 0
 
 /**
  * @file bsp_config.h
@@ -315,16 +315,22 @@
 #define BSP_BAT_HIGH_VOLT_RISE_STEP 1    ///< 满电区每采样周期最大回升步进（%），防止一次跳太多虚高
 
 // ─── 低电关机（GPIO18 → HK015T.1 OPT 软关机）─────────────────────────────────
-// 硬件：开关机由 HK015T.1 单键自锁芯片（U13）+ K1 长按 3S 实现真正断电（静态 1μA）。
-// GPIO18(BSP_OPT_OUT_PIN, OPT-OUT) 经 R29 接 HK015T.1 的 IO1，是 MCU 主动软关机的
-// 信号脚。原理图上 IO1 由 R26 100kΩ 下拉到 GND，故平时 GPIO18 输出低电平（保持工作），
-// MCU 拉高 GPIO18 即向芯片发出关机命令 → 翻转 Q4/Q3 切断主电源，效果等同用户长按 K1。
-// 重新开机由用户按 K1（长按 3S）冷启动，无需复位键。
+// 硬件：开关机由 HK015T.1 单键自锁芯片（U13）+ K1 长按实现真正断电（静态 1μA）。
+// GPIO18(BSP_OPT_OUT_PIN, OPT-OUT) 经 R29 1k 接 HK015T.1 的 OPT(pin6)，R26 100k 下拉。
+//
+// ★关机时序（屏幕探针实测 T2 确定，2026-07 更正）：
+//   经实测，单纯把 GPIO18 拉低【不断电】；单纯拉高也只瞬断自恢复、锁不住。
+//   真正让 HK015T 断电的是 **OPT 的"高→低"下降沿**：先把 GPIO18 推挽拉高一小段
+//   (BSP_PWR_OFF_PULSE_MS) 建立干净高电平，再推挽拉低保持 → OUTH(pin1) 翻低 →
+//   翻转 Q4/Q3 切断主电源（等同用户长按 K1）。重新开机由用户按 K1 冷启动。
+//   （旧固件"拉高保持"锁不住电、还把三级关机做成借重启死循环，已废弃。）
+// 正常工作期 GPIO18 保持默认输入(hi-Z)，OPT 浮空≈1.44V=开机，只在关机时才驱动它。
 //
 // 触发策略：锂电池接近 3.3V 已近放空，为避免舵机/扬声器瞬时负载压降误关，要求滤波后
 // 的 OCV 连续多次（BSP_BAT_POWEROFF_HIT_CNT）低于阈值才执行关机。
-#define BSP_BAT_POWEROFF_ENABLE 1           ///< 1=启用低电自动关机，0=仅告警不关机（便于调试时关掉）
-#define BSP_BAT_POWEROFF_MV 3300            ///< 低电关机阈值（mV）：OCV≤此值即视为放空，对应 0% 电量
-#define BSP_BAT_POWEROFF_HIT_CNT 5          ///< 连续命中次数：OCV 连续这么多次低于阈值才真正关机，滤掉瞬时尖峰
-#define BSP_PWR_OFF_ACTIVE_LEVEL 1          ///< GPIO18 软关机有效电平：1=拉高关机（按原理图 R26 下拉判定），实测为反则改 0
-#define BSP_PWR_OFF_IDLE_LEVEL (!BSP_PWR_OFF_ACTIVE_LEVEL) ///< 正常工作时 GPIO18 的空闲电平（与有效电平相反）
+#define BSP_BAT_POWEROFF_ENABLE 1  ///< 1=启用低电自动关机，0=仅告警不关机（便于调试时关掉）
+#define BSP_BAT_POWEROFF_MV 3300   ///< 低电关机阈值（mV）：OCV≤此值即视为放空，对应 0% 电量
+#define BSP_BAT_POWEROFF_HIT_CNT 5 ///< 连续命中次数：OCV 连续这么多次低于阈值才真正关机，滤掉瞬时尖峰
+#define BSP_PWR_OFF_ASSERT_LEVEL 1                             ///< 关机脉冲的“高”电平（先驱动此电平建立干净高）
+#define BSP_PWR_OFF_DEASSERT_LEVEL (!BSP_PWR_OFF_ASSERT_LEVEL) ///< 关机脉冲随后回落并保持的“低”电平（下降沿触发 HK015T 断电）
+#define BSP_PWR_OFF_PULSE_MS 300                               ///< 关机脉冲高电平保持时长（ms）：建立干净高后再拉低造下降沿

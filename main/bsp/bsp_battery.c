@@ -251,19 +251,16 @@ static void battery_nvs_save(uint8_t pct, uint32_t mv)
         ESP_LOGW(TAG, "NVS 存档失败：%s", esp_err_to_name(err));
 }
 
-// ─── 低电软关机（GPIO18 → HK015T.1 OPT/IO1 软关机脚）──────────────────────────
-// 锂电池放空（OCV ≤ BSP_BAT_POWEROFF_MV）时，主动拉 GPIO18 的有效电平，命令
-// HK015T.1 自锁芯片切断主电源，效果等同用户长按 K1 关机（硬件断电，静态 1μA）。
-// 重新开机由用户按 K1（长按 3S）冷启动。本函数不返回——执行后系统很快断电。
-static void battery_power_off(void)
+// ─── 软关机（GPIO18 → HK015T.1 OPT 脚，OPT 高→低下降沿断电）──────────────────
+// 屏幕探针实测（2026-07）：单纯拉低不断电、单纯拉高只瞬断自恢复；真正让 HK015T 断电
+// 的是 OPT 的"高→低"下降沿 —— 先把 GPIO18 推挽拉高 BSP_PWR_OFF_PULSE_MS 建立干净高，
+// 再推挽拉低保持 → OUTH 翻低 → 翻转 Q4/Q3 切断主电源，效果等同用户长按 K1（静态 1μA）。
+// 供低电自动关机与 standby 三级关机共用（见 bsp_board.h 声明）。本函数不返回——很快断电。
+void bsp_battery_power_off(void)
 {
-    ESP_LOGW(TAG, "🔌 电量耗尽（OCV≤%d mV），执行软关机：拉 GPIO%d → HK015T.1 断电",
-             BSP_BAT_POWEROFF_MV, BSP_OPT_OUT_PIN);
+    ESP_LOGW(TAG, "🔌 执行软关机：GPIO%d 拉高 %dms → 拉低造下降沿 → HK015T 断电",
+             BSP_OPT_OUT_PIN, BSP_PWR_OFF_PULSE_MS);
 
-    // 存档当前电量，下次开机不至于虚高（虽然此时已是 0%，仍保持一致性）
-    battery_nvs_save(0, s_ctx.ocv_mv);
-
-    // 配置 GPIO18 为推挽输出，先确保处于空闲电平，再拉到有效电平发出关机命令
     gpio_config_t io_cfg = {
         .pin_bit_mask = (1ULL << BSP_OPT_OUT_PIN),
         .mode = GPIO_MODE_OUTPUT,
@@ -272,23 +269,22 @@ static void battery_power_off(void)
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&io_cfg);
-    gpio_set_level(BSP_OPT_OUT_PIN, BSP_PWR_OFF_IDLE_LEVEL);
 
-    // 给硬件留出建立时间，再拉到关机有效电平并保持。HK015T.1 收到信号后内部锁存断电，
-    // 无论它是电平触发还是脉冲触发，"拉到有效电平并保持"都成立——反正马上就断电了。
-    vTaskDelay(pdMS_TO_TICKS(50));
-    gpio_set_level(BSP_OPT_OUT_PIN, BSP_PWR_OFF_ACTIVE_LEVEL);
+    // 1) 先建立干净高电平（OPT 高，HK015T 此刻仍保持开机）
+    gpio_set_level(BSP_OPT_OUT_PIN, BSP_PWR_OFF_ASSERT_LEVEL);
+    vTaskDelay(pdMS_TO_TICKS(BSP_PWR_OFF_PULSE_MS));
+    // 2) 拉低造"高→低"下降沿并保持 → HK015T 翻 OUTH 低 → 整机断电
+    gpio_set_level(BSP_OPT_OUT_PIN, BSP_PWR_OFF_DEASSERT_LEVEL);
 
-    // 硬件断电前自旋等待（正常情况下数十 ms 内整板掉电，此循环不会真正跑满）
+    // 断电前自旋等待（正常数十 ms 内整板掉电，此循环不会真正跑满）；持续保持低电平
     for (int i = 0; i < 200; i++)
     {
         vTaskDelay(pdMS_TO_TICKS(50));
-        // 保险：持续重申有效电平，防止某些芯片要求电平维持
-        gpio_set_level(BSP_OPT_OUT_PIN, BSP_PWR_OFF_ACTIVE_LEVEL);
+        gpio_set_level(BSP_OPT_OUT_PIN, BSP_PWR_OFF_DEASSERT_LEVEL);
     }
 
-    // 若 10s 后仍未断电（如调试时未接自锁电路 / 电平极性反了），告警提示
-    ESP_LOGE(TAG, "软关机信号已发出但系统未断电，请核对 BSP_PWR_OFF_ACTIVE_LEVEL 电平极性与硬件连线");
+    // 若 10s 后仍未断电（如调试时未接自锁电路 / 时序变化），告警提示
+    ESP_LOGE(TAG, "软关机信号已发出但系统未断电，请核对 GPIO%d→HK015T 链路/关机时序", BSP_OPT_OUT_PIN);
 }
 
 // ─── 内部：执行一次 ADC 多采样，去极值平均，返回真实电池电压（毫伏）───────────
@@ -473,9 +469,27 @@ static void battery_monitor_task(void *arg)
             }
 
             // ─── 充电判定（无充电脚，靠OCV趋势推断）──────────────────────
-            // OCV连续明显上升达阈值次数 → 判定充电，解锁电量回升；
-            // 一旦不再上升（下降或持平）→ 立即清零计数并取消充电态。
-            if ((int)s_ctx.ocv_mv - (int)s_ctx.last_ocv_mv >= BSP_BAT_CHARGE_RISE_MV)
+            // 满电区（OCV≥HIGH_VOLT_UNLOCK_MV，约4.0V）：电压已顶满，插着USB也不会
+            // 再持续上升，纯趋势判断会永远判不出"在充电"——所以满电区直接判定为充电中，
+            // 不要求上升趋势；只要明显下降（真的拔了/在放电）才退出充电态。
+            // 非满电区：维持原有逻辑——OCV连续明显上升达阈值次数才判定充电。
+            if (s_ctx.ocv_mv >= BSP_BAT_HIGH_VOLT_UNLOCK_MV)
+            {
+                if (!s_ctx.charging)
+                {
+                    s_ctx.charging = true;
+                    ESP_LOGI(TAG, "OCV已进入满电区(%lu mV)，判定为充电中", (unsigned long)s_ctx.ocv_mv);
+                }
+                if ((int)s_ctx.last_ocv_mv - (int)s_ctx.ocv_mv >= BSP_BAT_CHARGE_RISE_MV)
+                {
+                    // 满电区内明显下降：判定为真的在放电（拔了USB），退出充电态
+                    s_ctx.rise_cnt = 0;
+                    s_ctx.charging = false;
+                    ESP_LOGI(TAG, "满电区OCV转为下降，退出充电态");
+                }
+                s_ctx.last_ocv_mv = s_ctx.ocv_mv;
+            }
+            else if ((int)s_ctx.ocv_mv - (int)s_ctx.last_ocv_mv >= BSP_BAT_CHARGE_RISE_MV)
             {
                 if (s_ctx.rise_cnt < 0xFF)
                     s_ctx.rise_cnt++;
@@ -596,7 +610,8 @@ static void battery_monitor_task(void *arg)
                          s_ctx.poweroff_hit, BSP_BAT_POWEROFF_HIT_CNT);
                 if (s_ctx.poweroff_hit >= BSP_BAT_POWEROFF_HIT_CNT)
                 {
-                    battery_power_off(); // 拉 GPIO18 软关机，不返回（系统断电）
+                    battery_nvs_save(0, s_ctx.ocv_mv); // 放空存档，防下次上电电量虚高
+                    bsp_battery_power_off();            // GPIO18 高→低下降沿软关机，不返回
                 }
             }
             else
@@ -758,6 +773,11 @@ uint8_t bsp_battery_get_percent(void)
     if (mv == 0)
         return 0;
     return voltage_to_percent(mv);
+}
+
+bool bsp_battery_is_charging(void)
+{
+    return s_ctx.charging;
 }
 
 /**

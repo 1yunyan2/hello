@@ -11,9 +11,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 extern void apppp_main(void);
+
 /**
  * @brief ESP-IDF 程序入口
  * 系统启动后由 FreeRTOS 主任务调用，所有业务逻辑在 application_init() 中展开
+ *
+ * 注：三级关机不再"借重启断电"。实测 GPIO18(OPT) 高→低下降沿即可让 HK015T 在运行态
+ *     直接断电（见 standby.c enter_shutdown → bsp_battery_power_off），故此处不再需要
+ *     开机最早期消费 RTC 魔数拉脚的逻辑。
  */
 void app_main(void)
 {

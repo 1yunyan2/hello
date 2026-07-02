@@ -482,6 +482,25 @@ uint32_t bsp_battery_get_voltage_mv(void);
 uint8_t bsp_battery_get_percent(void);
 
 /**
+ * @brief 查询当前是否判定为正在充电（USB/适配器供电）
+ *
+ * 无独立 VBUS 检测脚，靠 OCV 连续上升趋势推断（见 bsp_battery.c 防回弹逻辑），
+ * 与低电自动关机共用同一个判定结果，保证两处认知一致。
+ *
+ * @return true=正在充电，false=未充电（或尚未判定出趋势）
+ */
+bool bsp_battery_is_charging(void);
+
+/**
+ * @brief 立即软关机（GPIO18/OPT 高→低下降沿命令 HK015T 切断主电源），不返回
+ *
+ * 屏幕探针实测：单纯拉低不断电、单纯拉高只瞬断自恢复；真正断电靠 OPT 的"高→低"
+ * 下降沿（先拉高 BSP_PWR_OFF_PULSE_MS 建立干净高，再拉低保持）。供低电自动关机与
+ * standby 三级关机共用。调用前如需存档电量请由调用方自行处理。
+ */
+void bsp_battery_power_off(void);
+
+/**
  * @brief 获取当前 WiFi 信号强度 RSSI
  *
  * @return RSSI 值（dBm，负数，越大越好）；未连接或读取失败返回 0
