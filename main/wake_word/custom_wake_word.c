@@ -1116,6 +1116,7 @@ void wake_word_start(void)
         while ((item = xRingbufferReceive(s_mn_pcm_buf, &sz, 0)) != NULL)
             vRingbufferReturnItem(s_mn_pcm_buf, item);
     }
+    printf("[wake_word] start\n");
 }
 
 // ─── 公开 API：获取 AFE feed 帧大小 ────────────────────────────────────
