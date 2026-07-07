@@ -5,6 +5,7 @@
 #include "freertos/timers.h" /* WiFi 断线去抖软件定时器 */
 #include "ui/ui_port.h"      /* ui_show_unbinding(): 解绑前显示静态提示页，避免 GIF 卡冻帧 */
 #include "esp_timer.h"       /* [DIAG] esp_timer_get_time()：微秒级时间戳，定位扫描各阶段耗时 */
+#include "udp_logger.h"      /* 纯电池调试用：拿到 IP 后把日志同时广播到 UDP，见 GOT_IP 分支 */
 
 /* ── BluFi 配网相关（替代原 Unified Provisioning）─────────────────────────── */
 #include "esp_blufi_api.h"        /* BluFi 事件枚举、回调结构、send 接口 */
@@ -87,6 +88,11 @@ static void wifi_debounce_timer_cb(TimerHandle_t xTimer)
     ESP_LOGW(TAG, "WiFi 断线持续超过 %d ms，确认掉线，通知上层断开", WIFI_DEBOUNCE_MS);
     if (s_debounce_board)
         xEventGroupClearBits(s_debounce_board->board_status, WIFI_BIT);
+
+    // ★关闭 UDP 日志 socket：断线确认（非短暂抖动）后，旧 socket 绑定的连接状态
+    //   已经失效，留着它没意义，且避免和重连后 GOT_IP 的 udp_logger_start() 出现
+    //   "该关未关、该建又建"的混乱。GOT_IP 恢复时会重新 start，重建全新 socket。
+    udp_logger_stop();
 }
 
 // ─── clear_wifi_and_restart ──────────────────────────────────────────────────
@@ -738,6 +744,12 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "成功获取 IP: " IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGW(TAG, "[DIAG] IP_EVENT_STA_GOT_IP @ %lld us", esp_timer_get_time());
+
+        // ★纯电池调试用：拿到 IP 后启动 UDP 日志单播（发到 udp_logger.c 里配置的电脑 IP），
+        //   电脑用 tools/udp_log_listen.py 监听同端口即可看到日志——解决"纯锂电池供电无法
+        //   接串口看低功耗全程日志"的问题。幂等，断线重连多次调用无副作用；不影响原 UART
+        //   日志输出（两路并存）。传 NULL 用 udp_logger.c 里的默认目标 IP。
+        // udp_logger_start(NULL, 0);
 
         // 连接成功，重置重连计数（下次断线时从 0 开始重新计数）
         s_retry_num = 0;

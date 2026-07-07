@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mv main/ui/games.c main/games/)",
+      "Bash(mv main/ui/games.h main/games/)",
+      "Bash(mv main/ui/game_whack.c main/games/)",
+      "Bash(mv main/ui/game_whack.h main/games/)",
+      "Bash(mv main/ui/game_jump.c main/games/)",
+      "Read(//d/ESP-IDF/.espressif/v5.3.4/esp-idf/components/bt/common/btc/profile/esp/blufi/include/**)",
+      "Read(//d/ESP-IDF/.espressif/v5.3.4/esp-idf/components/bt/**)",
+      "Bash(python -c ' *)",
+      "Read(//c/Users/esthe/**)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\esthe\\.claude\\projects\\d--new-Echopals-Echo2\\memory"
+    ]
+  }
+}

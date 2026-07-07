@@ -94,7 +94,9 @@ static void audio_processor_play_task(void *arg)
     if (board == NULL || board->i2s_tx_handle == NULL)
     {
         audio_processor->play_task_handle = NULL;
-        vTaskDelete(NULL);
+        // ★ 本任务栈由 WithCaps(...SPIRAM) 分配，早退自删也必须用 WithCaps，
+        //   否则 4KB SPIRAM 栈 + TCB 不回收（与正常退出路径 L249 一致）。
+        vTaskDeleteWithCaps(NULL);
         return;
     }
 

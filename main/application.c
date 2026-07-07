@@ -35,6 +35,7 @@
 #include "ui/interaction.h"
 #include "ui/reminder.h"
 #include "ui/standby.h"
+#include "ui/cry_anim_test.h" /* 临时测试：哭泣手绘动画 */
 #include "esp_lvgl_port.h"
 #define TAG "Application"
 
@@ -232,7 +233,7 @@ static void wake_word_callback(const char *wake_word_display)
     case WAKE_NEW_SESSION:
         // 真·开启新会话：给用户听觉反馈
         ESP_LOGW("WAKE_UP", "唤醒词触发（开启新会话）: [%s]", wake_word_display);
-        play_wake_tone(); // 播放 880Hz 提示音
+        // play_wake_tone(); // 播放 880Hz 提示音
         break;
     case WAKE_INTERRUPT:
         // 打断 TTS：不播提示音，避免打断用户插话的连贯性
@@ -312,73 +313,67 @@ void application_init(void)
     /* ── 步骤 2: NVS Flash ─────────────────────────────────────────────────── */
     bsp_board_nvs_init(bsp_board);
     PRINT_INTERNAL_HEAP;
+
+    /* ── 步骤 2.5: LCD + UI 初始化（必须早于 WiFi/配网）─────────────────────
+     * WiFi 步骤里若未配网会调 ui_show_qrcode 显示配网二维码，而该函数内部用
+     * lvgl_port_lock，要求 LVGL 已经 init。故 LCD/UI 必须先于 bsp_board_wifi_main
+     * 初始化，否则配网时断言 lvgl_port_init must be called first 直接崩溃。
+     * （裸板模式：无屏幕，注释掉 LCD / UI / standby）*/
+    bsp_board_lcd_init(bsp_board);
+    PRINT_INTERNAL_HEAP;
+    ui_init();
+    // cry_anim_test_start();  /* 临时测试：手绘哭泣动画，覆盖主界面 */
+    vTaskDelay(pdMS_TO_TICKS(100));
+    PRINT_INTERNAL_HEAP;
+    if (lvgl_port_lock(1000))
+    {
+        bsp_board_lcd_on(bsp_board);
+        lvgl_port_unlock();
+    }
+
     /* ── 步骤 5: WiFi（阻塞直至获取 IP 或彻底失败后重启）─────────────────── */
     bsp_board_wifi_main(bsp_board);
     PRINT_INTERNAL_HEAP;
 
-    /* ── 步骤 9.5: 电池电压监控（VBAT_ADC）── */
-    // 若 BSP_BAT_ADC_PIN 未配置（仍为占位 -1），bsp_battery_init 会返回错误，
-    // 仅打印警告，不影响其他流程。后续硬件确认引脚后即可自动启用。
-    // esp_err_t bat_ret = bsp_battery_init();
-    // if (bat_ret == ESP_OK)
-    // {
-    //     bsp_battery_start_task(NULL); // 暂不接低电回调，UI 自身已带变色提示
-    //     // bsp_battery_start_log_task(); // 新增：每 5s 打印一次电池电压/电量，便于调试
-    //     xEventGroupSetBits(bsp_board->board_status, BATTERY_BIT);
-    //     ESP_LOGI(TAG, "电池监控已启动");
-    // }
-    // else
-    // {
-    //     ESP_LOGW(TAG, "电池监控未启用 (%s)，UI 电量将显示 --%%", esp_err_to_name(bat_ret));
-    // }
-    // PRINT_INTERNAL_HEAP;
-    // ── 裸板模式：无屏幕，注释掉 LCD / UI / reminder / standby ──────────────
-    // bsp_board_lcd_init(bsp_board);
-    // PRINT_INTERNAL_HEAP;
-    // ui_init();
-    // vTaskDelay(pdMS_TO_TICKS(100));
-    // PRINT_INTERNAL_HEAP;
-    // if (lvgl_port_lock(1000))
-    // {
-    //     bsp_board_lcd_on(bsp_board);
-    //     lvgl_port_unlock();
-    // }
-    // reminder_init(NULL);
-    // PRINT_INTERNAL_HEAP;
-
     /* ── 步骤 3: 音频硬件 + 采集任务（裸板无 ES8311，注释）──────────────── */
-    // audio_init(bsp_board);
-    // PRINT_INTERNAL_HEAP;
+    audio_init(bsp_board);
+    PRINT_INTERNAL_HEAP;
 
     /* ── 步骤 4: 唤醒词引擎（裸板无麦克风，注释）──────────────────────────── */
-    // wake_word_init(wake_word_callback);
-    // wake_word_start();
-    // PRINT_INTERNAL_HEAP;
+    wake_word_init(wake_word_callback);
+    wake_word_start();
+    PRINT_INTERNAL_HEAP;
 
     /* ── 步骤 6: MQTT 客户端 ───────────────────────────────────────────────── */
     protocol_mqtt_start();
     PRINT_INTERNAL_HEAP;
 
+    /* ── 步骤 7: 会话模块（WebSocket 预连接）─────────────────────────────── */
+    // session_init("ws://122.224.191.2:4888/ws/omni");
+    session_init("wss://ai.strailine-space.com/ws/omni");
+
+    PRINT_INTERNAL_HEAP;
+
     // /* ── 步骤 8: 舵机硬件初始化（LEDC/PWM）──────────────────────────────── */
-    // bsp_board_servo_init(bsp_board);
-    // PRINT_INTERNAL_HEAP;
+    bsp_board_servo_init(bsp_board);
+    PRINT_INTERNAL_HEAP;
 
     // /* ── 步骤 9: 舵机管理器（队列 + worker task，栈在 SPIRAM）─────────────── */
-    // esp_err_t ret = servo_manager_init();
-    // if (ret != ESP_OK)
-    // {
-    //     ESP_LOGE(TAG, "servo_manager_init 失败: %s", esp_err_to_name(ret));
-    // }
-    // PRINT_INTERNAL_HEAP;
+    esp_err_t ret = servo_manager_init();
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "servo_manager_init 失败: %s", esp_err_to_name(ret));
+    }
+    PRINT_INTERNAL_HEAP;
 
-    // /* ── 步骤 10: 情绪交互管理器（情绪矩阵 + worker task，栈在 SPIRAM）────── */
-    // ret = interaction_manager_init();
-    // if (ret != ESP_OK)
-    // {
-    //     ESP_LOGE(TAG, "interaction_manager_init 失败: %s", esp_err_to_name(ret));
-    // }
-    // PRINT_INTERNAL_HEAP;
-    // 舵机测试任务（独立跑，不影响 LVGL 刷新）
+    /* ── 步骤 10: 情绪交互管理器（情绪矩阵 + worker task，栈在 SPIRAM）────── */
+    ret = interaction_manager_init();
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "interaction_manager_init 失败: %s", esp_err_to_name(ret));
+    }
+    PRINT_INTERNAL_HEAP;
+    // // 舵机测试任务（独立跑，不影响 LVGL 刷新）
     // xTaskCreatePinnedToCoreWithCaps(
     //     servo_test_task,
     //     "servo_test",
@@ -396,24 +391,24 @@ void application_init(void)
     //    SPIRAM 栈不可访问 → esp_task_stack_is_sane_cache_disabled() 断言 panic（BUG-010 家族）。
     //    实测进游戏路径栈高水位剩 5888B，即峰值用量仅 2304B，故 4096 足够（留 ~1.7× 余量）。
     //    内部 SRAM 净增 4KB，换来彻底消除「触摸任务里碰 flash 必崩」隐患。
-    // ret = xTaskCreatePinnedToCoreWithCaps(
-    //     touch_scan_task,
-    //     "touch_scan",
-    //     4096,
-    //     NULL,
-    //     4, // 优先级略低于舵机和音频
-    //     NULL,
-    //     tskNO_AFFINITY,
-    //     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    ret = xTaskCreatePinnedToCoreWithCaps(
+        touch_scan_task,
+        "touch_scan",
+        4096,
+        NULL,
+        4, // 优先级略低于舵机和音频
+        NULL,
+        tskNO_AFFINITY,
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 
-    // if (ret != pdPASS)
-    // {
-    //     ESP_LOGE(TAG, "创建触摸扫描任务失败！");
-    // }
-    // else
-    // {
-    //     ESP_LOGI(TAG, "触摸扫描任务创建完成");
-    // }
+    if (ret != pdPASS)
+    {
+        ESP_LOGE(TAG, "创建触摸扫描任务失败！");
+    }
+    else
+    {
+        ESP_LOGI(TAG, "触摸扫描任务创建完成");
+    }
 
     /* ═══ 【震动 PWM 方波测试】临时调试任务 ═══════════════════════════════════
      * 循环 0→25→50→75→100% 占空比，每档 3 秒，串口打印档位。
@@ -422,15 +417,29 @@ void application_init(void)
     // xTaskCreate(motor_pwm_test_task, "motor_pwm_test", 4096, NULL, 3, NULL);
 
     /* ── 步骤 10.5: 无活动待机模块（依赖 LCD/唤醒词/舵机管理器均已就绪）──── */
-    // standby_init();
-    // PRINT_INTERNAL_HEAP;
+    standby_init();
+    PRINT_INTERNAL_HEAP;
 
-    /* ── 步骤 7: 会话模块（WebSocket 预连接）─────────────────────────────── */
-
-    // session_init("ws://122.224.191.2:4888/ws/omni");
-    session_init("wss://ai.strailine-space.com/ws/omni");
-
-    // PRINT_INTERNAL_HEAP;
+    /* ── 步骤 11: 电池 + 提醒系统（无感/次要功能，后置以让核心链路尽早就绪）──
+     * 挪动理由：电池监控纯 ADC 无依赖；reminder_init 内部会同步做一次 IP 定位
+     * （阻塞 HTTPS，实测 ~850ms）+ 天气拉取。这两块对用户「看到 GIF、能对话、能
+     * 触摸互动」毫无感知贡献，故整体后移到所有可见模块之后，不再拖慢舵机/触摸/
+     * 待机的就绪。二者都依赖 WiFi 已连（此处 WiFi 早已就绪，无依赖风险）。 */
+    esp_err_t bat_ret = bsp_battery_init();
+    if (bat_ret == ESP_OK)
+    {
+        bsp_battery_start_task(NULL); // 暂不接低电回调，UI 自身已带变色提示
+        // bsp_battery_start_log_task(); // 新增：每 5s 打印一次电池电压/电量，便于调试
+        xEventGroupSetBits(bsp_board->board_status, BATTERY_BIT);
+        ESP_LOGI(TAG, "电池监控已启动");
+    }
+    else
+    {
+        ESP_LOGW(TAG, "电池监控未启用 (%s)，UI 电量将显示 --%%", esp_err_to_name(bat_ret));
+    }
+    PRINT_INTERNAL_HEAP;
+    reminder_init(NULL);
+    PRINT_INTERNAL_HEAP;
 
     /* ── 步骤 8: CPU 占用诊断任务（调试用，可注释掉）─────────────────────── */
     // 低优先级、tskNO_AFFINITY、栈在 SPIRAM，对业务无干扰

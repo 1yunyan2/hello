@@ -36,6 +36,7 @@
 #include "protocol/mqtt_protocol.h"
 #include "wake_word/custom_wake_word.h"
 #include "bsp/bsp_board.h"
+#include "ui/ui_port.h" /* ui_set_neutral_gif_state()：会话状态切换中性 GIF */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
@@ -583,6 +584,7 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
         ESP_LOGI(TAG, "[TTS] 服务器 TTS 开始播放");
         s_tts_data_done = false;   // 新一轮 TTS 开始，重置播放完成标志
         s_state = SESSION_PLAYING; // 暂停麦克风上传，防止回声/自激
+        ui_set_neutral_gif_state(NEUTRAL_SPEAKING); // 大模型说话：切“说话”中性 GIF（仅切图，不动舵机/震动）
         // TTS_START 隐含云端已开始干活，确保 wait_user 已停止（兜底，正常 STT/AUDIO 已先停）
         wait_user_timer_stop();
         // 新一轮 TTS 开始，解除打断时置位的静音标志，允许 play_task 正常写 I2S
@@ -789,6 +791,7 @@ static void ws_sender_task(void *arg)
             ESP_LOGI(TAG, "TTS 播放完成，切换到监听状态，开始500ms排空保护期");
             s_tts_data_done = false;
             s_state = SESSION_LISTENING;
+            ui_set_neutral_gif_state(NEUTRAL_LISTENING); // 回监听：切“监听”中性 GIF
             s_is_continuous_turn = false;
             s_reset_frame_counter = true;
             s_waiting_for_silence = true;
@@ -1030,6 +1033,7 @@ static void session_close(void)
 
     ESP_LOGI(TAG, "关闭会话");
     s_state = SESSION_IDLE; // 先置状态，sender 任务循环条件会检测到退出
+    ui_set_neutral_gif_state(NEUTRAL_IDLE); // 会话关闭：恢复待机自动随机 GIF 循环
     s_tts_data_done = false;
     s_is_continuous_turn = false;
     s_waiting_for_silence = false;
@@ -1050,6 +1054,10 @@ static void session_close(void)
     // 数据：修改 s_processor 和 s_sender_handle 全局变量
     if (s_processor != NULL)
     {
+        // [MEMDBG] 内存诊断埋点：把 stop / destroy 拆开各打一次快照，
+        //          用于定位"内存到底在会话哪一步丢失"。前缀 [MEMDBG] 方便串口 grep。
+        PRINT_MEM_INFO(TAG, "[MEMDBG] stop前（音频处理器仍在运行）");
+
         // 步骤1: 停止音频处理器（设置内部运行标志为false，让编码任务自然退出）
         audio_processor_stop(s_processor);
 
@@ -1068,9 +1076,18 @@ static void session_close(void)
         // // ★ sender 已安全退出，现在可以安全调 wake_word_stop()
         // wake_word_stop();
 
+        // [MEMDBG] stop 后 / destroy 前：encoder/decoder/play 任务应已退出，
+        //          若此处内部RAM/PSRAM 相比 stop前 没回涨甚至更低，说明任务栈/TCB
+        //          未被回收（decoder 的 vTaskDelete 漏点会在这里暴露）。
+        PRINT_MEM_INFO(TAG, "[MEMDBG] stop后-destroy前（任务应已退出）");
+
         // 步骤4: 销毁音频处理器实例，释放所有相关资源（缓冲区、编码器等）
         audio_processor_destroy(s_processor);
         s_processor = NULL;
+
+        // [MEMDBG] destroy 后：ringbuf + 编解码器已释放，与"会话开始前基线"对比
+        //          即为本轮会话的净内存变化（正数=泄漏）。
+        PRINT_MEM_INFO(TAG, "[MEMDBG] destroy后（ringbuf+编解码已释放）");
     }
 
     xEventGroupClearBits(s_session_eg, SESSION_SERVER_READY_BIT);
@@ -1232,7 +1249,7 @@ wake_result_t session_on_wake_word(const char *display)
     if (s_state == SESSION_LISTENING && !s_is_continuous_turn)
         return WAKE_IGNORED;
 
-    PRINT_MEM_INFO(TAG, "对话会话开始");
+    PRINT_MEM_INFO(TAG, "[MEMDBG] 会话开始前基线");
     if (s_state == SESSION_PLAYING)
     {
         // 区分两种 PLAYING（判据：扬声器缓冲是否还有 PCM 要播，而非 tts_end 文本标志）：
@@ -1262,6 +1279,7 @@ wake_result_t session_on_wake_word(const char *display)
         // 重置会话状态
         s_tts_data_done = false; // 打断 TTS，清除播放完成等待标志
         s_state = SESSION_LISTENING;
+        ui_set_neutral_gif_state(NEUTRAL_LISTENING); // 唤醒打断 TTS：切回“监听”中性 GIF
         s_is_continuous_turn = false; // 打断后直接发 start，不走延迟补发路径
 
         // ④ [P1] 开启排空保护期，防止flush后残余余振被上传
@@ -1282,6 +1300,10 @@ wake_result_t session_on_wake_word(const char *display)
         // 打断后等服务端 started → PROTOCOL_EVENT_start 会重新启动 wait_user_timer，
         // 这里只需停止已存在的两个静默定时器以免误触发
         session_timers_stop_all();
+        // [MEMDBG] 打断处理后：flush 但不销毁 processor（复用开新一轮）。
+        //          与"会话开始前基线"对比，看打断路径是否单独漏内存。
+        PRINT_MEM_INFO(TAG, "[MEMDBG] 打断处理后（flush完成，未销毁processor）");
+
         // ★ still_speaking 决定本次唤醒的语义：
         //   扬声器还在出声 → 真打断（不播提示音，避免打断用户插话的连贯性）；
         //   缓冲已排空 → 上一轮其实已说完，本次等同开启新一轮（播提示音）。
@@ -1316,6 +1338,7 @@ wake_result_t session_on_wake_word(const char *display)
 
     ESP_LOGI(TAG, "会话开始 [%s]", display);
     s_state = SESSION_LISTENING;
+    ui_set_neutral_gif_state(NEUTRAL_LISTENING); // 唤醒进对话：切“监听”中性 GIF
     xEventGroupClearBits(s_session_eg, SESSION_SERVER_READY_BIT);
 
     // TODO: 播放唤醒提示音 - 需要实现具体的音频播放接口
@@ -1375,6 +1398,7 @@ wake_result_t session_on_wake_word(const char *display)
 error:
     ESP_LOGE(TAG, "会话启动失败，回滚所有资源");
     s_state = SESSION_IDLE;
+    ui_set_neutral_gif_state(NEUTRAL_IDLE); // 启动失败回滚：恢复待机自动循环（幂等）
     xEventGroupClearBits(s_session_eg, SESSION_SERVER_READY_BIT);
     wake_word_start();
     return WAKE_IGNORED; // 启动失败，不播提示音

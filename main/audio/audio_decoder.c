@@ -210,7 +210,11 @@ void audio_decoder_task(void *arg)
     // ── 任务退出：释放 PCM 输出缓冲区，清空句柄，自删除 ──────────────────────
     free(out_buffer);
     audio_decoder->task_handle = NULL; // 通知 stop() 任务已安全退出
-    vTaskDelete(NULL);
+    // ★ 本任务栈由 xTaskCreatePinnedToCoreWithCaps(...MALLOC_CAP_SPIRAM) 分配，
+    //   自删必须用 vTaskDeleteWithCaps，否则 32KB SPIRAM 栈 + 内部RAM 的 TCB
+    //   都不会被回收 → 每轮会话泄漏（实测 PSRAM -32KB + 内部RAM -360B/轮）。
+    //   与 encoder 侧（audio_encoder.c:186）保持一致。参见 BUG-011/023 同类坑。
+    vTaskDeleteWithCaps(NULL);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -364,7 +368,10 @@ void audio_decoder_stop(audio_decoder_t *audio_decoder)
     if (audio_decoder->task_handle != NULL)
     {
         ESP_LOGW(TAG, "解码任务超时未退出，强制终止以释放 SPIRAM 栈");
-        vTaskDelete(audio_decoder->task_handle);
+        // ★ WithCaps 创建的栈必须用 vTaskDeleteWithCaps 才能回收（栈32KB SPIRAM + TCB内部RAM）。
+        //   先存句柄、置 NULL、再删，防止与自删路径竞态二次释放。与 encoder(audio_encoder.c:398) 一致。
+        TaskHandle_t h = audio_decoder->task_handle;
         audio_decoder->task_handle = NULL;
+        vTaskDeleteWithCaps(h);
     }
 }

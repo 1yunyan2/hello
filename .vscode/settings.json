@@ -14,5 +14,6 @@
     "--compile-commands-dir=d:\\new\\Echopals\\Echo\\build"
   ],
   "idf.flashType": "UART",
-  "idf.portWin": "COM13"
+  "idf.portWin": "COM3",
+  "Codegeex.RepoIndex": true
 }

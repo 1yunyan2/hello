@@ -7,7 +7,9 @@
       "Bash(idf.py build:*)",
       "Bash(\"C:/Espressif/tools/python/v5.3.4/venv/Scripts/python.exe\" \"D:/ESP-IDF/.espressif/v5.3.4/esp-idf/tools/idf.py\" build)",
       "Bash(export IDF_PATH=D:/Espressif/frameworks/esp-idf-v5.3.4)",
-      "Bash(source $IDF_PATH/export.sh)"
+      "Bash(source $IDF_PATH/export.sh)",
+      "Bash(find /c/Users/esthe/.claude/projects/d--new-Echopals-Echo2/memory/bugs -name 'BUG-*.md' 2>/dev/null | sort | tail -3)",
+      "Read(//c/Users/esthe/.claude/projects/d--new-Echopals-Echo2/memory/bugs/**)"
     ]
   }
 }
