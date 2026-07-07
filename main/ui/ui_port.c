@@ -27,7 +27,8 @@
 #include "ui/reminder.h"
 #include "ui/standby.h"
 #include "games/games.h"
-#include "ui/interaction.h" /* interaction_is_playing()：情绪播放中暂停自动循环 */
+#include "ui/interaction.h"  /* interaction_is_playing()：情绪播放中暂停自动循环 */
+#include "session/session.h" /* session_get_state()：对话中屏蔽情绪触摸 */
 #include "object.h"
 #include <string.h>
 #include <limits.h>
@@ -106,10 +107,15 @@ static void back_to_home(void);                 // 功能页/游戏 摸腹背 �
 static void menu_clear_func_pages(void);        // 隐藏所有功能页专属对象，仅留 title+body
 
 /* ── 配置宏 ── */
-#define UI_MAIN_GIF_RANDOM 0          // 主界面 GIF 是否随机（1=随机，0=顺序）。
-#define UI_MENU_IDLE_TIMEOUT_MS 30000 /* 主屏幕顶部状态栏（时间 / WiFi / 电量）总开关：1=显示，0=关闭。 \
-                                       * 关闭后既不创建标签也不启动刷新定时器，相关回调内均有 NULL 早退保护，安全。 */
-#define UI_SHOW_STATUS_BAR 0 /* 关闭顶部状态栏（时间/WiFi/电量全部不显示）*/
+#define UI_MAIN_GIF_RANDOM 1 // 主界面 GIF 是否随机（1=随机，0=顺序）。空闲 GIF 随机切换。
+/* 开机 Logo GIF：开机先固定播这一张（独立文件，不进 s_main_gif_table），播完一轮后
+ * 自动切入正常主界面轮播。因不在表内，随机/顺序逻辑永远不会再抽到它。
+ * 后续把真实 logo GIF 放进 SPIFFS 的 gif/ 目录，文件名对应 UI_BOOT_LOGO_PATH 即可。 */
+#define UI_BOOT_LOGO_GIF 0                  // 1=开机先播 logo，0=直接进正常轮播
+#define UI_BOOT_LOGO_PATH "S:/gif/logo.gif" // 开机 logo GIF 路径（独立文件，待放入）
+#define UI_MENU_IDLE_TIMEOUT_MS 30000       /* 主屏幕顶部状态栏（时间 / WiFi / 电量）总开关：1=显示，0=关闭。 \
+                                             * 关闭后既不创建标签也不启动刷新定时器，相关回调内均有 NULL 早退保护，安全。 */
+#define UI_SHOW_STATUS_BAR 0                /* 关闭顶部状态栏（时间/WiFi/电量全部不显示）*/
 
 /* ── 触摸调节步进 & 上限宏 ──
  * 修改此处统一控制所有触摸步进和上限值 */
@@ -169,11 +175,22 @@ static bool s_lvgl_ready = false;
  */
 static int s_gif_cur_index = -1;
 static int s_gif_pending_idx = -1;
+static bool s_boot_logo_playing = false; // true=正在播开机 logo，播完一轮后由 ready_cb 切入主轮播
 static lv_timer_t *s_gif_switch_tmr = NULL;
 /* 情绪触发时指定要切到的 GIF 路径（非随机）。非 NULL 优先于 s_gif_pending_idx。
  * 由 ui_request_emotion_gif()（任意线程）设置，main_gif_switch_timer_cb（LVGL线程）消费。
  * 见 BUG-010：lv_gif_set_src 必须在 LVGL 线程调，故走 pending + 延迟 timer 机制。 */
 static const char *volatile s_gif_pending_path = NULL;
+
+/* ── 对话状态中性 GIF 标志（纯视觉，无舵机/震动）──
+ *   s_neutral_active     : true=当前处于对话中（LISTENING/PLAYING），屏幕锁定在状态中性 GIF，
+ *                          此时 main_gif_ready_cb 不再自动随机循环（避免待机循环抢图）。
+ *   s_gif_pending_is_state: 标记本次 pending_path 是否来自“状态接口”（true）还是“情绪接口”（false）。
+ *                          用于 main_gif_switch_timer_cb 里实现“状态 > 情绪”优先级兜底：
+ *                          对话中若收到情绪 pending（is_state=false）则丢弃，不抢状态 GIF。
+ * 两个标志均由 LVGL 线程 / 状态接口写，跨线程仅做布尔赋值（原子），无需加锁。 */
+static volatile bool s_neutral_active = false;
+static volatile bool s_gif_pending_is_state = false;
 
 /* 主时钟 UI */
 static lv_obj_t *s_clock_d[6];
@@ -468,9 +485,146 @@ static const main_gif_entry_t s_main_gif_table[] = {
      /*l_arm*/ {SERVO_AMPLITUDE_10, SERVO_DIR_NEUTRAL, SERVO_SPEED_MID, 4, false},
      /*r_arm*/ {SERVO_AMPLITUDE_10, SERVO_DIR_NEUTRAL, SERVO_SPEED_MID, 4, false}},
 
+    // five.gif:惊喜 —— 头中速左右摆 2 次,双臂中速各摆 1 次
+    {"S:/gif/five.gif",
+     /*head */ {SERVO_AMPLITUDE_20, SERVO_DIR_LEFT, SERVO_SPEED_MID, 5, true},
+     /*l_arm*/ {SERVO_AMPLITUDE_15, SERVO_DIR_LEFT, SERVO_SPEED_MID, 5, false},
+     /*r_arm*/ {SERVO_AMPLITUDE_15, SERVO_DIR_RIGHT, SERVO_SPEED_MID, 5, false}},
+
     /* ↓↓↓ 以后加 GIF 只加一行(路径 + 三轴动作)↓↓↓ */
 };
 #define MAIN_GIF_COUNT (sizeof(s_main_gif_table) / sizeof(s_main_gif_table[0]))
+
+/* ═══════════════════════════════════════════════════════════════
+ * 对话状态动作表 —— 状态切换时播放 GIF + 三轴舵机 + 震动（经情绪 worker 执行）
+ *
+ * 设计：每个对话状态（LISTENING/SPEAKING）对应一组「状态动作」，每条动作
+ *       = {GIF 路径 + 三轴舵机绝对角度 + 震动序列}，三者各自独立配置。
+ *       组内随机选一条，调 ui_interaction_play_custom 交给情绪 worker 执行。
+ *       - is_state_gif=true：高优先级状态切图，不被对话中「丢弃情绪切图」兜底误伤；
+ *       - keep_screen=true：动作播完屏幕停在该 GIF（不跳回待机循环），舵机仍归中。
+ *       IDLE 不用本表：清 s_neutral_active + ui_resume_main_gif_loop 恢复待机循环。
+ *
+ * 扩展：往对应数组加一行 {gif, is_state, keep, vib, len, head, l_arm, r_arm} 即可。
+ * 占位：GIF 先复用现有 three/four.gif；素材到位后只改 .gif_path（换中性 GIF）和动作参数。
+ *       切图前 main_gif_switch_timer_cb 会 lv_fs_open 校验文件存在，不存在则保持当前画面（BUG-010）。
+ * 角度约定：中心 90°；head 左+右-，臂 前+后-。
+ * ═══════════════════════════════════════════════════════════════ */
+/* 状态动作专用震动序列（与情绪 vib_* 独立，可自由调手感） */
+static const VibStep_t s_vib_listen[] = {{50, 60, 0}};              // 监听：轻震 1 次
+static const VibStep_t s_vib_speak[] = {{70, 50, 50}, {70, 50, 0}}; // 说话：短促 2 次
+
+/* 监听组（用户说话 LISTENING）：占位 GIF three.gif + 轻摇头 + 轻震 */
+static const ia_custom_action_t s_listening_actions[] = {
+    {
+        .gif_path = "S:/gif/three.gif",
+        .is_state_gif = true,
+        .keep_screen = true,
+        .is_idle = false, // 对话动作不可被触摸打断
+        .vib_seq = s_vib_listen,
+        .vib_seq_len = sizeof(s_vib_listen) / sizeof(s_vib_listen[0]),
+        .head = {115.0f, 65.0f, SERVO_SPEED_SLOW, 2},   // 头轻摇 2 次
+        .left_arm = {90.0f, 90.0f, SERVO_SPEED_MID, 0}, // 臂不动（count=0）
+        .right_arm = {90.0f, 90.0f, SERVO_SPEED_MID, 0},
+    },
+};
+
+/* 说话组（大模型说话 PLAYING）：占位 GIF four.gif + 点头 + 短促震 */
+static const ia_custom_action_t s_speaking_actions[] = {
+    {
+        .gif_path = "S:/gif/four.gif",
+        .is_state_gif = true,
+        .keep_screen = true,
+        .is_idle = false, // 对话动作不可被触摸打断
+        .vib_seq = s_vib_speak,
+        .vib_seq_len = sizeof(s_vib_speak) / sizeof(s_vib_speak[0]),
+        .head = {120.0f, 60.0f, SERVO_SPEED_FAST, 2},    // 头快摆 2 次
+        .left_arm = {110.0f, 70.0f, SERVO_SPEED_MID, 1}, // 臂小幅摆 1 次
+        .right_arm = {110.0f, 70.0f, SERVO_SPEED_MID, 1},
+    },
+};
+
+/* 空闲动作专用震动序列（比对话更轻，"发呆"感；占位，后续调手感） */
+static const VibStep_t s_vib_idle[] = {{35, 60, 0}}; // 空闲：极轻震 1 次
+
+/* 空闲组（开机后随机 GIF 循环、未对话、未进待机）：一图一动作，「GIF 切换 = 动作切换」。
+ *
+ * 关键设计（根治"舵机不动"的 flush 风暴）：空闲动作【自己切图】(gif_path 填真实路径) +
+ * 舵机 + 震动，由 worker 串行执行；keep_screen=false → 播完调 ui_resume_main_gif_loop
+ * 触发下一条。节奏由【舵机摆动耗时】天然决定（ia_worker 等舵机摆完才算动作结束、才切
+ * 下一张），故"舵机动多久 = GIF 多久切一次"，调舵机/震动时间即调节奏，无需死时间。
+ *
+ *   - gif_path=NULL：动作【不切图】。GIF 切换完全交还 READY 机制（main_gif_apply_index），
+ *     GIF 完整播完一轮才切下一张，永不被动作打断；
+ *   - keep_screen=true：动作播完【不】调 ui_resume_main_gif_loop，不触发下一张
+ *     （切断"动作→切图→动作"的失控循环；下一张只由 GIF 的 READY 驱动）；
+ *   - is_idle=true：低优先级，触摸情绪可 flush 打断。
+ * 即：「GIF 播完一轮 → 切下一张 + 投递本表对应动作（只舵机+震动）」。舵机在这一轮 GIF
+ * 期间摆完就安静，等下一轮 READY。GIF 一定完整，舵机也完整，不依赖调参。
+ * 动作按 GIF 索引取（与 s_main_gif_table 对齐）；后续换中性 GIF 只改 s_main_gif_table + 本表动作参数。 */
+static const ia_custom_action_t s_idle_actions[] = {
+    {
+        // 对应 one.gif：头大幅左右摆 2 次 + 双臂摆（占位用明显幅度，验证舵机能动；后续按手感调小）
+        .gif_path = NULL,
+        .is_state_gif = false,
+        .keep_screen = true,
+        .is_idle = true,
+        .vib_seq = s_vib_idle,
+        .vib_seq_len = sizeof(s_vib_idle) / sizeof(s_vib_idle[0]),
+        .head = {120.0f, 60.0f, SERVO_SPEED_SLOW, 2},
+        .left_arm = {110.0f, 70.0f, SERVO_SPEED_SLOW, 2},
+        .right_arm = {110.0f, 70.0f, SERVO_SPEED_SLOW, 2},
+    },
+    {
+        // 对应 two.gif：头大幅摆 2 次
+        .gif_path = NULL,
+        .is_state_gif = false,
+        .keep_screen = true,
+        .is_idle = true,
+        .vib_seq = s_vib_idle,
+        .vib_seq_len = sizeof(s_vib_idle) / sizeof(s_vib_idle[0]),
+        .head = {125.0f, 55.0f, SERVO_SPEED_MID, 2},
+        .left_arm = {90.0f, 90.0f, SERVO_SPEED_SLOW, 0},
+        .right_arm = {90.0f, 90.0f, SERVO_SPEED_SLOW, 0},
+    },
+    {
+        // 对应 three.gif：头大幅摆 1 次 + 双臂，不震动（节奏变化）
+        .gif_path = NULL,
+        .is_state_gif = false,
+        .keep_screen = true,
+        .is_idle = true,
+        .vib_seq = NULL,
+        .vib_seq_len = 0,
+        .head = {120.0f, 60.0f, SERVO_SPEED_SLOW, 1},
+        .left_arm = {120.0f, 60.0f, SERVO_SPEED_SLOW, 1},
+        .right_arm = {120.0f, 60.0f, SERVO_SPEED_SLOW, 1},
+    },
+    {
+        // 对应 four.gif：头大幅摆 2 次 + 轻震
+        .gif_path = NULL,
+        .is_state_gif = false,
+        .keep_screen = true,
+        .is_idle = true,
+        .vib_seq = s_vib_idle,
+        .vib_seq_len = sizeof(s_vib_idle) / sizeof(s_vib_idle[0]),
+        .head = {130.0f, 50.0f, SERVO_SPEED_MID, 2},
+        .left_arm = {90.0f, 90.0f, SERVO_SPEED_SLOW, 0},
+        .right_arm = {90.0f, 90.0f, SERVO_SPEED_SLOW, 0},
+    },
+    {
+        // 对应 five.gif：头中幅摆 2 次 + 双臂各摆 1 次 + 轻震
+        .gif_path = NULL,
+        .is_state_gif = false,
+        .keep_screen = true,
+        .is_idle = true,
+        .vib_seq = s_vib_idle,
+        .vib_seq_len = sizeof(s_vib_idle) / sizeof(s_vib_idle[0]),
+        .head = {115.0f, 65.0f, SERVO_SPEED_MID, 2},
+        .left_arm = {110.0f, 70.0f, SERVO_SPEED_MID, 1},
+        .right_arm = {110.0f, 70.0f, SERVO_SPEED_MID, 1},
+    },
+};
+#define IDLE_ACTION_COUNT (sizeof(s_idle_actions) / sizeof(s_idle_actions[0]))
 
 /**
  * @brief 把一张 GIF 的三轴舵机动作以并行方式非阻塞入队(只动舵机,无震动/音频)
@@ -530,9 +684,42 @@ static int main_gif_pick_next_index(int cur)
     } while (next == cur); // 不与上一张重复
     return next;
 #else
-    // return (cur + 1) % (int)MAIN_GIF_COUNT; // 顺序循环
-    return 0;
+    return (cur + 1) % (int)MAIN_GIF_COUNT; // 顺序循环（cur=-1 时从 0 开始）
 #endif
+}
+
+/**
+ * @brief 校验 GIF 画布尺寸是否在安全范围内,超过屏幕面积过多则拒绝切图
+ *
+ * 【背书·血泪坑】lv_gif.c::gif_initialize 用 GIF 自身画布尺寸(而非屏幕尺寸)
+ *   分配 draw_buf(ARGB8888,宽*高*4字节)。曾把 three.gif 误换成 512x512
+ *   (屏幕仅 320x240),画布面积达屏幕 3.4 倍、单帧缓冲逼近 1MB,PSRAM 碎片化
+ *   下分配失败——而 gif_initialize 分配失败时只置 draw_buf=NULL 并 return,
+ *   并不会停 gifobj->timer,下一帧 gif_next_frame_task_cb 照常触发,解引用
+ *   NULL 的 draw_buf->header.w 直接 LoadProhibited 崩溃。故切图前先用
+ *   lv_gif_get_size 探测画布尺寸,超过屏幕面积 1.5 倍就拒绝,保留当前画面。
+ *
+ * @param gif_path 待切换的 GIF 路径
+ * @return true=尺寸安全可以切图；false=尺寸异常,已打日志,调用方应保持当前画面
+ */
+static bool main_gif_check_size_safe(const char *gif_path)
+{
+    uint16_t w = 0, h = 0;
+    if (!lv_gif_get_size(gif_path, &w, &h) || w == 0 || h == 0)
+    {
+        ESP_LOGW(TAG, "GIF 尺寸探测失败,拒绝切图: %s", gif_path);
+        return false;
+    }
+    /* 屏幕面积 1.5 倍上限:留一定余量给非全屏小图,同时挡住整倍数放大的误用素材 */
+    uint32_t gif_area = (uint32_t)w * (uint32_t)h;
+    uint32_t screen_area_limit = (uint32_t)BSP_LCD_WIDTH * (uint32_t)BSP_LCD_HEIGHT * 3 / 2;
+    if (gif_area > screen_area_limit)
+    {
+        ESP_LOGW(TAG, "GIF 尺寸过大拒绝切图(可能导致 draw_buf 分配失败崩溃): %s %ux%u > 屏幕(%dx%d)*1.5",
+                 gif_path, w, h, BSP_LCD_WIDTH, BSP_LCD_HEIGHT);
+        return false;
+    }
+    return true;
 }
 
 /**
@@ -554,6 +741,9 @@ static void main_gif_apply_index(int idx, bool with_servo)
         return;
 
     const main_gif_entry_t *entry = &s_main_gif_table[idx];
+
+    if (!main_gif_check_size_safe(entry->gif_path))
+        return; // 尺寸异常,保持当前画面,不切图、不驱动舵机
 
     lv_gif_set_src(gif_obj, entry->gif_path); // 切新图,内部自动重新播放
     s_gif_cur_index = idx;
@@ -580,17 +770,47 @@ static void main_gif_apply_index(int idx, bool with_servo)
 static void main_gif_ready_cb(lv_event_t *e)
 {
     (void)e;
+    // 【诊断-DBG4】GIF 每播完一轮都会进这里；重点看二级待机期间是否仍在持续触发
+    // （若二级期间此日志仍频繁刷屏，说明 GIF 动画没被冻结，一直在后台播放/切换，验证OK后可删）
+    ESP_LOGW("GIFDBG", "[DBG4] ready_cb 触发: s_view=%d standby_deep=%d interaction_playing=%d neutral=%d",
+             (int)s_view, (int)standby_is_deep_active(), (int)interaction_is_playing(), (int)s_neutral_active);
     // 仅在主界面才循环切换 GIF + 驱动舵机;进入功能菜单/闹钟编辑后 GIF 被隐藏,
     // 此时不应继续切图或驱动舵机(否则会出现"已在功能层却仍在动"的异常)。
     if (s_view != UI_VIEW_MAIN)
         return;
-    // 情绪播放中：暂停自动随机循环（不切图、不入舵机），让位给情绪动作。
-    // 情绪播完 ui_resume_main_gif_loop() 会重新唤醒本循环。
+    // ★开机 logo 播完一轮 → 切入正常主界面轮播的表内首张,之后 logo 永不再出现。
+    //   放在最靠前(仅次于 s_view 判断)是为了保证 logo 只播这一轮就必定让位给正常轮播,
+    //   不受待机/对话/动作等其它早退标志影响。
+    if (s_boot_logo_playing)
+    {
+        s_boot_logo_playing = false;
+        s_gif_pending_idx = main_gif_pick_next_index(-1); // 表内首张(随机/顺序都在表索引内取,不含 logo)
+        ESP_LOGI("GIFDBG", "ready_cb: 开机 logo 播完 → 切入主轮播 idx=%d", s_gif_pending_idx);
+        if (s_gif_switch_tmr != NULL)
+            lv_timer_resume(s_gif_switch_tmr);
+        return;
+    }
+    // ★（已废弃，与「低功耗随机情绪驱动 GIF+头部+音频」冲突，改由 main_gif_switch_timer_cb
+    //   的待机分支接管——见该函数内 standby_is_active() 判断）：原「待机定格当前GIF、
+    //   停自动循环」逻辑。若待机改回不需要随机情绪轮播，可取消注释恢复本行为。
+    // if (standby_is_active())
+    //     return;
+    // 任何动作（情绪/对话状态/空闲）播放中：暂停自动随机循环，让位给动作自己切图。
+    // 空闲动作 keep_screen=false，播完会调 ui_resume_main_gif_loop 主动触发下一轮切图，
+    // 故这里挡住不会导致停摆；反而避免「动作播放中 ready_cb 又排队切图」造成的重复切图/打断。
     if (interaction_is_playing())
+    {
+        ESP_LOGI("GIFDBG", "ready_cb: GIF播完一轮 但动作播放中(is_playing) → 早退不切图");
+        return;
+    }
+    // 对话中（LISTENING/PLAYING）：屏幕锁定状态中性 GIF，不自动随机循环（防待机循环抢图）。
+    // 状态回 IDLE 时 ui_set_neutral_gif_state(NEUTRAL_IDLE) 会清此标志并恢复循环。
+    if (s_neutral_active)
         return;
     if (s_gif_pending_idx >= 0)
         return; // 已有待切换,避免本轮重复排队
     s_gif_pending_idx = main_gif_pick_next_index(s_gif_cur_index);
+    ESP_LOGI("GIFDBG", "ready_cb: GIF播完一轮 → 排队下一张 idx=%d", s_gif_pending_idx);
     if (s_gif_switch_tmr != NULL)
         lv_timer_resume(s_gif_switch_tmr); // 唤醒延迟切换 timer,下个 tick 执行
 }
@@ -619,7 +839,15 @@ static void main_gif_switch_timer_cb(lv_timer_t *t)
     const char *path = s_gif_pending_path;
     if (path != NULL)
     {
+        /* ── 优先级兜底「状态 > 情绪」：对话中（s_neutral_active）只放行状态接口设置的
+         * pending（is_state=true）；若本次 pending 来自情绪接口（is_state=false），丢弃，
+         * 保持当前状态中性 GIF 不被情绪抢图。正常情况下 play_random_emotion 已在源头屏蔽
+         * 对话中触摸，这里是纵深防御。 */
+        bool is_state = s_gif_pending_is_state;
         s_gif_pending_path = NULL;
+        s_gif_pending_is_state = false;
+        if (s_neutral_active && !is_state)
+            return; // 对话中丢弃情绪切图请求
         if (gif_obj != NULL)
         {
             /* ★ 切图前先验证文件存在：lv_gif_set_src 切到不存在的文件会让 gif 对象
@@ -629,8 +857,14 @@ static void main_gif_switch_timer_cb(lv_timer_t *t)
             if (lv_fs_open(&f, path, LV_FS_MODE_RD) == LV_FS_RES_OK)
             {
                 lv_fs_close(&f);
-                lv_gif_set_src(gif_obj, path); // 文件存在才切，安全（BUG-010）
-                // s_gif_cur_index 不更新：情绪 GIF 不在 s_main_gif_table 索引体系内
+                /* 文件存在只是第一关，尺寸超标同样会在 gif_initialize 分配
+                 * draw_buf 失败后让 timer 继续跑，下一帧崩溃（同 BUG-010 根因）。 */
+                if (main_gif_check_size_safe(path))
+                {
+                    ESP_LOGI("GIFDBG", "timer_cb: 切图(pending_path)=%s is_state=%d", path, is_state);
+                    lv_gif_set_src(gif_obj, path); // 文件存在且尺寸安全才切
+                    // s_gif_cur_index 不更新：情绪 GIF 不在 s_main_gif_table 索引体系内
+                }
             }
             else
             {
@@ -646,13 +880,48 @@ static void main_gif_switch_timer_cb(lv_timer_t *t)
     if (idx < 0)
         return;
 
-    // 双保险：情绪播放中绝不自动切图/入舵机（ready_cb 已挡一道，这里再挡一道）
+    // 动作播放中：不在这里自动切图（让位）。空闲动作 gif_path=NULL 不切图、keep_screen=true
+    // 不 resume，故它播放期间被挡也不会停摆——下一张只由 GIF 的 READY 驱动（ready_cb），解耦。
     if (interaction_is_playing())
         return;
 
-    // 待机期间 GIF 继续随机切换，但不触发舵机联动
-    // 头部舵机由 standby_task 独占（慢摆头），两者同时驱动会互相打架
-    main_gif_apply_index(idx, /*with_servo=*/!standby_is_active());
+    /* ── 待机（一级低功耗）中：GIF 改由随机情绪矩阵驱动，不走 idx 表 ──────────────
+     * 必须在 main_gif_apply_index（按 idx 表切图）之前分流：否则会先切 idx 表的图、
+     * 紧接着情绪 worker 又切一次情绪自己的图，两次切图打架/闪烁。
+     * ui_interaction_play() 内部会走 ui_request_emotion_gif 切情绪 GIF + 播头部动作
+     * （手臂钉90°+跳过震动，由 interaction_set_lowpower(true) 生效，见 standby.c）。
+     * s_gif_pending_idx 本次直接丢弃（idx 表不参与待机），下一轮 READY 仍会正常排队，
+     * 不影响退出待机后恢复正常轮播。 */
+    if (standby_is_active())
+    {
+        /* ★二级（深度待机）：屏已关(bsp_board_lcd_off)、舵机 PWM 已停(bsp_servo_idle)，
+         * 此时绝不能再触发情绪动作——ui_interaction_play 会重新驱动头部舵机 PWM，
+         * 把 enter_deep_standby 刚停掉的舵机又点亮（"二级了头部还在动"的根因）。
+         * standby_is_active() 在一级/二级期间均为 true，必须用 standby_is_deep_active()
+         * 单独区分二级并直接丢弃本次切图，不入队、不驱动任何舵机。 */
+        if (standby_is_deep_active())
+        {
+            // 【诊断-DBG5】二级期间本 timer 仍被唤醒执行到这里，确认丢弃分支被命中的频率（验证OK后可删）
+            ESP_LOGW("GIFDBG", "[DBG5] timer_cb: 二级待机中，丢弃本次切图（gif_obj=%p pending_idx此次作废）", (void *)gif_obj);
+            return;
+        }
+        ESP_LOGI("GIFDBG", "timer_cb: 待机中，随机情绪驱动头部+GIF（丢弃idx表切图）");
+        ui_interaction_play(esp_random() % EMOTION_COUNT);
+        return;
+    }
+
+    /* ── 切图：GIF 完整播完一轮(READY) 才走到这里切下一张（READY 驱动，GIF 永不被打断）。── */
+    main_gif_apply_index(idx, /*with_servo=*/false);
+
+    /* ── 空闲（非待机）：切完图，附带投递本图对应动作（只舵机+震动）。
+     * 动作 gif_path=NULL（不切图）、keep_screen=true（不 resume、不触发下一张），舵机在
+     * 这一轮 GIF 期间摆完即安静，下一张由 READY 驱动。GIF 与舵机各自完整、互不打断。
+     * 动作按 GIF 索引取同序号（s_idle_actions 与 s_main_gif_table 对齐）。 */
+    if (idx >= 0 && (size_t)idx < IDLE_ACTION_COUNT)
+    {
+        ESP_LOGI("GIFDBG", "timer_cb: 切图 idx=%d + 投递舵机动作", idx);
+        ui_interaction_play_custom(&s_idle_actions[idx]);
+    }
 }
 
 /**
@@ -671,10 +940,78 @@ void ui_request_emotion_gif(const char *gif_path)
     if (gif_path == NULL || gif_path[0] == '\0')
         return;
     if (s_view != UI_VIEW_MAIN)
-        return;                    // 非主界面不切（功能层/闹钟编辑时 GIF 已隐藏）
+        return;                     // 非主界面不切（功能层/闹钟编辑时 GIF 已隐藏）
+    s_gif_pending_is_state = false; // 本次 pending 来自情绪接口（优先级低于状态 GIF）
+    s_gif_pending_path = gif_path;  // 指针赋值原子；指向常量字符串，生命周期安全
+    if (s_gif_switch_tmr != NULL)
+        lv_timer_resume(s_gif_switch_tmr); // 唤醒延迟切换 timer，下个 LVGL tick 执行
+}
+
+/**
+ * @brief 请求把主界面 GIF 切到指定路径（对话状态动作用，跨线程安全，高优先级）
+ *
+ * 与 ui_request_emotion_gif 唯一区别：设 s_gif_pending_is_state=true，使本次切图被
+ * main_gif_switch_timer_cb 视为「状态切图」（高优先级），不被对话中（s_neutral_active）
+ * 的「丢弃情绪切图」兜底误伤（D.1：否则现象为「舵机震动动了但 GIF 没切」）。
+ * 供 interaction worker 执行状态动作时切图调用。
+ */
+void ui_request_state_gif(const char *gif_path)
+{
+    if (gif_path == NULL || gif_path[0] == '\0')
+        return;
+    if (s_view != UI_VIEW_MAIN)
+        return;                    // 非主界面不切
+    s_gif_pending_is_state = true; // 高优先级状态切图（绕过兜底丢弃）
     s_gif_pending_path = gif_path; // 指针赋值原子；指向常量字符串，生命周期安全
     if (s_gif_switch_tmr != NULL)
         lv_timer_resume(s_gif_switch_tmr); // 唤醒延迟切换 timer，下个 LVGL tick 执行
+}
+
+/**
+ * @brief 按会话状态切换中性 GIF（待机/用户说话/大模型说话），跨线程安全
+ *
+ * 由 session 状态机在状态切换点调用（任意线程）。
+ * - LISTENING / SPEAKING：置 s_neutral_active=true（锁定对话态，main_gif_ready_cb
+ *   期间不再自动随机循环），从对应状态动作组随机选一条，调 ui_interaction_play_custom
+ *   交给情绪 worker 执行【切图 + 三轴舵机 + 震动】（worker 内用 ui_request_state_gif
+ *   高优先级切图、播完 keep_screen 停在该 GIF）。本函数只入队，不阻塞调用线程。
+ * - IDLE：清 s_neutral_active，调 ui_resume_main_gif_loop() 恢复主界面自动随机循环（不带动作）。
+ *
+ * @param st 目标会话状态（neutral_gif_state_t）
+ */
+void ui_set_neutral_gif_state(neutral_gif_state_t st)
+{
+    if (s_view != UI_VIEW_MAIN)
+        return; // 非主界面（功能盘/游戏/闹钟编辑）不切，避免抢功能层画面
+
+    /* IDLE：退出对话态，恢复待机自动随机循环（不带动作） */
+    if (st == NEUTRAL_IDLE)
+    {
+        s_neutral_active = false;
+        ui_resume_main_gif_loop(); // 内部自带 s_view==MAIN 判断与跨线程安全
+        return;
+    }
+
+    /* LISTENING / SPEAKING：从对应状态动作组随机选一条 */
+    const ia_custom_action_t *list = NULL;
+    size_t count = 0;
+    if (st == NEUTRAL_LISTENING)
+    {
+        list = s_listening_actions;
+        count = sizeof(s_listening_actions) / sizeof(s_listening_actions[0]);
+    }
+    else /* NEUTRAL_SPEAKING */
+    {
+        list = s_speaking_actions;
+        count = sizeof(s_speaking_actions) / sizeof(s_speaking_actions[0]);
+    }
+    if (list == NULL || count == 0)
+        return;
+
+    // 先锁对话态，再投递：确保投递后到 worker 真正切图之间，待机循环不会插入随机切图。
+    s_neutral_active = true;
+    const ia_custom_action_t *act = &list[esp_random() % count]; // 组内随机选一条
+    ui_interaction_play_custom(act);                             // 切图 + 舵机 + 震动全交给情绪 worker 执行
 }
 
 /**
@@ -691,12 +1028,16 @@ void ui_request_emotion_gif(const char *gif_path)
  */
 void ui_resume_main_gif_loop(void)
 {
+    // 【诊断-DBG3】函数入口打印 gif_obj 是否存在、当前 s_view、tmr 是否存在（验证OK后可删）
+    ESP_LOGW("GIFDBG", "[DBG3] resume_loop 入口: s_view=%d gif_obj=%p tmr=%p s_gif_cur_index=%d",
+             (int)s_view, (void *)gif_obj, (void *)s_gif_switch_tmr, s_gif_cur_index);
     if (s_view != UI_VIEW_MAIN)
         return; // 已不在主界面（如已进功能盘），不恢复
     if (s_gif_switch_tmr == NULL)
         return;
     s_gif_pending_path = NULL; // 确保走随机分支而非情绪指定分支
     s_gif_pending_idx = main_gif_pick_next_index(s_gif_cur_index);
+    ESP_LOGI("GIFDBG", "resume_loop: 动作播完恢复循环 → pending_idx=%d", s_gif_pending_idx);
     lv_timer_resume(s_gif_switch_tmr); // 下个 LVGL tick 切下一张，恢复循环
 }
 
@@ -752,13 +1093,22 @@ static void main_gif_create(void)
     s_gif_switch_tmr = lv_timer_create(main_gif_switch_timer_cb, 10, NULL);
     lv_timer_pause(s_gif_switch_tmr);
 
+#if UI_BOOT_LOGO_GIF
+    // 开机先播独立的 logo GIF(不在表内,故随机/顺序逻辑永不再抽到它)。
+    // 播完一轮触发 LV_EVENT_READY → main_gif_ready_cb 里切入表内首张进入正常轮播。
+    s_boot_logo_playing = true;
+    lv_gif_set_src(gif_obj, UI_BOOT_LOGO_PATH); // 直接播 logo,不走 main_gif_apply_index(它按表索引取图)
+    s_gif_cur_index = -1;                       // logo 不属于表,当前索引标记无效
+    ESP_LOGI(TAG, "GIF待机动画已创建,开机 logo=%s", UI_BOOT_LOGO_PATH);
+#else
     // 首张:只显示不配舵机(此刻 interaction 队列尚未就绪,且很快会切到下一张)
     int first = main_gif_pick_next_index(-1);
     main_gif_apply_index(first, /*with_servo=*/false);
+    ESP_LOGI(TAG, "GIF待机动画已创建,首张索引=%d", first);
+#endif
 
     lv_obj_center(gif_obj);
     lv_obj_clear_flag(gif_obj, LV_OBJ_FLAG_HIDDEN);
-    ESP_LOGI(TAG, "GIF待机动画已创建,首张索引=%d", first);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -2065,6 +2415,7 @@ static void menu_clear_func_pages(void)
 {
     alarm_page_hide();
     countdown_page_hide();
+    weather_page_hide();
 #if CONFIG_UI_USE_CALENDAR
     if (s_calendar)
         lv_obj_add_flag(s_calendar, LV_OBJ_FLAG_HIDDEN);
@@ -2089,6 +2440,7 @@ static void home_render(void)
     /* 隐藏功能页专属对象 + 旧文字面板，只留功能盘图标 */
     alarm_page_hide();
     countdown_page_hide();
+    weather_page_hide();
 #if CONFIG_UI_USE_CALENDAR
     if (s_calendar)
         lv_obj_add_flag(s_calendar, LV_OBJ_FLAG_HIDDEN);
@@ -2461,7 +2813,7 @@ void ui_show_unbinding(void)
         if (s_menu_title)
             lv_label_set_text(s_menu_title, "");
         if (s_menu_body)
-            lv_label_set_text(s_menu_body, "正在重置，请稍候…");
+            lv_label_set_text(s_menu_body, "正在重置中");
         lv_obj_clear_flag(s_menu_panel, LV_OBJ_FLAG_HIDDEN);
     }
 
@@ -2471,7 +2823,7 @@ void ui_show_unbinding(void)
     lv_refr_now(NULL);
 
     lvgl_port_unlock();
-    ESP_LOGW(TAG, "已显示解绑提示页（正在重置，请稍候…）");
+    ESP_LOGW(TAG, "已显示解绑提示页（正在重置中）");
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -2618,11 +2970,21 @@ static void play_random_emotion(const robot_emotion_t *group, size_t count)
 {
     if (group == NULL || count == 0)
         return;
-    // 情绪播放中：屏蔽新的情绪触摸（丢弃，不排队不打断，保证当前情绪完整播完）。
-    // 注意：进功能盘的长按耳事件不走本函数，故不受屏蔽影响（plan 步骤4）。
-    if (interaction_is_playing())
+    // 情绪/对话状态动作播放中：屏蔽新的情绪触摸（丢弃，不排队不打断，保证当前动作完整播完）。
+    // 但「空闲动作」播放中【不屏蔽】——触摸情绪优先级高于空闲，应能打断空闲（由
+    // ui_interaction_play 内部 flush 打断当前空闲动作后再入队本情绪）。
+    // 注意：进功能盘的长按耳事件不走本函数，故不受屏蔽影响。
+    if (interaction_is_playing() && !interaction_is_idle_action())
     {
-        ESP_LOGI("TOUCH", "情绪播放中，屏蔽本次触摸");
+        ESP_LOGI("TOUCH", "情绪/状态动作播放中，屏蔽本次触摸");
+        return;
+    }
+    // 对话中（LISTENING/PLAYING）屏蔽情绪触摸：不播情绪、不切情绪图、不动舵机/震动，
+    // 保证对话全程屏幕只显示状态中性 GIF，零抖动（用户明确诉求）。
+    // 长按进功能盘的耳部事件不走本函数，不受影响。
+    if (session_get_state() != SESSION_IDLE)
+    {
+        ESP_LOGI("TOUCH", "对话进行中，屏蔽情绪触摸（保持状态中性 GIF）");
         return;
     }
     robot_emotion_t emo = group[esp_random() % count];

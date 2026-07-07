@@ -59,3 +59,15 @@ void standby_wake(void);
  * @note 调用者：ui_port.c（摸头时判断是否需要先唤醒而非触发情绪）
  */
 bool standby_is_active(void);
+
+/**
+ * @brief 查询当前是否已进入二级（深度）待机
+ *
+ * 二级期间屏已关、舵机 PWM 已停（enter_deep_standby），不应再有任何代码路径
+ * 主动驱动舵机/切图——否则会出现"关了又被点亮"（PWM 被重新 set_duty）。
+ * standby_is_active() 在一级、二级期间均返回 true，无法区分二者，故新增本接口。
+ *
+ * @return true 已进入二级，false 未到二级（含未待机、仅一级）
+ * @note 调用者：ui_port.c（一级/二级待机分支需分别处理，二级不再触发随机情绪动作）
+ */
+bool standby_is_deep_active(void);

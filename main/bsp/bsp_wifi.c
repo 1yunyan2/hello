@@ -4,6 +4,7 @@
 #include "esp_heap_caps.h"
 #include "freertos/timers.h" /* WiFi 断线去抖软件定时器 */
 #include "ui/ui_port.h"      /* ui_show_unbinding(): 解绑前显示静态提示页，避免 GIF 卡冻帧 */
+#include "esp_timer.h"       /* [DIAG] esp_timer_get_time()：微秒级时间戳，定位扫描各阶段耗时 */
 
 /* ── BluFi 配网相关（替代原 Unified Provisioning）─────────────────────────── */
 #include "esp_blufi_api.h"        /* BluFi 事件枚举、回调结构、send 接口 */
@@ -15,7 +16,13 @@
 #endif
 // ─── 模块常量 ─────────────────────────────────────────────────────────────────
 #define CLEAR_WIFI_BUTTON_PIN GPIO_NUM_0 ///< 清除 WiFi 凭证的长按按键（Boot 按钮）
-#define MAX_RETRY_COUNT 5                ///< WiFi 断线后最大自动重连次数
+#define MAX_RETRY_COUNT 5                ///< WiFi 断线后最大自动重连次数（已配网运行态用）
+
+/// @brief 配网态连接失败最大重试次数：BluFi 配网期间下发凭证后连不上，连续尝试
+/// 这么多次仍拿不到 IP，就判定"本次配网失败"，向 App 回报 CONN_FAIL 并停下等
+/// App 重发凭证（不重启、不置 WIFI_FAIL_BIT，与运行态重连逻辑完全隔离）。
+/// 3 次足以排除偶发抖动，又不会让用户等太久（约 6~10s）。
+#define PROV_MAX_RETRY_COUNT 3
 
 /// @brief WiFi 断线去抖时长（ms）：断线后等这么久仍未恢复，才通知上层断开 WS/MQTT。
 /// 绝大多数 WiFi 抖动在 1~2 秒内自愈，期间不重建协议层 → 避免内部 SRAM 碎片化。
@@ -29,6 +36,21 @@ static const char *TAG = "EchoPals";
 static bool s_is_provisioning = false;
 /// @brief 当前已重连次数（超过 MAX_RETRY_COUNT 后置位 WIFI_FAIL_BIT）
 static int s_retry_num = 0;
+/// @brief 配网态连接尝试计数：BluFi 配网期间专用，与 s_retry_num（运行态）隔离。
+/// REQ_CONNECT_TO_AP 触发连接后每次断线 +1，达到 PROV_MAX_RETRY_COUNT 判定配网失败；
+/// App 重新下发凭证（RECV_STA_SSID/PASSWD）时清零，让二次配网干净开始。
+static int s_prov_retry_num = 0;
+/// @brief 连续 reason=201(NO_AP_FOUND) 的次数：用于判断信道记忆是否真的失效。
+/// 单次 201 可能只是同 SSID 多 BSSID 环境下的偶然波动（这次没扫到，下次驱动
+/// 自己就换到了对的 AP），连续 2 次才认为记忆过期，值得清空退回全信道扫描。
+static int s_no_ap_found_count = 0;
+
+/// @brief [DIAG-TEST] 真实 SSID 备份 + 是否已注入过一次性错误 SSID 的标志。
+/// 用于验证"连续 2 次 201 才清空信道提示"回退逻辑：只污染一次 SSID，让它
+/// 自然触发失败→回退→用真实 SSID 重连成功的完整闭环，不需要人工改回、
+/// 也不会真的耗到 MAX_RETRY_COUNT 触发重启。测试完毕整块删除。
+static char s_diag_real_ssid[33] = {0};
+static bool s_diag_ssid_corrupted = false;
 
 /// @brief WiFi 断线去抖定时器（one-shot）：断线时启动，GOT_IP 时取消
 static TimerHandle_t s_wifi_debounce_timer = NULL;
@@ -392,6 +414,7 @@ static void blufi_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_param_
         memset(s_blufi_sta_config.sta.ssid, 0, sizeof(s_blufi_sta_config.sta.ssid));
         memcpy(s_blufi_sta_config.sta.ssid, param->sta_ssid.ssid, param->sta_ssid.ssid_len);
         esp_wifi_set_config(WIFI_IF_STA, &s_blufi_sta_config);
+        s_prov_retry_num = 0; // App 重发凭证 → 上一轮失败计数作废，二次配网干净开始
         ESP_LOGI(TAG, "收到 WiFi SSID: %s", s_blufi_sta_config.sta.ssid);
         break;
 
@@ -406,14 +429,19 @@ static void blufi_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_param_
         memset(s_blufi_sta_config.sta.password, 0, sizeof(s_blufi_sta_config.sta.password));
         memcpy(s_blufi_sta_config.sta.password, param->sta_passwd.passwd, param->sta_passwd.passwd_len);
         esp_wifi_set_config(WIFI_IF_STA, &s_blufi_sta_config);
+        s_prov_retry_num = 0; // App 重发凭证 → 上一轮失败计数作废，二次配网干净开始
         ESP_LOGI(TAG, "收到 WiFi 密码（长度 %d）", param->sta_passwd.passwd_len);
         break;
 
     case ESP_BLUFI_EVENT_REQ_CONNECT_TO_AP:
         // 手机下发完凭证，请求设备连接 AP
+        // 注意：这里【不再】置 s_is_provisioning = false。保持配网态，让断线失败
+        // 走配网专用失败逻辑（有限次重试→回报 CONN_FAIL→停下等 App 重发），而不是
+        // 掉进运行态那套"耗尽 5 次→WIFI_FAIL_BIT→重启"的路径。s_is_provisioning
+        // 只在真正拿到 IP（GOT_IP）时才清零，标志配网成功结束。
         ESP_LOGI(TAG, "BluFi 请求连接 WiFi，开始连接...");
-        s_is_provisioning = false; // 解除配网保护，允许 wifi_ip_event_handler 正常重连
-        esp_wifi_disconnect();     // 先断开（若之前已连过），确保触发连接回调
+        s_prov_retry_num = 0;  // 本次连接尝试从 0 开始计数（二次配网也在此清零）
+        esp_wifi_disconnect(); // 先断开（若之前已连过），确保触发连接回调
         esp_wifi_connect();
         break;
 
@@ -496,6 +524,8 @@ static void blufi_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_param_
  * @note 调用者：esp_event 框架（两个 handler instance 共享此函数）
  * @note 线程安全：事件回调禁止阻塞，WIFI_BIT 操作是原子的
  */
+static void save_ap_channel_hint(void); // 前向声明：定义在文件后部，GOT_IP 分支中调用
+
 static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
                                   int32_t event_id, void *event_data)
 {
@@ -504,6 +534,8 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
     {
         // ── STA 模式已启动，立即尝试连接（使用 NVS 中已存储的 SSID/密码）────
+        ESP_LOGW(TAG, "[DIAG] WIFI_EVENT_STA_START @ %lld us，调用 esp_wifi_connect()",
+                 esp_timer_get_time());
         esp_wifi_connect();
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE)
@@ -514,7 +546,7 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
         //       仅在配网请求扫描时(s_blufi_wifi_list_pending)才回传，避免误把其它扫描结果发出。
         // 修改日期 6/22：新增，配合非阻塞 GET_WIFI_LIST，解决小程序"获取 WiFi 列表"转圈。
         if (!s_blufi_wifi_list_pending)
-            return;                          // 非配网触发的扫描，忽略
+            return; // 非配网触发的扫描，忽略
         s_blufi_wifi_list_pending = false;
 
         uint16_t ap_count = 0;
@@ -558,8 +590,114 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
         // ── WiFi 断线处理 ──────────────────────────────────────────────────────
+        wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
+        ESP_LOGW(TAG, "[DIAG] WIFI_EVENT_STA_DISCONNECTED @ %lld us，reason=%d",
+                 esp_timer_get_time(), disc ? disc->reason : -1);
+
+        // ══ 配网态失败处理（与运行态重连逻辑完全隔离）════════════════════════
+        // 仅当正处于 BluFi 配网流程、且手机蓝牙仍连着时走这里。典型场景：手机下发
+        // 了错误密码 → 反复连不上。ESP32 驱动无法 100% 区分"密码错/信号差"，密码
+        // 错最常见报 reason=15(握手超时)/205/2(认证失败) 等；这里不纠结精确原因，
+        // 统一用"连续尝试 PROV_MAX_RETRY_COUNT 次仍拿不到 IP"判定本次配网失败。
+        //   · 未达上限 → 继续 esp_wifi_connect() 重试；
+        //   · 达到上限 → ① 清除 NVS 里刚写入的错误 WiFi 账号密码（关键，见下）；
+        //     ② 向手机回报 CONN_FAIL；③ 停止重连、清零计数、保持配网态与蓝牙连接，
+        //     静候 App 重新下发凭证（RECV_STA_SSID/PASSWD 会再清零 → 无限次重配）。
+        // 全程不置 WIFI_FAIL_BIT、不重启、不断蓝牙，避免掉进运行态那套失败重启路径。
+        //
+        // 为什么必须清凭证：esp_wifi_set_config()（在 RECV_STA_PASSWD 里调用）会把
+        // SSID/密码【自动持久化到 NVS】，不管密码对错。若不清，设备一旦重启就会
+        // 被 wifi_is_provisioned() 判定为"已配网"→ 走已配网直连分支拿错密码死连→
+        // 重启→再死连，永远回不到配网模式（正是之前"错误后无法二次配网"的真因）。
+        //
+        // 【踩坑】不能用 esp_wifi_restore() 清：它是重量级操作，会重置整个 WiFi
+        // 配置栈（含 pmksa_cache）。在配网中途、STA 刚断开且后续还会 set_config
+        // 的场景下调用，会与 BluFi 第二轮下发凭证时的 wpa_config_reload 打架，实测
+        // 直接 LoadProhibited 崩溃（pmksa_cache_flush 空指针），且凭证清不干净、
+        // 重启后又被判"已配网"。改用温和方式：disconnect 停稳 + 空 config 覆盖，
+        // 只抹 SSID/密码，不动 WiFi 栈本身。
+        if (s_is_provisioning && s_blufi_ble_connected)
+        {
+            if (s_prov_retry_num < PROV_MAX_RETRY_COUNT)
+            {
+                esp_wifi_connect();
+                s_prov_retry_num++;
+                ESP_LOGW(TAG, "配网态连接失败（reason=%d），重试... (%d/%d)",
+                         disc ? disc->reason : -1, s_prov_retry_num, PROV_MAX_RETRY_COUNT);
+            }
+            else
+            {
+                ESP_LOGE(TAG, "配网态连续 %d 次连接失败，判定密码/凭证错误：回报 App 失败 + 清凭证 + 等待重发",
+                         PROV_MAX_RETRY_COUNT);
+                s_prov_retry_num = 0; // 复位，等 App 重发凭证后重新计数
+
+                // ① 先趁 WiFi 状态还正常，通过 BluFi 内置的"WiFi 连接状态上报"帧
+                //    告诉 App：连接失败。与成功上报走同一函数/同一回调，App 端只需
+                //    判 status：CONN_SUCCESS(0)=成功，CONN_FAIL(1)=失败。
+                //    放在清凭证之前，避免清除操作扰乱 mode / 上报时序。
+                wifi_mode_t mode;
+                esp_wifi_get_mode(&mode);
+                esp_blufi_send_wifi_conn_report(mode, ESP_BLUFI_STA_CONN_FAIL, 0, NULL);
+
+                // ② 停稳 STA，再用全零 wifi_config 覆盖，抹掉刚被持久化的错误账号
+                //    密码（同样会写回 NVS，把错凭证清成空）。不用 restore，避免崩溃。
+                esp_wifi_disconnect();
+                wifi_config_t empty_cfg = {0};
+                esp_err_t clr_err = esp_wifi_set_config(WIFI_IF_STA, &empty_cfg);
+                ESP_LOGW(TAG, "已用空配置覆盖清除错误 WiFi 凭证: %s", esp_err_to_name(clr_err));
+
+                // ③ 不再重连、不重启、不断蓝牙，保持配网态静待 App 重新下发凭证。
+                //    App 重发 SSID/密码 → RECV_STA_* 重新 set_config + 清零计数 → 原地重配。
+            }
+            return; // 配网态到此结束，不落入运行态重连 / 去抖逻辑
+        }
+
         if (!s_is_provisioning) // 配网期间不触发重连（避免抢占配网状态机）
         {
+            // ── 信道提示纠错：连续 2 次 reason=201(NO_AP_FOUND) 才清空提示退回全扫 ──
+            // 201 的语义是"扫描范围内压根没找到匹配的 AP"，本应对应"记忆的信道已
+            // 过期（路由器换信道了）"这种场景；但实测发现同一个 SSID 背后可能存在
+            // 多个不同 BSSID 的 AP（Mesh 子节点 / 路由器多 AP 负载均衡），单次 201
+            // 可能只是这次没扫到其中一个 AP 的偶然波动，下一次驱动自己就能换到能连
+            // 上的那个 —— 若第 1 次就清空提示会误伤这种正常波动。改为连续 2 次才
+            // 认定记忆真的过期，值得清空。其他断线原因（信号弱 246、握手超时 15 等）
+            // 大多是网络暂时不稳，信道本身没问题，不应清除提示，也不计入这个计数——
+            // 否则会把"正常抖动重连"错误降级成全信道扫描，拖慢本可以立即重连成功的场景。
+            // 只在信道提示还在生效（scan_method=FAST_SCAN）时才需要清，普通全扫模式
+            // 下这个分支不生效，不影响原有重连行为。
+            if (disc && disc->reason == WIFI_REASON_NO_AP_FOUND)
+            {
+                s_no_ap_found_count++;
+                ESP_LOGW(TAG, "[DIAG] reason=201，连续计数=%d", s_no_ap_found_count);
+                if (s_no_ap_found_count >= 2)
+                {
+                    wifi_config_t cfg = {0};
+                    if (esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK &&
+                        cfg.sta.scan_method == WIFI_FAST_SCAN)
+                    {
+                        cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+                        cfg.sta.channel = 0;
+                        // ── [DIAG-TEST] 已注释：还原测试污染 SSID 的实验代码 ──────
+                        // 配合上方 load_ap_channel_hint 里的 SSID 注入实验，已注释。
+                        // if (s_diag_ssid_corrupted && s_diag_real_ssid[0] != '\0')
+                        // {
+                        //     strncpy((char *)cfg.sta.ssid, s_diag_real_ssid, sizeof(cfg.sta.ssid) - 1);
+                        //     s_diag_ssid_corrupted = false;
+                        //     ESP_LOGW(TAG, "[DIAG-TEST] 已还原真实 SSID：%s", cfg.sta.ssid);
+                        // }
+                        esp_wifi_set_config(WIFI_IF_STA, &cfg);
+                        ESP_LOGW(TAG, "[DIAG] 连续 2 次 reason=201，信道提示已过期，清除后退回全信道扫描");
+                    }
+                    s_no_ap_found_count = 0;
+                }
+            }
+            else
+            {
+                // 非 201 的失败：说明这次至少找到了 AP（只是认证/握手等其他环节出问题），
+                // 不代表信道记忆有问题，清零计数避免和不相关的失败次数累积到一起。
+                s_no_ap_found_count = 0;
+            }
+
             if (s_retry_num < MAX_RETRY_COUNT)
             {
                 // 未超过最大重试次数，继续尝试重连
@@ -599,9 +737,14 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
         // ── 成功获取 IP 地址 ──────────────────────────────────────────────────
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "成功获取 IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGW(TAG, "[DIAG] IP_EVENT_STA_GOT_IP @ %lld us", esp_timer_get_time());
 
         // 连接成功，重置重连计数（下次断线时从 0 开始重新计数）
         s_retry_num = 0;
+        s_no_ap_found_count = 0;
+
+        // 记录本次连接的信道/BSSID，加速下次开机的定向连接（省去全信道扫描）
+        save_ap_channel_hint();
 
         // ── 去抖：网络已恢复，取消"宣告掉线"定时器 ───────────────────────────
         // 若本次断线在去抖窗口内恢复，定时器回调不会执行，WIFI_BIT 从未被清，
@@ -623,9 +766,123 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
             esp_wifi_get_mode(&mode);
             esp_blufi_send_wifi_conn_report(mode, ESP_BLUFI_STA_CONN_SUCCESS, 0, NULL);
         }
+        // 配网真正成功（拿到 IP）→ 解除配网态：此后断线才走运行态重连逻辑。
+        // 也清零配网态计数，保持状态干净。
+        s_is_provisioning = false;
+        s_prov_retry_num = 0;
         if (bsp_board)
             xEventGroupSetBits(bsp_board->board_status, PROV_DONE_BIT);
     }
+}
+
+// ─── save_ap_channel_hint / load_ap_channel_hint ─────────────────────────────
+
+/**
+ * @brief 将当前已连接 AP 的信道 + BSSID 存入 NVS（信道定向连接的加速提示）
+ *
+ * 已配网直连时 esp_wifi 默认逐信道（1~13）扫描寻找目标 AP，实测耗时 ~2.4s。
+ * 存下本次连接成功的信道号和 BSSID，下次启动时填入 wifi_config_t 后，驱动
+ * 只需在该信道定向查找，省去全信道扫描。
+ *
+ * @note 调用者：wifi_ip_event_handler() 的 IP_EVENT_STA_GOT_IP 分支
+ * @note 每次成功连接都刷新一次，而非只存一次：路由器信道可能变化（如自动
+ *       选道重选），需要保持提示信息与实际信道同步。
+ */
+static void save_ap_channel_hint(void)
+{
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK)
+        return;
+
+    nvs_handle_t h;
+    if (nvs_open("net_config", NVS_READWRITE, &h) != ESP_OK)
+        return;
+    nvs_set_u8(h, "wifi_ch", ap_info.primary);
+    nvs_set_blob(h, "wifi_bssid", ap_info.bssid, sizeof(ap_info.bssid));
+    nvs_commit(h);
+    nvs_close(h);
+    ESP_LOGI(TAG, "已记录信道提示：channel=%d，下次连接可跳过全信道扫描", ap_info.primary);
+}
+
+/**
+ * @brief 从 NVS 读取上次记录的信道 + BSSID，填入 STA 配置（连接前调用）
+ *
+ * 若 NVS 中无记录（首次连接、或曾清除过），保持 wifi_config 原样不变，
+ * 驱动退化为默认的全信道扫描 —— 不影响可用性，仅少了加速效果。若信道已
+ * 变化导致定向连接失败，esp_wifi 会自动回退全信道扫描，连上后下次又会
+ * 被 save_ap_channel_hint() 刷新为新信道。
+ *
+ * @note 调用者：bsp_board_wifi_main() 已配网直连分支，在 esp_wifi_start() 之前
+ */
+static void load_ap_channel_hint(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("net_config", NVS_READONLY, &h) != ESP_OK)
+        return;
+
+    uint8_t channel = 0;
+    size_t bssid_len = 6;
+    uint8_t bssid[6] = {0};
+    bool have_channel = (nvs_get_u8(h, "wifi_ch", &channel) == ESP_OK) && channel > 0;
+    bool have_bssid = (nvs_get_blob(h, "wifi_bssid", bssid, &bssid_len) == ESP_OK) && bssid_len == 6;
+    nvs_close(h);
+
+#define DIAG_FORCE_WRONG_CHANNEL 1 // 保留宏定义供下方 bssid_set 清空块复用（SSID 测试不依赖它触发信道错误）
+
+    if (!have_channel)
+        return;
+
+    wifi_config_t cfg = {0};
+    if (esp_wifi_get_config(WIFI_IF_STA, &cfg) != ESP_OK)
+        return;
+    cfg.sta.scan_method = WIFI_FAST_SCAN; // 定向扫描（只扫指定信道，按 SSID 匹配）
+    cfg.sta.channel = channel;            // 记录的信道号
+
+    // ── [DIAG-TEST] 已注释：人为把 SSID 改成不存在名字强制触发 201 的实验代码 ──
+    // 该实验用于验证"连续 2 次 201 才清空信道记忆"的回退逻辑，已完成使命。
+    // 现在要测真实的"密码错误"配网失败：若保留会把 SSID 污染成假名字，逼出的是
+    // reason=201（找不到 AP），而非真正的密码错误码（reason=15 握手超时等），
+    // 会干扰判断。故整块注释。确认稳定后可连同 s_diag_* 变量一并删除。
+    //
+    // #if DIAG_FORCE_WRONG_CHANNEL
+    //     strncpy(s_diag_real_ssid, "TC-BJ", sizeof(s_diag_real_ssid) - 1);
+    //     if (!s_diag_ssid_corrupted)
+    //     {
+    //         strncpy((char *)cfg.sta.ssid, "TC-BJ-NOTEXIST", sizeof(cfg.sta.ssid) - 1);
+    //         s_diag_ssid_corrupted = true;
+    //         ESP_LOGW(TAG, "[DIAG-TEST] 故意把 SSID 改成不存在的 \"%s\"...", cfg.sta.ssid);
+    //     }
+    // #endif
+    //
+    // #if DIAG_FORCE_WRONG_CHANNEL   // 强制清空 bssid_set，不让旧 BSSID 帮驱动纠错
+    //     cfg.sta.bssid_set = false;
+    //     memset(cfg.sta.bssid, 0, sizeof(cfg.sta.bssid));
+    // #endif
+
+    // 不设 bssid_set：只给信道提示，不做 MAC 精确匹配。
+    // 之前 channel+bssid_set 组合在断线重连路径上触发了 esp-idf 驱动的不稳定行为
+    // （实测：连续 4 次 reason=201 NO_AP_FOUND，且日志里未见驱动真正切换信道，
+    // 直到第 5 次耗光重试后才碰巧成功）。只给 channel，匹配逻辑退回按 SSID 找
+    // （和原全信道扫描一致，同名 WiFi 冲突风险不变），只是把扫描范围从 13 个
+    // 信道收窄到 1 个。have_bssid/bssid 变量暂时不再使用，NVS 里继续存着，
+    // 留作后续排查 bssid_set 问题的数据。
+    (void)have_bssid;
+    // ── 诊断日志：写入前打印将要下发的字段，确认 scan_method 是否为默认全扫 ──
+    ESP_LOGW(TAG, "[DIAG] 写入前 cfg: scan_method=%d channel=%d bssid_set=%d bssid=%02X:%02X:%02X:%02X:%02X:%02X ssid=%s",
+             cfg.sta.scan_method, cfg.sta.channel, cfg.sta.bssid_set,
+             cfg.sta.bssid[0], cfg.sta.bssid[1], cfg.sta.bssid[2], cfg.sta.bssid[3], cfg.sta.bssid[4], cfg.sta.bssid[5],
+             cfg.sta.ssid);
+    esp_err_t set_err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    ESP_LOGW(TAG, "[DIAG] esp_wifi_set_config 返回: %s", esp_err_to_name(set_err));
+
+    // 回读校验：确认驱动真的记住了这些字段（而不是被内部逻辑重置）
+    wifi_config_t verify_cfg = {0};
+    if (esp_wifi_get_config(WIFI_IF_STA, &verify_cfg) == ESP_OK)
+    {
+        ESP_LOGW(TAG, "[DIAG] 回读校验 cfg: scan_method=%d channel=%d bssid_set=%d",
+                 verify_cfg.sta.scan_method, verify_cfg.sta.channel, verify_cfg.sta.bssid_set);
+    }
+    ESP_LOGI(TAG, "已加载信道提示：channel=%d，尝试定向连接（连不上会自动回退全信道扫描）", channel);
 }
 
 // ─── bsp_wifi_get_rssi ───────────────────────────────────────────────────────
@@ -846,13 +1103,23 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
     {
         // ════ 已配网分支：直接 STA 连接（不开蓝牙，省内存）══════════════════
         ESP_LOGI(TAG, "设备已配网，直接连接 WiFi...");
+        ESP_LOGW(TAG, "[DIAG] 进入已配网分支 @ %lld us", esp_timer_get_time());
+
+        // 加载上次连接成功的信道/BSSID 提示，让驱动定向连接而非全信道扫描
+        // （实测全信道扫描耗时 ~2.4s；信道若已变化，esp_wifi 会自动回退全扫）
+        load_ap_channel_hint();
+        ESP_LOGW(TAG, "[DIAG] load_ap_channel_hint 返回 @ %lld us", esp_timer_get_time());
+
         // 启动 WiFi 驱动（触发 WIFI_EVENT_STA_START → esp_wifi_connect()）
+        ESP_LOGW(TAG, "[DIAG] 调用 esp_wifi_start() 前 @ %lld us", esp_timer_get_time());
         ESP_ERROR_CHECK(esp_wifi_start());
+        ESP_LOGW(TAG, "[DIAG] esp_wifi_start() 返回 @ %lld us", esp_timer_get_time());
     }
 
     // ── 步骤 8：最终阻塞等待网络就绪或彻底失败 ──────────────────────────────
     // 调用方拿到函数返回即可认为网络状态已确定（要么 WIFI_BIT 置位，要么重启）
     ESP_LOGI(TAG, "等待 WiFi 连接完成...");
+    ESP_LOGW(TAG, "[DIAG] 开始阻塞等待 WIFI_BIT @ %lld us", esp_timer_get_time());
     EventBits_t bits = xEventGroupWaitBits(
         bsp_board->board_status,
         WIFI_BIT | WIFI_FAIL_BIT, // 等待任一位被置位（OR 等待，pdFALSE）

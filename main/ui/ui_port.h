@@ -187,12 +187,44 @@ void ui_dispatch_touch_event(touch_event_t event);
 void ui_request_emotion_gif(const char *gif_path);
 
 /**
+ * @brief 请求把主界面 GIF 切到指定路径（对话状态动作用，跨线程安全，高优先级）
+ *
+ * 与 ui_request_emotion_gif 同机制，唯一区别：标记为「状态切图」（高优先级），
+ * 不会被对话中（s_neutral_active）的「丢弃情绪切图」兜底误伤。供 interaction
+ * worker 执行状态动作时切图调用。
+ * @param gif_path 目标 GIF 路径（NULL/空串忽略）
+ */
+void ui_request_state_gif(const char *gif_path);
+
+/**
  * @brief 情绪播放完毕后恢复主界面自动随机 GIF + 舵机循环（跨线程安全）
  *
  * 由 interaction worker 在情绪播完、清 is_playing 标志后调用。仅设 pending 标记
  * + 唤醒延迟 timer，真正切图在 LVGL 线程执行；内部判 s_view==MAIN，已进功能盘则不恢复。
  */
 void ui_resume_main_gif_loop(void);
+
+/* ═══════════════════════════════════════════════════════════════
+ * 对话状态中性 GIF 接口
+ * ═══════════════════════════════════════════════════════════════ */
+/**
+ * @brief 会话状态对应的中性 GIF 分组（纯视觉，无舵机/震动）
+ */
+typedef enum
+{
+    NEUTRAL_IDLE = 0,  // 待机：恢复主界面自动随机循环
+    NEUTRAL_LISTENING, // 用户说话（监听）
+    NEUTRAL_SPEAKING,  // 大模型说话（TTS 播放）
+} neutral_gif_state_t;
+
+/**
+ * @brief 按会话状态切换中性 GIF（跨线程安全，仅切图、不驱动舵机/震动）
+ *
+ * 由 session 状态机在状态切换点调用。LISTENING/SPEAKING 锁定屏幕在对应状态的
+ * 中性 GIF（期间停掉待机自动循环）；IDLE 恢复主界面自动随机循环。仅在主界面生效。
+ * @param st 目标会话状态
+ */
+void ui_set_neutral_gif_state(neutral_gif_state_t st);
 
 /**
  * @brief 获取当前UI视图状态

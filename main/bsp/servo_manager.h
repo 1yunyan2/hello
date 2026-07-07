@@ -152,6 +152,17 @@ esp_err_t servo_manager_submit_abs_parallel_notify(const servo_abs_parallel_requ
 esp_err_t servo_manager_flush(void);
 
 /**
+ * @brief 查询 servo_manager 是否「真正空闲」（队列空 且 worker 当前无请求在执行/归中）
+ *
+ * 供 standby.c 进二级待机前判断舵机是否已彻底静止：相比「固定延时猜测」，本接口
+ * 直接反映 worker 的真实执行状态，避免归中动作还没走完就被 bsp_servo_idle()
+ * 的 ledc_stop 撞车，产生偶发的「进/退二级瞬间抖一下」。
+ *
+ * @return true 队列空且 worker 空闲，false 仍有请求排队或正在执行（含归中中）
+ */
+bool servo_manager_is_idle(void);
+
+/**
  * @brief 用一个简单的 index（0..N-1）生成一个模式并入队执行。
  *        这个函数用于 UI 以数字索引触发“37 种”或更多组合，内部根据固定规则生成 amplitude/speed/direction。
  * @param channel 通道

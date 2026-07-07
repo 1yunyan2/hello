@@ -16,8 +16,10 @@
 #include "bsp/bsp_board.h"
 #include "iot_servo.h"
 #include <math.h>
-#include <stdatomic.h>       // atomic_bool 打断标志（跨核安全）
-#include "freertos/semphr.h" // 互斥锁，保证多任务调用线程安全
+#include <stdatomic.h>         // atomic_bool 打断标志（跨核安全）
+#include "freertos/FreeRTOS.h" // pdMS_TO_TICKS
+#include "freertos/task.h"     // vTaskDelay（错峰归中用）
+#include "freertos/semphr.h"   // 互斥锁，保证多任务调用线程安全
 #include "bsp/bsp_config.h"
 // 注意：robot_emotion_t 唯一定义在 interaction.h，此处不重复定义。
 // 注意：不 include servo_manager.h，避免与上层形成循环依赖。
@@ -47,7 +49,7 @@ static atomic_bool s_servo_abort = ATOMIC_VAR_INIT(false);
 
 void bsp_servo_request_abort(void)
 {
-    atomic_store(&s_servo_abort, true);
+    atomic_store(&s_servo_abort, true); // 中断标志
 }
 
 void bsp_servo_clear_abort(void)
@@ -321,6 +323,33 @@ void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms)
     xSemaphoreGive(s_ch_mutex[channel]);
 }
 
+/**
+ * @brief 读取指定舵机通道的当前角度（LEDC 寄存器推算值）
+ *
+ * 供上层（如 standby.c 进一级低功耗时）按当前角度动态计算归中所需的
+ * step_ms，使手臂归中总耗时能与熄屏渐变时长对齐。
+ *
+ * @note 线程安全：持该通道互斥锁读取，与 bsp_servo_move_smooth 互斥。
+ */
+bool bsp_servo_read_angle(uint8_t channel, float *out_angle)
+{
+    bsp_board_t *board = bsp_board_get_instance();
+    if (board == NULL || !board->servo_initialized || out_angle == NULL)
+        return false;
+    if (channel >= 3 || s_ch_mutex[channel] == NULL)
+        return false;
+
+    xSemaphoreTake(s_ch_mutex[channel], portMAX_DELAY);
+    float current = 0.0f;
+    esp_err_t err = iot_servo_read_angle(LEDC_LOW_SPEED_MODE, channel, &current);
+    xSemaphoreGive(s_ch_mutex[channel]);
+
+    if (err != ESP_OK)
+        return false;
+    *out_angle = current;
+    return true;
+}
+
 // ==========================================
 // API: 舵机低功耗休眠 / 恢复（供二级待机 standby 使用）
 // ==========================================
@@ -380,27 +409,23 @@ void bsp_servo_resume(void)
     if (board == NULL || !board->servo_initialized)
         return;
 
-    // 步骤 1：先直接写一次 90° 重启 PWM 输出。
-    // ★必要性：通道被 ledc_stop 后，bsp_servo_move_smooth 的“读当前角度→死区过滤”
-    //   逻辑可能因读到异常/恰好≈90 而直接跳过，导致 PWM 没被重新点亮。这里加锁后
-    //   用 iot_servo_write_angle 强制重置 duty，确保三路 PWM 真正恢复输出。
+    // ★错峰归中（问题2 电源半根因修复）：三路【逐个】慢速归中，路与路之间隔 200ms。
+    //   原实现先三路同时 iot_servo_write_angle(90°) 瞬时跳变，再走 move_smooth（此时寄存器
+    //   已是 90°，走死区直接返回=没有平滑）。三舵机从失力松弛位【同时】瞬跳 90° 的堵转电流
+    //   叠加背光渐亮，锂电池瞬时压降 → 舵机欠压失步/卡死（"退二级三舵机卡死"，仅电池出现）。
+    //   改为逐路平滑归中 + 200ms 错峰后，任一时刻只有一路在动，电流尖峰被摊平。
+    //   bsp_servo_move_smooth 内部读当前角度→逐度插值写 duty，会自动重启被 ledc_stop 的 PWM
+    //   （write_angle 内部 set_duty+update_duty），无需再单独瞬跳一次。
+    //   ★注意 ledc_stop(...,0) 后 duty 寄存器状态不保证保留，故不依赖"写回读回的当前角度"，
+    //     直接慢速去 90°（本就是归中目标）即可。
     const uint8_t chs[3] = {CH_HEAD, CH_L_ARM, CH_R_ARM};
     for (int i = 0; i < 3; i++)
     {
-        uint8_t ch = chs[i];
-        if (s_ch_mutex[ch] == NULL)
-            continue;
-        xSemaphoreTake(s_ch_mutex[ch], portMAX_DELAY);
-        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, ch, 90.0f);
-        xSemaphoreGive(s_ch_mutex[ch]);
+        bsp_servo_move_smooth(chs[i], 90.0f, SERVO_SPEED_SLOW); // 逐路慢速平滑归中（自带每通道锁）
+        if (i < 2)
+            vTaskDelay(pdMS_TO_TICKS(200)); // 路间错峰 200ms，摊平瞬时电流尖峰（占位经验值，可据实测调）
     }
-
-    // 步骤 2：再走一次慢速归中做对齐（此时已在 90° 附近，move_smooth 多为死区直接返回，
-    //         保留此步是为了与其它路径“运动后归中”的习惯一致，且无副作用）。
-    bsp_servo_move_smooth(CH_HEAD, 90.0f, SERVO_SPEED_SLOW);
-    bsp_servo_move_smooth(CH_L_ARM, 90.0f, SERVO_SPEED_SLOW);
-    bsp_servo_move_smooth(CH_R_ARM, 90.0f, SERVO_SPEED_SLOW);
-    ESP_LOGI(TAG, "舵机已从低功耗休眠恢复并归中");
+    ESP_LOGI(TAG, "舵机已从低功耗休眠错峰恢复并归中");
 }
 
 // ==========================================

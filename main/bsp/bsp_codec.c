@@ -11,9 +11,16 @@ static const char *TAG = "BSP_CODEC";
 // 音量持久化用的 NVS 命名空间与键名（与 mqtt_creds 同款 NVS 用法）
 #define AUDIO_CFG_NVS_NS "audio_cfg" // 音频配置命名空间
 #define AUDIO_CFG_KEY_VOL "out_vol"  // 扬声器输出音量键（int32，0~100）
-#define BSP_CODEC_DEFAULT_VOLUME 50  // 默认扬声器音量（NVS 未配置时使用）
+
+#define BSP_CODEC_DEFAULT_VOLUME 50 // 默认扬声器音量（NVS 未配置时使用）
 #define MAX_VOLUME 100
 #define MIN_VOLUME 0
+
+// 低功耗（一级待机）期间的固定压低音量（宏定义，不写 NVS，与用户设置的音量独立）
+#define BSP_CODEC_LOWPOWER_VOLUME 10
+// 低功耗音量线性渐变总耗时 500ms，与 LCD 亮度渐变（bsp_lcd.c，800ms）各自独立配置
+#define BSP_CODEC_LOWPOWER_FADE_MS 500
+#define BSP_CODEC_LOWPOWER_FADE_STEPS 10 // 步数，每步间隔 = FADE_MS/STEPS = 50ms
 
 // ── 防爆音（Anti-Pop）软启动参数 ─────────────────────────────────────────────
 // 背景：本板 NS4150 功放的 CTRL 脚仅由 R13 上拉常开，MCU 无法控制功放开关，
@@ -441,6 +448,134 @@ esp_err_t bsp_board_codec_set_volume(int volume)
     }
 
     return ESP_OK;
+}
+
+/**
+ * @brief 进入低功耗：音量从当前值线性渐变压低到 BSP_CODEC_LOWPOWER_VOLUME（不写 NVS）
+ *
+ * 见 bsp_board.h 接口说明。分 BSP_CODEC_LOWPOWER_FADE_STEPS 步、每步间隔
+ * BSP_CODEC_LOWPOWER_FADE_MS/STEPS 毫秒线性下降，总耗时 BSP_CODEC_LOWPOWER_FADE_MS。
+ * 全程直接调 esp_codec_dev_set_out_vol，跳过 bsp_board_codec_set_volume() 的
+ * NVS 写入，避免把渐变中间值/最终低音量误持久化，覆盖用户/MQTT 设置的音量。
+ *
+ * @note 阻塞：本函数会 vTaskDelay 直到渐变完成（约 BSP_CODEC_LOWPOWER_FADE_MS），
+ *       调用者须能接受此阻塞（当前设计为 standby_task 自身低优先级任务内调用）。
+ */
+void bsp_board_codec_enter_lowpower(void)
+{
+    bsp_board_t *bsp_board = bsp_board_get_instance();
+    if (bsp_board == NULL || bsp_board->codec_dev == NULL)
+        return; // 未就绪：静默返回，不影响待机流程
+
+    // 当前音量作为渐变起点：读 NVS（用户/MQTT 最后设定值），无记录则用默认音量。
+    int from_vol = BSP_CODEC_DEFAULT_VOLUME;
+    nvs_handle_t nvs;
+    if (nvs_open(AUDIO_CFG_NVS_NS, NVS_READONLY, &nvs) == ESP_OK)
+    {
+        int32_t saved_vol = 0;
+        if (nvs_get_i32(nvs, AUDIO_CFG_KEY_VOL, &saved_vol) == ESP_OK)
+            from_vol = (int)saved_vol;
+        nvs_close(nvs);
+    }
+
+    const int to_vol = BSP_CODEC_LOWPOWER_VOLUME;
+    const uint32_t step_ms = BSP_CODEC_LOWPOWER_FADE_MS / BSP_CODEC_LOWPOWER_FADE_STEPS;
+    for (int s = 1; s <= BSP_CODEC_LOWPOWER_FADE_STEPS; s++)
+    {
+        int vol = from_vol + (to_vol - from_vol) * s / BSP_CODEC_LOWPOWER_FADE_STEPS;
+        esp_codec_dev_set_out_vol(bsp_board->codec_dev, vol);
+        vTaskDelay(pdMS_TO_TICKS(step_ms));
+    }
+    esp_codec_dev_set_out_vol(bsp_board->codec_dev, to_vol); // 兜底精确落点
+    ESP_LOGI(TAG, "低功耗：音量线性渐变 %d→%d（%dms，NVS 保存值不变）", from_vol, to_vol, BSP_CODEC_LOWPOWER_FADE_MS);
+}
+
+/**
+ * @brief 退出低功耗：音量从 BSP_CODEC_LOWPOWER_VOLUME 线性渐变恢复到 NVS 保存值
+ *
+ * 见 bsp_board.h 接口说明。渐变参数与 enter 对称（同样 FADE_MS/FADE_STEPS）。
+ * 读法与 audio_init() 的初始音量读取一致：NVS 无记录（从未设置过）则回退到
+ * BSP_CODEC_DEFAULT_VOLUME。全程不重新写 NVS。
+ *
+ * @note 阻塞：约 BSP_CODEC_LOWPOWER_FADE_MS，同上，须在能接受阻塞的任务中调用。
+ */
+void bsp_board_codec_exit_lowpower(void)
+{
+    bsp_board_t *bsp_board = bsp_board_get_instance();
+    if (bsp_board == NULL || bsp_board->codec_dev == NULL)
+        return;
+
+    int to_vol = BSP_CODEC_DEFAULT_VOLUME;
+    nvs_handle_t nvs;
+    if (nvs_open(AUDIO_CFG_NVS_NS, NVS_READONLY, &nvs) == ESP_OK)
+    {
+        int32_t saved_vol = 0;
+        if (nvs_get_i32(nvs, AUDIO_CFG_KEY_VOL, &saved_vol) == ESP_OK)
+            to_vol = (int)saved_vol;
+        nvs_close(nvs);
+    }
+
+    const int from_vol = BSP_CODEC_LOWPOWER_VOLUME;
+    const uint32_t step_ms = BSP_CODEC_LOWPOWER_FADE_MS / BSP_CODEC_LOWPOWER_FADE_STEPS;
+    for (int s = 1; s <= BSP_CODEC_LOWPOWER_FADE_STEPS; s++)
+    {
+        int vol = from_vol + (to_vol - from_vol) * s / BSP_CODEC_LOWPOWER_FADE_STEPS;
+        esp_codec_dev_set_out_vol(bsp_board->codec_dev, vol);
+        vTaskDelay(pdMS_TO_TICKS(step_ms));
+    }
+    esp_codec_dev_set_out_vol(bsp_board->codec_dev, to_vol); // 兜底精确落点（读自 NVS）
+    ESP_LOGI(TAG, "退出低功耗：音量线性渐变 %d→%d（%dms，读自 NVS）", from_vol, to_vol, BSP_CODEC_LOWPOWER_FADE_MS);
+}
+
+/**
+ * @brief 读取「退出低功耗应恢复到的音量」（即 NVS 保存值，无记录则默认音量）
+ *
+ * 纯读取，不设置任何音量。供不能阻塞的调用方（standby_wake() 可能被触摸/MQTT
+ * 任务同步调用）在退出低功耗时先取到目标值，交给 bsp_board_codec_fade_step()
+ * 在轮询任务中非阻塞推进。
+ */
+int bsp_board_codec_get_restore_volume(void)
+{
+    int restore_vol = BSP_CODEC_DEFAULT_VOLUME;
+    nvs_handle_t nvs;
+    if (nvs_open(AUDIO_CFG_NVS_NS, NVS_READONLY, &nvs) == ESP_OK)
+    {
+        int32_t saved_vol = 0;
+        if (nvs_get_i32(nvs, AUDIO_CFG_KEY_VOL, &saved_vol) == ESP_OK)
+            restore_vol = (int)saved_vol;
+        nvs_close(nvs);
+    }
+    return restore_vol;
+}
+
+/**
+ * @brief 音量渐变——非阻塞单步版（按已过时间算当前应有音量并设置一次）
+ *
+ * 与 bsp_board_codec_enter_lowpower()（阻塞版）配套：供不能阻塞的调用方使用，
+ * 全程直接调 esp_codec_dev_set_out_vol，不写 NVS（临时值不应持久化）。
+ *
+ * @param from_vol   起始音量 0~100
+ * @param to_vol     目标音量 0~100
+ * @param elapsed_ms 距渐变开始已过的毫秒数
+ * @param total_ms   渐变总耗时（毫秒）
+ * @return true=渐变已到达终点（已设为 to_vol），false=尚在进行中
+ * @note 非阻塞，无 vTaskDelay，可在任意任务的轮询循环中调用。
+ * @note 调用者：standby.c standby_task（一级待机退出时的非阻塞音量渐变）
+ */
+bool bsp_board_codec_fade_step(int from_vol, int to_vol, uint32_t elapsed_ms, uint32_t total_ms)
+{
+    bsp_board_t *bsp_board = bsp_board_get_instance();
+    if (bsp_board == NULL || bsp_board->codec_dev == NULL)
+        return true; // 未就绪：视为已完成，避免调用方无限等待
+
+    if (total_ms == 0 || elapsed_ms >= total_ms)
+    {
+        esp_codec_dev_set_out_vol(bsp_board->codec_dev, to_vol);
+        return true;
+    }
+    int vol = from_vol + (to_vol - from_vol) * (int)elapsed_ms / (int)total_ms;
+    esp_codec_dev_set_out_vol(bsp_board->codec_dev, vol);
+    return false;
 }
 
 /**

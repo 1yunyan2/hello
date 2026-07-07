@@ -59,6 +59,16 @@ static bool s_inited = false;        // 初始化状态标志
 // 在下一个循环边界 break 跳出；worker 归中后清回 false。atomic 保证跨核可见（plan R2）。
 static atomic_bool s_flush_req = ATOMIC_VAR_INIT(false);
 
+// ★worker「真正空闲」标志（供 standby.c 进二级前判断舵机是否已彻底静止，见 servo_manager_is_idle）。
+//   根因：旧实现里 standby.c 只查 interaction_is_playing()==false + 固定等 200ms 就认为舵机
+//   已静止，但 servo_manager worker 的归中动作（bsp_servo_move_all_parallel 90/90/90）是在本
+//   worker 任务里异步执行的，耗时取决于归中前的角度偏移，200ms 不一定够。一旦 standby.c 在
+//   worker 仍在写 iot_servo_write_angle 时就调 bsp_servo_idle()（ledc_stop），两者对同一 LEDC
+//   通道竞争写，会造成偶发的「进/退二级瞬间抖一下」（概率性，取决于是否撞上这个窗口）。
+//   本标志在 worker 取出请求开始执行时置 true，执行完（含归中）后置 false，队列为空且本标志
+//   为 false 才是「真空闲」，比固定延时可靠。
+static atomic_bool s_worker_busy = ATOMIC_VAR_INIT(false);
+
 /* 内部：将方向与幅度转换为目标角（正负号依据 bsp 语义：head left = +） */
 static inline float calc_target_angle(servo_direction_t dir, servo_amplitude_t amp)
 {
@@ -236,6 +246,7 @@ static void servo_worker_task(void *arg)
         if (xQueueReceive(s_queue, &item, portMAX_DELAY) == pdTRUE)
         {
             bool aborted = false;
+            atomic_store(&s_worker_busy, true); // 开始执行（含随后可能的归中），标记「忙」
 
             // ★ 取出新请求、开始执行前清两个打断标志：避免「flush 时队列空、worker 阻塞
             //   在 xQueueReceive，没有正在执行的请求可打断 → 标志悬留为 true →
@@ -272,6 +283,8 @@ static void servo_worker_task(void *arg)
             // 无论正常完成还是被打断都 give，防止调用方永久阻塞（plan R4）。
             if (item.done != NULL)
                 xSemaphoreGive(item.done);
+
+            atomic_store(&s_worker_busy, false); // 本条请求（含归中）已彻底执行完毕，真正空闲
         }
     }
 }
@@ -388,12 +401,23 @@ esp_err_t servo_manager_submit_abs_parallel_notify(const servo_abs_parallel_requ
 esp_err_t servo_manager_flush(void)
 {
     if (!s_inited)
-        return ESP_ERR_INVALID_STATE;
+        return ESP_ERR_INVALID_STATE; // 初始化无效
     atomic_store(&s_flush_req, true); // 通知 servo_exec 外层循环在轮边界跳出
     bsp_servo_request_abort();        // ★ 通知 bsp 插值步循环立即停（几十 ms 内），不等整轮
     xQueueReset(s_queue);             // 清掉所有未执行请求
     // ESP_LOGI(TAG, "servo flush：清队 + 立即打断当前插值，舵机归中");
     return ESP_OK;
+}
+
+bool servo_manager_is_idle(void)
+{
+    if (!s_inited || s_queue == NULL)
+        return true;
+    // 队列为空 且 worker 当前没有正在执行的请求（含归中），才是真正静止。
+    // uxQueueMessagesWaiting 与 s_worker_busy 分属两个状态源，理论上有极小窗口
+    // （worker 刚 xQueueReceive 取走一条、s_worker_busy 还没来得及置 true），
+    // 但调用方（standby.c）本身是轮询等待，下一拍会再次确认，不影响正确性。
+    return (uxQueueMessagesWaiting(s_queue) == 0) && !atomic_load(&s_worker_busy);
 }
 
 /*预留接口，按 index 生成模式并提交 - 通过索引触发预设组合，适用于 UI 场景

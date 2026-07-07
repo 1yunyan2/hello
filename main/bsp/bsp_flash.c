@@ -35,7 +35,7 @@ static wl_handle_t s_wl_handle = WL_INVALID_HANDLE;
 // 用法：电脑先跑 3.py（它会等设备），再按板子 RST，窗口内即可握手重烧。
 // 设为 0 可彻底关闭本窗口、恢复纯零延迟启动（届时已烧板将无法再重烧）。
 // 取 3s 是为给 PC 端 3.py（连接后约 1.5s 才开始读）留足握手余量。
-#define BURN_FORCE_WINDOW_MS 100 //! 烧录模式需要，运行模式不需要
+#define BURN_FORCE_WINDOW_MS 10 //! 烧录模式需要，运行模式不需要
 
 // 擦除进度上报:esp_flash_erase_region 是单次原子操作(芯片擦除指令 0xC7),
 // 无法实时拿真实进度,只能按经验值线性估算百分比 —— 真擦完时会强制跳到 100%。

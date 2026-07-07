@@ -242,6 +242,51 @@ void audio_feed_task(void *arg);
  */
 esp_err_t bsp_board_codec_set_volume(int volume);
 
+/**
+ * @brief 进入低功耗：把扬声器音量临时压到固定低音量（不影响 NVS 持久化值）
+ *
+ * 与 bsp_board_codec_set_volume() 的区别：本函数【不写 NVS】，只是临时调低运行期
+ * 音量，避免低功耗期间的提示音/离线音频音量过大打扰。用户此前通过 MQTT/本地设置的
+ * 音量（NVS "audio_cfg/out_vol"）保持不变，供 bsp_board_codec_exit_lowpower() 读回恢复。
+ *
+ * @note 幂等：codec_dev 未就绪时静默返回，不报错。
+ * @note 调用者：standby.c enter_standby()（进一级低功耗时）
+ */
+void bsp_board_codec_enter_lowpower(void);
+
+/**
+ * @brief 退出低功耗：把扬声器音量恢复为用户此前设置的值（读 NVS，不重新写 NVS）
+ *
+ * 阻塞版：分步线性渐变直到完成再返回，仅供能接受阻塞的调用方使用
+ * （standby_wake() 可能被触摸/MQTT 任务同步调用，不能用此版本——见下方非阻塞两件套）。
+ *
+ * @note 幂等：codec_dev 未就绪时静默返回。
+ */
+void bsp_board_codec_exit_lowpower(void);
+
+/**
+ * @brief 读取「退出低功耗应恢复到的音量」（NVS 保存值，无记录则默认音量），纯读取不设置
+ * @return 目标音量 0~100
+ * @note 调用者：standby.c standby_wake()（退出一级低功耗时取目标值，交给下面的 fade_step 推进）
+ */
+int bsp_board_codec_get_restore_volume(void);
+
+/**
+ * @brief 音量渐变——非阻塞单步版（按已过时间设置一次目标音量，不写 NVS）
+ *
+ * 供不能阻塞的调用方使用：调用方记录渐变起始时间戳，在自己的轮询循环里每 tick
+ * 传入已过时间调用本函数，真正的分步设置在内部完成，不产生 vTaskDelay。
+ *
+ * @param from_vol   起始音量 0~100
+ * @param to_vol     目标音量 0~100
+ * @param elapsed_ms 距渐变开始已过的毫秒数
+ * @param total_ms   渐变总耗时（毫秒）
+ * @return true=已到达终点（本次已设为 to_vol），false=仍在渐变中
+ * @note 非阻塞，可在任意任务的轮询循环中调用；不写 NVS。
+ * @note 调用者：standby.c standby_task（一级待机退出时的非阻塞音量渐变）
+ */
+bool bsp_board_codec_fade_step(int from_vol, int to_vol, uint32_t elapsed_ms, uint32_t total_ms);
+
 // ─── 公开 API：音频初始化 ─────────────────────────────────────────────────────
 
 void bsp_board_lcd_init(bsp_board_t *bsp_board);
@@ -269,6 +314,29 @@ void bsp_board_lcd_on(bsp_board_t *bsp_board);
 void bsp_board_lcd_off(bsp_board_t *bsp_board);
 
 /**
+ * @brief 仅关闭显示控制器输出（DISPOFF），不碰背光 PWM
+ *
+ * 配合 bsp_board_lcd_fade_brightness() 实现二级待机「背光先线性渐暗到 0 →
+ * 再关显示控制器」，避免 bsp_board_lcd_off() 背光直接跳变到 0 的生硬观感。
+ *
+ * @param bsp_board BSP 实例指针
+ * @note 调用者：standby.c enter_deep_standby()（二级待机线性关屏）
+ */
+void bsp_board_lcd_disp_off(bsp_board_t *bsp_board);
+
+/**
+ * @brief 仅打开显示控制器输出（DISPON），不碰背光 PWM
+ *
+ * 配合 bsp_board_lcd_fade_brightness() 实现二级待机退出「先开显示控制器
+ * （此时背光仍是0，不可见）→ 再背光线性渐亮到 100%」，避免 bsp_board_lcd_on()
+ * 背光直接跳变到 100% 的生硬观感。
+ *
+ * @param bsp_board BSP 实例指针
+ * @note 调用者：standby.c standby_wake()（二级待机线性开屏）
+ */
+void bsp_board_lcd_disp_on(bsp_board_t *bsp_board);
+
+/**
  * @brief 设置 LCD 背光亮度（LEDC PWM 调光，0~100%）
  *
  * 背光由 LEDC PWM 驱动，可在运行时无级调节亮度。0=熄灭，100=最亮。
@@ -279,6 +347,37 @@ void bsp_board_lcd_off(bsp_board_t *bsp_board);
  * @note 前置条件：bsp_board_lcd_init() 已完成 LEDC 配置
  */
 void bsp_board_lcd_set_brightness(uint8_t percent);
+
+/**
+ * @brief 背光亮度线性渐变（阻塞，从 from_pct 渐变到 to_pct）
+ *
+ * 分步线性过渡，避免瞬间跳变的生硬观感。总耗时由 bsp_lcd.c 内部宏
+ * BSP_LCD_BK_FADE_MS 控制（当前 800ms）。
+ *
+ * @param from_pct 起始亮度百分比 0~100
+ * @param to_pct   目标亮度百分比 0~100
+ * @note 阻塞：调用期间会 vTaskDelay 约 BSP_LCD_BK_FADE_MS，仅供能接受阻塞的
+ *       任务调用（当前设计为 standby_task 自身低优先级任务）。
+ * @note 调用者：standby.c enter_standby()/standby_wake()（一级待机降/恢复亮度）
+ */
+void bsp_board_lcd_fade_brightness(uint8_t from_pct, uint8_t to_pct);
+
+/**
+ * @brief 背光亮度渐变——非阻塞单步版（按已过时间设置一次目标亮度）
+ *
+ * 供不能阻塞的调用方使用（如 standby_wake() 可能被触摸/MQTT任务同步调用）：
+ * 调用方只需记录渐变起始时间戳，在自己的轮询循环里每 tick 传入已过时间调用本函数，
+ * 真正的分步设置在本函数内部完成，不产生 vTaskDelay。
+ *
+ * @param from_pct   起始亮度百分比 0~100
+ * @param to_pct     目标亮度百分比 0~100
+ * @param elapsed_ms 距渐变开始已过的毫秒数
+ * @param total_ms   渐变总耗时（毫秒）
+ * @return true=已到达终点（本次已设为 to_pct），false=仍在渐变中
+ * @note 非阻塞，可在任意任务的轮询循环中调用。
+ * @note 调用者：standby.c standby_task（一级待机退出时的非阻塞亮度渐变）
+ */
+bool bsp_board_lcd_fade_step(uint8_t from_pct, uint8_t to_pct, uint32_t elapsed_ms, uint32_t total_ms);
 
 // ========== 3. 在 API 声明区添加 ==========
 /**
@@ -294,6 +393,16 @@ void bsp_board_servo_init(bsp_board_t *bsp_board);
  * @param step_ms   步进延时，数值越大动作越慢 (推荐使用 SERVO_SPEED_xxx 宏)
  */
 void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms);
+
+/**
+ * @brief 读取指定舵机通道的当前角度（LEDC 寄存器推算值，非物理传感器反馈）
+ *
+ * @param channel  舵机通道 (CH_HEAD, CH_L_ARM, CH_R_ARM)
+ * @param out_angle 输出参数：当前角度（度）
+ * @return true 读取成功，false 未就绪/通道无效/读取失败（out_angle 不会被修改）
+ * @note 调用者：standby.c enter_standby()（按当前角度动态计算归中速度，与熄屏时长对齐）
+ */
+bool bsp_servo_read_angle(uint8_t channel, float *out_angle);
 
 /**
  * @brief 三轴舵机同时平滑运动到各自目标（并行插值，不割裂）

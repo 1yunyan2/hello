@@ -208,7 +208,12 @@
 #define BSP_LCD_BK_LEDC_RES LEDC_TIMER_10_BIT ///< 10 位分辨率（占空范围 0~1023，与舵机一致）
 #define BSP_LCD_BK_DUTY_MAX 1023              ///< 10 位满占空（对应 100% 亮度）
 #define BSP_LCD_BK_DEFAULT_PCT 100            ///< 正常点亮亮度（%）
-#define BSP_LCD_BK_STANDBY_PCT 20             ///< 待机模式亮度（%）
+#define BSP_LCD_BK_STANDBY_PCT 10             ///< 待机模式亮度（%）
+
+// ★进入一级低功耗的「过渡总时长」：熄屏亮度渐变（bsp_lcd.c）与手臂归中动态调速
+//   （standby.c enter_standby）共用此值，确保手臂归中和屏幕变暗同时完成。
+//   两处均引用本宏，不要各自定义独立时长，否则会失去同步意义。
+#define BSP_STANDBY_ENTER_TRANSITION_MS 2000U
 
 // 注意：以下 WIDTH/HEIGHT 是 **LVGL 逻辑分辨率（旋转后视角）**，不是 P3 物理分辨率。
 // P3 屏物理为 240×320 竖屏，UI 通过 LVGL swap_xy=true 旋转为 320×240 横屏显示。
@@ -328,9 +333,9 @@
 //
 // 触发策略：锂电池接近 3.3V 已近放空，为避免舵机/扬声器瞬时负载压降误关，要求滤波后
 // 的 OCV 连续多次（BSP_BAT_POWEROFF_HIT_CNT）低于阈值才执行关机。
-#define BSP_BAT_POWEROFF_ENABLE 1  ///< 1=启用低电自动关机，0=仅告警不关机（便于调试时关掉）
-#define BSP_BAT_POWEROFF_MV 3300   ///< 低电关机阈值（mV）：OCV≤此值即视为放空，对应 0% 电量
-#define BSP_BAT_POWEROFF_HIT_CNT 5 ///< 连续命中次数：OCV 连续这么多次低于阈值才真正关机，滤掉瞬时尖峰
+#define BSP_BAT_POWEROFF_ENABLE 1                              ///< 1=启用低电自动关机，0=仅告警不关机（便于调试时关掉）
+#define BSP_BAT_POWEROFF_MV 3300                               ///< 低电关机阈值（mV）：OCV≤此值即视为放空，对应 0% 电量
+#define BSP_BAT_POWEROFF_HIT_CNT 5                             ///< 连续命中次数：OCV 连续这么多次低于阈值才真正关机，滤掉瞬时尖峰
 #define BSP_PWR_OFF_ASSERT_LEVEL 1                             ///< 关机脉冲的“高”电平（先驱动此电平建立干净高）
 #define BSP_PWR_OFF_DEASSERT_LEVEL (!BSP_PWR_OFF_ASSERT_LEVEL) ///< 关机脉冲随后回落并保持的“低”电平（下降沿触发 HK015T 断电）
 #define BSP_PWR_OFF_PULSE_MS 300                               ///< 关机脉冲高电平保持时长（ms）：建立干净高后再拉低造下降沿

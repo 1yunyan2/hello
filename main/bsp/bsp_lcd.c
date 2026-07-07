@@ -43,6 +43,70 @@ void bsp_board_lcd_set_brightness(uint8_t percent)
     bsp_lcd_bk_set_percent(percent);
 }
 
+// 背光线性渐变总耗时：与手臂归中动态调速共用 BSP_STANDBY_ENTER_TRANSITION_MS（bsp_config.h），
+// 确保 enter_standby() 时熄屏和手臂归中同时完成，不要改成独立数值。
+#define BSP_LCD_BK_FADE_MS BSP_STANDBY_ENTER_TRANSITION_MS
+#define BSP_LCD_BK_FADE_STEPS 16 // 步数，每步间隔 = FADE_MS/STEPS
+
+/**
+ * @brief 背光亮度线性渐变（阻塞，供待机模块进/退一级低功耗调用）
+ *
+ * 从 from_pct 线性渐变到 to_pct，分 BSP_LCD_BK_FADE_STEPS 步、每步间隔
+ * BSP_LCD_BK_FADE_MS/FADE_STEPS 毫秒，总耗时 BSP_LCD_BK_FADE_MS，避免瞬间跳变。
+ *
+ * @param from_pct 起始亮度百分比 0~100
+ * @param to_pct   目标亮度百分比 0~100
+ * @note 阻塞：本函数会 vTaskDelay 直到渐变完成（约 BSP_LCD_BK_FADE_MS），
+ *       调用者须能接受此阻塞（当前设计为 standby_task 自身低优先级任务内调用）。
+ */
+void bsp_board_lcd_fade_brightness(uint8_t from_pct, uint8_t to_pct)
+{
+    if (from_pct > 100)
+        from_pct = 100;
+    if (to_pct > 100)
+        to_pct = 100;
+
+    const uint32_t step_ms = BSP_LCD_BK_FADE_MS / BSP_LCD_BK_FADE_STEPS;
+    for (int s = 1; s <= BSP_LCD_BK_FADE_STEPS; s++)
+    {
+        int pct = (int)from_pct + ((int)to_pct - (int)from_pct) * s / BSP_LCD_BK_FADE_STEPS;
+        bsp_lcd_bk_set_percent((uint8_t)pct);
+        vTaskDelay(pdMS_TO_TICKS(step_ms));
+    }
+    bsp_lcd_bk_set_percent(to_pct); // 兜底精确落点
+}
+
+/**
+ * @brief 背光亮度渐变——非阻塞单步版（按已过时间算当前应有亮度并设置一次）
+ *
+ * 与 bsp_board_lcd_fade_brightness()（阻塞版）配套：供不能阻塞的调用方
+ * （如 standby_wake() 可能被触摸/MQTT任务同步调用）使用——只置标志记录起点，
+ * 真正的渐变推进交给低优先级轮询任务（standby_task）每 tick 调本函数一次。
+ *
+ * @param from_pct    起始亮度百分比 0~100
+ * @param to_pct      目标亮度百分比 0~100
+ * @param elapsed_ms  距渐变开始已过的毫秒数
+ * @param total_ms    渐变总耗时（毫秒），通常传 BSP_LCD_BK_FADE_MS 的调用方常量
+ * @return true=渐变已到达终点（elapsed_ms >= total_ms，已设为 to_pct），false=尚在进行中
+ * @note 非阻塞，无 vTaskDelay，可在任意任务的轮询循环中调用。
+ */
+bool bsp_board_lcd_fade_step(uint8_t from_pct, uint8_t to_pct, uint32_t elapsed_ms, uint32_t total_ms)
+{
+    if (from_pct > 100)
+        from_pct = 100;
+    if (to_pct > 100)
+        to_pct = 100;
+
+    if (total_ms == 0 || elapsed_ms >= total_ms)
+    {
+        bsp_lcd_bk_set_percent(to_pct);
+        return true;
+    }
+    int pct = (int)from_pct + ((int)to_pct - (int)from_pct) * (int)elapsed_ms / (int)total_ms;
+    bsp_lcd_bk_set_percent((uint8_t)pct);
+    return false;
+}
+
 /**
  * @brief 初始化 LCD 显示屏（ST7789，240×320，RGB565）
  *
@@ -196,4 +260,18 @@ void bsp_board_lcd_off(bsp_board_t *bsp_board)
     // 先关背光（用户立即看不到画面），再关显示控制器
     bsp_lcd_bk_set_percent(0);                                               // 关闭背光（PWM 占空比 0）
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(bsp_board->lcd_panel, false)); // 关闭显示
+}
+
+void bsp_board_lcd_disp_off(bsp_board_t *bsp_board)
+{
+    // 只关显示控制器，背光不动（调用方应已通过 bsp_board_lcd_fade_brightness
+    // 把背光线性渐暗到 0，此时关显示不会有可见跳变）
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(bsp_board->lcd_panel, false));
+}
+
+void bsp_board_lcd_disp_on(bsp_board_t *bsp_board)
+{
+    // 只开显示控制器，背光不动（此刻背光仍为 0，调用方随后应用
+    // bsp_board_lcd_fade_brightness 把背光线性渐亮，不会有可见跳变）
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(bsp_board->lcd_panel, true));
 }
