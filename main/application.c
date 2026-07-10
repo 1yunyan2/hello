@@ -20,6 +20,7 @@
  */
 
 #include "bsp/bsp_board.h"
+#include "object.h" // PRINT_TASK_CREATED：任务创建后打印栈+堆
 #include "protocol/mqtt_protocol.h"
 #include "wake_word/custom_wake_word.h"
 #include "application.h"
@@ -38,6 +39,37 @@
 #include "ui/cry_anim_test.h" /* 临时测试：哭泣手绘动画 */
 #include "esp_lvgl_port.h"
 #define TAG "Application"
+
+/**
+ * @brief 打印当前内部 SRAM 剩余空间，并自动算出"相对上一个打点消耗了多少"
+ *
+ * 用法：PRINT_INTERNAL_HEAP_STEP("步骤名")，紧跟在每个 init 调用之后。
+ * 靠 static 变量记住上一次的剩余值，第一次调用没有基准，只打印当前值。
+ * 谁消耗大，打印里会直接标红（Wxxx 级别日志）以便一眼看出。
+ */
+#define PRINT_INTERNAL_HEAP_STEP(step_name)                                            \
+    do                                                                                 \
+    {                                                                                  \
+        static uint32_t s_last_internal_free = 0;                                      \
+        static bool s_has_last = false;                                                \
+        uint32_t now_free = (uint32_t)esp_get_free_internal_heap_size();               \
+        if (!s_has_last)                                                               \
+        {                                                                              \
+            ESP_LOGI(TAG, "[heap] %-24s internal free: %lu B", (step_name), now_free); \
+        }                                                                              \
+        else                                                                           \
+        {                                                                              \
+            int32_t used = (int32_t)s_last_internal_free - (int32_t)now_free;          \
+            if (used >= 2048)                                                          \
+                ESP_LOGW(TAG, "[heap] %-24s internal free: %lu B（本步消耗 %ld B）★",  \
+                         (step_name), now_free, (long)used);                           \
+            else                                                                       \
+                ESP_LOGI(TAG, "[heap] %-24s internal free: %lu B（本步消耗 %ld B）",   \
+                         (step_name), now_free, (long)used);                           \
+        }                                                                              \
+        s_last_internal_free = now_free;                                               \
+        s_has_last = true;                                                             \
+    } while (0)
 
 /** @brief 打印当前内部 SRAM 剩余空间（追踪初始化内存消耗） */
 #define PRINT_INTERNAL_HEAP \
@@ -300,7 +332,7 @@ void application_init(void)
     ESP_ERROR_CHECK(gpio_config(&io_conf_g14));
     gpio_set_level(GPIO_NUM_14, 0); // 主动输出 0V，停止舵机误抖动
     bsp_flash_init();
-    PRINT_INTERNAL_HEAP;
+    PRINT_INTERNAL_HEAP_STEP("bsp_flash_init");
     debug_root_files();
     scan_production_assets("/S"); // 扫描 /S 目录下的所有资源
     if (access("/S/assets/gif/one.gif", F_OK) == 0)
@@ -312,51 +344,50 @@ void application_init(void)
 
     /* ── 步骤 2: NVS Flash ─────────────────────────────────────────────────── */
     bsp_board_nvs_init(bsp_board);
-    PRINT_INTERNAL_HEAP;
+    PRINT_INTERNAL_HEAP_STEP("bsp_board_nvs_init");
 
-    /* ── 步骤 2.5: LCD + UI 初始化（必须早于 WiFi/配网）─────────────────────
-     * WiFi 步骤里若未配网会调 ui_show_qrcode 显示配网二维码，而该函数内部用
-     * lvgl_port_lock，要求 LVGL 已经 init。故 LCD/UI 必须先于 bsp_board_wifi_main
-     * 初始化，否则配网时断言 lvgl_port_init must be called first 直接崩溃。
-     * （裸板模式：无屏幕，注释掉 LCD / UI / standby）*/
+    /* ── 步骤 5: WiFi / BluFi 配网（阻塞直至获取 IP 或彻底失败后重启）───────
+     * ★LCD/UI 初始化必须放在此步【之后】：BLE controller 使能窗口内若 LVGL 正在
+     *   并发解码 GIF / SPI DMA 刷屏 / 投递舵机，会与 BT 抢内部资源，导致 BLE 初始化
+     *   随机崩溃（LoadProhibited 野 handle 或 ble_svc_gap_init 断言，见 BUG-026）。
+     *   配网不再显示二维码（已删除该逻辑），因此 UI 无需早于 WiFi，放回配网之后即可。*/
+    bsp_board_wifi_main(bsp_board);
+    PRINT_INTERNAL_HEAP_STEP("bsp_board_wifi_main");
+    /* ── 步骤 2.5: LCD + UI 初始化（WiFi/配网完成后再起，避开 BLE 初始化窗口）── */
     bsp_board_lcd_init(bsp_board);
-    PRINT_INTERNAL_HEAP;
+    PRINT_INTERNAL_HEAP_STEP("bsp_board_lcd_init");
     ui_init();
     // cry_anim_test_start();  /* 临时测试：手绘哭泣动画，覆盖主界面 */
     vTaskDelay(pdMS_TO_TICKS(100));
-    PRINT_INTERNAL_HEAP;
+    PRINT_INTERNAL_HEAP_STEP("ui_init");
     if (lvgl_port_lock(1000))
     {
         bsp_board_lcd_on(bsp_board);
         lvgl_port_unlock();
     }
 
-    /* ── 步骤 5: WiFi（阻塞直至获取 IP 或彻底失败后重启）─────────────────── */
-    bsp_board_wifi_main(bsp_board);
-    PRINT_INTERNAL_HEAP;
-
     /* ── 步骤 3: 音频硬件 + 采集任务（裸板无 ES8311，注释）──────────────── */
     audio_init(bsp_board);
-    PRINT_INTERNAL_HEAP;
+    PRINT_INTERNAL_HEAP_STEP("audio_init");
 
     /* ── 步骤 4: 唤醒词引擎（裸板无麦克风，注释）──────────────────────────── */
     wake_word_init(wake_word_callback);
     wake_word_start();
-    PRINT_INTERNAL_HEAP;
+    PRINT_INTERNAL_HEAP_STEP("wake_word_init+start");
 
     /* ── 步骤 6: MQTT 客户端 ───────────────────────────────────────────────── */
     protocol_mqtt_start();
-    PRINT_INTERNAL_HEAP;
+    PRINT_INTERNAL_HEAP_STEP("protocol_mqtt_start");
 
     /* ── 步骤 7: 会话模块（WebSocket 预连接）─────────────────────────────── */
     // session_init("ws://122.224.191.2:4888/ws/omni");
     session_init("wss://ai.strailine-space.com/ws/omni");
 
-    PRINT_INTERNAL_HEAP;
+    PRINT_INTERNAL_HEAP_STEP("session_init");
 
     // /* ── 步骤 8: 舵机硬件初始化（LEDC/PWM）──────────────────────────────── */
     bsp_board_servo_init(bsp_board);
-    PRINT_INTERNAL_HEAP;
+    PRINT_INTERNAL_HEAP_STEP("bsp_board_servo_init");
 
     // /* ── 步骤 9: 舵机管理器（队列 + worker task，栈在 SPIRAM）─────────────── */
     esp_err_t ret = servo_manager_init();
@@ -364,7 +395,7 @@ void application_init(void)
     {
         ESP_LOGE(TAG, "servo_manager_init 失败: %s", esp_err_to_name(ret));
     }
-    PRINT_INTERNAL_HEAP;
+    PRINT_INTERNAL_HEAP_STEP("servo_manager_init");
 
     /* ── 步骤 10: 情绪交互管理器（情绪矩阵 + worker task，栈在 SPIRAM）────── */
     ret = interaction_manager_init();
@@ -372,7 +403,7 @@ void application_init(void)
     {
         ESP_LOGE(TAG, "interaction_manager_init 失败: %s", esp_err_to_name(ret));
     }
-    PRINT_INTERNAL_HEAP;
+    PRINT_INTERNAL_HEAP_STEP("interaction_manager_init");
     // // 舵机测试任务（独立跑，不影响 LVGL 刷新）
     // xTaskCreatePinnedToCoreWithCaps(
     //     servo_test_task,
@@ -408,6 +439,7 @@ void application_init(void)
     else
     {
         ESP_LOGI(TAG, "触摸扫描任务创建完成");
+        PRINT_TASK_CREATED(TAG, "touch_scan", 4096, 1); // 栈在内部SRAM
     }
 
     /* ═══ 【震动 PWM 方波测试】临时调试任务 ═══════════════════════════════════
@@ -418,7 +450,7 @@ void application_init(void)
 
     /* ── 步骤 10.5: 无活动待机模块（依赖 LCD/唤醒词/舵机管理器均已就绪）──── */
     standby_init();
-    PRINT_INTERNAL_HEAP;
+    PRINT_INTERNAL_HEAP_STEP("standby_init");
 
     /* ── 步骤 11: 电池 + 提醒系统（无感/次要功能，后置以让核心链路尽早就绪）──
      * 挪动理由：电池监控纯 ADC 无依赖；reminder_init 内部会同步做一次 IP 定位
@@ -429,7 +461,7 @@ void application_init(void)
     if (bat_ret == ESP_OK)
     {
         bsp_battery_start_task(NULL); // 暂不接低电回调，UI 自身已带变色提示
-        // bsp_battery_start_log_task(); // 新增：每 5s 打印一次电池电压/电量，便于调试
+        bsp_battery_start_log_task(); // 新增：每 5s 打印一次电池电压/电量，便于调试
         xEventGroupSetBits(bsp_board->board_status, BATTERY_BIT);
         ESP_LOGI(TAG, "电池监控已启动");
     }
@@ -437,9 +469,9 @@ void application_init(void)
     {
         ESP_LOGW(TAG, "电池监控未启用 (%s)，UI 电量将显示 --%%", esp_err_to_name(bat_ret));
     }
-    PRINT_INTERNAL_HEAP;
+    PRINT_INTERNAL_HEAP_STEP("bsp_battery_init");
     reminder_init(NULL);
-    PRINT_INTERNAL_HEAP;
+    PRINT_INTERNAL_HEAP_STEP("reminder_init");
 
     /* ── 步骤 8: CPU 占用诊断任务（调试用，可注释掉）─────────────────────── */
     // 低优先级、tskNO_AFFINITY、栈在 SPIRAM，对业务无干扰

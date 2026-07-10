@@ -5,6 +5,7 @@
 
 #include "udp_logger.h"
 #include "esp_log.h"
+#include "esp_system.h"    // esp_reset_reason()：读取上次复位原因（RTC 寄存器），UDP 抓不到串口/bootloader 日志时用它定位重启
 #include "esp_heap_caps.h" // xTaskCreatePinnedToCoreWithCaps：初始化任务栈放 SPIRAM，不占调用者栈
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -15,11 +16,16 @@
 #include <errno.h>  // errno（初始化失败诊断日志用）
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "object.h" // PRINT_TASK_CREATED / PRINT_TASK_STACK_HWM
 
 #define UDP_LOGGER_DEFAULT_PORT 3333
-// ★开发电脑默认 IP：改成你自己电脑的局域网 IPv4（ipconfig 里 WLAN 的 IPv4 地址）。
-//   若设备/电脑换了网络导致 IP 变化，改这里重新烧录，或调用方传参覆盖。
-#define UDP_LOGGER_DEFAULT_DEST_IP "192.168.1.252"
+// ★默认改为【广播】地址 255.255.255.255：同一局域网内所有电脑都能收到，
+//   电脑 IP 变了（DHCP 重新分配、换网）也不用改这里重新烧——彻底解决"单播写死
+//   某个 IP，电脑 IP 一变就收不到日志"的老问题（见 2026-07-09 排查）。
+//   电脑端 tools/udp_log_listen.py 监听同端口即可（它 bind 0.0.0.0，能收广播）。
+//   代价：广播包同网段所有机器都会收到；开发调试用无妨。若某些路由器/防火墙拦广播，
+//   可由调用方传入电脑固定 IP 覆盖（单播），或改回具体 IP。
+#define UDP_LOGGER_DEFAULT_DEST_IP "192.168.1.255"
 #define UDP_LOGGER_BUF_SIZE 512 // 单条日志最大长度，超出截断（够用；ESP_LOG 单行一般 <200B）
 #define UDP_LOGGER_QUEUE_LEN 32 // 发送队列深度：突发日志（如启动阶段）允许暂存这么多条，超出直接丢弃最旧的
 
@@ -89,6 +95,7 @@ static int udp_logger_vprintf(const char *fmt, va_list args)
  */
 static void udp_logger_send_task(void *arg)
 {
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
     const char *dest_ip = (const char *)arg;
     uint16_t port = UDP_LOGGER_DEFAULT_PORT;
 
@@ -101,6 +108,23 @@ static void udp_logger_send_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
+
+    // ★关键修复（此前重写为队列方案时误删）：UDP socket 默认是【阻塞】的，sendto
+    //   在 ARP 解析中/发送缓冲区满/网络状态异常等情况下会实际阻塞——即使把 sendto
+    //   放进了独立任务，一旦某次 sendto 永久阻塞（比如目标不可达、无人消费的
+    //   ARP 请求），这个任务会卡死在第一次 sendto 里再也出不来，队列后续日志全部
+    //   堆积到满后被静默丢弃，表现为"启动成功打印了一次，之后再无任何 UDP 日志"。
+    //   显式设 O_NONBLOCK，sendto 发不出去立即返回 EWOULDBLOCK 而不阻塞。
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0)
+        ESP_LOGW(TAG, "设置 O_NONBLOCK 失败，errno=%d（sendto 仍可能阻塞）", errno);
+
+    // ★开启广播权限：目标为 255.255.255.255（或子网广播 x.x.x.255）时，socket 必须
+    //   显式设置 SO_BROADCAST，否则 sendto 到广播地址会返回 EACCES 失败，日志发不出去。
+    //   单播目标不需要此选项，但设了也无副作用，故无条件开启，兼容调用方传单播 IP 的情况。
+    int broadcast_enable = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast_enable, sizeof(broadcast_enable)) < 0)
+        ESP_LOGW(TAG, "设置 SO_BROADCAST 失败，errno=%d（广播地址将发送失败）", errno);
 
     struct sockaddr_in dest_addr;
     memset(&dest_addr, 0, sizeof(dest_addr));
@@ -124,6 +148,46 @@ static void udp_logger_send_task(void *arg)
     s_started = true;
     ESP_LOGI(TAG, "启动完成，sock=%d，开始接管日志输出", sock);
 
+    // ★复位原因诊断：UDP 抓不到 bootloader 的 rst:0x.. 与 "Brownout detector was triggered"
+    //   （那些走 UART0），故在 UDP 接管日志后，用 esp_reset_reason() 补打上一次复位原因。
+    //   该值读自 RTC 寄存器，任何时机调用都一致。用于定位低功耗切换瞬间的偶发重启：
+    //   ESP_RST_BROWNOUT=欠压/负载冲击掉压；ESP_RST_TASK_WDT/INT_WDT=看门狗；ESP_RST_PANIC=软件崩溃。
+    esp_reset_reason_t rst = esp_reset_reason();
+    const char *rst_str = "未知";
+    switch (rst)
+    {
+    case ESP_RST_POWERON:
+        rst_str = "POWERON(上电)";
+        break;
+    case ESP_RST_SW:
+        rst_str = "SW(软件esp_restart)";
+        break;
+    case ESP_RST_PANIC:
+        rst_str = "PANIC(软件崩溃)";
+        break;
+    case ESP_RST_INT_WDT:
+        rst_str = "INT_WDT(中断看门狗)";
+        break;
+    case ESP_RST_TASK_WDT:
+        rst_str = "TASK_WDT(任务看门狗)";
+        break;
+    case ESP_RST_WDT:
+        rst_str = "WDT(其他看门狗)";
+        break;
+    case ESP_RST_BROWNOUT:
+        rst_str = "BROWNOUT(欠压复位)";
+        break;
+    case ESP_RST_DEEPSLEEP:
+        rst_str = "DEEPSLEEP(深睡唤醒)";
+        break;
+    case ESP_RST_EXT:
+        rst_str = "EXT(外部复位)";
+        break;
+    default:
+        break;
+    }
+    ESP_LOGW(TAG, "⚡ 上次复位原因: %s (reason=%d)", rst_str, (int)rst);
+
     udp_log_item_t item;
     for (;;)
     {
@@ -132,10 +196,19 @@ static void udp_logger_send_task(void *arg)
             continue;
         if (s_sock < 0)
             continue; // udp_logger_stop() 已关闭 socket，丢弃剩余队列内容
-        // sendto 失败（网络异常/发送队列满等）静默丢弃即可：只影响本任务自己，
-        // 不占用、不拖慢任何业务线程，不需要像旧版那样为了避免"拖累调用者"而
-        // 设置连续失败重建 socket——网络恢复后 sendto 自然会恢复成功。
-        sendto(s_sock, item.data, item.len, 0, (struct sockaddr *)&s_dest_addr, sizeof(s_dest_addr));
+        // ★排查结论：sendto 失败绝大多数是 errno=12(ENOMEM)——系统启动阶段
+        //   （AFE/唤醒词模型/MQTT/WebSocket 密集初始化）internal RAM 一度探底到
+        //   1~2 万字节，lwIP 内部分配 pbuf 失败，包根本没上网卡，与网络/目标IP
+        //   无关。此处短暂让出 CPU 后重试几次：多数情况下几毫秒后其他任务已释放
+        //   内存，重试即可发出去；仍失败就丢弃这一条，不无限重试拖慢发送任务。
+        int sent = -1;
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            sent = sendto(s_sock, item.data, item.len, 0, (struct sockaddr *)&s_dest_addr, sizeof(s_dest_addr));
+            if (sent >= 0 || errno != ENOMEM)
+                break;
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
     }
 }
 
@@ -161,6 +234,8 @@ void udp_logger_start(const char *dest_ip, uint16_t port)
         udp_logger_send_task, "udp_log_send", 4096,
         (void *)dest_ip, tskIDLE_PRIORITY + 1, NULL,
         tskNO_AFFINITY, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ret == pdPASS)
+        PRINT_TASK_CREATED(TAG, "udp_log_send", 4096, 0); // 首选栈在PSRAM
     if (ret != pdPASS)
     {
         ESP_LOGW(TAG, "SPIRAM 建发送任务失败(ret=%d)，改用内部SRAM重试", (int)ret);
@@ -168,7 +243,9 @@ void udp_logger_start(const char *dest_ip, uint16_t port)
             udp_logger_send_task, "udp_log_send", 4096,
             (void *)dest_ip, tskIDLE_PRIORITY + 1, NULL,
             tskNO_AFFINITY, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (ret != pdPASS)
+        if (ret == pdPASS)
+            PRINT_TASK_CREATED(TAG, "udp_log_send", 4096, 1); // 回退栈在内部SRAM
+        else
             ESP_LOGE(TAG, "内部SRAM建发送任务仍失败(ret=%d)，本次放弃启动UDP日志", (int)ret);
     }
 }

@@ -7,3 +7,4 @@ dependencies:
   lvgl/lvgl: ^9.5.0
   espressif/esp_lvgl_port: ^2.7.0
   ningzixi/weather: ^1.1.0
+  xianjielianmeng/remote_udp_logger: ^0.1.1
