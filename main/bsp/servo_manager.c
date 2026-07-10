@@ -21,6 +21,7 @@
 #include "nvs_flash.h"
 #include "bsp_board.h" // 提供 bsp_servo_move_smooth、SERVO_SPEED_*、CH_*
 #include "bsp_config.h"
+#include "object.h" // PRINT_TASK_CREATED / PRINT_TASK_STACK_HWM
 
 static const char *TAG = "SERVO_MGR";
 
@@ -239,6 +240,7 @@ static bool servo_exec_abs_parallel(const servo_abs_parallel_request_t *p)
 /* 内部：worker 主循环，串行消费动作请求 */
 static void servo_worker_task(void *arg)
 {
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
     internal_req_t item;
     for (;;)
     {
@@ -310,6 +312,8 @@ esp_err_t servo_manager_init(void)
         "servo_mgr",
         SERVO_MGR_TASK_STACK, NULL, SERVO_MGR_TASK_PRIO, &s_worker,
         tskNO_AFFINITY, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (r == pdPASS)
+        PRINT_TASK_CREATED(TAG, "servo_mgr", SERVO_MGR_TASK_STACK, 0); // 栈在PSRAM
     if (r != pdPASS)
     {
         vQueueDelete(s_queue);

@@ -70,6 +70,7 @@ struct audio_encoder
  */
 void audio_encoder_task(void *arg)
 {
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
     audio_encoder_t *audio_encoder = (audio_encoder_t *)arg;
 
     // ── 帧缓冲已由 audio_encoder_start() 预分配在结构体中 ───────────────────
@@ -358,6 +359,8 @@ void audio_encoder_start(audio_encoder_t *audio_encoder)
         AUDIO_ENCODER_TASK_CORE_ID,                  // 绑定核心：CPU1
         MALLOC_CAP_SPIRAM);                          // 栈内存来源：外部 SPIRAM
 
+    if (ret == pdPASS)
+        PRINT_TASK_CREATED(TAG, "encoder_task", AUDIO_ENCODER_TASK_STACK_SIZE, 0); // 栈在PSRAM
     if (ret != pdPASS)
     {
         ESP_LOGE(TAG, "编码任务创建失败（内存不足或参数错误）");

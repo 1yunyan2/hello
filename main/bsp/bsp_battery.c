@@ -31,6 +31,7 @@
 #include "nvs.h"
 #include <string.h>
 #include <stdlib.h>
+#include "object.h" // PRINT_TASK_CREATED / PRINT_TASK_STACK_HWM
 
 // ─── NVS 持久化（断电存档，防止上电电量回弹）─────────────────────────────────
 // 锂电池断电静置后电压会自然回弹，若上电重新查表会导致电量虚高。这里把上次的
@@ -356,6 +357,7 @@ static uint32_t do_sample_voltage_mv(void)
 static void battery_monitor_task(void *arg)
 {
     ESP_LOGI(TAG, "电池监控任务启动，采样周期 %d ms", BSP_BAT_TASK_INTERVAL_MS);
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
 
     // 多次快速采样初始化 filtered_mv，从真实带载电压开始
     {
@@ -611,7 +613,7 @@ static void battery_monitor_task(void *arg)
                 if (s_ctx.poweroff_hit >= BSP_BAT_POWEROFF_HIT_CNT)
                 {
                     battery_nvs_save(0, s_ctx.ocv_mv); // 放空存档，防下次上电电量虚高
-                    bsp_battery_power_off();            // GPIO18 高→低下降沿软关机，不返回
+                    bsp_battery_power_off();           // GPIO18 高→低下降沿软关机，不返回
                 }
             }
             else
@@ -640,6 +642,7 @@ static void battery_monitor_task(void *arg)
 static void battery_log_task(void *arg)
 {
     ESP_LOGI(TAG, "电池日志任务启动，每 %d ms 打印一次", BSP_BAT_LOG_INTERVAL_MS);
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
     while (s_log_task_running)
     {
         uint32_t mv = bsp_battery_get_voltage_mv();
@@ -749,6 +752,11 @@ esp_err_t bsp_battery_deinit(void)
     return ESP_OK;
 }
 
+/**
+ * @brief 请求停止电池监控任务
+ * @return 电池电压（毫伏）
+ *
+ */
 uint32_t bsp_battery_read_voltage_mv(void)
 {
     return do_sample_voltage_mv();
@@ -814,6 +822,7 @@ esp_err_t bsp_battery_start_task(bsp_battery_low_cb_t low_cb)
         ESP_LOGE(TAG, "创建后台任务失败");
         return ESP_ERR_NO_MEM;
     }
+    PRINT_TASK_CREATED(TAG, "bat_mon", BSP_BAT_TASK_STACK_SIZE, 1); // xTaskCreate → 栈在内部SRAM
     return ESP_OK;
 }
 
@@ -863,6 +872,7 @@ esp_err_t bsp_battery_start_log_task(void)
         ESP_LOGE(TAG, "创建电池日志任务失败");
         return ESP_ERR_NO_MEM;
     }
+    PRINT_TASK_CREATED(TAG, "bat_log", BSP_BAT_TASK_STACK_SIZE, 1); // xTaskCreate → 栈在内部SRAM
     return ESP_OK;
 }
 

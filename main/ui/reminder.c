@@ -193,6 +193,7 @@ static void nvs_save_calendars_immediate(void)
 /* [FIX-6] NVS 保存任务支持闹钟/日历/退出三种命令 */
 static void nvs_save_task(void *arg)
 {
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
     uint8_t cmd;
     while (1)
     {
@@ -788,6 +789,7 @@ static void reminder_task(void *arg)
 {
     reminder_evt_t evt;
     ESP_LOGI(TAG, "提醒任务启动");
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
 
     while (1)
     {
@@ -947,6 +949,7 @@ esp_err_t reminder_init(reminder_trigger_cb_t cb)
             s_ctx.mutex = NULL;
             return ESP_FAIL;
         }
+        PRINT_TASK_CREATED(TAG, "nvs_save", 3072, 1); // 栈在内部SRAM
     }
 
     nvs_load_alarms();
@@ -975,6 +978,7 @@ esp_err_t reminder_init(reminder_trigger_cb_t cb)
         s_ctx.mutex = NULL;
         return ESP_FAIL;
     }
+    PRINT_TASK_CREATED(TAG, "reminder_task", 8192, 0); // 栈在PSRAM
 
     esp_timer_create_args_t timer_args = {
         .callback = poll_timer_callback,

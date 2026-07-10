@@ -548,6 +548,7 @@ esp_err_t wake_word_init(wake_word_detected_cb_t cb)
     xTaskCreatePinnedToCoreWithCaps(afe_fetch_task, "afe_fetch",
                                     4096, NULL, 5, NULL, 1,
                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    PRINT_TASK_CREATED(TAG, "afe_fetch", 4096, 0); // 栈在PSRAM
     ESP_LOGI(TAG, "afe_fetch_task 提前启动，AFE FEED 将不再溢出");
 
     if (load_model_for_lang(lang) != ESP_OK)
@@ -600,6 +601,7 @@ esp_err_t wake_word_init(wake_word_detected_cb_t cb)
                                     &s_mn_detect_handle,
                                     1, // 同 CPU1，共享缓存
                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    PRINT_TASK_CREATED(TAG, "mn_detect", 4096, 0); // 栈在PSRAM
 
     return ESP_OK;
 }
@@ -818,6 +820,7 @@ size_t custom_wake_word_get_chunksize(void)
 static void afe_fetch_task(void *arg)
 {
     ESP_LOGI(TAG, "AFE fetch 任务启动");
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
     /**
      * 风险：
 如果你的 CPU1 音频任务真的因为 Bug 死循环了，由于 WDT 关了，CPU1 就真的永久卡死了，
@@ -894,6 +897,7 @@ static void afe_fetch_task(void *arg)
 static void multinet_detect_task(void *arg)
 {
     ESP_LOGI(TAG, "MultiNet 检测任务启动（优先级 4，CPU1）");
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
 
     while (1)
     {

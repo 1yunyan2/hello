@@ -86,6 +86,11 @@ esp_err_t esp_blufi_host_init(void)
 
     int rc;
     rc = esp_blufi_gatt_svr_init();
+    // 诊断日志（待验证）：assert 前先打印具体错误码，排查 GAP/GATT 表注册失败原因
+    // （例如 BLE_HS_EBUSY=13 表示 host 已有连接/GAP流程在跑, BLE_HS_ENOMEM=6 表示内存不足）
+    if (rc != 0) {
+        ESP_LOGE("BLUFI_INIT", "esp_blufi_gatt_svr_init 失败，rc=%d", rc);
+    }
     assert(rc == 0);
 
 #if CONFIG_BT_NIMBLE_GAP_SERVICE

@@ -6,6 +6,7 @@
 #include "ui/ui_port.h"      /* ui_show_unbinding(): 解绑前显示静态提示页，避免 GIF 卡冻帧 */
 #include "esp_timer.h"       /* [DIAG] esp_timer_get_time()：微秒级时间戳，定位扫描各阶段耗时 */
 #include "udp_logger.h"      /* 纯电池调试用：拿到 IP 后把日志同时广播到 UDP，见 GOT_IP 分支 */
+#include "object.h"          /* PRINT_TASK_CREATED / PRINT_TASK_STACK_HWM：栈+堆打印 */
 
 /* ── BluFi 配网相关（替代原 Unified Provisioning）─────────────────────────── */
 #include "esp_blufi_api.h"        /* BluFi 事件枚举、回调结构、send 接口 */
@@ -35,6 +36,16 @@ static const char *TAG = "EchoPals";
 
 /// @brief 是否正处于 BLE 配网流程中（配网期间禁止断线重连，避免与配网状态机冲突）
 static bool s_is_provisioning = false;
+/// @brief 是否正在执行解绑/重置（清凭证 + 即将 esp_restart）。置位后 esp_wifi_restore()
+/// 触发的 WIFI_EVENT_STA_DISCONNECTED 里的重连 / 去抖等重活全部跳过——马上就要重启，
+/// 这些操作纯属多余，且叠在 2304 字节的 sys_evt 栈上会栈溢出崩溃（解绑必崩的根因）。
+static volatile bool s_is_resetting = false;
+/// @brief GOT_IP 事件请求主流程补写信道提示到 NVS。NVS 写栈开销大，不能在 sys_evt
+/// 小栈（2304B）上做，故 GOT_IP 回调仅置位，由 bsp_board_wifi_main 在大栈上执行。
+static volatile bool s_need_save_channel_hint = false;
+/// @brief GOT_IP 事件请求主流程向手机补发 BluFi 配网成功报告。同样为避免 sys_evt
+/// 小栈溢出，回调仅置位，由 bsp_board_wifi_main 在大栈上、蓝牙释放前补发。
+static volatile bool s_need_send_prov_report = false;
 /// @brief 当前已重连次数（超过 MAX_RETRY_COUNT 后置位 WIFI_FAIL_BIT）
 static int s_retry_num = 0;
 /// @brief 配网态连接尝试计数：BluFi 配网期间专用，与 s_retry_num（运行态）隔离。
@@ -149,18 +160,25 @@ void clear_wifi_and_restart(void)
     }
 
     // ── 清除 NVS 中的 WiFi 凭证 ──────────────────────────────────────────────
+    // ★先置"正在重置"标志：esp_wifi_restore() 会触发 WIFI_EVENT_STA_DISCONNECTED，
+    //   该事件在 sys_evt 任务（栈仅 2304B）上跑，若照常执行重连 + 去抖等重活会栈溢出
+    //   崩溃（解绑必崩根因）。此刻马上就要 esp_restart，重连毫无意义，故让事件处理
+    //   开头据此标志直接 return，避开重活。
+    s_is_resetting = true;
+
     // wifi_prov_mgr_reset_provisioning() 内部删除 WiFi 配置分区中的 SSID/密码键值对
     // err = wifi_prov_mgr_reset_provisioning();
     err = esp_wifi_restore(); // 它可以在任何状态下安全地抹除 WiFi 配置
     if (err == ESP_OK)
-        ESP_LOGI(TAG, "WiFi 凭证清除成功，即将重启...");
+        ESP_LOGI(TAG, "WiFi 凭证清除成功，立即重启...");
     else
         ESP_LOGE(TAG, "WiFi 凭证清除失败: %s", esp_err_to_name(err));
 
-    // ── 等待 1 秒，保证日志输出完毕，便于用户通过串口观察 ───────────────────
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    // ── 软件复位（重启后重新进入配网模式）───────────────────────────────────
+    // ── 立即软件复位（重启后重新进入配网模式）─────────────────────────────
+    // ★不再 vTaskDelay(1000) 等日志：esp_wifi_restore() 会触发一连串 WiFi 事件，
+    //   这些事件在 sys_evt 任务上处理，与本次 restore/重启并发时容易撞车（栈溢出
+    //   或 esp_event 锁失效断言，即解绑必崩）。凭证已清、目标就是重启回配网态，
+    //   故清完立即 esp_restart()，把事件在 sys_evt 上闹事的时间窗口压到最小。
     esp_restart();
 }
 
@@ -207,6 +225,7 @@ static void button_monitor_task(void *pvParameters)
         .intr_type = GPIO_INTR_DISABLE,                  // 不使用中断（轮询模式）
     };
     gpio_config(&io_conf);
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
 
     int press_count = 0; // 连续低电平帧计数（每帧 10ms）
 
@@ -228,7 +247,8 @@ static void button_monitor_task(void *pvParameters)
                     btn_reset_task, "btn_reset",
                     8192, NULL, 5, NULL,
                     tskNO_AFFINITY, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-                vTaskDelete(NULL); // btn_task 使命完成自删（清除+重启在 btn_reset 任务里完成）
+                PRINT_TASK_CREATED(TAG, "btn_reset", 8192, 1); // 栈在内部SRAM
+                vTaskDelete(NULL);                             // btn_task 使命完成自删（清除+重启在 btn_reset 任务里完成）
             }
         }
         else
@@ -596,6 +616,15 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
         // ── WiFi 断线处理 ──────────────────────────────────────────────────────
+        // ★解绑/重置拦截：clear_wifi_and_restart() 里 esp_wifi_restore() 会触发本事件，
+        //   此刻设备正准备 esp_restart，重连 + 去抖等重活既多余又会撑爆 sys_evt 栈
+        //   （2304B）导致解绑必崩。据 s_is_resetting 直接返回，让重启流程干净收尾。
+        if (s_is_resetting)
+        {
+            ESP_LOGW(TAG, "解绑/重置进行中，忽略断线事件（即将重启）");
+            return;
+        }
+
         wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
         ESP_LOGW(TAG, "[DIAG] WIFI_EVENT_STA_DISCONNECTED @ %lld us，reason=%d",
                  esp_timer_get_time(), disc ? disc->reason : -1);
@@ -647,8 +676,12 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
 
                 // ② 停稳 STA，再用全零 wifi_config 覆盖，抹掉刚被持久化的错误账号
                 //    密码（同样会写回 NVS，把错凭证清成空）。不用 restore，避免崩溃。
+                //    ★wifi_config_t 达 132 字节，本函数跑在 sys_evt 任务（栈仅 2304B），
+                //    不能在栈上放这么大的局部变量（会栈溢出，是 86d0553 引入的解绑必崩根因）。
+                //    改为函数级 static：不占栈；事件回调由单一 sys_evt 任务串行处理，无重入。
                 esp_wifi_disconnect();
-                wifi_config_t empty_cfg = {0};
+                static wifi_config_t empty_cfg;
+                memset(&empty_cfg, 0, sizeof(empty_cfg));
                 esp_err_t clr_err = esp_wifi_set_config(WIFI_IF_STA, &empty_cfg);
                 ESP_LOGW(TAG, "已用空配置覆盖清除错误 WiFi 凭证: %s", esp_err_to_name(clr_err));
 
@@ -677,7 +710,9 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
                 ESP_LOGW(TAG, "[DIAG] reason=201，连续计数=%d", s_no_ap_found_count);
                 if (s_no_ap_found_count >= 2)
                 {
-                    wifi_config_t cfg = {0};
+                    // ★同上：wifi_config_t 132 字节，不能放 sys_evt 小栈，改函数级 static。
+                    static wifi_config_t cfg;
+                    memset(&cfg, 0, sizeof(cfg));
                     if (esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK &&
                         cfg.sta.scan_method == WIFI_FAST_SCAN)
                     {
@@ -745,18 +780,22 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "成功获取 IP: " IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGW(TAG, "[DIAG] IP_EVENT_STA_GOT_IP @ %lld us", esp_timer_get_time());
 
-        // ★纯电池调试用：拿到 IP 后启动 UDP 日志单播（发到 udp_logger.c 里配置的电脑 IP），
+        //! ★纯电池调试用：拿到 IP 后启动 UDP 日志单播（发到 udp_logger.c 里配置的电脑 IP），
         //   电脑用 tools/udp_log_listen.py 监听同端口即可看到日志——解决"纯锂电池供电无法
         //   接串口看低功耗全程日志"的问题。幂等，断线重连多次调用无副作用；不影响原 UART
         //   日志输出（两路并存）。传 NULL 用 udp_logger.c 里的默认目标 IP。
-        // udp_logger_start(NULL, 0);
+        udp_logger_start(NULL, 0);
 
         // 连接成功，重置重连计数（下次断线时从 0 开始重新计数）
         s_retry_num = 0;
         s_no_ap_found_count = 0;
 
-        // 记录本次连接的信道/BSSID，加速下次开机的定向连接（省去全信道扫描）
-        save_ap_channel_hint();
+        // ★信道提示的 NVS 写【不在此处做】：本回调运行在 sys_evt 任务（栈仅 2304B），
+        //   save_ap_channel_hint() 内部 nvs_open/set_blob/commit 栈开销很大，叠加本分支
+        //   已有的 udp_logger_start(建socket) + esp_blufi_send_wifi_conn_report(BluFi加密帧)
+        //   会撑爆 sys_evt 栈（实测配网拿到 IP 瞬间 stack overflow 崩溃重启）。改为置位
+        //   请求标志，由 bsp_board_wifi_main() 主流程在自己的大栈上补写（见 WIFI_BIT 就绪后）。
+        s_need_save_channel_hint = true;
 
         // ── 去抖：网络已恢复，取消"宣告掉线"定时器 ───────────────────────────
         // 若本次断线在去抖窗口内恢复，定时器回调不会执行，WIFI_BIT 从未被清，
@@ -769,15 +808,12 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
             xEventGroupSetBits(bsp_board->board_status, WIFI_BIT);
 
         // ── BluFi 配网期：拿到 IP 即视为配网成功 ─────────────────────────────
-        // BluFi 没有 Unified Provisioning 的 WIFI_PROV_END 事件，改由「拿到 IP」
-        // 作为配网结束信号：① 向手机回报连接成功（手机 App 显示配网成功）；
-        // ② 置 PROV_DONE_BIT 解除 bsp_board_wifi_main 的配网等待，触发蓝牙释放。
-        if (s_blufi_ble_connected)
-        {
-            wifi_mode_t mode;
-            esp_wifi_get_mode(&mode);
-            esp_blufi_send_wifi_conn_report(mode, ESP_BLUFI_STA_CONN_SUCCESS, 0, NULL);
-        }
+        // BluFi 没有 Unified Provisioning 的 WIFI_PROV_END 事件，改由「拿到 IP」作为
+        // 配网结束信号。★向手机回报连接成功的 esp_blufi_send_wifi_conn_report【不在此处
+        // 调用】：它内部要组 BluFi 加密帧、走协议栈，栈开销不小，叠加本分支的 socket/NVS
+        // 操作会撑爆 sys_evt 小栈（2304B）。改为置标志，由 bsp_board_wifi_main 主流程在
+        // 大栈上、蓝牙释放前补发（时序上仍早于 esp_blufi_host_deinit，手机能正常收到）。
+        s_need_send_prov_report = true;
         // 配网真正成功（拿到 IP）→ 解除配网态：此后断线才走运行态重连逻辑。
         // 也清零配网态计数，保持状态干净。
         s_is_provisioning = false;
@@ -1030,9 +1066,7 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
         button_monitor_task, "btn_task",
         3072, NULL, 5, NULL,
         0, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    ESP_LOGI(TAG, "[内存] btn_task 创建后 → 内部SRAM剩余: %u B，PSRAM剩余: %u B",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    PRINT_TASK_CREATED(TAG, "btn_task", 3072, 1); // 栈在内部SRAM
 
     // ── 步骤 5.5：生成 MAC 派生蓝牙名 + 打印设备唯一标识 ─────────────────────
     uint8_t mac[6];
@@ -1049,14 +1083,18 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
         // ════ 未配网分支：启动 BluFi（BLE）配网，等待手机配网 ════════════════
         ESP_LOGI(TAG, "设备未配网，启动 BluFi 配网...");
         ESP_LOGI(TAG, "📱 配网入口 → 蓝牙名: %s（用 EspBlufi App 或小程序扫描）", service_name);
+        // 配网入口仅靠蓝牙广播 + 串口打印设备 ID；不再显示配网二维码（已删除该逻辑）。
 
-        // 有屏幕时：生成二维码显示在 LCD 上，方便用户扫码定位设备
-        // 无屏幕时（裸板）：仅靠蓝牙广播，串口打印设备 ID 供调试核对
-#if CONFIG_BSP_HAS_DISPLAY
-        ui_show_qrcode(service_name);
-#endif
-
-        // 启动 WiFi 驱动（配网期需要 STA 就绪以便后续 connect）
+        // ★WiFi 与 BLE 的初始化顺序：必须【先 esp_wifi_start()，再拉起 BT controller】。
+        //   根因（实测 coex_hook_check_wifi_sleep 野指针 LoadProhibited）：ESP32-S3 的
+        //   WiFi/BT 软件共存(coexist)在 BT controller 使能中断时会回调 coexist 钩子去查
+        //   WiFi 侧睡眠状态；而 WiFi 侧的 coexist 上下文要到 esp_wifi_start() 才建立完成。
+        //   若 BT 先起、WiFi 未 start，BT enable 中断时 coexist 读到未初始化的 WiFi 侧
+        //   数据结构 → 野指针崩溃（未配网分支必现，且清配网后无限重启）。故先 start WiFi
+        //   把 coexist 上下文建好，BT 再 init。配网期 STA 不需要立刻连（等手机下发凭证），
+        //   先 start 不影响配网逻辑。
+        //   注意：本顺序只在【未配网分支】需要（此分支才同时开 WiFi+BT）；已配网分支不开
+        //   BT、无 coexist，UI/GIF 可照常尽早显示，不受影响。
         ESP_ERROR_CHECK(esp_wifi_start());
 
         // 拉起 BT 控制器（NimBLE 下由该接口初始化 BLE 控制器）
@@ -1092,10 +1130,17 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
             esp_restart();
         }
 
-        // 配网成功后撤掉二维码（有屏幕时）
-#if CONFIG_BSP_HAS_DISPLAY
-        ui_hide_qrcode();
-#endif
+        // ★向手机补发"配网成功"报告（GOT_IP 回调因 sys_evt 栈太小只置了标志）。
+        //   必须在蓝牙释放【之前】发，否则 NimBLE 主机已 deinit、帧发不出去。此处运行
+        //   在 bsp_board_wifi_main 大栈，安全。
+        if (s_need_send_prov_report && s_blufi_ble_connected)
+        {
+            s_need_send_prov_report = false;
+            wifi_mode_t mode;
+            esp_wifi_get_mode(&mode);
+            esp_blufi_send_wifi_conn_report(mode, ESP_BLUFI_STA_CONN_SUCCESS, 0, NULL);
+            ESP_LOGI(TAG, "已向手机回报配网成功");
+        }
 
         // ── 配网成功：立即释放蓝牙（BluFi profile + NimBLE 主机 + 控制器）─────
         // 用户要求"无论 App 还是小程序配网成功，蓝牙都释放"，与原 FREE_BTDM 思路一致。
@@ -1142,6 +1187,14 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
     if (bits & WIFI_BIT)
     {
         ESP_LOGI(TAG, "WiFi 就绪，网络可用！");
+
+        // ★在主流程大栈上补写信道提示（GOT_IP 回调因 sys_evt 栈太小只置了标志）。
+        //   此处运行在 bsp_board_wifi_main 任务栈，NVS 写安全。幂等：仅标志置位时执行。
+        if (s_need_save_channel_hint)
+        {
+            s_need_save_channel_hint = false;
+            save_ap_channel_hint();
+        }
     }
     else if (bits & WIFI_FAIL_BIT)
     {

@@ -18,6 +18,7 @@
 #include "bsp/bsp_config.h"
 #include "ui/interaction.h"
 #include "ui/ui_port.h"
+#include "object.h" // PRINT_TASK_STACK_HWM：任务栈高水位打印
 #define BSP_USE_TTP223 1
 
 #if !BSP_USE_TTP223
@@ -558,6 +559,7 @@ void touch_scan_task(void *pvParameters)
     // 初始化触摸硬件
     bsp_touch_init();
     printf("\n触摸铜箔就绪\n");
+    PRINT_TASK_STACK_HWM("touch_scan"); // 打印本任务栈历史最小剩余
 
     touch_event_t event;
 

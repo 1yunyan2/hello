@@ -17,6 +17,7 @@
 #include "freertos/task.h"
 #include "bsp/bsp_config.h"
 #include "bsp/bsp_board.h"
+#include "object.h" // PRINT_TASK_CREATED / PRINT_TASK_STACK_HWM
 static const char *TAG = "PROD_BURNER";
 esp_flash_t *ext_flash = NULL;
 static wl_handle_t s_wl_handle = WL_INVALID_HANDLE;
@@ -45,6 +46,7 @@ static int64_t s_erase_start_us = 0;
 
 static void erase_progress_task(void *arg)
 {
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
     while (s_erase_in_progress)
     {
         vTaskDelay(pdMS_TO_TICKS(10000));
@@ -80,6 +82,7 @@ void start_production_burning(void)
     s_erase_start_us = esp_timer_get_time();
     s_erase_in_progress = true;
     xTaskCreate(erase_progress_task, "erase_prog", 3072, NULL, 1, NULL);
+    PRINT_TASK_CREATED(TAG, "erase_prog", 3072, 1); // xTaskCreate → 栈在内部SRAM
 
     esp_flash_erase_region(ext_flash, 0, TOTAL_FLASH_SIZE);
 

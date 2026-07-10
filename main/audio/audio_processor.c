@@ -88,6 +88,7 @@ struct audio_processor
  */
 static void audio_processor_play_task(void *arg)
 {
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
     audio_processor_t *audio_processor = (audio_processor_t *)arg;
     bsp_board_t *board = bsp_board_get_instance();
 
@@ -374,6 +375,7 @@ void audio_processor_start(audio_processor_t *audio_processor)
                                     AUDIO_PROCESSOR_TASK_PRIORITY,
                                     &audio_processor->play_task_handle,
                                     AUDIO_PROCESSOR_TASK_CORE_ID, MALLOC_CAP_SPIRAM);
+    PRINT_TASK_CREATED(TAG, "play_task", AUDIO_PROCESSOR_TASK_STACK_SIZE, 0); // 栈在PSRAM
     PRINT_MEM_INFO(TAG, "音频处理器启动后（编解码+播放任务均已创建）");
 }
 

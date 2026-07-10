@@ -5,6 +5,7 @@
 #include "wake_word/custom_wake_word.h"
 #include "esp_heap_caps.h"
 #include <math.h>
+#include "object.h" // PRINT_TASK_CREATED / PRINT_TASK_STACK_HWM
 
 static const char *TAG = "BSP_CODEC";
 
@@ -279,6 +280,7 @@ void bsp_board_codec_init(bsp_board_t *bsp_board)
  */
 void audio_feed_task(void *arg)
 {
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
     bsp_board_t *bsp_board = (bsp_board_t *)arg;
 
     // ── 步骤 1：获取 AFE 要求的每次投喂采样点数 ──────────────────────────────
@@ -666,4 +668,5 @@ void audio_init(bsp_board_t *bsp_board)
         NULL,                                 // 不需要保存任务句柄（任务永远运行，无需管理）
         1,                                    // 固定到 CPU 核心 1（WiFi 协议栈默认用 CPU0，避免竞争）
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); // 栈分配在 SPIRAM
+    PRINT_TASK_CREATED(TAG, "audio_feed", 8192, 0); // 栈在PSRAM
 }

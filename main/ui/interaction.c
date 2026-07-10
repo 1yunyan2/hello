@@ -25,6 +25,7 @@
 #include <stdatomic.h> // atomic_bool 播放中标志（跨核安全）
 #include "bsp/bsp_board.h"
 #include "ui/ui_port.h"
+#include "object.h" // PRINT_TASK_CREATED / PRINT_TASK_STACK_HWM
 
 static const char *TAG = "INTERACTION";
 
@@ -655,6 +656,7 @@ static void interaction_play_custom_blocking(const ia_custom_action_t *act)
  */
 static void interaction_worker_task(void *arg)
 {
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
     ia_request_t req;
     for (;;)
     {
@@ -719,6 +721,7 @@ esp_err_t interaction_manager_init(void)
         ESP_LOGE(TAG, "创建 interaction worker 任务失败，内存不足!");
         return ESP_ERR_NO_MEM;
     }
+    PRINT_TASK_CREATED(TAG, "ia_worker", INTERACTION_TASK_STACK, 0); // 栈在PSRAM
 
     s_ia_inited = true;
     ESP_LOGI(TAG, "interaction_manager 初始化完成（队列深度=%d）", INTERACTION_QUEUE_LEN);

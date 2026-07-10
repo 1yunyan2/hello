@@ -74,6 +74,7 @@ struct audio_decoder
  */
 void audio_decoder_task(void *arg)
 {
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
     audio_decoder_t *audio_decoder = (audio_decoder_t *)arg;
 
     // ── 步骤 1：计算 PCM 输出缓冲区大小 ──────────────────────────────────────
@@ -336,6 +337,7 @@ void audio_decoder_start(audio_decoder_t *audio_decoder)
         (TaskHandle_t *)&audio_decoder->task_handle, // 保存句柄，用于超时强制终止
         AUDIO_DECODER_TASK_CORE_ID,                  // 绑定核心：CPU0
         MALLOC_CAP_SPIRAM);                          // 栈内存来源：外部 SPIRAM
+    PRINT_TASK_CREATED(TAG, "decoder_task", AUDIO_DECODER_TASK_STACK_SIZE, 0); // 栈在PSRAM
 }
 
 /**

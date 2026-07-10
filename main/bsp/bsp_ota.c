@@ -22,6 +22,7 @@
 #include <strings.h> // strcasecmp
 #include <stdio.h>   // sprintf
 #include <stdlib.h>
+#include "object.h" // PRINT_TASK_CREATED / PRINT_TASK_STACK_HWM
 
 #define TAG "OTA"
 
@@ -259,6 +260,7 @@ static bool verify_partition_sha256(const esp_partition_t *part, size_t fw_size,
  */
 static void ota_task(void *pvParameters)
 {
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
     ota_params_t *p = (ota_params_t *)pvParameters;
     ESP_LOGI(TAG, "开始 OTA：url=%s version=%s size=%u sha256=%s",
              p->url, p->version, (unsigned)p->size,
@@ -436,6 +438,7 @@ esp_err_t bsp_ota_trigger(const bsp_ota_req_t *req)
         free(p);
         return ESP_FAIL;
     }
+    PRINT_TASK_CREATED(TAG, "ota_task", 8192, 1); // 栈在内部SRAM
     return ESP_OK;
 }
 /**

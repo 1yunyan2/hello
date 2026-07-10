@@ -198,6 +198,7 @@ static void session_event_task(void *arg)
 {
     session_evt_t evt;
     ESP_LOGI(TAG, "session_event_task启动，...");
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
 
     while (1)
     {
@@ -243,6 +244,8 @@ static void session_event_task(void *arg)
                         6144, (void *)(intptr_t)delay_ms, 4,
                         (TaskHandle_t *)&s_reconnect_handle,
                         tskNO_AFFINITY, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                    if (r == pdPASS)
+                        PRINT_TASK_CREATED(TAG, "ws_reconn", 6144, 1); // 栈在内部SRAM
                     if (r != pdPASS)
                     {
                         ESP_LOGE(TAG, "[MEM] 重连任务创建失败，回退计数，下次断开重试");
@@ -744,6 +747,7 @@ static void ws_sender_task(void *arg)
     uint8_t buf[OPUS_SEND_BUF];
 
     ESP_LOGI(TAG, "发送任务启动，等待服务器就绪...");
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余（栈上有 OPUS_SEND_BUF 缓冲）
 
     // 1. 开局等待阶段：等待服务器 started 响应，最多等待 8s
     //    enc_output（8KB ≈ 2.7s OPUS）足以缓冲 start/started RTT 期间的帧，
@@ -888,6 +892,7 @@ exit:
 static void session_reconnect_task(void *arg)
 {
     int delay_ms = (int)(intptr_t)arg;
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
 
     // 重入守卫：与 s_reconnect_handle 一起防止重复重连
     s_reconnecting = true;
@@ -1126,6 +1131,7 @@ void session_init(const char *ws_uri)
                                         8192, NULL, 5,
                                         &s_session_evt_task,
                                         1, MALLOC_CAP_SPIRAM);
+        PRINT_TASK_CREATED(TAG, "session_evt_tsk", 8192, 0); // 栈在PSRAM
     }
 
     // 从 NVS 读取配置
@@ -1370,6 +1376,8 @@ wake_result_t session_on_wake_word(const char *display)
                                                      4096, NULL, 4,
                                                      (TaskHandle_t *)&s_sender_handle,
                                                      0, MALLOC_CAP_SPIRAM);
+    if (ret == pdPASS)
+        PRINT_TASK_CREATED(TAG, "ws_sender", 4096, 0); // 栈在PSRAM
     if (ret != pdPASS)
     {
         ESP_LOGE(TAG, "发送任务创建失败");
@@ -1431,6 +1439,7 @@ session_state_t session_get_state(void)
 static void session_debug_kill_ws_task(void *arg)
 {
     ESP_LOGW(TAG, "[调试] 收到 ws_kill 指令，主动断开 WebSocket 模拟服务端 FIN...");
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
     if (s_protocol_mutex != NULL)
         xSemaphoreTake(s_protocol_mutex, portMAX_DELAY);
     if (s_protocol != NULL)
@@ -1455,6 +1464,8 @@ void session_debug_kill_ws(void)
         session_debug_kill_ws_task, "dbg_ws_kill",
         4096, NULL, 4, NULL,
         tskNO_AFFINITY, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (ret == pdPASS)
+        PRINT_TASK_CREATED(TAG, "dbg_ws_kill", 4096, 1); // 栈在内部SRAM
     if (ret != pdPASS)
         ESP_LOGE(TAG, "[调试] 创建 ws_kill 任务失败（内存不足）");
 }

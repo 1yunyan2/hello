@@ -194,6 +194,7 @@ static void async_update_wakeword_task(void *pvParameters)
  */
 static void heartbeat_task(void *arg)
 {
+    PRINT_TASK_STACK_HWM(MQTT_TAG); // 打印本任务栈历史最小剩余
     char device_id[16];
     get_short_device_id(device_id, sizeof(device_id));
 
@@ -242,6 +243,7 @@ static void heartbeat_task(void *arg)
  */
 static void mqtt_reconnect_task(void *arg)
 {
+    PRINT_TASK_STACK_HWM(MQTT_TAG); // 打印本任务栈历史最小剩余
     // ★ BUG-023：esp_mqtt_client_stop 不能在 MQTT 事件回调（MQTT 任务自身上下文）里调用，
     //   会报 "Client cannot be stopped from MQTT task" 且永远失败 → 内置 25s 自动重连一直活着，
     //   退避策略形同虚设。改为在本任务（独立上下文）里执行 stop，这才是合法调用点。
@@ -477,6 +479,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                             static bool s_printed_async_ww = false;
                             if (!s_printed_async_ww)
                             {
+                                PRINT_TASK_CREATED(MQTT_TAG, "async_ww_update", 4096, 1); // 栈在内部SRAM
                                 PRINT_MEM_INFO(MQTT_TAG, "async_ww_update 4KB INTERNAL 栈首次分配后");
                                 s_printed_async_ww = true;
                             }
@@ -517,7 +520,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         async_unbind_task, "async_unbind",
                         8192, NULL, 5, NULL,
                         tskNO_AFFINITY, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-                    if (ret != pdPASS)
+                    if (ret == pdPASS)
+                        PRINT_TASK_CREATED(MQTT_TAG, "async_unbind", 8192, 1); // 栈在内部SRAM
+                    else
                         ESP_LOGE(MQTT_TAG, "内存不足，无法创建解绑任务！");
                 }
                 else if (cJSON_IsString(type_item) && strcmp(type_item->valuestring, "ota") == 0)
@@ -679,6 +684,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             static bool s_printed_mqtt_reconn = false;
             if (!s_printed_mqtt_reconn)
             {
+                PRINT_TASK_CREATED(MQTT_TAG, "mqtt_reconn", 3072, 0); // 栈在PSRAM
                 PRINT_MEM_INFO(MQTT_TAG, "mqtt_reconn 3KB SPIRAM 栈首次分配后");
                 s_printed_mqtt_reconn = true;
             }
@@ -715,6 +721,7 @@ void protocol_mqtt_start(void)
     /* 心跳任务栈分配在 SPIRAM，节省内部 SRAM */
     xTaskCreatePinnedToCoreWithCaps(heartbeat_task, "heartbeat_task", 4096, NULL, 4, NULL,
                                     tskNO_AFFINITY, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    PRINT_TASK_CREATED(MQTT_TAG, "heartbeat_task", 4096, 0); // 栈在PSRAM
 };
 
 /**
