@@ -53,14 +53,6 @@ void standby_notify_activity(void);
 void standby_wake(void);
 
 /**
- * @brief 查询当前是否处于待机状态
- *
- * @return true 待机中，false 正常
- * @note 调用者：ui_port.c（摸头时判断是否需要先唤醒而非触发情绪）
- */
-bool standby_is_active(void);
-
-/**
  * @brief 查询当前是否已进入二级（深度）待机
  *
  * 二级期间屏已关、舵机 PWM 已停（enter_deep_standby），不应再有任何代码路径

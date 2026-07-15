@@ -19,13 +19,15 @@
 #include "object.h" // PRINT_TASK_CREATED / PRINT_TASK_STACK_HWM
 
 #define UDP_LOGGER_DEFAULT_PORT 3333
-// ★默认改为【广播】地址 255.255.255.255：同一局域网内所有电脑都能收到，
-//   电脑 IP 变了（DHCP 重新分配、换网）也不用改这里重新烧——彻底解决"单播写死
-//   某个 IP，电脑 IP 一变就收不到日志"的老问题（见 2026-07-09 排查）。
-//   电脑端 tools/udp_log_listen.py 监听同端口即可（它 bind 0.0.0.0，能收广播）。
-//   代价：广播包同网段所有机器都会收到；开发调试用无妨。若某些路由器/防火墙拦广播，
-//   可由调用方传入电脑固定 IP 覆盖（单播），或改回具体 IP。
-#define UDP_LOGGER_DEFAULT_DEST_IP "192.168.1.255"
+// ★默认改回【单播】到开发电脑固定 IP：广播（x.x.x.255）虽免维护 IP，但每包都走
+//   完整发送路径、无法被 ARP 缓存复用，对 lwIP 负担明显更大。实测在启动/低功耗切换
+//   等日志爆发期，广播灌包会冲垮与 WebSocket 共用的 lwIP tcpip_task 收发管道
+//   （UDP/TCP RECVMBOX 各仅 6），导致 WS 长连接握手不上或时断时续（见 2026-07-14 排查）。
+//   单播只发给这一台电脑，路由器不广播、lwIP 可复用 ARP，压力小得多。
+//   代价：换网/电脑 IP 变了需改这里重烧（配合发送任务节流，是当前最稳的组合）。
+//   电脑端 tools/udp_log_listen.py 监听同端口即可（它 bind 0.0.0.0，单播/广播都能收）。
+//   若需临时收广播，可由调用方给 udp_logger_start() 传具体地址覆盖本默认值。
+#define UDP_LOGGER_DEFAULT_DEST_IP "192.168.1.243"
 #define UDP_LOGGER_BUF_SIZE 512 // 单条日志最大长度，超出截断（够用；ESP_LOG 单行一般 <200B）
 #define UDP_LOGGER_QUEUE_LEN 32 // 发送队列深度：突发日志（如启动阶段）允许暂存这么多条，超出直接丢弃最旧的
 
@@ -43,7 +45,23 @@ typedef struct
     char data[UDP_LOGGER_BUF_SIZE];
 } udp_log_item_t;
 
+// ★队列本体（约 32×518B≈16.5KB）改用 xQueueCreateStatic + PSRAM 静态存储区，
+//   避免 xQueueCreate 默认从内部 SRAM 分配这一整块。队列本身只是数据搬运，不涉及
+//   Flash/NVS 操作，PSRAM 存储区在这里没有 BUG-010 那类 cache 关闭期不可访问的风险。
+static StaticQueue_t s_log_queue_struct;
+static uint8_t *s_log_queue_storage = NULL; // heap_caps_malloc(..., MALLOC_CAP_SPIRAM)
+
 static const char *TAG = "UDP_LOGGER";
+
+// ★启动宽限期（毫秒）：接管日志后的头这么长时间内，udp_logger_vprintf 只把日志
+//   写 UART、【不入队发 UDP】。原因：DNS 查询、WS/MQTT 建连都走 UDP/网络，而它们
+//   与 UDP 日志出包争用同一个 lwIP tcpip_task 和 UDP 收发 mbox（UDP_RECVMBOX_SIZE=6）。
+//   系统启动阶段日志爆发（GIF/PCM/待机刷屏），若同时全速灌 UDP 出包，会把 DNS 应答
+//   挤不进 mbox → getaddrinfo() 超时返回 202 → 域名解析失败 → WS 连不上。实测关掉
+//   UDP 日志则一切正常，证明就是 UDP 出包挤占了 DNS 的 UDP 通道。故在建连最脆弱的
+//   启动期让 UDP 完全让路（这段日志插 USB 用 UART 照样看得全），等网络连稳后再放行。
+#define UDP_LOGGER_STARTUP_GRACE_MS 20000
+static uint32_t s_grace_until_tick = 0; // 达到此 tick 之前不发 UDP（0=尚未接管）
 
 /**
  * @brief 替换 esp_log 的 vprintf：只管格式化 + 入队，不碰 socket
@@ -64,7 +82,13 @@ static const char *TAG = "UDP_LOGGER";
  */
 static int udp_logger_vprintf(const char *fmt, va_list args)
 {
-    if (s_log_queue != NULL)
+    // ★启动宽限期内不入队发 UDP：让 DNS/WS 建连的 UDP/网络流量独占 lwIP 通道，
+    //   避免 UDP 日志出包挤占 DNS 应答 mbox 导致 getaddrinfo 202、WS 连不上。
+    //   s_grace_until_tick==0 表示尚未接管日志（发送任务还没设置基准），也不发。
+    bool in_grace = (s_grace_until_tick == 0) ||
+                    ((int32_t)(xTaskGetTickCount() - s_grace_until_tick) < 0);
+
+    if (s_log_queue != NULL && !in_grace)
     {
         udp_log_item_t item;
         int len = vsnprintf(item.data, sizeof(item.data), fmt, args);
@@ -145,8 +169,18 @@ static void udp_logger_send_task(void *arg)
     //   存进 s_orig_vprintf，造成自调用死循环。只在首次接管。
     if (s_orig_vprintf == NULL)
         s_orig_vprintf = esp_log_set_vprintf(udp_logger_vprintf);
+    // ★设置启动宽限期基准：从现在（接管日志的瞬间）起，头 UDP_LOGGER_STARTUP_GRACE_MS
+    //   毫秒内 udp_logger_vprintf 只写 UART 不发 UDP，把网络让给 DNS/WS 建连。放在接管
+    //   之后设置，确保 in_grace 判断从接管起才生效（此前 s_grace_until_tick==0 也不发）。
+    {
+        uint32_t now = xTaskGetTickCount();
+        s_grace_until_tick = now + pdMS_TO_TICKS(UDP_LOGGER_STARTUP_GRACE_MS);
+        if (s_grace_until_tick == 0) // 极罕见回绕到 0，避开"0=未接管"语义
+            s_grace_until_tick = 1;
+    }
     s_started = true;
-    ESP_LOGI(TAG, "启动完成，sock=%d，开始接管日志输出", sock);
+    ESP_LOGI(TAG, "启动完成，sock=%d，开始接管日志输出（前 %d ms 宽限期只走UART，让路给DNS/WS建连）",
+             sock, UDP_LOGGER_STARTUP_GRACE_MS);
 
     // ★复位原因诊断：UDP 抓不到 bootloader 的 rst:0x.. 与 "Brownout detector was triggered"
     //   （那些走 UART0），故在 UDP 接管日志后，用 esp_reset_reason() 补打上一次复位原因。
@@ -207,8 +241,14 @@ static void udp_logger_send_task(void *arg)
             sent = sendto(s_sock, item.data, item.len, 0, (struct sockaddr *)&s_dest_addr, sizeof(s_dest_addr));
             if (sent >= 0 || errno != ENOMEM)
                 break;
-            vTaskDelay(pdMS_TO_TICKS(2));
+            vTaskDelay(pdMS_TO_TICKS(2)); // 仅 ENOMEM 重试：等其他任务释放内存后再试
         }
+
+        // ★发送节流：每处理一条日志后主动让出 2ms，把 UDP 出包速率压平，避免在
+        //   启动/低功耗切换等日志爆发期，独立发送任务全速灌包冲垮与 WebSocket 共用的
+        //   lwIP tcpip_task 收发管道（UDP/TCP RECVMBOX 各仅 6），导致 WS 长连接握手
+        //   不上或时断时续。宁可日志晚几毫秒发出，也不与业务 TCP 抢瞬时带宽。
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
 }
 
@@ -222,9 +262,18 @@ void udp_logger_start(const char *dest_ip, uint16_t port)
 
     if (s_log_queue == NULL)
     {
-        s_log_queue = xQueueCreate(UDP_LOGGER_QUEUE_LEN, sizeof(udp_log_item_t));
+        s_log_queue_storage = heap_caps_malloc(UDP_LOGGER_QUEUE_LEN * sizeof(udp_log_item_t),
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_log_queue_storage == NULL)
+            return; // PSRAM 不足：放弃启动，日志仍走原路径
+        s_log_queue = xQueueCreateStatic(UDP_LOGGER_QUEUE_LEN, sizeof(udp_log_item_t),
+                                         s_log_queue_storage, &s_log_queue_struct);
         if (s_log_queue == NULL)
+        {
+            heap_caps_free(s_log_queue_storage);
+            s_log_queue_storage = NULL;
             return; // 内存不足：放弃启动，日志仍走原路径
+        }
     }
 
     // ★不在当前上下文（可能是 sys_evt 等小栈任务）直接创建 socket，改投递到独立任务执行。

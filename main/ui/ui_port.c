@@ -20,6 +20,7 @@
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_random.h"
+#include "esp_timer.h" /* 初次联网避让窗口计时：esp_timer_get_time() */
 #include "bsp/bsp_config.h"
 #include "bsp/bsp_board.h"
 #include "bsp/servo_manager.h" /* GIF 切换时只驱动舵机:非阻塞入队 + 独立 worker 执行 */
@@ -181,6 +182,18 @@ static lv_timer_t *s_gif_switch_tmr = NULL;
  * 由 ui_request_emotion_gif()（任意线程）设置，main_gif_switch_timer_cb（LVGL线程）消费。
  * 见 BUG-010：lv_gif_set_src 必须在 LVGL 线程调，故走 pending + 延迟 timer 机制。 */
 static const char *volatile s_gif_pending_path = NULL;
+
+/* ── 初次联网避让窗口 ────────────────────────────────────────────────────────
+ * 现象（wdt 误报）：初次联网瞬间 WiFi/TLS/WebSocket 连接 + NVS 写等突发工作集中砸在
+ *   CPU0，taskLVGL（GIF 解码优先级仅 5）被反复挤住，此刻若正好在跑 lv_gif_set_src
+ *   （读文件 + 解码首帧 + 分配 draw_buf），会把这一拍彻底顶死，导致 IDLE0 连续得不到
+ *   运行触发一次 task_wdt（10s 窗口）。只发生一次、联网后即消失。
+ * 方案：初次联网成功后开一个短窗口（FIRST_ONLINE_DEFER_MS），期间 main_gif_switch_timer_cb
+ *   不真正切图，而是把 timer 重排到窗口之后再执行（保留 pending 不丢弃），让联网突发先过去。
+ * 只对【初次】生效：ui_notify_first_online() 只由初次联网主流程调用一次（重连不走）。
+ * s_first_online_defer_until_us：避让截止时间(esp_timer 微秒)；0=未武装/已过窗口。 */
+#define FIRST_ONLINE_DEFER_MS 2000
+static volatile int64_t s_first_online_defer_until_us = 0;
 
 /* ── 对话状态中性 GIF 标志（纯视觉，无舵机/震动）──
  *   s_neutral_active     : true=当前处于对话中（LISTENING/PLAYING），屏幕锁定在状态中性 GIF，
@@ -825,6 +838,27 @@ static void main_gif_switch_timer_cb(lv_timer_t *t)
 {
     lv_timer_pause(t);
 
+    /* ── 初次联网避让：窗口内不切图（切图含文件 I/O + 解码首帧，会与联网突发争 CPU0
+     *   把 taskLVGL 顶死触发 wdt）。不丢 pending，把 timer 重排到窗口末端再触发一次，
+     *   届时窗口已过、联网突发已散，正常切图。仅初次联网后短暂生效（见 s_first_online_defer_until_us）。 */
+    if (s_first_online_defer_until_us != 0)
+    {
+        int64_t remain_us = s_first_online_defer_until_us - esp_timer_get_time();
+        if (remain_us > 0)
+        {
+            /* 睡到窗口末端再跑一拍（+10ms 余量确保跨过截止点）；resume 后本回调下次触发时
+             * remain<=0 走清零分支，恢复正常 10ms 周期后按原逻辑切图。 */
+            uint32_t defer_ms = (uint32_t)(remain_us / 1000) + 10;
+            lv_timer_set_period(t, defer_ms);
+            lv_timer_resume(t);
+            ESP_LOGI("GIFDBG", "timer_cb: 初次联网避让，延后 %lu ms 再切图", (unsigned long)defer_ms);
+            return; // 保留 pending，本拍不切图
+        }
+        /* 窗口已过：清零标志并恢复正常周期，本拍继续正常切图 */
+        s_first_online_defer_until_us = 0;
+        lv_timer_set_period(t, 10);
+    }
+
     // 双保险:READY 到延迟这一拍之间若已切到功能层,放弃本次切换(不切图、不动舵机)
     if (s_view != UI_VIEW_MAIN)
     {
@@ -885,28 +919,15 @@ static void main_gif_switch_timer_cb(lv_timer_t *t)
     if (interaction_is_playing())
         return;
 
-    /* ── 待机（一级低功耗）中：GIF 改由随机情绪矩阵驱动，不走 idx 表 ──────────────
-     * 必须在 main_gif_apply_index（按 idx 表切图）之前分流：否则会先切 idx 表的图、
-     * 紧接着情绪 worker 又切一次情绪自己的图，两次切图打架/闪烁。
-     * ui_interaction_play() 内部会走 ui_request_emotion_gif 切情绪 GIF + 播头部动作
-     * （手臂钉90°+跳过震动，由 interaction_set_lowpower(true) 生效，见 standby.c）。
-     * s_gif_pending_idx 本次直接丢弃（idx 表不参与待机），下一轮 READY 仍会正常排队，
-     * 不影响退出待机后恢复正常轮播。 */
-    if (standby_is_active())
+    /* ── 深度待机（唯一低功耗档）中：屏已关(bsp_board_lcd_disp_off)、舵机 PWM 已停
+     * (bsp_servo_idle)，直接丢弃本次切图，绝不触发任何情绪动作 / 舵机 PWM。────────────
+     * 删一级后低功耗不再靠情绪队列驱动 GIF/头部动作（原一级那套 ui_interaction_play
+     * 随机情绪已删除）：黑屏期什么队列都不放，退出深度待机由 ui_resume_main_gif_loop
+     * 恢复空闲队列的正常随机 GIF 轮播。standby_is_deep_active() 为唯一低功耗标志。 */
+    if (standby_is_deep_active())
     {
-        /* ★二级（深度待机）：屏已关(bsp_board_lcd_off)、舵机 PWM 已停(bsp_servo_idle)，
-         * 此时绝不能再触发情绪动作——ui_interaction_play 会重新驱动头部舵机 PWM，
-         * 把 enter_deep_standby 刚停掉的舵机又点亮（"二级了头部还在动"的根因）。
-         * standby_is_active() 在一级/二级期间均为 true，必须用 standby_is_deep_active()
-         * 单独区分二级并直接丢弃本次切图，不入队、不驱动任何舵机。 */
-        if (standby_is_deep_active())
-        {
-            // 【诊断-DBG5】二级期间本 timer 仍被唤醒执行到这里，确认丢弃分支被命中的频率（验证OK后可删）
-            ESP_LOGW("GIFDBG", "[DBG5] timer_cb: 二级待机中，丢弃本次切图（gif_obj=%p pending_idx此次作废）", (void *)gif_obj);
-            return;
-        }
-        ESP_LOGI("GIFDBG", "timer_cb: 待机中，随机情绪驱动头部+GIF（丢弃idx表切图）");
-        ui_interaction_play(esp_random() % EMOTION_COUNT);
+        // 【诊断-DBG5】深度待机期本 timer 仍被唤醒执行到这里，确认丢弃分支被命中的频率（验证OK后可删）
+        ESP_LOGW("GIFDBG", "[DBG5] timer_cb: 深度待机中，丢弃本次切图（gif_obj=%p pending_idx此次作废）", (void *)gif_obj);
         return;
     }
 
@@ -965,6 +986,19 @@ void ui_request_state_gif(const char *gif_path)
     s_gif_pending_path = gif_path; // 指针赋值原子；指向常量字符串，生命周期安全
     if (s_gif_switch_tmr != NULL)
         lv_timer_resume(s_gif_switch_tmr); // 唤醒延迟切换 timer，下个 LVGL tick 执行
+}
+
+/**
+ * @brief 通知 UI「初次联网成功」，开启短暂 GIF 切图避让窗口（见头文件说明）
+ *
+ * 只做一次原子赋值（int64_t 写在 32 位 ESP32-S3 上非严格原子，但本值仅由 LVGL 线程
+ * 消费、且写入与读取相差远大于一次写周期，撕裂不会造成逻辑错误——最坏是多避让/少避让
+ * 一拍），无需加 LVGL 锁，可在 bsp_board_wifi_main（非 LVGL 线程）直接调用。
+ */
+void ui_notify_first_online(void)
+{
+    s_first_online_defer_until_us = esp_timer_get_time() + (int64_t)FIRST_ONLINE_DEFER_MS * 1000;
+    ESP_LOGI("GIFDBG", "初次联网：开启 %d ms GIF 切图避让窗口", FIRST_ONLINE_DEFER_MS);
 }
 
 /**
@@ -1039,6 +1073,70 @@ void ui_resume_main_gif_loop(void)
     s_gif_pending_idx = main_gif_pick_next_index(s_gif_cur_index);
     ESP_LOGI("GIFDBG", "resume_loop: 动作播完恢复循环 → pending_idx=%d", s_gif_pending_idx);
     lv_timer_resume(s_gif_switch_tmr); // 下个 LVGL tick 切下一张，恢复循环
+}
+
+/**
+ * @brief 定格主界面 GIF 动画（跨线程安全，需 LVGL 锁）——进深度待机第一步调用
+ *
+ * 供 standby.c 的 enter_deep_standby() 在【背光渐暗之前】调用，实现「先关 GIF 再降亮度」：
+ *   1. lv_timer_pause(s_gif_switch_tmr)：掐断 main_gif_ready_cb 继续排队「切下一张」的链路，
+ *      同时消除深度待机期间 s_gif_switch_tmr 反复被唤醒又丢弃的空转（治标又治本的第一环）。
+ *   2. lv_gif_pause(gif_obj)：真正冻结 GIF 内部逐帧推进定时器，画面【定格在当前帧】
+ *      （不黑屏、不复位到首帧），停止解码/刷新，彻底不再耗 CPU。
+ *
+ * 定格瞬间画面完全静止、与当前帧无差别，此刻屏幕仍亮，用户无感；之后再对静止画面渐暗。
+ * ★根因关联：GIF 持续排队解码与 standby_task 同优先级(5)争抢 CPU，是背光渐暗延迟十几秒
+ *   才开始的元凶——先定格 GIF 让出 CPU，standby_task 才能顺畅执行到后续的渐暗步骤。
+ *
+ * 跨线程：本函数从 standby_task（非 LVGL 线程）调用，碰 gif_obj 必须持 LVGL 锁（BUG-010）。
+ * 取锁失败即超时跳过、打警告，不阻塞、不硬等——最坏退化回「GIF 停在最后一帧空转」的现状，
+ * 绝不更糟，也绝不崩/卡死。s_gif_switch_tmr 的 pause 是纯 timer 指针操作，无需持锁，故放锁外。
+ */
+void ui_pause_main_gif(void)
+{
+    if (s_gif_switch_tmr != NULL)
+        lv_timer_pause(s_gif_switch_tmr); // 先停「切下一张」排队（无需 LVGL 锁）
+    if (gif_obj == NULL)
+        return;
+    if (lvgl_port_lock(200))
+    {
+        lv_gif_pause(gif_obj); // 定格当前帧，停止内部解码/刷新
+        lvgl_port_unlock();
+        ESP_LOGI("GIFDBG", "ui_pause_main_gif: GIF 已定格当前帧（进深度待机）");
+    }
+    else
+    {
+        ESP_LOGW("GIFDBG", "ui_pause_main_gif 取 LVGL 锁超时，跳过定格（GIF 可能仍在最后一帧空转，无害退化）");
+    }
+}
+
+/**
+ * @brief 恢复主界面 GIF 动画播放（跨线程安全，需 LVGL 锁）——退深度待机、亮屏前调用
+ *
+ * 供 standby.c 的 standby_wake() 在 disp_on 成功【之后】、背光渐亮【之前】调用，保证
+ * 「先恢复 GIF 再亮屏」：GIF 从定格帧继续播放的这段过渡，发生在背光仍为 0（屏不可见）的
+ * 窗口内，亮起来时画面已经在动，用户无感。与 ui_pause_main_gif() 成对。
+ *
+ * 跨线程规避 / 取锁失败退化策略同 ui_pause_main_gif()。s_gif_switch_tmr 的 resume
+ * 恢复自动轮播排队，纯 timer 指针操作、无需持锁，放锁外。
+ */
+void ui_resume_main_gif(void)
+{
+    if (gif_obj != NULL)
+    {
+        if (lvgl_port_lock(200))
+        {
+            lv_gif_resume(gif_obj); // 从定格帧继续播放
+            lvgl_port_unlock();
+            ESP_LOGI("GIFDBG", "ui_resume_main_gif: GIF 已从定格帧恢复播放（退深度待机）");
+        }
+        else
+        {
+            ESP_LOGW("GIFDBG", "ui_resume_main_gif 取 LVGL 锁超时，跳过恢复（GIF 可能仍停在定格帧，无害退化）");
+        }
+    }
+    if (s_gif_switch_tmr != NULL)
+        lv_timer_resume(s_gif_switch_tmr); // 恢复「切下一张」自动轮播排队
 }
 
 /**
@@ -1167,7 +1265,7 @@ static esp_err_t app_lvgl_init(void)
         //   W*H/16 = 9600 字节：余量更大但 GIF 帧率会更慢
         // PSRAM 全屏 buffer 导致 SPI DMA 无法访问 PSRAM 指针 → tx_color failed
         // 稳态：W*H/8 = 19200 字节，内部 SRAM + DMA，PARTIAL 模式分 8 次 flush
-        .buffer_size = BSP_LCD_WIDTH * BSP_LCD_HEIGHT / 5, // 30720 字节：理论上可分配但实测不稳，但是已经是极限了
+        .buffer_size = BSP_LCD_WIDTH * BSP_LCD_HEIGHT / 7, // 30720 字节：理论上可分配但实测不稳，但是已经是极限了
         .double_buffer = false,
         .hres = BSP_LCD_WIDTH,
         .vres = BSP_LCD_HEIGHT,
@@ -1176,16 +1274,17 @@ static esp_err_t app_lvgl_init(void)
         .rotation = {.swap_xy = true, .mirror_x = false, .mirror_y = true},
         .flags = {.buff_dma = true, .swap_bytes = false, .buff_spiram = false}};
 
+    PRINT_MEM_INFO(TAG, "lvgl_port_add_disp 前(即将申请30720B DMA-SRAM draw buffer)");
     lvgl_disp = lvgl_port_add_disp(&disp_cfg);
     if (lvgl_disp == NULL)
     {
         // disp 创建失败时必须返回错误，否则 ui_init 后续会调 lv_screen_active()
         // 拿到失效对象，main_desplay_create 解引用导致 LoadProhibited 崩溃
-        ESP_LOGE(TAG, "lvgl_port_add_disp 失败：DMA 内部 SRAM 不足 19200 字节连续区");
-        PRINT_MEM_INFO(TAG, "LVGL flush buffer 19200B DMA-SRAM 分配失败");
+        ESP_LOGE(TAG, "lvgl_port_add_disp 失败：DMA 内部 SRAM 不足 30720 字节连续区");
+        PRINT_MEM_INFO(TAG, "LVGL flush buffer 30720B DMA-SRAM 分配失败");
         return ESP_ERR_NO_MEM;
     }
-    PRINT_MEM_INFO(TAG, "LVGL flush buffer 19200B DMA-SRAM 分配后");
+    PRINT_MEM_INFO(TAG, "LVGL flush buffer 30720B DMA-SRAM 分配后");
 
     // 注意：esp_lvgl_port 在 double_buffer=false 时已自动注册为 PARTIAL 模式，
     // 这里不再调 lv_display_set_render_mode 覆盖（之前调用会与内部 flush 逻辑冲突）
@@ -2935,7 +3034,7 @@ void ui_dispatch_touch_event(touch_event_t event)
 
     /* 先记下「本次触摸发生时是否处于待机」。必须在 notify 之前取，
      * 因为下面的 standby_notify_activity() 会顺带唤醒、把待机标志清掉。 */
-    bool was_standby = standby_is_active();
+    bool was_standby = standby_is_deep_active();
 
     /* 任意触摸都算「活动」：刷新待机倒计时，且若在待机中则一并退出待机
      * （头部/腹背/左右翻页等任意部位皆可唤醒，唤醒逻辑收口在此函数内部）。 */

@@ -18,7 +18,7 @@ static const char *TAG = "BSP_CODEC";
 #define MIN_VOLUME 0
 
 // 低功耗（一级待机）期间的固定压低音量（宏定义，不写 NVS，与用户设置的音量独立）
-#define BSP_CODEC_LOWPOWER_VOLUME 10
+#define BSP_CODEC_LOWPOWER_VOLUME 0
 // 低功耗音量线性渐变总耗时 500ms，与 LCD 亮度渐变（bsp_lcd.c，800ms）各自独立配置
 #define BSP_CODEC_LOWPOWER_FADE_MS 500
 #define BSP_CODEC_LOWPOWER_FADE_STEPS 10 // 步数，每步间隔 = FADE_MS/STEPS = 50ms
@@ -660,13 +660,13 @@ void audio_init(bsp_board_t *bsp_board)
     // 必须在 codec_dev 完全打开后才能创建，否则 read() 会失败
     /* 任务栈分配到 SPIRAM，节省内部 SRAM（audio_feed 无实时 ISR 调用，PSRAM cache 足够快） */
     xTaskCreatePinnedToCoreWithCaps(
-        audio_feed_task,                      // 任务函数
-        "audio_feed",                         // 任务名称（用于 FreeRTOS 调试工具显示）
-        8192,                                 // 栈大小（8KB：含 DMA 缓冲区指针和局部变量）
-        bsp_board,                            // 传入 bsp_board 指针（任务需要 codec_dev 读取音频）
-        5,                                    // 优先级（与编解码任务对称，保证实时性）
-        NULL,                                 // 不需要保存任务句柄（任务永远运行，无需管理）
-        1,                                    // 固定到 CPU 核心 1（WiFi 协议栈默认用 CPU0，避免竞争）
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); // 栈分配在 SPIRAM
+        audio_feed_task,                            // 任务函数
+        "audio_feed",                               // 任务名称（用于 FreeRTOS 调试工具显示）
+        8192,                                       // 栈大小（8KB：含 DMA 缓冲区指针和局部变量）
+        bsp_board,                                  // 传入 bsp_board 指针（任务需要 codec_dev 读取音频）
+        5,                                          // 优先级（与编解码任务对称，保证实时性）
+        NULL,                                       // 不需要保存任务句柄（任务永远运行，无需管理）
+        1,                                          // 固定到 CPU 核心 1（WiFi 协议栈默认用 CPU0，避免竞争）
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);       // 栈分配在 SPIRAM
     PRINT_TASK_CREATED(TAG, "audio_feed", 8192, 0); // 栈在PSRAM
 }

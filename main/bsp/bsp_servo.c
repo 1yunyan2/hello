@@ -79,6 +79,13 @@ bool bsp_servo_abort_requested(void)
 #define R_ARM_MIN_ANGLE 0.0f   ///< 右臂向后最大极限角度（度）
 #define R_ARM_MAX_ANGLE 180.0f ///< 右臂向前最大极限角度（度），防止撞头
 
+// 单脉冲判定实验开关（2026-07-10 已测完，保留备查）：1=上电只发1~2个90°脉冲后永久断信号。
+// ★实验结论（铁证）：断信号后舵机仍一路走完 90° —— 本款舵机为"记忆型"（保持最后目标
+//   继续运动），断脉冲不失力。因此小步进/脉冲串等一切软件限速手段对上电归中【无效】，
+//   上电回正速度=舵机硬件全速（规格属性，不可调）。要慢速上电归中只能硬件换型
+//   （失力型模拟舵机 或 速度可编程的串行总线舵机）。
+#define SERVO_SINGLE_PULSE_TEST 0
+
 // ==========================================
 // 私有函数：角度边界裁剪 (防止物理撞击)
 // ==========================================
@@ -203,21 +210,50 @@ void bsp_board_servo_init(bsp_board_t *bsp_board)
 
     if (err == ESP_OK)
     {
-        // ── 步骤 3：标记初始化成功 ────────────────────────────────────────────
-        bsp_board->servo_initialized = true;
+        // 注：servo 组件已收编到 components/servo（2026-07-10）并把 init 初始 duty 改为 0
+        // （真正零占空比，不输出任何脉冲）——init 静默、舵机纹丝不动，上电首个指令完全由
+        // 下面的软启动脉冲串控制，无需再"掐断 init 自带输出"。
+
         ESP_LOGI(TAG, "三轴舵机硬件初始化成功!");
 
-        // ── 步骤 4：上电缓慢归中（防止舵机从随机位置快速跳到目标位置产生抽搐）──
-        // SERVO_SPEED_MID = 15ms/度，从任意位置到 90° 最长约 1.35 秒
-        bsp_servo_move_smooth(CH_HEAD, 90.0f, SERVO_SPEED_MID);  // 头部归中
-        bsp_servo_move_smooth(CH_L_ARM, 90.0f, SERVO_SPEED_MID); // 左臂归中
-        bsp_servo_move_smooth(CH_R_ARM, 90.0f, SERVO_SPEED_MID); // 右臂归中
+#if SERVO_SINGLE_PULSE_TEST
+        // ══ 【单脉冲判定实验，测完把宏改回 0】═══════════════════════════════════
+        // 目的：一次定性回答"这颗舵机断信号后到底停不停"，终结两种互斥解释：
+        //   A. 失力型（标准模拟舵机）：断脉冲即失力 → 只走一小段(~10°)就停 → 脉冲串限速可行
+        //   B. 记忆型：断脉冲仍自行走完目标 → 一路走到 90° → 软件限速彻底无解
+        // 操作：把头掰离 90°（越远越明显）→ 上电 → 观察舵机走多远。
+        // 保障：发完唯一脉冲后【不置 servo_initialized】——后续一切舵机指令（GIF 空闲动作等）
+        //   均被丢弃，观察窗口纯净、不限时。测完改回正式逻辑（#else 分支）。
+        for (int i = 0; i < 3; i++)
+            iot_servo_write_angle(LEDC_LOW_SPEED_MODE, (uint8_t)i, 90.0f); // 开始输出 90°
+        vTaskDelay(pdMS_TO_TICKS(40)); // 40ms ≈ 保证输出 1~2 个完整 50Hz 脉冲
+        for (int i = 0; i < 3; i++)
+        {
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)i, 0); // 永久断信号
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)i);
+        }
+        ESP_LOGW(TAG, "★单脉冲测试：已发 1~2 个 90° 脉冲并永久断信号。观察舵机：");
+        ESP_LOGW(TAG, "★  只走一小段就停 = 失力型（脉冲串可行）｜一路走完90° = 记忆型（软件无解）");
+        ESP_LOGW(TAG, "★  测试模式下舵机不再响应任何指令（未置 initialized），测完把宏改回 0");
+        // 注意：不置 servo_initialized、不置 SERVO_READY —— 测试模式舵机全程静默
+#else
+        // ── 步骤 3：上电归中——三路直接持续输出 90° ─────────────────────────────
+        //   - 正常开机：固件保证深度待机/关机前三轴已归中 90°（standby.c），物理就在 90°，
+        //     脉冲一来纹丝不动，零甩动；
+        //   - 断电期间被外力掰歪：上电回正一次（速度取决于单脉冲测试结论：失力型可换回
+        //     脉冲串软启动限速；记忆型则为舵机全速，硬件属性不可调）。
+        //   - iot_servo_init 已收编改为 duty=0 静默启动（components/servo），首个脉冲的
+        //     时机由这里完全掌控。
+        for (int i = 0; i < 3; i++)
+            iot_servo_write_angle(LEDC_LOW_SPEED_MODE, (uint8_t)i, 90.0f);
 
-        // ── 步骤 5：置位事件标志位，通知其他模块（如 interaction）舵机已就绪──
+        // ── 步骤 4：标记初始化成功 + 置位就绪事件 ────────────────────────────────
+        bsp_board->servo_initialized = true;
         if (bsp_board->board_status != NULL)
         {
             xEventGroupSetBits(bsp_board->board_status, BOARD_STATUS_SERVO_READY);
         }
+#endif // SERVO_SINGLE_PULSE_TEST
     }
     else
     {
@@ -377,19 +413,41 @@ void bsp_servo_idle(void)
     if (board == NULL || !board->servo_initialized)
         return; // 未就绪：无需停止
 
-    // 逐通道加锁后停 PWM，避免与正在进行的插值运动写入竞争（与 move_smooth 同锁）。
+    // 逐通道加锁操作，避免与正在进行的插值运动写入竞争（与 move_smooth 同锁）。
     const uint8_t chs[3] = {CH_HEAD, CH_L_ARM, CH_R_ARM};
+
+    // ── 第一步：三路 duty 先拉 0 并 update（引脚变为无脉冲的干净低电平）────────────
+    // ★防"停止瞬间抽搐"：直接 ledc_stop 可能在脉冲高电平段拦腰截断，产生一个畸形短脉冲，
+    //   舵机会把它解读成一个极端角度、向一侧猛抽一下（实测三轴同时向右甩约 45°）。
+    //   先把 duty 归 0，让输出自然变为恒低（对舵机=无信号，不产生任何角度指令）。
     for (int i = 0; i < 3; i++)
     {
         uint8_t ch = chs[i];
         if (s_ch_mutex[ch] == NULL)
             continue;
         xSemaphoreTake(s_ch_mutex[ch], portMAX_DELAY);
-        // idle_level=0：停止后引脚保持低电平（舵机失力，不抽搐）。只动通道，不动 timer。
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, ch, 0);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, ch);
+        xSemaphoreGive(s_ch_mutex[ch]);
+    }
+
+    // ── 第二步：等一个完整 PWM 周期，确保"最后一个在途脉冲"完整走完 ─────────────
+    // 舵机 PWM 为 50Hz（周期 20ms），等 25ms 保证 update 生效且当前周期内的脉冲输出完毕，
+    // 之后引脚上已是持续低电平，此时 stop 不可能再截出畸形脉冲。
+    vTaskDelay(pdMS_TO_TICKS(25));
+
+    // ── 第三步：真正停通道（idle_level=0，引脚保持低电平）。只动通道，不动 timer ────
+    // ★绝不触碰共享的 LEDC_TIMER_0 本身（参见函数头注释与 BUG-015 教训）。
+    for (int i = 0; i < 3; i++)
+    {
+        uint8_t ch = chs[i];
+        if (s_ch_mutex[ch] == NULL)
+            continue;
+        xSemaphoreTake(s_ch_mutex[ch], portMAX_DELAY);
         ledc_stop(LEDC_LOW_SPEED_MODE, ch, 0);
         xSemaphoreGive(s_ch_mutex[ch]);
     }
-    ESP_LOGI(TAG, "舵机已进入低功耗休眠（三路 PWM 已停止）");
+    ESP_LOGI(TAG, "舵机已进入低功耗休眠（三路 PWM 已停止，duty 先归零防截断抽搐）");
 }
 
 /**
@@ -409,23 +467,29 @@ void bsp_servo_resume(void)
     if (board == NULL || !board->servo_initialized)
         return;
 
-    // ★错峰归中（问题2 电源半根因修复）：三路【逐个】慢速归中，路与路之间隔 200ms。
-    //   原实现先三路同时 iot_servo_write_angle(90°) 瞬时跳变，再走 move_smooth（此时寄存器
-    //   已是 90°，走死区直接返回=没有平滑）。三舵机从失力松弛位【同时】瞬跳 90° 的堵转电流
-    //   叠加背光渐亮，锂电池瞬时压降 → 舵机欠压失步/卡死（"退二级三舵机卡死"，仅电池出现）。
-    //   改为逐路平滑归中 + 200ms 错峰后，任一时刻只有一路在动，电流尖峰被摊平。
-    //   bsp_servo_move_smooth 内部读当前角度→逐度插值写 duty，会自动重启被 ledc_stop 的 PWM
-    //   （write_angle 内部 set_duty+update_duty），无需再单独瞬跳一次。
-    //   ★注意 ledc_stop(...,0) 后 duty 寄存器状态不保证保留，故不依赖"写回读回的当前角度"，
-    //     直接慢速去 90°（本就是归中目标）即可。
+    // ★直接写 90°，不再走 move_smooth 扫描式归中（修"退低功耗舵机先抽到0°再慢慢转回90°"）：
+    //   进深度待机前 enter_deep_standby 已保证三轴【先归中 90° 再停 PWM】，物理位置就在 90°。
+    //   旧实现 move_smooth 第一步 iot_servo_read_angle 读"当前角"做插值起点——但该函数是拿
+    //   LEDC duty 寄存器反算角度，而 bsp_servo_idle 停止前已把 duty 清 0（防截断抽搐），
+    //   反算结果恒为 0°→ 插值从假起点 0° 逐度扫到 90°→ 发给舵机的第一个脉冲就是 0°，
+    //   物理上舵机（实际在90°）猛跳到 0° 再慢慢扫回 90°，表现为"退出像重启归中"。
+    //   现直接写 90°：舵机本来就在 90°，脉冲一来纹丝不动，零跳变、零堵转电流。
+    //   保留逐路 + 200ms 错峰（防御：万一某轴被外力掰离 90°，单发 90° 脉冲会产生一次快速
+    //   回位，逐路错峰确保任一时刻只有一路可能在动，电流尖峰不叠加）。
     const uint8_t chs[3] = {CH_HEAD, CH_L_ARM, CH_R_ARM};
     for (int i = 0; i < 3; i++)
     {
-        bsp_servo_move_smooth(chs[i], 90.0f, SERVO_SPEED_SLOW); // 逐路慢速平滑归中（自带每通道锁）
+        uint8_t ch = chs[i];
+        if (s_ch_mutex[ch] != NULL)
+        {
+            xSemaphoreTake(s_ch_mutex[ch], portMAX_DELAY);
+            iot_servo_write_angle(LEDC_LOW_SPEED_MODE, ch, 90.0f); // 恢复 PWM 输出 90°（write 内部 set_duty+update）
+            xSemaphoreGive(s_ch_mutex[ch]);
+        }
         if (i < 2)
-            vTaskDelay(pdMS_TO_TICKS(200)); // 路间错峰 200ms，摊平瞬时电流尖峰（占位经验值，可据实测调）
+            vTaskDelay(pdMS_TO_TICKS(200)); // 路间错峰 200ms，摊平可能的瞬时电流尖峰
     }
-    ESP_LOGI(TAG, "舵机已从低功耗休眠错峰恢复并归中");
+    ESP_LOGI(TAG, "舵机已从低功耗休眠恢复（直接写90°，无扫描归中）");
 }
 
 // ==========================================

@@ -3,7 +3,7 @@ dependencies:
   espressif/esp_codec_dev: ^1.5.4
   espressif/esp_audio_codec: ^2.4.0
   espressif/esp_websocket_client: ^1.6.0
-  espressif/servo: ^0.1.0
+  # espressif/servo: ^0.1.0  # 已收编到 components/servo（2026-07-10）：改 init 初始 duty=0 不输出脉冲，防上电甩动；回滚=取消本行注释+删 components/servo
   lvgl/lvgl: ^9.5.0
   espressif/esp_lvgl_port: ^2.7.0
   ningzixi/weather: ^1.1.0

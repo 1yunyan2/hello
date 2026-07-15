@@ -166,12 +166,42 @@ void ui_request_emotion_gif(const char *gif_path);
 void ui_request_state_gif(const char *gif_path);
 
 /**
+ * @brief 通知 UI「初次联网成功」，开启一个短暂的 GIF 切图避让窗口（跨线程安全）
+ *
+ * 背景：初次联网瞬间 WiFi/TLS/WebSocket 连接等突发工作集中在 CPU0，会把优先级仅 5 的
+ * taskLVGL 挤住；此刻若正好在跑 GIF 切图（文件 I/O + 解码首帧），会把这一拍顶死导致
+ * 一次 task_wdt 误报（10s 窗口，仅联网后出现一次）。本函数开一个 FIRST_ONLINE_DEFER_MS
+ * 窗口，期间 main_gif_switch_timer_cb 延后切图（不丢 pending），让联网突发先过去。
+ *
+ * 只应在【初次】联网主流程调用一次（重连不调用），故窗口只武装一次。仅做原子赋值，
+ * 可在任意线程调用，无需持 LVGL 锁。
+ */
+void ui_notify_first_online(void);
+
+/**
  * @brief 情绪播放完毕后恢复主界面自动随机 GIF + 舵机循环（跨线程安全）
  *
  * 由 interaction worker 在情绪播完、清 is_playing 标志后调用。仅设 pending 标记
  * + 唤醒延迟 timer，真正切图在 LVGL 线程执行；内部判 s_view==MAIN，已进功能盘则不恢复。
  */
 void ui_resume_main_gif_loop(void);
+
+/**
+ * @brief 定格主界面 GIF（进深度待机第一步，背光渐暗前调用，跨线程安全）
+ *
+ * 停「切下一张」排队 + lv_gif_pause 冻结当前帧，停止解码/刷新。画面定格不黑屏，
+ * 屏仍亮时定格用户无感；根治 GIF 与 standby_task 争 CPU 致背光渐暗延迟的问题。
+ * 与 ui_resume_main_gif() 成对。内部加 LVGL 锁碰 gif_obj，取锁超时安全跳过。
+ */
+void ui_pause_main_gif(void);
+
+/**
+ * @brief 恢复主界面 GIF（退深度待机、亮屏前调用，跨线程安全）
+ *
+ * disp_on 后、背光渐亮前调用：GIF 从定格帧继续播的过渡发生在屏不可见时，用户无感。
+ * 与 ui_pause_main_gif() 成对。内部加 LVGL 锁碰 gif_obj，取锁超时安全跳过。
+ */
+void ui_resume_main_gif(void);
 
 /* ═══════════════════════════════════════════════════════════════
  * 对话状态中性 GIF 接口
