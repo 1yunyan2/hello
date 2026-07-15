@@ -24,6 +24,7 @@
 #include "esp_check.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_heap_caps.h" // xTaskCreatePinnedToCoreWithCaps + MALLOC_CAP_SPIRAM（bat_log 栈迁移用）
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
@@ -860,19 +861,24 @@ esp_err_t bsp_battery_start_log_task(void)
     }
 
     s_log_task_running = true;
-    BaseType_t ok = xTaskCreate(battery_log_task,
+    // ★ 本任务只读 ADC 值 + 打印日志，不碰 NVS/Flash，栈可安全放 SPIRAM（省内部 SRAM）。
+    //   与 bat_mon 不同：bat_mon 会调 battery_nvs_save() 写 Flash，触发 cache 关闭窗口，
+    //   PSRAM 栈在那期间不可访问会崩溃，所以 bat_mon 的栈必须留在内部 SRAM，不能一起搬。
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(battery_log_task,
                                 "bat_log",
                                 BSP_BAT_TASK_STACK_SIZE,
                                 NULL,
                                 BSP_BAT_TASK_PRIORITY,
-                                &s_log_task_handle);
+                                &s_log_task_handle,
+                                tskNO_AFFINITY,
+                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ok != pdPASS)
     {
         s_log_task_running = false;
         ESP_LOGE(TAG, "创建电池日志任务失败");
         return ESP_ERR_NO_MEM;
     }
-    PRINT_TASK_CREATED(TAG, "bat_log", BSP_BAT_TASK_STACK_SIZE, 1); // xTaskCreate → 栈在内部SRAM
+    PRINT_TASK_CREATED(TAG, "bat_log", BSP_BAT_TASK_STACK_SIZE, 0); // 栈在PSRAM
     return ESP_OK;
 }
 

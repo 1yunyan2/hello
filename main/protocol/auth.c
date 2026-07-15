@@ -145,7 +145,8 @@ void auth_perform(auth_t *auth, const char *device_token)
 
     esp_err_t ret = ESP_FAIL;
     int status_code = 0;
-    const int max_retries = 3; // 同步最多尝试 3 次（约 9 秒），失败后由后台 session_reconnect_task 指数退避无限重试
+    const int max_retries = 3;               // 同步最多尝试 3 次（约 9 秒），失败后由后台 session_reconnect_task 指数退避无限重试
+    PRINT_MEM_INFO(TAG, "Auth HTTP 请求前"); // 拆分埋点：区分"请求本身开销"与"请求前已有的基线"
     for (int attempt = 0; attempt < max_retries; attempt++)
     {
         esp_http_client_config_t config = {
@@ -153,7 +154,7 @@ void auth_perform(auth_t *auth, const char *device_token)
             .method = HTTP_METHOD_POST,
             .event_handler = auth_http_event_handler,
             .user_data = wrapper,
-            .timeout_ms = 3000, // 3秒超时，与 WebSocket 网络超时一致，服务器不可达时快速失败
+            .timeout_ms = 3000,                         // 3秒超时，与 WebSocket 网络超时一致，服务器不可达时快速失败
             .crt_bundle_attach = esp_crt_bundle_attach, // HTTPS 根证书校验
         };
         esp_http_client_handle_t client = esp_http_client_init(&config);

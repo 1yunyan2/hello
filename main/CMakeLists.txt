@@ -21,7 +21,6 @@ idf_component_register(SRCS
 "ui/reminder.c"
 "ui/ui_port.c"
 "ui/standby.c"
-"ui/cry_anim_test.c"
 "ui/font_cn_16.c"
 "ui/font_cn_32.c"
 "ui/dishu.c"

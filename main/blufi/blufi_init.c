@@ -115,20 +115,31 @@ esp_err_t esp_blufi_host_init(void)
 
 esp_err_t esp_blufi_host_deinit(void)
 {
-    esp_err_t ret = ESP_OK;
+    // 释放策略：即使中途某步失败，也【继续走完全部 deinit】，确保蓝牙内存
+    // 尽量释放干净（配网仅开局一次，之后不再开蓝牙，残留内存无处回收）。
+    // 原示例遇错即 return，会跳过后续 esp_nimble_deinit / btc_deinit，
+    // 导致主机未清干净就返回，上层还会接着 deinit 控制器，更易残留。
+    esp_err_t ret = ESP_OK;  // 记录首个出错码，最终返回；不因单步失败而中断
+    esp_err_t step;
 
     esp_blufi_gatt_svr_deinit();
-    ret = nimble_port_stop();
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    if (ret == 0) {
-        esp_nimble_deinit();
-    }
 
-    ret = esp_blufi_profile_deinit();
-    if (ret != ESP_OK) {
-        return ret;
+    step = nimble_port_stop();
+    if (step != ESP_OK) {
+        BLUFI_ERROR("%s nimble_port_stop failed: %s\n", __func__, esp_err_to_name(step));
+        if (ret == ESP_OK) {
+            ret = step;
+        }
+    }
+    // 无论 nimble_port_stop 是否成功都执行 nimble_deinit，避免主机资源残留
+    esp_nimble_deinit();
+
+    step = esp_blufi_profile_deinit();
+    if (step != ESP_OK) {
+        BLUFI_ERROR("%s esp_blufi_profile_deinit failed: %s\n", __func__, esp_err_to_name(step));
+        if (ret == ESP_OK) {
+            ret = step;
+        }
     }
 
     esp_blufi_btc_deinit();

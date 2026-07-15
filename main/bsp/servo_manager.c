@@ -56,6 +56,13 @@ static QueueHandle_t s_queue = NULL; // 舵机动作请求队列句柄
 static TaskHandle_t s_worker = NULL; // 舵机工作线程句柄
 static bool s_inited = false;        // 初始化状态标志
 
+// ★队列本体（64×sizeof(internal_req_t)≈3.6KB）改用 xQueueCreateStatic + PSRAM 静态存储区，
+//   避免 xQueueCreate 默认从内部 SRAM 分配这一整块（回收 ~3.6KB 内部 SRAM）。
+//   队列只是数据搬运，worker 取出后才调 bsp_servo_*（不涉及 Flash/NVS），队列存储区放
+//   PSRAM 没有 cache 关闭期不可访问的风险（与 udp_logger.c 同款做法）。
+static StaticQueue_t s_queue_struct;         // 队列控制块（TCB 级，静态放 .bss）
+static uint8_t *s_queue_storage = NULL;      // heap_caps_malloc(..., MALLOC_CAP_SPIRAM) 的存储区
+
 // flush 中断标志：servo_manager_flush() 置 true，正在执行的并行动作循环检测到后
 // 在下一个循环边界 break 跳出；worker 归中后清回 false。atomic 保证跨核可见（plan R2）。
 static atomic_bool s_flush_req = ATOMIC_VAR_INIT(false);
@@ -297,10 +304,20 @@ esp_err_t servo_manager_init(void)
     if (s_inited)
         return ESP_OK;
 
-    // 创建舵机动作请求队列
-    s_queue = xQueueCreate(SERVO_MGR_QUEUE_LEN, sizeof(internal_req_t));
+    // 创建舵机动作请求队列（存储区放 PSRAM，回收 ~3.6KB 内部 SRAM）
+    s_queue_storage = heap_caps_malloc(SERVO_MGR_QUEUE_LEN * sizeof(internal_req_t),
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_queue_storage)
+    {
+        ESP_LOGE(TAG, "队列 PSRAM 存储区分配失败");
+        return ESP_ERR_NO_MEM;
+    }
+    s_queue = xQueueCreateStatic(SERVO_MGR_QUEUE_LEN, sizeof(internal_req_t),
+                                 s_queue_storage, &s_queue_struct);
     if (!s_queue)
     {
+        heap_caps_free(s_queue_storage);
+        s_queue_storage = NULL;
         ESP_LOGE(TAG, "创建队列失败");
         return ESP_ERR_NO_MEM;
     }
@@ -316,8 +333,10 @@ esp_err_t servo_manager_init(void)
         PRINT_TASK_CREATED(TAG, "servo_mgr", SERVO_MGR_TASK_STACK, 0); // 栈在PSRAM
     if (r != pdPASS)
     {
-        vQueueDelete(s_queue);
+        vQueueDelete(s_queue); // 静态队列 delete 不释放存储区，需手动 free
         s_queue = NULL;
+        heap_caps_free(s_queue_storage);
+        s_queue_storage = NULL;
         ESP_LOGE(TAG, "创建 worker 任务失败");
         return ESP_ERR_NO_MEM;
     }
@@ -340,8 +359,13 @@ void servo_manager_deinit(void)
     }
     if (s_queue)
     {
-        vQueueDelete(s_queue);
+        vQueueDelete(s_queue); // 静态队列：仅注销队列，存储区由下面手动 free
         s_queue = NULL;
+    }
+    if (s_queue_storage)
+    {
+        heap_caps_free(s_queue_storage); // 释放 PSRAM 静态存储区，避免泄漏
+        s_queue_storage = NULL;
     }
     s_inited = false;
 }

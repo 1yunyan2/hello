@@ -5,8 +5,11 @@
 #include "freertos/timers.h" /* WiFi 断线去抖软件定时器 */
 #include "ui/ui_port.h"      /* ui_show_unbinding(): 解绑前显示静态提示页，避免 GIF 卡冻帧 */
 #include "esp_timer.h"       /* [DIAG] esp_timer_get_time()：微秒级时间戳，定位扫描各阶段耗时 */
+#include "esp_netif.h"       /* [DNS诊断] esp_netif_get_dns_info()：拿到 IP 后打印设备实际 DNS 服务器 */
 #include "udp_logger.h"      /* 纯电池调试用：拿到 IP 后把日志同时广播到 UDP，见 GOT_IP 分支 */
 #include "object.h"          /* PRINT_TASK_CREATED / PRINT_TASK_STACK_HWM：栈+堆打印 */
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 /* ── BluFi 配网相关（替代原 Unified Provisioning）─────────────────────────── */
 #include "esp_blufi_api.h"        /* BluFi 事件枚举、回调结构、send 接口 */
@@ -103,7 +106,7 @@ static void wifi_debounce_timer_cb(TimerHandle_t xTimer)
     // ★关闭 UDP 日志 socket：断线确认（非短暂抖动）后，旧 socket 绑定的连接状态
     //   已经失效，留着它没意义，且避免和重连后 GOT_IP 的 udp_logger_start() 出现
     //   "该关未关、该建又建"的混乱。GOT_IP 恢复时会重新 start，重建全新 socket。
-    udp_logger_stop();
+    // udp_logger_stop();
 }
 
 // ─── clear_wifi_and_restart ──────────────────────────────────────────────────
@@ -780,11 +783,28 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "成功获取 IP: " IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGW(TAG, "[DIAG] IP_EVENT_STA_GOT_IP @ %lld us", esp_timer_get_time());
 
+        // ── [DNS诊断] 打印设备实际拿到的 DNS 服务器地址 ─────────────────────────
+        //   现象：设备 getaddrinfo() 对 api.strailine-space.com 返回 202(EAI_FAIL)，
+        //   而电脑（用 8.8.8.8）能正常解析出 122.224.191.2 → 怀疑设备侧 DNS 不通：
+        //   要么 DHCP 没下发 DNS server，要么下发的内网 DNS 解析不了该域名。
+        //   这里只【读】netif 的 DNS 配置并打印（无堆分配、无阻塞），可安全放在
+        //   sys_evt 小栈（2304B）上——不像 getaddrinfo() 那样会走查询+吃栈+阻塞。
+        //   若打印出 DNS=0.0.0.0 → DHCP 没给 DNS；若是路由器内网 IP → 换成公共 DNS
+        //   （esp_netif_set_dns_info 设 8.8.8.8/223.5.5.5）即可修复。诊断完删除本块。
+        {
+            esp_netif_dns_info_t dns_main = {0};
+            esp_netif_dns_info_t dns_backup = {0};
+            esp_netif_get_dns_info(event->esp_netif, ESP_NETIF_DNS_MAIN, &dns_main);
+            esp_netif_get_dns_info(event->esp_netif, ESP_NETIF_DNS_BACKUP, &dns_backup);
+            ESP_LOGW(TAG, "[DNS诊断] 主 DNS = " IPSTR " | 备 DNS = " IPSTR,
+                     IP2STR(&dns_main.ip.u_addr.ip4), IP2STR(&dns_backup.ip.u_addr.ip4));
+        }
+
         //! ★纯电池调试用：拿到 IP 后启动 UDP 日志单播（发到 udp_logger.c 里配置的电脑 IP），
         //   电脑用 tools/udp_log_listen.py 监听同端口即可看到日志——解决"纯锂电池供电无法
         //   接串口看低功耗全程日志"的问题。幂等，断线重连多次调用无副作用；不影响原 UART
         //   日志输出（两路并存）。传 NULL 用 udp_logger.c 里的默认目标 IP。
-        udp_logger_start(NULL, 0);
+        // udp_logger_start(NULL, 0);
 
         // 连接成功，重置重连计数（下次断线时从 0 开始重新计数）
         s_retry_num = 0;
@@ -1059,6 +1079,8 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
+    PRINT_MEM_INFO(TAG, "esp_wifi_init+set_mode 后");
+
     // ── 步骤 5：启动按键监控任务（GPIO0 长按 3s 触发 WiFi 重置）─────────────
     // button_monitor_task 会调用 nvs_erase_key/nvs_set_str/nvs_commit（Flash 操作），
     // Flash 操作占用 SPI 总线期间 CPU 需访问任务栈，栈必须在内部 SRAM，否则 WDT 复位。
@@ -1105,6 +1127,7 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
             ESP_LOGE(TAG, "BT 控制器初始化失败: %s，跳过配网直接重启", esp_err_to_name(bt_err));
             esp_restart();
         }
+        PRINT_MEM_INFO(TAG, "esp_blufi_controller_init 后(BLE controller已起)");
 #endif
         // 设置 MAC 派生蓝牙名（必须在 host_and_cb_init 之前，sync 回调里才能用正确的名字广播）
         blufi_set_device_name(service_name);
@@ -1116,6 +1139,7 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
             esp_restart();
         }
         ESP_LOGI(TAG, "BluFi 配网就绪 → 蓝牙名: %s（手机用 EspBlufi / 微信小程序配网）", service_name);
+        PRINT_MEM_INFO(TAG, "esp_blufi_host_and_cb_init 后(NimBLE host已起)");
 
         // 阻塞等待配网完成（PROV_DONE_BIT 由 wifi_ip_event_handler 在 GOT_IP 时置位）
         // 超时 120 秒：防止设备永远卡在配网模式
@@ -1161,6 +1185,7 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
         // ════ 已配网分支：直接 STA 连接（不开蓝牙，省内存）══════════════════
         ESP_LOGI(TAG, "设备已配网，直接连接 WiFi...");
         ESP_LOGW(TAG, "[DIAG] 进入已配网分支 @ %lld us", esp_timer_get_time());
+        PRINT_MEM_INFO(TAG, "已配网分支入口(esp_wifi_start前)");
 
         // 加载上次连接成功的信道/BSSID 提示，让驱动定向连接而非全信道扫描
         // （实测全信道扫描耗时 ~2.4s；信道若已变化，esp_wifi 会自动回退全扫）
@@ -1171,6 +1196,7 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
         ESP_LOGW(TAG, "[DIAG] 调用 esp_wifi_start() 前 @ %lld us", esp_timer_get_time());
         ESP_ERROR_CHECK(esp_wifi_start());
         ESP_LOGW(TAG, "[DIAG] esp_wifi_start() 返回 @ %lld us", esp_timer_get_time());
+        PRINT_MEM_INFO(TAG, "已配网分支(esp_wifi_start后)");
     }
 
     // ── 步骤 8：最终阻塞等待网络就绪或彻底失败 ──────────────────────────────
@@ -1195,6 +1221,11 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
             s_need_save_channel_hint = false;
             save_ap_channel_hint();
         }
+
+        /* ★初次联网避让：此处是初次联网主流程的必经点（重连走 GOT_IP 回调+去抖，不重入
+         *   本函数），故只会调用一次。开一个短窗口让 GIF 切图暂避联网突发，消除初次联网
+         *   后 taskLVGL 被顶死引发的一次 task_wdt 误报。见 ui_notify_first_online 说明。 */
+        ui_notify_first_online();
     }
     else if (bits & WIFI_FAIL_BIT)
     {

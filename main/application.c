@@ -36,7 +36,6 @@
 #include "ui/interaction.h"
 #include "ui/reminder.h"
 #include "ui/standby.h"
-#include "ui/cry_anim_test.h" /* 临时测试：哭泣手绘动画 */
 #include "esp_lvgl_port.h"
 #define TAG "Application"
 
@@ -357,7 +356,6 @@ void application_init(void)
     bsp_board_lcd_init(bsp_board);
     PRINT_INTERNAL_HEAP_STEP("bsp_board_lcd_init");
     ui_init();
-    // cry_anim_test_start();  /* 临时测试：手绘哭泣动画，覆盖主界面 */
     vTaskDelay(pdMS_TO_TICKS(100));
     PRINT_INTERNAL_HEAP_STEP("ui_init");
     if (lvgl_port_lock(1000))
@@ -472,6 +470,40 @@ void application_init(void)
     PRINT_INTERNAL_HEAP_STEP("bsp_battery_init");
     reminder_init(NULL);
     PRINT_INTERNAL_HEAP_STEP("reminder_init");
+
+    /* ── 诊断：全部初始化跑完后的内存全量快照 + 逐任务栈占用清单 ──────────────
+     * 用于定位"初始化结束后内部SRAM仅剩极少"的问题：
+     *   - PRINT_MEM_INFO 给出内部SRAM/PSRAM当前剩余 + 历史最低值（历史最低更能反映
+     *     启动过程中的峰值消耗，比"当前剩余"更接近问题根因）
+     *   - uxTaskGetSystemState 遍历当前所有任务，打印每个任务的栈总深度和历史最小
+     *     剩余水位（栈总深度可反推"这个任务在内部/外部SRAM分别占了多少"，需要人工
+     *     核对该任务创建时用的是 MALLOC_CAP_INTERNAL 还是 MALLOC_CAP_SPIRAM）
+     */
+    PRINT_MEM_INFO(TAG, "★全部初始化完成★");
+    {
+        UBaseType_t task_count = uxTaskGetNumberOfTasks();
+        TaskStatus_t *task_list = heap_caps_malloc(task_count * sizeof(TaskStatus_t),
+                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (task_list != NULL)
+        {
+            uint32_t total_runtime;
+            UBaseType_t got = uxTaskGetSystemState(task_list, task_count, &total_runtime);
+            ESP_LOGW(TAG, "[任务清单] 共 %u 个任务（栈深度单位：字，×4=字节）：", (unsigned)got);
+            for (UBaseType_t i = 0; i < got; i++)
+            {
+                ESP_LOGW(TAG, "  #%2u %-16s 优先级%2u 栈历史最小剩余 %5u 字(≈%5u B)",
+                         (unsigned)i, task_list[i].pcTaskName,
+                         (unsigned)task_list[i].uxCurrentPriority,
+                         (unsigned)task_list[i].usStackHighWaterMark,
+                         (unsigned)(task_list[i].usStackHighWaterMark * sizeof(StackType_t)));
+            }
+            free(task_list);
+        }
+        else
+        {
+            ESP_LOGE(TAG, "[任务清单] SPIRAM分配失败，无法打印任务清单（任务数=%u）", (unsigned)task_count);
+        }
+    }
 
     /* ── 步骤 8: CPU 占用诊断任务（调试用，可注释掉）─────────────────────── */
     // 低优先级、tskNO_AFFINITY、栈在 SPIRAM，对业务无干扰

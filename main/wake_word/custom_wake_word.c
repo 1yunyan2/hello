@@ -288,7 +288,9 @@ static esp_err_t load_model_for_lang(const char *lang)
     multinet_iface = new_iface;
 
     // 创建新模型实例，检测窗口 3000ms（3 秒内未说完则超时重置）
+    PRINT_MEM_INFO(TAG, "multinet create 前(mn6模型加载即将开始)");
     multinet_model_data = multinet_iface->create(mn_name, 3000);
+    PRINT_MEM_INFO(TAG, "multinet create 后(mn6模型加载完成)");
     if (multinet_model_data == NULL)
     {
         ESP_LOGE(TAG, "创建 '%s' MultiNet 模型失败", lang);
@@ -439,6 +441,7 @@ esp_err_t wake_word_init(wake_word_detected_cb_t cb)
     // play_task 写 I2S 时同步推副本到 aec_ref_buf，custom_wake_word_feed
     // 交织 [mic,ref,...] 后送入 AFE，AFE AEC 消除 TTS 回声，
     // 使 MultiNet 能在大模型说话时检测到唤醒词（支持打断）。
+    PRINT_MEM_INFO(TAG, "AFE配置创建前"); // 拆分埋点：区分 afe_config_init 与 esp_afe_handle_from_config 各自开销
     afe_config_t *afe_cfg = afe_config_init("MR", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
     if (afe_cfg == NULL)
     {
@@ -481,7 +484,9 @@ esp_err_t wake_word_init(wake_word_detected_cb_t cb)
     afe_cfg->vad_mode = VAD_MODE_1;                           // VAD 模式 1：适合唤醒词场景，快速响应，适度误触；
 
     // 获取 AFE 接口并创建实例
+    PRINT_MEM_INFO(TAG, "afe_config_init 后(esp_afe_handle_from_config 前)");
     s_afe_iface = esp_afe_handle_from_config(afe_cfg);
+    PRINT_MEM_INFO(TAG, "esp_afe_handle_from_config 后(AFE实例已创建)");
     if (s_afe_iface == NULL)
     {
         ESP_LOGE(TAG, "AFE 接口获取失败");

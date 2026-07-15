@@ -62,7 +62,7 @@
 // 目的：兼顾「用户说话续命」与「防 TTS 回声/底噪把定时器顶满导致永不超时」（旧坑）。
 // 一旦从切回 LISTENING 起经过 SESSION_NEXT_TURN_HARD_LIMIT_MS 仍无云端下行业务事件，
 // 即便上行人声持续刷新也强制结束会话。
-#define SESSION_NEXT_TURN_HARD_LIMIT_MS 40000
+#define SESSION_NEXT_TURN_HARD_LIMIT_MS 30000
 // Token主动刷新时间：110分钟（accessToken过期时间为2小时，提前10分钟刷新）
 #define TOKEN_REFRESH_MS (110 * 60 * 1000)
 // OPUS音频帧发送缓冲区大小
