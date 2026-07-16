@@ -156,6 +156,9 @@ void bsp_board_codec_init(bsp_board_t *bsp_board)
     i2c_master_bus_handle_t bus_handle = NULL;
     bsp_board_codec_i2c_init(bsp_board, &bus_handle);
 
+    // 保存总线句柄到 BSP 单例，供其它 I2C 从机（如 PCA9536 IO 扩展器）共享复用
+    bsp_board->i2c_bus = bus_handle;
+
     // [PCBA 诊断] 裸 I2C 回读 ES8311 chip ID 寄存器，判断 I2C 通信是否真实可靠
     // R0xFD 出厂值 = 0x83 (CHIP_ID1)；R0xFE 出厂值 = 0x11 (CHIP_ID2)
     // 若读回值正确 → I2C 干净，问题在模拟侧（MCLK/AVDD/VMID/MIC 焊接）

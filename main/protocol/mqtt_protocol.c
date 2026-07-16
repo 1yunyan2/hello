@@ -282,11 +282,29 @@ static void mqtt_reconnect_task(void *arg)
         }
 
         ESP_LOGI(MQTT_TAG, "正在重连 MQTT...");
-        esp_mqtt_client_start(s_mqtt_client);
-        ESP_LOGW(MQTT_TAG, "MQTT 重连尝试完成");
-        // start 之后若连接再次失败，会触发 DISCONNECTED 事件重新创建本任务，
-        // 形成"stop → 退避 → start"的闭环，本轮任务使命完成，退出。
-        break;
+
+        // ★ 关键修复：本任务开头调过 esp_mqtt_client_stop()，客户端已进入
+        //   MQTT_STATE_DISCONNECTED（停止态）。此态下【必须用 esp_mqtt_client_start()
+        //   复活】——esp_mqtt_client_reconnect() 内部要求 state==MQTT_STATE_WAIT_RECONNECT，
+        //   对已 stop 的客户端会直接 "Ignore the request" 返回 ESP_FAIL，什么都不做，
+        //   且不产生任何 MQTT 事件 → 重连链路彻底死掉、client 永停 DISCONNECTED，
+        //   之后解绑/唤醒词等下行全部收不到（换网后 MQTT 卡死、解绑无反应的真因）。
+        //   IDF 源码铁证：mqtt_client.c reconnect() @1799、start() @1758 的 state 判断。
+        esp_err_t start_ret = esp_mqtt_client_start(s_mqtt_client);
+        if (start_ret == ESP_OK)
+        {
+            ESP_LOGW(MQTT_TAG, "MQTT 重连尝试完成（已 start，等待 CONNECTED 事件）");
+            // start 成功后若连接再次失败，MQTT 内部会走 DISCONNECTED 事件重新创建本任务，
+            // 形成"stop → 退避 → start"的闭环，本轮任务使命完成，退出循环。
+            break;
+        }
+        else
+        {
+            // start 失败（如内部资源暂不可用）：不退出，继续留在退避循环里重试，
+            // 避免像旧代码那样退出后 client 停在 DISCONNECTED 再无人复活。
+            ESP_LOGE(MQTT_TAG, "MQTT start 失败(%s)，继续退避重试", esp_err_to_name(start_ret));
+            continue;
+        }
     }
 
     s_mqtt_reconnect_handle = NULL;

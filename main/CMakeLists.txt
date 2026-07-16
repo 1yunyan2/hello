@@ -4,6 +4,7 @@ idf_component_register(SRCS
 "bsp/bsp_wifi.c"
 "bsp/udp_logger.c"
 "bsp/bsp_codec.c"
+"bsp/bsp_pca9536.c"
 "bsp/bsp_lcd.c"
 "bsp/bsp_touch.c"
 "bsp/bsp_servo.c"
@@ -14,6 +15,7 @@ idf_component_register(SRCS
 "audio/audio_processor.c"
 "audio/audio_encoder.c"
 "audio/audio_decoder.c"
+"audio/offline_audio.c"
 "session/session.c"
 "application.c"
 "protocol/auth.c"
@@ -64,6 +66,9 @@ idf_component_register(SRCS
 "blufi/blufi_init.c"
 "blufi/blufi_security.c"
 INCLUDE_DIRS "."
+# 离线音频开机自测用的内嵌测试音频(application.c OFFLINE_AUDIO_BOOT_TEST)
+# 验证完成后可连同 test_assets/ 目录一起移除,省 ~15KB 固件体积
+EMBED_FILES "audio/test_assets/test.mp3" "audio/test_assets/test.p3"
 )
 # 注：main 组件默认会包含所有公共组件（包括 esp_adc），无需显式 PRIV_REQUIRES。
 # 之前尝试添加 PRIV_REQUIRES esp_adc 会触发 IDF 把 main 当作普通组件，

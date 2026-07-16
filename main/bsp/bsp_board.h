@@ -41,6 +41,7 @@
 #include "freertos/event_groups.h"
 #include "esp_codec_dev.h"
 #include "driver/i2s_std.h"
+#include "driver/i2c_master.h"
 #include "nvs.h"
 #include "esp_random.h"
 #include "esp_lcd_panel_io.h"
@@ -86,6 +87,8 @@ typedef struct
     esp_lcd_panel_io_handle_t lcd_io; ///< LCD SPI 传输接口句柄，由 bsp_board_lcd_init() 填充
     esp_lcd_panel_handle_t lcd_panel; ///< LCD ST7789 面板驱动句柄，由 bsp_board_lcd_init() 填充
     bool servo_initialized;           ///< 记录舵机是否成功初始化
+    i2c_master_bus_handle_t i2c_bus;  ///< I2C 主机总线句柄（I2C_NUM_0），由 bsp_board_codec_init() 填充
+                                      ///< 供 ES8311 及其它 I2C 从机（如 PCA9536 IO 扩展器）共享复用
 } bsp_board_t;
 
 // ─── 公开 API：生命周期管理 ───────────────────────────────────────────────────

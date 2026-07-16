@@ -33,6 +33,16 @@
 /// 绝大多数 WiFi 抖动在 1~2 秒内自愈，期间不重建协议层 → 避免内部 SRAM 碎片化。
 #define WIFI_DEBOUNCE_MS 1500
 
+/// @brief 运行态重连额度耗尽后的"复位看门狗"缓冲时长（ms）。
+/// 运行态（已配网、非开机首连）断线重连 MAX_RETRY_COUNT 次仍失败时，不再置
+/// WIFI_FAIL_BIT 永久放弃（那样运行态无人接管 → 彻底卡死，只能人工软重启，见修复背景），
+/// 而是启动本看门狗：期间仍继续 esp_wifi_connect() 尝试自愈；若 WIFI_RESET_WATCHDOG_MS
+/// 内成功拿到 IP（GOT_IP 会取消本定时器），则不复位；否则判定真掉网，esp_restart() 刷新。
+/// 复位=用户原本手动软重启的自动化版：内存干净重来，规避运行态无限重连的 SRAM 碎片/泄漏
+/// （见 BUG-011 / BUG-023）。给 8 秒缓冲：让 reason=1 这类驱动 1 秒内连抖 5 次、AP 稍后自愈
+/// 的正常波动不被误复位，只有真正持续掉网才复位。
+#define WIFI_RESET_WATCHDOG_MS 8000
+
 static const char *TAG = "EchoPals";
 
 // ─── 模块级状态变量 ────────────────────────────────────────────────────────────
@@ -69,6 +79,9 @@ static bool s_diag_ssid_corrupted = false;
 
 /// @brief WiFi 断线去抖定时器（one-shot）：断线时启动，GOT_IP 时取消
 static TimerHandle_t s_wifi_debounce_timer = NULL;
+/// @brief 运行态重连额度耗尽后的复位看门狗（one-shot）：达上限时启动，GOT_IP 时取消；
+/// 超时（WIFI_RESET_WATCHDOG_MS 内仍未拿到 IP）则 esp_restart() 刷新设备。
+static TimerHandle_t s_wifi_reset_timer = NULL;
 /// @brief 供去抖定时器回调访问的 bsp_board 指针（事件 handler 中保存）
 static bsp_board_t *s_debounce_board = NULL;
 
@@ -107,6 +120,27 @@ static void wifi_debounce_timer_cb(TimerHandle_t xTimer)
     //   已经失效，留着它没意义，且避免和重连后 GOT_IP 的 udp_logger_start() 出现
     //   "该关未关、该建又建"的混乱。GOT_IP 恢复时会重新 start，重建全新 socket。
     // udp_logger_stop();
+}
+
+// ─── wifi_reset_watchdog_cb ──────────────────────────────────────────────────
+
+/**
+ * @brief 运行态重连额度耗尽后的"复位看门狗"回调（真正执行软复位的地方）
+ *
+ * 运行态断线重连 MAX_RETRY_COUNT 次仍失败时启动本 one-shot 定时器（见断线事件处理）。
+ * WIFI_RESET_WATCHDOG_MS 内若 GOT_IP 恢复，本回调会被取消、永不执行；只有缓冲期满
+ * 仍未拿到 IP（判定真掉网），才在此 esp_restart() 刷新设备——等价于用户原本手动软
+ * 重启，让内存干净重来，规避运行态无限重连的 SRAM 碎片/泄漏（BUG-011 / BUG-023）。
+ *
+ * @param xTimer 定时器句柄（未使用）
+ * @note 运行在 FreeRTOS Timer 服务任务上下文；esp_restart() 不返回。
+ */
+static void wifi_reset_watchdog_cb(TimerHandle_t xTimer)
+{
+    (void)xTimer;
+    ESP_LOGE(TAG, "WiFi 重连 %d 次全部失败，且缓冲 %d ms 内仍未恢复 → 软复位刷新设备",
+             MAX_RETRY_COUNT, WIFI_RESET_WATCHDOG_MS);
+    esp_restart(); // 内存干净重来；不返回
 }
 
 // ─── clear_wifi_and_restart ──────────────────────────────────────────────────
@@ -751,10 +785,34 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
             }
             else
             {
-                // 超过最大重试次数，放弃重连，通知上层处理（通常是重启）
-                if (bsp_board)
-                    xEventGroupSetBits(bsp_board->board_status, WIFI_FAIL_BIT);
-                ESP_LOGE(TAG, "WiFi 重连失败，已达最大重试次数 (%d)，放弃连接", MAX_RETRY_COUNT);
+                // ── 运行态重连额度耗尽：启动复位看门狗，而非永久放弃 ──────────────
+                // 【旧行为的坑】原来这里置 WIFI_FAIL_BIT。但该位只有开机首连时的
+                //   xEventGroupWaitBits 在等；运行态（已 GOT_IP 过、wifi_main 早已返回）
+                //   置位后无人接管，s_retry_num 又只在 GOT_IP 清零 → 此后再无任何代码
+                //   调 esp_wifi_connect()，设备永久卡死，只能人工软重启（用户实测现象）。
+                //   典型触发：reason=1 驱动 1 秒内连抖 5 次瞬间烧光额度，而 AP 稍后自愈。
+                // 【新行为】不置 WIFI_FAIL_BIT：① 仍继续 esp_wifi_connect() 让驱动保持
+                //   重连，AP 回来即 GOT_IP 自愈（GOT_IP 会清 s_retry_num + 停本定时器）；
+                //   ② 启动 WIFI_RESET_WATCHDOG_MS 的 one-shot 看门狗，缓冲期满仍未恢复
+                //   才 esp_restart() 刷新（内存干净重来，规避无限重连的 SRAM 碎片/泄漏）。
+                //   看门狗已在运行则不重启计时（xTimerStart 对已运行定时器会复位周期，
+                //   会把复位时点无限往后推，故仅首次达上限时启动一次）。
+                esp_wifi_connect(); // 继续尝试，AP 回来能自愈
+                if (s_wifi_reset_timer != NULL)
+                {
+                    if (xTimerIsTimerActive(s_wifi_reset_timer) == pdFALSE)
+                    {
+                        xTimerStart(s_wifi_reset_timer, 0);
+                        ESP_LOGE(TAG, "WiFi 重连已达上限 (%d)，启动 %d ms 复位看门狗（期间仍尝试自愈）",
+                                 MAX_RETRY_COUNT, WIFI_RESET_WATCHDOG_MS);
+                    }
+                }
+                else
+                {
+                    // 定时器未创建（理论上 wifi_main 已创建，此为兜底）：退化为立即复位
+                    ESP_LOGE(TAG, "WiFi 重连已达上限 (%d)，复位定时器缺失，立即软复位", MAX_RETRY_COUNT);
+                    esp_restart();
+                }
             }
         }
 
@@ -822,6 +880,12 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
         // WS/MQTT 也就不会经历销毁重建 → 从源头避免碎片。
         if (s_wifi_debounce_timer != NULL)
             xTimerStop(s_wifi_debounce_timer, 0);
+
+        // ── 复位看门狗：网络已恢复，取消"缓冲期满就软复位"的定时器 ─────────────
+        // 运行态曾重连耗尽启动了复位看门狗；此刻 AP 回来并拿到 IP，说明是可自愈的
+        // 波动，撤销复位。s_retry_num 下方清零，下次断线额度从头再来。
+        if (s_wifi_reset_timer != NULL)
+            xTimerStop(s_wifi_reset_timer, 0);
 
         // 置位 WIFI_BIT，解除 bsp_board_wifi_main() 末尾的 xEventGroupWaitBits 阻塞
         if (bsp_board)
@@ -1073,6 +1137,20 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
             ESP_LOGE(TAG, "WiFi 去抖定时器创建失败，将退化为断线立即通知上层");
     }
 
+    // ── 步骤 3.6：创建运行态"复位看门狗"定时器（one-shot）───────────────────
+    // 运行态重连额度耗尽后启动；缓冲期满仍未恢复则 esp_restart() 刷新（见断线事件处理）。
+    if (s_wifi_reset_timer == NULL)
+    {
+        s_wifi_reset_timer = xTimerCreate(
+            "wifi_reset_wd",
+            pdMS_TO_TICKS(WIFI_RESET_WATCHDOG_MS),
+            pdFALSE, // one-shot：触发一次即复位，不自动重载
+            NULL,
+            wifi_reset_watchdog_cb);
+        if (s_wifi_reset_timer == NULL)
+            ESP_LOGE(TAG, "WiFi 复位看门狗定时器创建失败，达上限将退化为立即软复位");
+    }
+
     // ── 步骤 4：初始化 WiFi 驱动并设为 STA 模式 ──────────────────────────────
     // BluFi 配网与已配网直连都基于 STA：配网时手机把家庭 WiFi 凭证下发到 STA。
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -1197,6 +1275,17 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
         ESP_ERROR_CHECK(esp_wifi_start());
         ESP_LOGW(TAG, "[DIAG] esp_wifi_start() 返回 @ %lld us", esp_timer_get_time());
         PRINT_MEM_INFO(TAG, "已配网分支(esp_wifi_start后)");
+    }
+
+    // ── 排查 pp.c:4384 / ppProcTxSecFrame 卡死看门狗：关闭 WiFi 省电模式 ────────
+    // 日志曾出现 `wifi:pm start, type: 1`（Modem-sleep 已开）。某些 IDF 版本在 PS
+    // 模式下 TX 安全帧（硬件加密）路径存在已知卡死 bug：连上后一旦开始上行发包，
+    // ppTask 在 CPU0 上自旋不让出，IDLE0 饿死触发 task_wdt。此处强制 WIFI_PS_NONE
+    // 关闭省电，用以证伪"省电 bug"这一原因。必须在 esp_wifi_start() 之后调用才生效。
+    // 注意：关省电会增加平均功耗，若确认非省电引起，后续应改回 WIFI_PS_MIN_MODEM。
+    {
+        esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
+        ESP_LOGW(TAG, "[排查] esp_wifi_set_ps(WIFI_PS_NONE) 返回: %s", esp_err_to_name(ps_err));
     }
 
     // ── 步骤 8：最终阻塞等待网络就绪或彻底失败 ──────────────────────────────
