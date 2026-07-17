@@ -97,6 +97,10 @@ static TaskHandle_t s_session_evt_task = NULL;
 // ─── 模块级状态变量 ──────────────────────────────────────────────────────────
 // 当前会话状态（SESSION_IDLE, SESSION_LISTENING, SESSION_PLAYING）
 static volatile session_state_t s_state = SESSION_IDLE;
+
+// OTA 升级锁定标志：session_stop_for_ota() 置 true 后，唤醒词不再拉起会话，
+// 会话彻底停止以把内部 SRAM/CPU 让给 OTA 下载。置位后不清除（升级成功/失败均重启）。
+static volatile bool s_ota_locked = false;
 // 音频处理器实例指针
 static audio_processor_t *s_processor = NULL;
 
@@ -1249,6 +1253,15 @@ void session_init(const char *ws_uri)
  */
 wake_result_t session_on_wake_word(const char *display)
 {
+    // OTA 升级锁定期：会话已被 session_stop_for_ota() 彻底关闭以腾出内存，
+    // 此期间任何唤醒词都不得重新拉起会话（否则会重新占用刚释放的内部 SRAM，
+    // 破坏 OTA 下载所需的空闲内存）。设备很快会重启，无需响应。
+    if (s_ota_locked)
+    {
+        ESP_LOGW(TAG, "OTA 升级中，忽略唤醒词");
+        return WAKE_IGNORED;
+    }
+
     // LISTENING 期间（用户说话中）完全忽略唤醒词触发。
     // wake_word_stop() 已在进入 LISTENING 时调用，此处兜底防竞态窗口误打断。
     // 连麦等待期（s_is_continuous_turn=true）属于 LISTENING 中的特殊子状态，仍需响应。
@@ -1468,4 +1481,28 @@ void session_debug_kill_ws(void)
         PRINT_TASK_CREATED(TAG, "dbg_ws_kill", 4096, 1); // 栈在内部SRAM
     if (ret != pdPASS)
         ESP_LOGE(TAG, "[调试] 创建 ws_kill 任务失败（内存不足）");
+}
+
+/**
+ * @brief 为 OTA 升级彻底停止会话，释放内部 SRAM/CPU（见 .h 说明）
+ *
+ * 实现：置 s_ota_locked=true（此后唤醒词不再拉起会话），并往常驻
+ * session_event_task 的队列投递 SESSION_EVT_CLOSE，走与超时/打断关闭
+ * 完全相同的线程安全路径。session_close() 会停 PCM Hook、停并销毁
+ * audio_processor、停所有定时器、回到 IDLE，从而把内部 SRAM 让给 OTA 下载。
+ *
+ * 本函数只投递事件立即返回（异步关闭），由 bsp_ota 在下载前调用后短暂等待。
+ */
+void session_stop_for_ota(void)
+{
+    s_ota_locked = true; // 先锁定：即使此刻有唤醒词也不会再拉起会话
+    if (s_session_evt_queue != NULL)
+    {
+        // 先 ABORT（若在会话中，通知服务端停止推流），再 CLOSE（安全关闭并销毁 processor）
+        session_evt_t evt = SESSION_EVT_ABORT;
+        xQueueSend(s_session_evt_queue, &evt, 0);
+        evt = SESSION_EVT_CLOSE;
+        xQueueSend(s_session_evt_queue, &evt, 0);
+        ESP_LOGW(TAG, "OTA：已投递会话关闭事件，释放内存给固件下载");
+    }
 }

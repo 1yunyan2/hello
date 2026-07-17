@@ -11,6 +11,7 @@
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
+#include "esp_tls.h" // 【临时调试】抠底层 TLS 错误码
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "mbedtls/sha256.h"
@@ -22,7 +23,12 @@
 #include <strings.h> // strcasecmp
 #include <stdio.h>   // sprintf
 #include <stdlib.h>
-#include "object.h" // PRINT_TASK_CREATED / PRINT_TASK_STACK_HWM
+#include "object.h"     // PRINT_TASK_CREATED / PRINT_TASK_STACK_HWM
+#include "ui/standby.h" // standby_notify_activity：OTA 期间持续喂计时器，防止进深度待机
+#include "ui/ui_port.h" // ui_show_ota_progress / ui_pause_main_gif：升级中屏幕反馈
+#include "session/session.h" // session_stop_for_ota：升级前彻底停语音链路，腾内部 SRAM/CPU 给下载
+#include "bsp/bsp_board.h" // bsp_battery_stop_task / bsp_battery_stop_log_task：停电池监控与日志任务
+#include "ui/interaction.h" // interaction_stop_for_ota：停 GIF 切图 + 舵机 + 震动（触摸随之哑火）
 
 #define TAG "OTA"
 
@@ -253,10 +259,27 @@ static bool verify_partition_sha256(const esp_partition_t *part, size_t fw_size,
 // ─────────────────────────────────────────────────────────────────────────
 
 /**
+ * @brief OTA 失败统一收尾：延时 → 重启（本函数不返回）
+ *
+ * 由于升级前已调 session_stop_for_ota() 彻底停掉语音链路（不可简单软恢复），
+ * 按产品约定：无论成功或失败都重启——失败重启后 bootloader 因备用分区未提交
+ * (PENDING_VERIFY 未 mark_valid) 自动回滚到旧固件，旧固件照常运行。
+ * LCD 不显示失败结果（只在下载过程显示进度条），失败静默重启。
+ *
+ * @param reason 失败原因短语，仅用于串口日志
+ */
+static void ota_fail_restart(const char *reason)
+{
+    ESP_LOGE(TAG, "OTA 失败(%s)，3 秒后重启回退旧固件", reason ? reason : "");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    esp_restart(); // 备用分区未提交，重启后 bootloader 自动回滚到旧固件
+}
+
+/**
  * @brief OTA 下载与重启任务（独立任务执行，避免阻塞 MQTT 回调）
  *
- * 失败处理：若下载失败，不重启，旧固件 ota_0 继续运行；
- * 成功处理：延迟 3 秒后 esp_restart()，让日志有机会刷新到串口。
+ * 失败处理：升级前已停语音链路，失败后统一走 ota_fail_restart()（显示失败页→重启回退）；
+ * 成功处理：显示成功页，延迟 3 秒后 esp_restart()，让日志有机会刷新到串口。
  */
 static void ota_task(void *pvParameters)
 {
@@ -269,6 +292,38 @@ static void ota_task(void *pvParameters)
     // 写入 pending 版本（断电也能恢复）
     stage_pending(p->version, p->url);
 
+    // ── 升级前：关闭所有与下载无关的任务，把 CPU/内存/带宽全让给固件下载 ──────────
+    // 原则：OTA 无论成功失败都会 esp_restart()，无需恢复，故可放心彻底关停——
+    //       关坏了也无所谓，3 秒后重启一切重建。
+    // 保留（下载必须）：WiFi、MQTT/心跳（上报进度+收指令）、LVGL/屏幕（显示进度条）、ota_task 本身。
+    // 关闭（全部无关任务）：
+    //   ① 唤醒词引擎（afe_fetch/mn_detect）——占满 CPU1 做神经网络推理，最大的资源占用者；
+    //   ② 语音会话 + audio_processor（采集/编解码）——最吃内部 SRAM；
+    //   ③ GIF 动画——逐帧读 flash、抢 CPU；
+    //   ④ 电池监控 + 电池日志——多余的 ADC 采样与串口打印。
+    ESP_LOGW(TAG, "OTA：关闭无关任务（语音/动画/电池），全力下载固件");
+
+    // 注意：不动唤醒词引擎（afe_fetch_task）——它是 CPU1 上的 while(1) 常驻死循环，
+    // 没有安全退出机制；若把 s_afe_data 置 NULL 或停 is_running，该任务只会空转并
+    // 每 10ms 刷屏「afe_fetch_with_delay: handle is NULL!」，反而消耗 CPU/串口，得不偿失。
+    // 它跑在 CPU1，而下载主体在 CPU0 + 网络栈，让它继续运行即可。
+
+    // ① 语音会话（异步关闭：停并销毁 audio_processor，回 IDLE，释放内部 SRAM）
+    session_stop_for_ota();
+    vTaskDelay(pdMS_TO_TICKS(500)); // 等 session_event_task 完成关闭并释放内存
+
+    // ② interaction：停 GIF 切图 + 舵机 + 震动（丢弃一切情绪/动作请求）。
+    //    触摸任务(touch_scan)仍在扫描，但它只负责往 interaction 投递请求——
+    //    interaction 一停，触摸按下也不会有任何动作，等同哑火，无需单独关闭。
+    interaction_stop_for_ota();
+    ui_pause_main_gif(); // 再定格主界面 GIF 当前帧，停止其自动轮播解码
+
+    // ③ 电池监控与日志任务（纯调试/后台采样，OTA 期间无用）
+    bsp_battery_stop_log_task(); // 停「每 5s 打印电压」日志任务
+    bsp_battery_stop_task();     // 停后台电池采样任务
+
+    ui_show_ota_progress(0); // 显示「固件升级中 0%」，隐藏 GIF 独占屏幕
+
     esp_http_client_config_t http_cfg = {
         .url = p->url,
         .timeout_ms = 30000, // 30 秒超时
@@ -278,6 +333,13 @@ static void ota_task(void *pvParameters)
     };
     esp_https_ota_config_t ota_cfg = {
         .http_config = &http_cfg,
+        // ★ 分段下载（双保险）：用 HTTP Range 把固件切成小段请求，服务器每段只回
+        //   max_http_request_size 字节，TLS record 随之变小。根本修复靠 sdkconfig 的
+        //   MBEDTLS_SSL_IN_CONTENT_LEN=16384（已能一次收下 16KB 大 record），此处作为
+        //   冗余防护：万一将来换服务器发出更大 record、或证书链变大，分段可继续兜底。
+        //   前提：服务器支持 Range 请求（当前服务器已实测返回 206 Partial Content）。
+        .partial_http_download = true,
+        .max_http_request_size = 8192, // 每段字节数，≤ IN_CONTENT_LEN(16384) 即可
     };
 
     // ── 1. 开始 OTA 会话 ──────────────────────────────────────────────
@@ -288,8 +350,7 @@ static void ota_task(void *pvParameters)
         ESP_LOGE(TAG, "esp_https_ota_begin 失败: %s", esp_err_to_name(err));
         ota_report(BSP_OTA_FAILED, 0, p->version, "下载连接失败，无法访问固件地址");
         free(p);
-        vTaskDelete(NULL); // 不重启，旧固件继续跑
-        return;
+        ota_fail_restart("下载连接失败"); // 显示失败页 → 延时 → 重启（不返回）
     }
 
     // ── 2. 分步下载循环，过程中上报进度 ───────────────────────────────
@@ -300,6 +361,7 @@ static void ota_task(void *pvParameters)
 
     while ((err = esp_https_ota_perform(ota_handle)) == ESP_ERR_HTTPS_OTA_IN_PROGRESS)
     {
+        standby_notify_activity(); // 刷新低功耗计时器
         int read = esp_https_ota_get_image_len_read(ota_handle);
         int progress = (total > 0) ? (int)((int64_t)read * 100 / total) : 0;
         if (progress > 100)
@@ -313,6 +375,7 @@ static void ota_task(void *pvParameters)
             ESP_LOGI(TAG, "更新中 %d%% (%d/%d)", progress, read, total);
             // 按后端口径：下载过程也统一上报 upgrading（带进度），用户全程只看到"更新中"
             ota_report(BSP_OTA_UPGRADING, progress, p->version, NULL);
+            ui_show_ota_progress(progress); // 屏幕同步显示「固件升级中 XX%」
             last_progress = progress;
             last_report_ms = now_ms;
         }
@@ -324,15 +387,18 @@ static void ota_task(void *pvParameters)
         ota_report(BSP_OTA_FAILED, 0, p->version, "固件更新中断，数据不完整");
         esp_https_ota_abort(ota_handle);
         free(p);
-        vTaskDelete(NULL); // 不重启
-        return;
+        ota_fail_restart("下载中断/数据不完整"); // 显示失败页 → 延时 → 重启回退（不返回）
     }
     ota_report(BSP_OTA_UPGRADING, 100, p->version, NULL);
+    ui_show_ota_progress(100); // 屏幕补到 100%（下载循环已退出，此处不再进循环体刷新）
     ESP_LOGI(TAG, "固件下载完成");
+
+    standby_notify_activity(); // 校验读整个分区耗时数秒，先刷新计时防此间进待机
 
     // ── 3. SHA256 完整性校验（防止坏包烧进设备变砖）─────────────────────
     if (p->sha256[0] != '\0')
     {
+        ESP_LOGI(TAG, "开始 SHA256 校验（读整个分区，约数秒）...");
         const esp_partition_t *update_part = esp_ota_get_next_update_partition(NULL);
         size_t fw_size = (p->size > 0)
                              ? (size_t)p->size
@@ -343,14 +409,15 @@ static void ota_task(void *pvParameters)
             ota_report(BSP_OTA_FAILED, 0, p->version, "SHA256 校验失败，固件已损坏");
             esp_https_ota_abort(ota_handle); // 不调 finish，备用分区不会被启用
             free(p);
-            vTaskDelete(NULL); // 不重启，旧固件安然继续跑
-            return;
+            ota_fail_restart("SHA256 校验失败"); // 显示失败页 → 延时 → 重启回退（不返回）
         }
     }
     else
     {
         ESP_LOGW(TAG, "后端未下发 sha256，跳过完整性校验");
     }
+
+    ESP_LOGI(TAG, "SHA256 校验通过，开始写 otadata 收尾...");
 
     // ── 4. 收尾：写 otadata，把备用分区置为 PENDING_VERIFY ──────────────
     err = esp_https_ota_finish(ota_handle);
@@ -359,8 +426,7 @@ static void ota_task(void *pvParameters)
         ESP_LOGE(TAG, "esp_https_ota_finish 失败: %s", esp_err_to_name(err));
         ota_report(BSP_OTA_FAILED, 0, p->version, "固件写入收尾失败");
         free(p);
-        vTaskDelete(NULL); // 不重启
-        return;
+        ota_fail_restart("固件写入收尾失败"); // 显示失败页 → 延时 → 重启回退（不返回）
     }
 
     // ── 5. 上报 upgrading + 记录待上报 success，延时后重启 ──────────────

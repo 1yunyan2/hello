@@ -214,3 +214,14 @@ void interaction_set_lowpower(bool enable);
  * @note 调用者：standby.c enter_standby()/enter_deep_standby()
  */
 void interaction_flush_queue(void);
+
+/**
+ * @brief 为 OTA 升级彻底停止 interaction（GIF 切图 + 舵机 + 震动全部静默）
+ *
+ * 置内部停止标志（worker 此后丢弃一切请求）、清空未执行队列、打断正在执行的舵机动作。
+ * 用于 OTA 升级期间释放 CPU/避免 GIF 逐帧读 flash 与下载抢资源。
+ *
+ * @note 停止标志不清除——OTA 无论成功失败都会 esp_restart()，重启后自然复位。
+ * @note 线程安全，可从任意任务（如 OTA 下载任务）调用。
+ */
+void interaction_stop_for_ota(void);

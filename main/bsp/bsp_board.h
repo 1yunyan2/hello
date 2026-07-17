@@ -661,3 +661,12 @@ esp_err_t bsp_battery_stop_task(void);
  * @return ESP_OK；若任务已存在则返回 ESP_ERR_INVALID_STATE
  */
 esp_err_t bsp_battery_start_log_task(void);
+
+/**
+ * @brief 停止电池电压日志任务（与 bsp_battery_start_log_task 成对）
+ *
+ * 请求日志任务退出并等待其真正结束。用于 OTA 升级等需要关闭无关后台任务的场景。
+ *
+ * @return ESP_OK；若任务不存在则返回 ESP_OK（幂等）
+ */
+esp_err_t bsp_battery_stop_log_task(void);

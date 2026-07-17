@@ -135,6 +135,16 @@ void ui_menu_show_text(const char *title, const char *body);
  */
 void ui_show_unbinding(void);
 
+/**
+ * @brief 显示「固件升级中 XX%」进度页（OTA 下载过程调用，跨线程安全，内部自持 LVGL 锁）
+ *
+ * 隐藏主界面 GIF、独占全屏显示升级进度，给用户明确反馈并避免 GIF 逐帧读 flash 与
+ * OTA 抢资源。取锁失败则跳过本次刷新（下次进度回调会再刷），无害退化。
+ *
+ * @param pct 下载进度百分比（0~100，越界自动裁剪）
+ */
+void ui_show_ota_progress(int pct);
+
 /* ═══════════════════════════════════════════════════════════════
  * 触摸事件分发接口（由 touch_scan_task 触摸扫描任务调用）
  * ═══════════════════════════════════════════════════════════════ */

@@ -142,3 +142,16 @@ session_state_t session_get_state(void);
  * @note 调用者：mqtt_protocol.c 收到 {"type":"ws_kill"} 指令时；仅供联调测试。
  */
 void session_debug_kill_ws(void);
+
+/**
+ * @brief 为 OTA 升级彻底停止会话，释放内部 SRAM/CPU 给固件下载
+ *
+ * 置内部 OTA 锁定标志（此后唤醒词不再拉起会话），并异步投递关闭事件：
+ * 停止 PCM Hook、停止并销毁 audio_processor、停所有定时器、会话回到 IDLE。
+ * 关闭为异步执行（投递事件后立即返回），调用方（bsp_ota）应在下载前调用并
+ * 短暂等待（如 500ms）让关闭完成后再开始下载。
+ *
+ * @note 锁定标志不会清除——OTA 无论成功或失败都会 esp_restart()，重启后自然复位。
+ * @note 线程安全：可从任意任务（如 OTA 下载任务）调用。
+ */
+void session_stop_for_ota(void);

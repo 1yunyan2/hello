@@ -715,10 +715,51 @@ static int main_gif_pick_next_index(int cur)
  * @param gif_path 待切换的 GIF 路径
  * @return true=尺寸安全可以切图；false=尺寸异常,已打日志,调用方应保持当前画面
  */
+/**
+ * @brief 直接读 GIF 文件头取画布宽高（替代 lv_gif_get_size，零额外内存）
+ *
+ * 【为何不用 lv_gif_get_size】该库函数为了拿两个数，会在【栈上】声明整个
+ *   GIFIMAGE 解码器结构体（约 24KB：ucFileBuf 4KB + usGIFTable 8KB +
+ *   ucGIFPixels 8KB + 调色板/行缓冲）。而 LVGL 任务栈仅 8192B（见本文件
+ *   lvgl_port_cfg.task_stack），24KB 局部变量直接撑穿栈块 16KB，写坏栈外
+ *   邻接的堆内存 → 随机堆损坏 + 各处 LoadProhibited 崩溃（受害者随堆布局
+ *   变化，曾表现为 WiFi esf_buf / MultiNet / lv_fs_close 崩）。
+ *
+ * 【本函数做法】GIF 头格式固定：字节 0~5 为魔数 "GIF87"/"GIF89"，
+ *   字节 6~7 为画布宽（小端），字节 8~9 为画布高（小端）——与库内
+ *   gif.c 的 INTELSHORT(&p[6]) / INTELSHORT(&p[8]) 完全一致。只读 10 字节，
+ *   栈上仅一个 10 字节小数组，彻底避开 24KB 大结构体。
+ *
+ * @param path GIF 文件路径
+ * @param w    输出画布宽
+ * @param h    输出画布高
+ * @return true=读取成功且为合法 GIF；false=打开失败/非 GIF/数据不足
+ */
+static bool gif_read_canvas_size(const char *path, uint16_t *w, uint16_t *h)
+{
+    lv_fs_file_t f;
+    if (lv_fs_open(&f, path, LV_FS_MODE_RD) != LV_FS_RES_OK)
+        return false;
+
+    uint8_t hdr[10];
+    uint32_t rd = 0;
+    lv_fs_res_t res = lv_fs_read(&f, hdr, sizeof(hdr), &rd);
+    lv_fs_close(&f);
+
+    if (res != LV_FS_RES_OK || rd < sizeof(hdr))
+        return false;
+    if (memcmp(hdr, "GIF89", 5) != 0 && memcmp(hdr, "GIF87", 5) != 0)
+        return false;
+
+    *w = (uint16_t)(hdr[6] | (hdr[7] << 8)); // 小端，同库 INTELSHORT
+    *h = (uint16_t)(hdr[8] | (hdr[9] << 8));
+    return true;
+}
+
 static bool main_gif_check_size_safe(const char *gif_path)
 {
     uint16_t w = 0, h = 0;
-    if (!lv_gif_get_size(gif_path, &w, &h) || w == 0 || h == 0)
+    if (!gif_read_canvas_size(gif_path, &w, &h) || w == 0 || h == 0)
     {
         ESP_LOGW(TAG, "GIF 尺寸探测失败,拒绝切图: %s", gif_path);
         return false;
@@ -758,7 +799,14 @@ static void main_gif_apply_index(int idx, bool with_servo)
     if (!main_gif_check_size_safe(entry->gif_path))
         return; // 尺寸异常,保持当前画面,不切图、不驱动舵机
 
+    // 【堆探针·已停用】曾用于抓 lv_gif_set_src 并发写坏堆；根因（lv_gif_get_size
+    //   栈上 24KB GIFIMAGE 打穿栈）已由 gif_read_canvas_size 修复。全堆扫描太重会触发
+    //   看门狗，暂注释保留，需再排查堆损坏时取消注释即可。
+    // if (!heap_caps_check_integrity_all(true))
+    //     ESP_LOGE("HEAPCHK", "★堆损坏@lv_gif_set_src之前 idx=%d", idx);
     lv_gif_set_src(gif_obj, entry->gif_path); // 切新图,内部自动重新播放
+    // if (!heap_caps_check_integrity_all(true))
+    //     ESP_LOGE("HEAPCHK", "★堆损坏@lv_gif_set_src之后 idx=%d", idx);
     s_gif_cur_index = idx;
 
     if (with_servo)
@@ -783,6 +831,9 @@ static void main_gif_apply_index(int idx, bool with_servo)
 static void main_gif_ready_cb(lv_event_t *e)
 {
     (void)e;
+    // 【堆探针·已停用】GIF 解码线程视角查堆；根因已修，全堆扫描太重触发看门狗，暂注释保留。
+    // if (!heap_caps_check_integrity_all(true))
+    //     ESP_LOGE("HEAPCHK", "★堆损坏@GIF ready_cb(解码线程视角)");
     // 【诊断-DBG4】GIF 每播完一轮都会进这里；重点看二级待机期间是否仍在持续触发
     // （若二级期间此日志仍频繁刷屏，说明 GIF 动画没被冻结，一直在后台播放/切换，验证OK后可删）
     ESP_LOGW("GIFDBG", "[DBG4] ready_cb 触发: s_view=%d standby_deep=%d interaction_playing=%d neutral=%d",
@@ -940,8 +991,13 @@ static void main_gif_switch_timer_cb(lv_timer_t *t)
      * 动作按 GIF 索引取同序号（s_idle_actions 与 s_main_gif_table 对齐）。 */
     if (idx >= 0 && (size_t)idx < IDLE_ACTION_COUNT)
     {
+        // 【堆探针·已停用】舵机入队前后查堆；根因已修，全堆扫描太重触发看门狗，暂注释保留。
+        // if (!heap_caps_check_integrity_all(true))
+        //     ESP_LOGE("HEAPCHK", "★堆损坏@投递舵机前(切图已完成) idx=%d", idx);
         ESP_LOGI("GIFDBG", "timer_cb: 切图 idx=%d + 投递舵机动作", idx);
         ui_interaction_play_custom(&s_idle_actions[idx]);
+        // if (!heap_caps_check_integrity_all(true))
+        //     ESP_LOGE("HEAPCHK", "★堆损坏@投递舵机后 idx=%d", idx);
     }
 }
 
@@ -2851,6 +2907,61 @@ void ui_show_unbinding(void)
 
     lvgl_port_unlock();
     ESP_LOGW(TAG, "已显示解绑提示页（正在重置中）");
+}
+
+/**
+ * @brief 显示「固件升级中」进度页（OTA 下载过程中调用，跨线程安全）
+ *
+ * 与 ui_show_unbinding() 同机制：隐藏逐帧读 flash 的 GIF、复用全屏黑底文字面板，
+ * 独占整块屏幕给出明确的「升级中」反馈，避免用户误以为设备卡死。
+ *
+ * 由 bsp_ota 的下载任务在下载前及每次进度上报时调用（非 LVGL 线程），函数内部
+ * 自持 LVGL 锁；取锁失败（如正忙）则直接跳过本次刷新，无害退化——下次进度回调
+ * 会再刷一次。
+ *
+ * @param pct 下载进度百分比（0~100）
+ */
+void ui_show_ota_progress(int pct)
+{
+    if (!s_lvgl_ready)
+        return;
+    if (pct < 0)
+        pct = 0;
+    if (pct > 100)
+        pct = 100;
+
+    if (!lvgl_port_lock(100))
+        return; // 取锁失败：跳过本次刷新，等下次进度回调再刷（无害）
+
+    /* 隐藏 GIF，避免它在升级期间继续逐帧读 flash 与 OTA 抢 flash/CPU */
+    if (gif_obj != NULL)
+        lv_obj_add_flag(gif_obj, LV_OBJ_FLAG_HIDDEN);
+
+    /* 复用功能菜单全屏黑底面板，写入升级进度文案 */
+    ensure_menu_panel();
+    if (s_menu_panel != NULL)
+    {
+        menu_clear_func_pages(); // 清掉功能页专属对象，仅留 title+body
+        if (s_menu_title)
+        {
+            lv_label_set_text(s_menu_title, "固件升级中");
+            // 标题临时移到屏幕中心偏上（默认是 TOP_MID）；面板复用，别处会各自重设对齐
+            lv_obj_align(s_menu_title, LV_ALIGN_CENTER, 0, -20);
+        }
+        if (s_menu_body)
+        {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%d%%", pct);
+            lv_label_set_text(s_menu_body, buf);
+            lv_obj_align(s_menu_body, LV_ALIGN_CENTER, 0, 12); // 百分比在中心偏下
+        }
+        lv_obj_clear_flag(s_menu_panel, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // 不调 lv_refr_now()：同步强刷会阻塞本函数直到整帧渲染完成，OTA 下载中反复调用
+    // 既拖慢下载、又可能与已暂停的任务状态冲突卡住。改由 LVGL 自身刷新任务异步渲染即可，
+    // 只需更新完 label 文本后立即释放锁返回。
+    lvgl_port_unlock();
 }
 
 /* ═══════════════════════════════════════════════════════════════

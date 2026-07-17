@@ -44,6 +44,7 @@
 #include "bsp/bsp_ota.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_cpu.h" // 【临时调试】esp_cpu_set_watchpoint 抓越界写
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "ui/ui_port.h"
@@ -87,6 +88,17 @@
 /** @brief 打印当前内部 SRAM 剩余空间（追踪初始化内存消耗） */
 #define PRINT_INTERNAL_HEAP \
     ESP_LOGI(TAG, "[heap] internal free: %lu B", esp_get_free_internal_heap_size())
+
+/** @brief 【临时调试】查堆完整性，坏了就大声报是哪一步之后坏的 —— 定位越界元凶 */
+#define HEAP_CHECK_STEP(step_name)                                               \
+    do                                                                           \
+    {                                                                            \
+        if (!heap_caps_check_integrity_all(false))                               \
+            ESP_LOGE("HEAPSTEP", "☠☠☠ 堆在【%s】之后已损坏！凶手就在此步或之前", \
+                     (step_name));                                               \
+        else                                                                     \
+            ESP_LOGW("HEAPSTEP", "✓ [%s] 之后堆完好", (step_name));              \
+    } while (0)
 
 // ─── CPU 占用诊断 ───────────────────────────────────────────────────────────
 // 依赖 sdkconfig：
@@ -429,6 +441,7 @@ void application_init(void)
     gpio_set_level(GPIO_NUM_14, 0); // 主动输出 0V，停止舵机误抖动
     bsp_flash_init();
     PRINT_INTERNAL_HEAP_STEP("bsp_flash_init");
+    HEAP_CHECK_STEP("bsp_flash_init");
     debug_root_files();
     scan_production_assets("/S"); // 扫描 /S 目录下的所有资源
     if (access("/S/assets/gif/one.gif", F_OK) == 0)
@@ -558,8 +571,8 @@ void application_init(void)
     // xTaskCreate(motor_pwm_test_task, "motor_pwm_test", 4096, NULL, 3, NULL);
 
     /* ── 步骤 10.5: 无活动待机模块（依赖 LCD/唤醒词/舵机管理器均已就绪）──── */
-    standby_init();
-    PRINT_INTERNAL_HEAP_STEP("standby_init");
+    // standby_init();
+    // PRINT_INTERNAL_HEAP_STEP("standby_init");
 
     /* ── 步骤 11: 电池 + 提醒系统（无感/次要功能，后置以让核心链路尽早就绪）──
      * 挪动理由：电池监控纯 ADC 无依赖；reminder_init 内部会同步做一次 IP 定位

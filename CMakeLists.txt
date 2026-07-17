@@ -9,7 +9,7 @@ cmake_minimum_required(VERSION 3.16)
 # bsp_ota.c 的 is_newer_version() 依赖此值做语义化版本比较（如 "1.0.0" < "1.0.1"）。
 # 不设置时默认从 git tag/commit hash 生成，会导致版本比较失效。
 # 升级流程：修改下行版本号 → idf.py build → 把 build/Echo.bin 放到 HTTP 服务器
-set(PROJECT_VER "未定义版本")
+set(PROJECT_VER "1.0.0")
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(Echo)

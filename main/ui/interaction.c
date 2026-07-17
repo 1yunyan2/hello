@@ -65,6 +65,10 @@ void interaction_set_lowpower(bool enable)
 
 static QueueHandle_t s_ia_queue = NULL; ///< 动作请求队列（情绪 ID / 自定义动作）
 static TaskHandle_t s_ia_worker = NULL; ///< worker 任务句柄
+
+/// OTA 停止标志：置 true 后 worker 丢弃一切请求、不再切 GIF/驱动舵机/震动。
+/// 用于 OTA 升级期间彻底静默 interaction（GIF+舵机+震动）。置位后不清除（OTA 必重启）。
+static volatile bool s_ia_stopped_for_ota = false;
 static bool s_ia_inited = false;        // 初始化完成
 
 // ==========================================
@@ -603,7 +607,13 @@ static void interaction_play_custom_blocking(const ia_custom_action_t *act)
     atomic_store(&s_ia_playing, true);
     ESP_LOGI("GIFDBG", "custom动作 开始 idle=%d gif=%s keep=%d",
              act->is_idle, act->gif_path ? act->gif_path : "(NULL)", act->keep_screen);
+    // 【堆探针·已停用】根因（lv_gif_get_size 栈上 24KB 打穿栈）已由 gif_read_canvas_size
+    //   修复；全堆扫描太重会触发看门狗，暂注释保留，需再排查堆损坏时取消注释。
+    // if (!heap_caps_check_integrity_all(true))
+    //     ESP_LOGE("HEAPCHK", "★堆损坏@custom进入前(上一动作遗留)");
     servo_manager_flush();
+    // if (!heap_caps_check_integrity_all(true))
+    //     ESP_LOGE("HEAPCHK", "★堆损坏@servo_manager_flush()之后");
 
     // 切图（跨线程安全）：状态动作走高优先级 ui_request_state_gif（is_state=true），
     // 否则会被对话中 main_gif_switch_timer_cb 的「丢弃情绪切图」兜底误伤（D.1）。
@@ -614,9 +624,13 @@ static void interaction_play_custom_blocking(const ia_custom_action_t *act)
         else
             ui_request_emotion_gif(act->gif_path);
     }
+    // if (!heap_caps_check_integrity_all(true))
+    //     ESP_LOGE("HEAPCHK", "★堆损坏@切图之后");
 
     // 震动（逐段阻塞播放；NULL/0 直接返回）
     trigger_vibration_motor(act->vib_seq, act->vib_seq_len);
+    // if (!heap_caps_check_integrity_all(true))
+    //     ESP_LOGE("HEAPCHK", "★堆损坏@震动之后");
 
     // 三轴舵机绝对角度并行动作（与情绪同一执行体，执行完 worker 统一归中 90°）
     servo_abs_parallel_request_t preq = {
@@ -635,6 +649,8 @@ static void interaction_play_custom_blocking(const ia_custom_action_t *act)
         ESP_LOGW(TAG, "状态动作舵机请求入队失败（队列满？），跳过本次动作");
     }
 
+    // if (!heap_caps_check_integrity_all(true))
+    //     ESP_LOGE("HEAPCHK", "★堆损坏@舵机动作之后");
     servo_manager_flush(); // 归中（含打断兜底）
     atomic_store(&s_ia_is_idle, false);
     atomic_store(&s_ia_playing, false);
@@ -663,6 +679,9 @@ static void interaction_worker_task(void *arg)
         // 无限等待，收到请求后按类型分发执行（阻塞期间不占 CPU）
         if (xQueueReceive(s_ia_queue, &req, portMAX_DELAY) == pdTRUE)
         {
+            // OTA 升级期间：丢弃一切请求，不切 GIF / 不驱动舵机 / 不震动
+            if (s_ia_stopped_for_ota)
+                continue;
             if (req.type == IA_REQ_EMOTION)
                 interaction_play_blocking(req.u.emo);
             else /* IA_REQ_CUSTOM */
@@ -794,4 +813,16 @@ void interaction_flush_queue(void)
     // 只清「未执行」的存量请求；正在执行的那条由 servo_manager_flush 打断（二者配合）。
     if (s_ia_inited && s_ia_queue != NULL)
         xQueueReset(s_ia_queue);
+}
+
+void interaction_stop_for_ota(void)
+{
+    // ① 置停止标志：worker 此后取到任何请求都直接丢弃，不再切 GIF/舵机/震动
+    s_ia_stopped_for_ota = true;
+    // ② 清空队列里未执行的存量请求
+    if (s_ia_inited && s_ia_queue != NULL)
+        xQueueReset(s_ia_queue);
+    // ③ 打断【正在执行】的那条舵机动作（含归中兜底），让当前动作立即收尾
+    servo_manager_flush();
+    ESP_LOGW(TAG, "interaction 已为 OTA 停止（GIF/舵机/震动全部静默）");
 }
