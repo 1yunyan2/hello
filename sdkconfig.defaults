@@ -43,3 +43,8 @@ CONFIG_LWIP_DEFAULT_TCP_RECVMBOX_IN_PSRAM=y
 
 # --- 顺手把 mbedTLS (MQTT/WebSocket 加密握手) 的内存也挪出去 ---
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+
+# --- 【临时调试】定位随机堆损坏：LIGHT 毒化，free 时对越界块报 CORRUPT HEAP ---
+#     用 LIGHT 而非 COMPREHENSIVE：本设备内部 SRAM 紧张，COMPREHENSIVE 开销会压爆
+#     WiFi esf_buf 造成开机伪故障。定位完成后删除本行。
+CONFIG_HEAP_POISONING_LIGHT=y
