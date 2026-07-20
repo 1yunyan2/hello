@@ -1078,6 +1078,32 @@ void wake_word_suspend_feed(void)
     s_afe_data = NULL;
 }
 
+// ─── 公开 API：OTA 升级前彻底停止麦克风监听（不可逆，重启前调用）─────────
+/**
+ * @brief OTA 升级前停掉唤醒词引擎的检测与麦克风投喂，让出 CPU1 给固件下载。
+ *
+ * 与 session_stop_for_ota() 互补：那个只关「会话+编码上云」链路，唤醒引擎
+ * （afe_feed / afe_fetch / multinet_detect）是独立常驻任务，一直在采麦克风、跑
+ * 神经网络推理，会持续「听到唤醒词」并触发 MultiNet buffer overflow，还占满 CPU1
+ * 与下载抢资源。本函数把它安全停住：
+ *   1. is_running = false：multinet_detect_task 跳过 detect（不再识别唤醒词、不再
+ *      overflow 刷屏），afe_fetch_task 也不再往 MultiNet 队列推数据；
+ *   2. s_feed_suspended = true：custom_wake_word_feed() 入口直接 return，断掉对 AFE
+ *      的原始 PCM 投喂，麦克风采集链路空转。
+ *
+ * ★ 故意不置 s_afe_data=NULL、不杀 afe_fetch_task 死循环：feed 停后 AFE 无新数据，
+ *   afe_fetch_task 的 fetch() 取不到帧走 NULL 分支 vTaskDelay(10) 安全空转，既不崩
+ *   （避免把 NULL 传进 s_afe_iface->fetch()）也不刷屏。CPU1 占用大幅回落。
+ *
+ * 不可逆：仅在 OTA 升级前调用，升级后必定 esp_restart()，无需恢复。
+ */
+void bsp_wake_word_stop_for_ota(void)
+{
+    is_running = false;        // 停 detect：不再识别唤醒词、不再 MultiNet overflow
+    s_feed_suspended = true;   // 断 feed：custom_wake_word_feed 入口 return，停止麦克风投喂
+    ESP_LOGW(TAG, "OTA：唤醒词引擎已停（detect 关闭 + 麦克风投喂挂起），让出 CPU1");
+}
+
 // ─── 公开 API：恢复引擎监听 ─────────────────────────────────────────────
 
 /**

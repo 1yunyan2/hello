@@ -189,6 +189,15 @@ void wake_word_stop(void);
 void wake_word_suspend_feed(void);
 
 /**
+ * @brief OTA 升级前彻底停止唤醒词检测与麦克风投喂（不可逆，重启前调用）
+ *
+ * 停 detect（is_running=false）+ 挂起 feed（s_feed_suspended=true），让唤醒引擎
+ * 不再识别唤醒词、不再 MultiNet overflow、不再采麦克风，让出 CPU1 给固件下载。
+ * 故意不置 s_afe_data=NULL、不杀死循环任务，fetch 侧安全空转。详见 .c 实现注释。
+ */
+void bsp_wake_word_stop_for_ota(void);
+
+/**
  * @brief 恢复 MultiNet 命令词检测监听
  *
  * 设置 is_running = true，afe_fetch_task 恢复 MultiNet detect 检测循环。

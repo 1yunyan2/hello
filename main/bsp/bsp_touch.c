@@ -34,6 +34,11 @@ static QueueHandle_t s_touch_event_queue = NULL;
  * 在 update_page_btn 松手算出 held 后写入，bsp_touch_last_page_hold_ms() 读取。 */
 static volatile uint32_t s_last_page_hold_ms = 0;
 
+// OTA 升级时置位：touch_scan_task 在循环开头检测到后自删（vTaskDelete(NULL)），
+// 让出 CPU、彻底停止触摸扫描。不可逆——OTA 结束必重启，无需恢复。
+static volatile bool s_touch_stop_for_ota = false;
+void bsp_touch_stop_for_ota(void) { s_touch_stop_for_ota = true; }
+
 uint32_t bsp_touch_last_page_hold_ms(void)
 {
     return s_last_page_hold_ms;
@@ -566,6 +571,12 @@ void touch_scan_task(void *pvParameters)
     // 主循环
     while (1)
     {
+        // OTA 升级：停止扫描并自删任务，让出 CPU 给固件下载（不可逆，重启前）
+        if (s_touch_stop_for_ota)
+        {
+            ESP_LOGW("BSP_TOUCH", "OTA：触摸扫描任务退出，让出 CPU");
+            vTaskDelete(NULL);
+        }
 #if BSP_USE_TTP223
         // TTP223 已在芯片内完成测量，直接读 GPIO
         vTaskDelay(pdMS_TO_TICKS(20));

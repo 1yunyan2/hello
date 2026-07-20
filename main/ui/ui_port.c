@@ -2933,9 +2933,20 @@ void ui_show_ota_progress(int pct)
     if (!lvgl_port_lock(100))
         return; // 取锁失败：跳过本次刷新，等下次进度回调再刷（无害）
 
-    /* 隐藏 GIF，避免它在升级期间继续逐帧读 flash 与 OTA 抢 flash/CPU */
+    /* 隐藏 GIF，避免它在升级期间继续逐帧读 flash 与 OTA 抢 flash/CPU。
+     * ★ 关键：仅 HIDDEN 不停解码——GIF 内部逐帧 timer 仍在跑，播完一轮照样发
+     *   LV_EVENT_READY，被 main_gif_ready_cb 捕获后又 lv_timer_resume(s_gif_switch_tmr)，
+     *   于是 switch timer 被反复唤醒继续切图/解码/读 flash，直到 esp_restart() 那一刻
+     *   正好卡在 gif_blend_to_rgb565 导致重启崩溃、屏幕定死、新固件切换被干扰。
+     *   因此这里必须同时 lv_gif_pause 冻结内部解码 timer + 暂停 switch timer 排队，
+     *   双保险彻底断掉「ready → resume → 切图」的自我唤醒环。 */
+    if (s_gif_switch_tmr != NULL)
+        lv_timer_pause(s_gif_switch_tmr);
     if (gif_obj != NULL)
+    {
+        lv_gif_pause(gif_obj); // 冻结 GIF 内部逐帧解码 timer，从根上不再发 READY 事件
         lv_obj_add_flag(gif_obj, LV_OBJ_FLAG_HIDDEN);
+    }
 
     /* 复用功能菜单全屏黑底面板，写入升级进度文案 */
     ensure_menu_panel();

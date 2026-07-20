@@ -27,7 +27,8 @@
 #include "ui/standby.h" // standby_notify_activity：OTA 期间持续喂计时器，防止进深度待机
 #include "ui/ui_port.h" // ui_show_ota_progress / ui_pause_main_gif：升级中屏幕反馈
 #include "session/session.h" // session_stop_for_ota：升级前彻底停语音链路，腾内部 SRAM/CPU 给下载
-#include "bsp/bsp_board.h" // bsp_battery_stop_task / bsp_battery_stop_log_task：停电池监控与日志任务
+#include "bsp/bsp_board.h" // bsp_battery_stop_task / bsp_battery_stop_log_task / bsp_touch_stop_for_ota
+#include "wake_word/custom_wake_word.h" // bsp_wake_word_stop_for_ota：升级前停唤醒引擎+麦克风采集
 #include "ui/interaction.h" // interaction_stop_for_ota：停 GIF 切图 + 舵机 + 震动（触摸随之哑火）
 
 #define TAG "OTA"
@@ -301,24 +302,27 @@ static void ota_task(void *pvParameters)
     //   ② 语音会话 + audio_processor（采集/编解码）——最吃内部 SRAM；
     //   ③ GIF 动画——逐帧读 flash、抢 CPU；
     //   ④ 电池监控 + 电池日志——多余的 ADC 采样与串口打印。
-    ESP_LOGW(TAG, "OTA：关闭无关任务（语音/动画/电池），全力下载固件");
+    ESP_LOGW(TAG, "OTA：关闭无关任务（唤醒词/麦克风/语音/触摸/动画/电池），全力下载固件");
 
-    // 注意：不动唤醒词引擎（afe_fetch_task）——它是 CPU1 上的 while(1) 常驻死循环，
-    // 没有安全退出机制；若把 s_afe_data 置 NULL 或停 is_running，该任务只会空转并
-    // 每 10ms 刷屏「afe_fetch_with_delay: handle is NULL!」，反而消耗 CPU/串口，得不偿失。
-    // 它跑在 CPU1，而下载主体在 CPU0 + 网络栈，让它继续运行即可。
+    // ① 唤醒词引擎 + 麦克风采集（最大的 CPU/资源占用者，独立于 session 常驻运行）。
+    //    停 detect + 挂起 feed：不再识别唤醒词、不再 MultiNet overflow、不再采麦克风。
+    //    故意不杀 afe_fetch_task 死循环、不置 s_afe_data=NULL——feed 停后 fetch 取不到
+    //    帧走 vTaskDelay 安全空转，既不崩也不刷屏。详见 bsp_wake_word_stop_for_ota 注释。
+    bsp_wake_word_stop_for_ota();
 
-    // ① 语音会话（异步关闭：停并销毁 audio_processor，回 IDLE，释放内部 SRAM）
+    // ② 语音会话（异步关闭：停并销毁 audio_processor，回 IDLE，释放内部 SRAM）
     session_stop_for_ota();
     vTaskDelay(pdMS_TO_TICKS(500)); // 等 session_event_task 完成关闭并释放内存
 
-    // ② interaction：停 GIF 切图 + 舵机 + 震动（丢弃一切情绪/动作请求）。
-    //    触摸任务(touch_scan)仍在扫描，但它只负责往 interaction 投递请求——
-    //    interaction 一停，触摸按下也不会有任何动作，等同哑火，无需单独关闭。
+    // ③ 触摸扫描任务（自删退出，让出 CPU）。虽然 interaction 已停使触摸按下无动作，
+    //    但扫描任务本身仍在耗 CPU，升级期间彻底停掉更干净。
+    bsp_touch_stop_for_ota();
+
+    // ④ interaction：停 GIF 切图 + 舵机 + 震动（丢弃一切情绪/动作请求）。
     interaction_stop_for_ota();
     ui_pause_main_gif(); // 再定格主界面 GIF 当前帧，停止其自动轮播解码
 
-    // ③ 电池监控与日志任务（纯调试/后台采样，OTA 期间无用）
+    // ⑤ 电池监控与日志任务（纯调试/后台采样，OTA 期间无用）
     bsp_battery_stop_log_task(); // 停「每 5s 打印电压」日志任务
     bsp_battery_stop_task();     // 停后台电池采样任务
 

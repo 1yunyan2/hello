@@ -479,6 +479,14 @@ typedef enum
 void touch_scan_task(void *pvParameters);
 
 /**
+ * @brief OTA 升级前停止触摸扫描任务（不可逆，重启前调用）
+ *
+ * 置停止标志，touch_scan_task 在循环开头检测到后 vTaskDelete(NULL) 自删，
+ * 彻底停止触摸扫描、让出 CPU 给固件下载。OTA 结束必重启，无需恢复。
+ */
+void bsp_touch_stop_for_ota(void);
+
+/**
  * @brief 非阻塞获取触摸事件（立即返回）
  * @param out_event 输出触摸事件
  * @return true 有事件，false 无事件
