@@ -67,3 +67,12 @@ void games_handle_touch(touch_event_t event);
  * 占位游戏无资源，真实游戏（如打地鼠）借此删除 LVGL 对象与定时器，避免泄漏。
  */
 void games_stop(void);
+
+/**
+ * @brief 获取当前正在运行的游戏 ID
+ *
+ * 供 bsp_touch.c 判断当前是哪个具体游戏，以便按游戏切换触摸触发方式
+ * （例如打地鼠/赛车改为「按下即触发」，跳一跳仍需「松手才触发」以配合蓄力）。
+ * @return 当前游戏 ID；未在游戏中时返回 -1
+ */
+int games_get_current(void);

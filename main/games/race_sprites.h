@@ -116,8 +116,32 @@ extern const lv_image_dsc_t c7; /* 78×115 玩家（机器人）*/
  * 同时保证不会三道同时被堵死（至少留一条逃生道）。*/
 #define RACE_SPAWN_SAFE_T 220
 
-#define RACE_TOUCH_COOLDOWN_MS 180 /* 换道防误触冷却 */
-#define RACE_FLASH_MS 200          /* 撞车红屏闪烁时长 */
+/* ── 换道灵敏度 ──
+ * 两次换道之间的强制冷却：这段时间内的耳朵事件直接丢弃。
+ * 越小 = 挪移越跟手、可连续快速换道；越大 = 越不容易误触但手感发钝。
+ * 参考：180ms 偏保守（一秒最多换 5 次）；90ms 手感明显更跟手；
+ *       0 = 不限速，完全跟随触摸事件（受 bsp_touch.c 扫描/消抖限制，约 75ms 一次）。*/
+#define RACE_TOUCH_COOLDOWN_MS 10 /* 换道防误触冷却（ms），调这一个即可 */
+#define RACE_FLASH_MS 200         /* 撞车红屏闪烁时长 */
 
 #define RACE_COUNTDOWN_FROM 3
 #define RACE_COUNTDOWN_STEP_MS 700
+
+/* ═══════════════════════════════════════════════════════════════
+ * 开场进度条（复用打地鼠 game_whack.c 的时间条做法）
+ *
+ * 替代原「3→2→1→GO」大数字倒计时：进入游戏后顶部一条进度条在
+ * RACE_INTRO_MS 内从满线性耗到空，耗空即开打。
+ * ★ 与打地鼠不同：赛车【只在开场用】这条进度条，正式开打后整条隐藏
+ *   （赛车没有限时，撞车才结束，游戏中没有"剩余时间"可显示）。
+ * 由 engine_cb 的 RS_COUNTDOWN 分支按 intro_t0 每帧平滑驱动。
+ * ═══════════════════════════════════════════════════════════════ */
+#define RACE_INTRO_MS 3000 /* 开场进度条耗空时长（ms）= 入场三秒倒计时 */
+
+#define RACE_TIMEBAR_H 16                  /* 进度条高度 px */
+#define RACE_TIMEBAR_MARGIN 8              /* 距屏幕左右/顶部的边距 px */
+#define RACE_TIMEBAR_RADIUS 8              /* 圆角半径 */
+#define RACE_TIMEBAR_BG_COLOR 0x16213E     /* 轨道底色（深蓝）*/
+#define RACE_TIMEBAR_OK_COLOR 0x00D466     /* 正常（绿）*/
+#define RACE_TIMEBAR_WARN_COLOR 0xFFA502   /* 警告：剩余≤1/3（橙）*/
+#define RACE_TIMEBAR_DANGER_COLOR 0xFF3B30 /* 危险：剩余≤1/6（红）*/

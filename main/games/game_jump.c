@@ -207,12 +207,37 @@ static lv_obj_t *s_center = NULL;
 
 static lv_timer_t *s_engine_tmr = NULL;
 
+/* ── 结算后自动重开 ──
+ * 需求：摔倒结算界面只留背景图，停 JUMP_RESTART_DELAY_MS 后自动重来一局，
+ * 等价于以前在结算界面「触摸头部继续」。头部触摸仍保留（想立刻重来也行）。*/
+#define JUMP_RESTART_DELAY_MS 1000       /* 结算停留时长（ms）*/
+static lv_timer_t *s_restart_tmr = NULL; /* one-shot 自动重开定时器 */
+
 /* 前置 */
 static void enter_select(void);
 static void enter_playing(void);
 static void enter_result(void);
 static void trigger_next_drop(void); /* 触发下一块目标台从天而降（开局/镜头停稳后调用）*/
 static int player_base_scale(void);  /* 棋子等比缩放基准，plat_foot_half_w 提前用到 */
+
+/* 取消尚未触发的自动重开定时器。
+ * 手动重开 / 退出游戏时必须调用，否则面板已删而定时器仍在，回调里会碰野指针。*/
+static void restart_timer_cancel(void)
+{
+    if (s_restart_tmr)
+    {
+        lv_timer_del(s_restart_tmr);
+        s_restart_tmr = NULL;
+    }
+}
+
+/* one-shot 回调：结算停留结束，自动开下一局（等价于在结算界面按一次头部）*/
+static void restart_cb(lv_timer_t *t)
+{
+    (void)t;
+    s_restart_tmr = NULL; /* repeat_count=1：LVGL 在本回调返回后自动删除该定时器 */
+    enter_playing();
+}
 
 /* ══════════════════════════════════════════════════
  * NVS
@@ -1290,15 +1315,26 @@ static void engine_cb(lv_timer_t *t)
         {
             /* 落空：从飞行末态平滑接力掉落（连续抛物线，不再瞬间垂直撞墙）。
              * - 水平速度 fall_vx = 飞行每帧的水平位移（继续往前飞）
-             * - 弧高余量 fall_h = 飞行最后一帧的离地高度（被重力逐帧吃掉）
-             * - 垂直速度 fall_vy 从 0 起重力加速 */
+             * - 垂直速度 fall_vy = 飞行「最后一帧的真实下落速度」，之后按重力继续加速 */
             g.player_wx = actual_wx;
-            g.fall_vx = g.fly_total_x / g.fly_steps;                       /* 飞行平均每帧水平位移 */
-            g.fall_h = g.fly_apex * 4 * t256 * (256 - t256) / (256 * 256); /* 末帧弧高 */
-            g.fall_vy = 0;
+            g.fall_vx = g.fly_total_x / g.fly_steps; /* 飞行平均每帧水平位移 */
+            /* 判定发生在 t=1，弧高恒为 0（无残余高度可接力），故直接置 0。
+             * 旧代码在这里用 t256 算 fall_h，因 t256==256 结果永远是 0，属死代码。*/
+            g.fall_h = 0;
+            /* ⭐ 速度连续性：飞行末帧的屏幕下落量 = 每帧世界 y 位移 + 弧高降幅
+             *      Δ弧高 = fly_h(t=1-1/n) - 0 = 4*apex*(n-1)/n²
+             *      代入 apex=dist*JUMP_APEX_RATIO%、n=dist/JUMP_FLY_STEP_PX，
+             *      该值与蓄力距离无关，恒约 12~14 px/帧。
+             * 旧代码 fall_vy=0 把这 14px/帧丢了：落空瞬间竖直速度 14→3 骤降，
+             * 而水平仍是 9px/帧，于是有 2~3 帧「贴着台面高度横向平移」，
+             * 肉眼看就是"踩到一块透明台子上滑了一下才掉下去"。*/
+            int n = g.fly_steps;
+            g.fall_vy = g.fly_total_y / n + 4 * g.fly_apex * (n - 1) / (n * n);
+            if (g.fall_vy < JUMP_FALL_GRAVITY)
+                g.fall_vy = JUMP_FALL_GRAVITY; /* 兜底：至少一帧重力的速度，杜绝竖直静止起跌 */
             g.phase = PH_FALL;
             highscore_save_if_better(g.score);
-            ESP_LOGI(TAG, "落空 wx=%d vx=%d h=%d", g.player_wx, g.fall_vx, g.fall_h);
+            ESP_LOGI(TAG, "落空 wx=%d vx=%d vy0=%d(接力飞行末帧速度)", g.player_wx, g.fall_vx, g.fall_vy);
         }
         break;
     }
@@ -1397,19 +1433,21 @@ static void engine_cb(lv_timer_t *t)
     {
         /* 水平继续往前（衰减一点，模拟空气阻力，避免飞太远）*/
         g.player_wx += g.fall_vx;
-        /* 弧高先把残余顶起的高度吃掉，吃完才开始真正下坠 */
+        /* 弧高先把残余顶起的高度吃掉，吃完才开始真正下坠。
+         * 注：当前唯一入口（PH_FLY 判定落空）处 fall_h 恒为 0，本分支不会走到，
+         * 保留仅作防御（若将来允许飞行中途提前判定落空，残余弧高才需消退）。*/
         int h;
         if (g.fall_h > 0)
         {
-            g.fall_h -= 3; /* 弧高逐帧消退 */
+            g.fall_h -= JUMP_FALL_GRAVITY; /* 弧高逐帧消退 */
             if (g.fall_h < 0)
                 g.fall_h = 0;
             h = g.fall_h; /* 仍被弧高顶着，player_wy 不动 */
         }
         else
         {
-            g.fall_vy += 3;           /* 重力加速 */
-            g.player_wy += g.fall_vy; /* 真正下坠 */
+            g.fall_vy += JUMP_FALL_GRAVITY; /* 重力加速（初速已在落空判定处接力飞行末帧速度）*/
+            g.player_wy += g.fall_vy;       /* 真正下坠 */
             h = 0;
         }
         player_render(0, h, 0); /* h 作为离地高度，保持弧线连续 */
@@ -1495,6 +1533,7 @@ static void enter_select(void)
 
 static void enter_playing(void)
 {
+    restart_timer_cancel(); /* 手动/自动重开都从这里进，先撤掉挂起的自动重开 */
     g.screen = JS_PLAYING;
     g.phase = PH_IDLE;
     g.score = 0;
@@ -1507,8 +1546,9 @@ static void enter_playing(void)
 
     if (s_center)
         lv_obj_add_flag(s_center, LV_OBJ_FLAG_HIDDEN);
+    /* 按需求去除「游戏内分数显示」：HUD 始终隐藏（分数仍在内部累加、仍写 NVS 高分）*/
     if (s_hud)
-        lv_obj_clear_flag(s_hud, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_hud, LV_OBJ_FLAG_HIDDEN);
     hud_refresh();
     player_render(0, 0, 0);
     if (s_engine_tmr)
@@ -1528,35 +1568,27 @@ static void enter_result(void)
         if (g.plats[i].cube)
             lv_obj_add_flag(g.plats[i].cube, LV_OBJ_FLAG_HIDDEN);
     }
-    /* 先记下「打破前」的历史最高分（save_if_better 会就地更新 g.high_score）*/
+    /* 高分照常写 NVS（只是不再显示），先记下「打破前」的历史最高分：
+     * highscore_save_if_better 会就地更新 g.high_score，取值须放在它之前。*/
     int prev_high = g.high_score;
     bool refreshed = highscore_save_if_better(g.score);
-    int shown_high = refreshed ? g.score : prev_high; /* 当前应展示的最高分 */
+
+    /* 结算界面「只显示背景图」：得分/最高分/破纪录文字一律不显示，只打串口 */
     if (s_center)
-    {
-        char buf[96];
-        /* 注意：font_cn_32 是裁剪字库，「游戏结束/打」等字不在其中（会显示豆腐块）。
-         * 只用字库确含的字：得 分 最 高 破 纪 录 新 数 等。*/
-        if (refreshed)
-        {
-            /* 超过 NVS 记录：得分 + 破纪录 + 新最高分 */
-            snprintf(buf, sizeof(buf),
-                     "得分 %d\n破纪录\n历史最高 %d",
-                     g.score, shown_high);
-            ESP_LOGI(TAG, "破纪录！得分=%d（旧纪录 %d）", g.score, prev_high);
-        }
-        else
-        {
-            /* 未破纪录：得分 + 历史最高分 */
-            snprintf(buf, sizeof(buf),
-                     "得分 %d\n历史最高 %d",
-                     g.score, shown_high);
-        }
-        lv_label_set_text(s_center, buf);
-        lv_obj_clear_flag(s_center, LV_OBJ_FLAG_HIDDEN);
-    }
+        lv_obj_add_flag(s_center, LV_OBJ_FLAG_HIDDEN);
     if (s_hud)
         lv_obj_add_flag(s_hud, LV_OBJ_FLAG_HIDDEN);
+
+    /* 停留 1 秒后自动重开一局（one-shot，触发一次后 LVGL 自动删除）*/
+    restart_timer_cancel();
+    s_restart_tmr = lv_timer_create(restart_cb, JUMP_RESTART_DELAY_MS, NULL);
+    if (s_restart_tmr)
+        lv_timer_set_repeat_count(s_restart_tmr, 1);
+
+    ESP_LOGI(TAG, "结算: 得分=%d 历史最高=%d%s（%d ms 后自动重开）",
+             g.score, g.high_score, refreshed ? " [破纪录]" : "",
+             JUMP_RESTART_DELAY_MS);
+    (void)prev_high;
 }
 
 /* ══════════════════════════════════════════════════
@@ -1710,6 +1742,7 @@ void jump_stop(void)
         lv_timer_del(s_engine_tmr);
         s_engine_tmr = NULL;
     }
+    restart_timer_cancel(); /* 退出时撤掉自动重开，防面板删后回调野指针 */
     lv_obj_del(s_panel);
     s_panel = s_player = s_player_shadow = s_hud = s_center = NULL;
     for (int i = 0; i < JUMP_SPARK_COUNT; i++)

@@ -3,12 +3,12 @@
 Project Echo 资源打包工具 v1.0
 ================================
 
-把本地 assetsss/ 目录直接打成 32MB FAT 镜像 (storage.bin),布局与固件
+把本地 assets/ 目录直接打成 32MB FAT 镜像 (storage.bin),布局与固件
   esp_vfs_fat_spiflash_mount_rw_wl("/S", "ext_storage", &cfg, ...)
 完全一致 (wear-leveling + sector 4096),写完直接给 3.py 烧。
 
 使用流程:
-    python 2.py        ← 本脚本,assetsss/ → storage.bin
+    python 2.py        ← 本脚本,assets/ → storage.bin
     python 3.py        ← 把 storage.bin 烧到设备外挂 Flash
     设备重启 → /S 挂载成功 → 代码可读 /S/gif/one.gif 等
 
@@ -27,10 +27,34 @@ except Exception:
 
 
 # === 必须和固件参数严格一致 ===
-PARTITION_SIZE = 32 * 1024 * 1024   # 对应 main/ui/flash.c TOTAL_FLASH_SIZE
+# ⭐ 支持命令行指定大小（不写则默认 32MB），支持以下写法：
+#   python 2.py 16777216    (纯数字，单位字节)
+#   python 2.py 16M         (简写，16MB)
+#   python 2.py 32M         (简写，32MB)
+#   python 2.py             (不加参数，默认 32MB)
+_DEFAULT_PARTITION_SIZE = 32 * 1024 * 1024
+if len(sys.argv) >= 2:
+    _arg = sys.argv[1].strip().upper()
+    try:
+        if _arg.endswith('M'):
+            PARTITION_SIZE = int(_arg[:-1]) * 1024 * 1024
+        elif _arg.endswith('K'):
+            PARTITION_SIZE = int(_arg[:-1]) * 1024
+        else:
+            PARTITION_SIZE = int(_arg)
+        print(f'📌 命令行指定分区大小: {PARTITION_SIZE/1024/1024:.0f}MB ({PARTITION_SIZE} 字节)')
+        if PARTITION_SIZE not in (16*1024*1024, 32*1024*1024):
+            print(f'   ⚠️  注意：{PARTITION_SIZE/1024/1024:.0f}MB 不是标准的 16MB/32MB，请确认芯片容量')
+    except ValueError:
+        print(f'❌ 参数无法解析：{sys.argv[1]}，使用默认 {_DEFAULT_PARTITION_SIZE/1024/1024:.0f}MB')
+        PARTITION_SIZE = _DEFAULT_PARTITION_SIZE
+else:
+    PARTITION_SIZE = _DEFAULT_PARTITION_SIZE
+    print(f'📌 未指定大小，使用默认 {PARTITION_SIZE/1024/1024:.0f}MB（加参数可切换，如 python 2.py 16M）')
+
 SECTOR_SIZE    = 4096               # 对应 mount_config.allocation_unit_size
 
-SOURCE_DIR  = 'assetsss'
+SOURCE_DIR  = 'assets'
 OUTPUT_FILE = 'storage.bin'
 
 # IDF 路径优先取环境变量,否则用本机固定路径(从 .vscode/settings.json 拿到的)

@@ -119,9 +119,20 @@ extern const lv_image_dsc_t ds_bg;
 #define WHACK_FALL_PX 30 /* 缩回 30 px/帧（原10px×3，约0.1s缩回） */
 
 /* ── 命中表现 ── */
-#define WHACK_HIT_SHOW_MS 500    /* 被打后扁掉(ds1)停留时长：砸中→打扁停顿 0.5s→再下洞消失 */
-#define WHACK_HIT_BONUS_MS 1000  /* 砸中地鼠奖励时间：时间条 +1 秒（封顶满格 30s）*/
-#define WHACK_HAMMER_SHOW_MS 120 /* 锤子击打动作停留时长（每次敲击都显示，到时收回）*/
+#define WHACK_HIT_SHOW_MS 500   /* 被打后扁掉(ds1)停留时长：砸中→打扁停顿 0.5s→再下洞消失 */
+#define WHACK_HIT_BONUS_MS 1000 /* 砸中地鼠奖励时间：时间条 +1 秒（封顶满格 30s）*/
+/* ── 敲击灵敏度 ──
+ * 打地鼠的判定本身【不限速】：每收到一次左/右耳事件就判一次命中，
+ * 因此「最快能敲多快」由 bsp_touch.c 顶部的触摸灵敏度总开关决定
+ * （按下确认 + 松手确认 ≈ 75ms/次，因为耳朵是松手才算一次敲击）。
+ * 这里只控制【锤子动画】停留多久：若它比敲击间隔还长，连敲时锤子会一直杵着，
+ * 看起来像"没响应"。想连敲更爽就把它调小（建议 ≤ 敲击间隔，60~120ms）。*/
+#define WHACK_HAMMER_SHOW_MS 50 /* 锤子击打动作停留时长（每次敲击都显示，到时收回）*/
+
+/* 命中震动时长（ms）。非阻塞：try_hit 开震动记时刻，引擎到时关闭。
+ * ⚠ 不要改回 bsp_motor_pulse()，它内部 vTaskDelay(30) 会卡住 LVGL 线程，
+ *   把锤子动画的寿命吃掉（曾导致「命中看不到锤子、空敲却看得到」）。*/
+#define WHACK_MOTOR_MS 30
 
 /* ── 空敲惩罚 ── */
 #define WHACK_MISS_PENALTY 1 /* 敲到空洞扣 1 分（最低不低于 0）*/
@@ -130,12 +141,12 @@ extern const lv_image_dsc_t ds_bg;
 #define WHACK_INTRO_MS 3000 /* 开场：时间条从满 3 秒耗到空，随后回满即开打 */
 
 /* ── 时间条（顶部缓慢消失的剩余时间可视化）── */
-#define WHACK_TIMEBAR_H 16             /* 时间条高度 px */
-#define WHACK_TIMEBAR_MARGIN 8         /* 时间条距屏幕左右/顶部的边距 px */
-#define WHACK_TIMEBAR_RADIUS 8         /* 圆角半径 */
-#define WHACK_TIMEBAR_BG_COLOR 0x16213E   /* 轨道底色（深蓝）*/
-#define WHACK_TIMEBAR_OK_COLOR 0x00D466   /* 正常（绿）*/
-#define WHACK_TIMEBAR_WARN_COLOR 0xFFA502 /* 警告：剩余≤1/3（橙）*/
+#define WHACK_TIMEBAR_H 16                  /* 时间条高度 px */
+#define WHACK_TIMEBAR_MARGIN 8              /* 时间条距屏幕左右/顶部的边距 px */
+#define WHACK_TIMEBAR_RADIUS 8              /* 圆角半径 */
+#define WHACK_TIMEBAR_BG_COLOR 0x16213E     /* 轨道底色（深蓝）*/
+#define WHACK_TIMEBAR_OK_COLOR 0x00D466     /* 正常（绿）*/
+#define WHACK_TIMEBAR_WARN_COLOR 0xFFA502   /* 警告：剩余≤1/3（橙）*/
 #define WHACK_TIMEBAR_DANGER_COLOR 0xFF3B30 /* 危险：剩余≤1/6（红）*/
 
 /* 旧难度数字倒计时（已由时间条开场动画取代，保留宏以防引用）*/

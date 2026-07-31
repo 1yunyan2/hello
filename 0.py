@@ -7,8 +7,8 @@ Project Echo 一键全流程 v1.0
     python 0.py
 
 逻辑:
-    1.py 图片转换(img_src/*.png → assetsss/img/*.bin)
-      └ 成功 → 2.py 打包(assetsss/ → storage.bin)
+    1.py 图片转换(img_src/*.png → assets/img/*.bin)
+      └ 成功 → 2.py 打包(assets/ → storage.bin)
           └ 成功 → 3.py 烧录(storage.bin → 外挂 Flash,持续等设备,不返回)
     任一步失败 → 立即停止报错,绝不带着错误镜像去烧。
 

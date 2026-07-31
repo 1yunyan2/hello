@@ -148,6 +148,9 @@ static struct
     hole_state_t st[HOLE_COUNT];
     uint32_t t0[HOLE_COUNT];
     uint32_t hammer_t0[HOLE_COUNT]; /* 锤子出现时刻（用于到时自动收回）*/
+    /* 命中震动起始时刻（0=未在震动）。非阻塞震动：try_hit 里只开，引擎按时关，
+     * 避免 bsp_motor_pulse() 的 30ms vTaskDelay 卡住 LVGL 线程拖垮锤子动画。*/
+    uint32_t motor_t0;
     int16_t mole_y[HOLE_COUNT];
     int16_t mole_hide_y;
     int16_t mole_show_y;
@@ -171,12 +174,37 @@ static lv_timer_t *s_engine_tmr = NULL; /* 动画/物理引擎 */
 static lv_timer_t *s_clock_tmr = NULL;  /* 1Hz 倒计时 + 10 秒加速 */
 static lv_timer_t *s_cd_tmr = NULL;     /* 开局 3 秒倒计时 */
 
+/* ── 结算后自动重开 ──
+ * 需求：时间到的结算界面只留背景图，停 WHACK_RESTART_DELAY_MS 后自动重来一局，
+ * 等价于以前在结算界面「触摸头部继续」。头部触摸仍保留（想立刻重来也行）。*/
+#define WHACK_RESTART_DELAY_MS 1000      /* 结算停留时长（ms）*/
+static lv_timer_t *s_restart_tmr = NULL; /* one-shot 自动重开定时器 */
+
 /* 前置声明 */
 static void enter_select(void);
 static void enter_countdown(void);
 static void enter_playing(void);
 static void enter_result(void);
 static void game_timers_stop(void);
+
+/* 取消尚未触发的自动重开定时器。
+ * 手动重开 / 退出游戏时必须调用，否则面板已删而定时器仍在，回调里会碰野指针。*/
+static void restart_timer_cancel(void)
+{
+    if (s_restart_tmr)
+    {
+        lv_timer_del(s_restart_tmr);
+        s_restart_tmr = NULL;
+    }
+}
+
+/* one-shot 回调：结算停留结束，自动开下一局（等价于在结算界面按一次头部）*/
+static void restart_cb(lv_timer_t *t)
+{
+    (void)t;
+    s_restart_tmr = NULL; /* repeat_count=1：LVGL 在本回调返回后自动删除该定时器 */
+    enter_countdown();
+}
 
 /* ═══════════════════════════════════════════════════════════════
  * NVS 高分读写（按难度独立 key）
@@ -507,6 +535,14 @@ static void engine_cb(lv_timer_t *t)
         }
     }
 
+    /* 命中震动关闭（非阻塞）：到时长就停，替代 bsp_motor_pulse() 里的 vTaskDelay。
+     * 放在洞循环外，因为震动是全局一个马达，与具体哪个洞无关。*/
+    if (g.motor_t0 != 0 && (now - g.motor_t0) >= WHACK_MOTOR_MS)
+    {
+        bsp_motor_set(0);
+        g.motor_t0 = 0;
+    }
+
     if (dirty)
         hud_refresh();
 }
@@ -590,12 +626,19 @@ static void try_hit(int hole)
         if (g.time_left_ms > WHACK_GAME_SECONDS * 1000)
             g.time_left_ms = WHACK_GAME_SECONDS * 1000;
 
-        bsp_motor_pulse(); /* 命中震动 */
-
         mole_set_visual(hole, HOLE_HIT);
         stars_set_visual(hole, true); /* 眩晕星星 */
         hud_refresh();
         ESP_LOGI(TAG, "命中洞%d! 得分=%d", hole, g.score);
+
+        /* ★ 命中震动必须放在最后，且不能阻塞：
+         * bsp_motor_pulse() 内部是 set(100) + vTaskDelay(30) + set(0)，会把
+         * 本函数所在的 LVGL 线程卡住 30ms。原先它排在 mole/hammer 渲染之前，
+         * 导致锤子刚显示就被这 30ms 吃掉寿命（WHACK_HAMMER_SHOW_MS=30 时锤子
+         * 还没渲染出来就到期被收回）→ 表现为「空敲看得见锤子、命中却看不见」。
+         * 改用 bsp_motor_set() 只开震动不等待，关闭交给引擎按时间片处理。*/
+        bsp_motor_set(BSP_MOTOR_DEFAULT_STRENGTH);
+        g.motor_t0 = lv_tick_get();
     }
     else
     {
@@ -659,6 +702,7 @@ static void enter_select(void)
  * ═══════════════════════════════════════════════════════════════ */
 static void enter_countdown(void)
 {
+    restart_timer_cancel(); /* 手动/自动重开都从这里进，先撤掉挂起的自动重开 */
     g.screen = WS_COUNTDOWN;
     if (s_hint)
         lv_obj_add_flag(s_hint, LV_OBJ_FLAG_HIDDEN);
@@ -776,6 +820,13 @@ static void enter_result(void)
         lv_obj_add_flag(s_hud, LV_OBJ_FLAG_HIDDEN);
     if (s_hint)
         lv_obj_add_flag(s_hint, LV_OBJ_FLAG_HIDDEN); /* 结算页不显示操作提示 */
+
+    /* 停留 1 秒后自动重开一局（one-shot，触发一次后 LVGL 自动删除）*/
+    restart_timer_cancel();
+    s_restart_tmr = lv_timer_create(restart_cb, WHACK_RESTART_DELAY_MS, NULL);
+    if (s_restart_tmr)
+        lv_timer_set_repeat_count(s_restart_tmr, 1);
+
     ESP_LOGI(TAG, "结算: 难度=%s 得分=%d 击中=%d 未中=%d 空敲=%d 准确=%d%% %s",
              s_diff[g.diff].name, g.score, g.hits, g.escaped, g.misses, acc,
              refreshed ? "[新纪录]" : "");
@@ -1064,6 +1115,14 @@ void whack_stop(void)
     {
         lv_timer_del(s_cd_tmr);
         s_cd_tmr = NULL;
+    }
+    restart_timer_cancel(); /* 退出时撤掉自动重开，防面板删后回调野指针 */
+
+    /* 退出时若正在震动，引擎已停不会再有人关它，这里兜底关闭，防马达一直震 */
+    if (g.motor_t0 != 0)
+    {
+        bsp_motor_set(0);
+        g.motor_t0 = 0;
     }
 
     lv_obj_del(s_panel);

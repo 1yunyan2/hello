@@ -3,11 +3,11 @@
 Project Echo 图片转换工具 v1.0
 ================================
 把根目录 img_src/ 下的 PNG 原图,批量转成 LVGL v9 二进制 .bin,
-输出到 assetsss/img/,供 2.py 打包、3.py 烧进外挂 Flash。
+输出到 assets/img/,供 2.py 打包、3.py 烧进外挂 Flash。
 
 完整流程(三个脚本接力,全在根目录按数字顺序跑):
-    python 1.py   ← 本脚本,img_src/*.png → assetsss/img/*.bin
-    python 2.py   ← assetsss/ → storage.bin
+    python 1.py   ← 本脚本,img_src/*.png → assets/img/*.bin
+    python 2.py   ← assets/ → storage.bin
     python 3.py   ← storage.bin 烧到设备外挂 Flash
     设备重启 → /S 挂载 → 代码读 "S:/img/cc.bin" 等
 
@@ -32,7 +32,7 @@ except Exception:
 
 # === 路径与格式配置(按需改这里)===
 SOURCE_DIR = 'img_src'         # 原图目录(根目录下),放 PNG
-OUTPUT_DIR = 'assetsss/img'    # 成品 .bin 输出目录(会被 packer 打包)
+OUTPUT_DIR = 'assets/img'    # 成品 .bin 输出目录(会被 packer 打包)
 COLOR_FORMAT = 'RGB565A8'      # 颜色格式,与现有 .c 图片一致(带透明)
 # LVGL v9 官方转换脚本(项目自带,随 lvgl 组件下载)
 CONVERTER = os.path.join(

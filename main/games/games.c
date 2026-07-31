@@ -99,6 +99,11 @@ void games_handle_touch(touch_event_t event)
         g_games[s_current_game].on_touch(event);
 }
 
+int games_get_current(void)
+{
+    return s_current_game;
+}
+
 void games_stop(void)
 {
     if (s_current_game < 0 || s_current_game >= GAME_COUNT)

@@ -1,5 +1,8 @@
 # 记忆索引
 
+- [每日总结 2026-07-31 游戏结算与触摸触发改造](daily/2026-07-31_游戏结算与触摸触发改造.md) — 三游戏结算1秒自动重开(one-shot lv_timer，stop/重开入口都须cancel否则野指针)+结算只留背景图(去赛车得分/跳一跳HUD与结算分数)；打地鼠赛车改**按下即触发**(新增games_get_current()按具体游戏分流，跳一跳蓄力必须留松手；松手分支须加空分支拦截否则一次触摸算两次)；⚠️**超范围改bsp_touch.c全局参数被用户叫停已回退**；触摸灵敏度真相=TTP223下硬件决定软件只能调响应快慢
+- [BUG-038](bugs/BUG-038.md) 打地鼠"命中看不到锤子、空敲却看得到" — 命中分支`bsp_motor_pulse()`内含30ms vTaskDelay卡住LVGL线程，把锤子动画寿命(WHACK_HAMMER_SHOW_MS=30)整个吃光；空敲分支无此调用故正常；⭐参数调小会让被余量掩盖的阻塞bug突然现形；已改非阻塞；指纹=**"A分支看得到B分支看不到"且B多一个阻塞调用**
+- [改动范围要守住](feedback_respect_scope.md) — 用户说"只改X"时，底层/公共代码即使有缺陷也先报告再等指令，不顺手改
 - [用户语言偏好](user_language.md) — 用户是中国人，所有对话必须使用中文
 - [项目概况](project_overview.md) — ESP32-S3 智能语音助手，唤醒→ASR→LLM→TTS 完整对话流程
 - [开发环境](reference_dev_env.md) — ESP-IDF v5.3.4 路径和工具链配置
@@ -15,7 +18,9 @@
 - [分类指令批量执行](feedback_batch_execute.md) — 说大类名自动执行所有子能力
 - [用户积极性](feedback_enthusiasm.md) — 用户愿意全面启用所有辅助能力
 - [Token预算意识](feedback_token_budget.md) — 回答前先评估token够不够，避免半途浪费
-- 踩坑日志：[BUG-001](bugs/BUG-001.md) 蓝牙释放崩溃 | [BUG-002](bugs/BUG-002.md) SPIFFS内存冲突 | [BUG-003](bugs/BUG-003.md) 任务参数顺序错 | [BUG-004](bugs/BUG-004.md) WS握手类型错 | [BUG-005](bugs/BUG-005.md) HTTP 201未兼容 | [BUG-006](bugs/BUG-006.md) MultiNet CPU占满 | [BUG-007](bugs/BUG-007.md) 唤醒尾音误触EOS | [BUG-008](bugs/BUG-008.md) 定时器栈溢出 | [BUG-009](bugs/BUG-009.md) LVGL 64KB静态池吃SRAM | [BUG-010](bugs/BUG-010.md) LVGL stack在SPIRAM读SPIFFS崩 | [BUG-011](bugs/BUG-011.md) 音频任务SPIRAM栈泄漏 | [BUG-012](bugs/BUG-012.md) WS文本分片未重组 | [BUG-013](bugs/BUG-013.md) 长TTS残留被识别为下一轮输入 | [BUG-014](bugs/BUG-014.md) 多轮SERVER_READY丢失+尾端字保护被风扇噪声玩坏 | [BUG-015](bugs/BUG-015.md) GPIO14 FSPIWP复用引起I2C NACK+共timer舵机失灵 | [BUG-016](bugs/BUG-016.md) PCM全0/FFFF/高字节恒0x00 — ES8311虚焊诊断指纹
+- [每日总结 2026-06-30 三级断电排查](daily/2026-06-30_三级断电排查.md) — IO1实测1.45V分压态/插USB测试无效/满电误判充电导致低功耗延迟/"两次才断电"根因未定论，当前改bsp_battery_power_off()待烧录验证
+- [每日总结 2026-06-30 烧录DTR堵死命令通道](daily/2026-06-30_烧录DTR堵死命令通道.md) — 已烧板重烧不进去：真因是3.py `ser.dtr=False`，S3内置USB-JTAG(CDC-ACM)在DTR未置位时host写入不交付设备，**方向不对称**(日志照收/命令发不进)所以"日志完美却烧不进"；一条指纹结案=**全程无STARTING_ERASE**；已修dtr=True+发START后等回执补发；教训=发命令必等设备回执，靠"多试几次总能成"的链路等于没修
+- 踩坑日志：[BUG-001](bugs/BUG-001.md) 蓝牙释放崩溃 | [BUG-002](bugs/BUG-002.md) SPIFFS内存冲突 | [BUG-003](bugs/BUG-003.md) 任务参数顺序错 | [BUG-004](bugs/BUG-004.md) WS握手类型错 | [BUG-005](bugs/BUG-005.md) HTTP 201未兼容 | [BUG-006](bugs/BUG-006.md) MultiNet CPU占满 | [BUG-007](bugs/BUG-007.md) 唤醒尾音误触EOS | [BUG-008](bugs/BUG-008.md) 定时器栈溢出 | [BUG-009](bugs/BUG-009.md) LVGL 64KB静态池吃SRAM | [BUG-010](bugs/BUG-010.md) LVGL stack在SPIRAM读SPIFFS崩 | [BUG-011](bugs/BUG-011.md) 音频任务SPIRAM栈泄漏 | [BUG-012](bugs/BUG-012.md) WS文本分片未重组 | [BUG-013](bugs/BUG-013.md) 长TTS残留被识别为下一轮输入 | [BUG-014](bugs/BUG-014.md) 多轮SERVER_READY丢失+尾端字保护被风扇噪声玩坏 | [BUG-015](bugs/BUG-015.md) GPIO14 FSPIWP复用引起I2C NACK+共timer舵机失灵 | [BUG-016](bugs/BUG-016.md) PCM全0/FFFF/高字节恒0x00 — ES8311虚焊诊断指纹 | [BUG-037](bugs/BUG-037.md) 跳一跳落空"贴台面高度横向平移一下才掉"(像透明台子) — `fall_vy=0`丢掉飞行末帧恒约14px/帧竖直速度，水平仍9px/帧→头2~3帧近似纯横移；`fall_h`用t256算恒为0属死代码掩盖真因；已修，07-31烧录实测通过(vy0=11、横移消失)
 - [2026-05月度BUG对照表](bugs/MONTHLY-2026-05.md) — 本月新增BUG-013~016 发现↔解决速查
 - 决策记录：[DEC-001](decisions/DEC-001.md) OPUS 24kbps CBR | [DEC-002](decisions/DEC-002.md) 四层环形缓冲 | [DEC-003](decisions/DEC-003.md) Token双重刷新 | [DEC-004](decisions/DEC-004.md) AFE WebRTC VAD | [DEC-005](decisions/DEC-005.md) GPIO引脚分配
 - [Bug汇总索引](bugs/ALL_BUGS.md) — BUG-001~008 快速查表，按模块分类

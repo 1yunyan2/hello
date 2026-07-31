@@ -17,7 +17,9 @@
  *   障碍中心 y 越过 RACE_COLLIDE_Y 时与玩家比对车道：同道=撞车，异道=放过 +1 分。
  *
  * ── 子状态机（全部在本模块内部，ui_port 只认一个 UI_VIEW_GAME）──
- *   ① RS_COUNTDOWN 3 秒倒计时（大数字 3→2→1→GO，期间忽略输入）
+ *   ① RS_COUNTDOWN 3 秒开场（顶部进度条 3 秒耗空即开打，期间忽略输入。
+ *                  做法复用打地鼠 game_whack.c 的时间条；赛车只在开场用它，
+ *                  开打后隐藏——赛车不限时、撞车才结束，没有剩余时间可显示）
  *   ② RS_PLAYING   游戏进行（左耳左移一道 / 右耳右移一道）
  *   ③ RS_RESULT    结算（居中显示「游戏结束 + 得分」，头部=重玩）
  *
@@ -101,7 +103,8 @@ static struct
     int cur_spawn_ms;
 
     /* 倒计时 */
-    int cd_value; /* 3 → 2 → 1 → 0(GO) */
+    int cd_value;      /* 3 → 2 → 1 → 0(GO)（旧数字倒计时，已由进度条取代）*/
+    uint32_t intro_t0; /* 开场进度条起始 tick（RACE_INTRO_MS 内耗空即开打）*/
 
     /* 对局数据 */
     bool over;
@@ -123,11 +126,20 @@ static lv_image_dsc_t s_bg_dsc;   /* 指向 PSRAM 缓冲的背景描述符（内
 static lv_obj_t *s_player = NULL; /* 玩家车 c7 */
 static lv_obj_t *s_center = NULL; /* 居中大文字（难度/倒计时/结算共用）*/
 static lv_obj_t *s_hint = NULL;   /* 底部操作提示 */
+/* 开场进度条（复用打地鼠做法，仅入场三秒倒计时用，开打后隐藏）*/
+static lv_obj_t *s_timebar_bg = NULL;   /* 轨道（底）*/
+static lv_obj_t *s_timebar_fill = NULL; /* 填充（随剩余时间收缩）*/
 
 static lv_timer_t *s_engine_tmr = NULL; /* 动画/物理引擎 */
 static lv_timer_t *s_spawn_tmr = NULL;  /* 障碍生成节拍 */
 static lv_timer_t *s_clock_tmr = NULL;  /* 1Hz 倒计时 + 10 秒加速 */
 static lv_timer_t *s_cd_tmr = NULL;     /* 开局 3 秒倒计时 */
+
+/* ── 结算后自动重开 ──
+ * 需求：撞车结算界面只留背景图，停 RACE_RESTART_DELAY_MS 后自动重来一局，
+ * 等价于以前在结算界面「触摸头部继续」。头部触摸仍保留（想立刻重来也行）。*/
+#define RACE_RESTART_DELAY_MS 1000      /* 结算停留时长（ms）*/
+static lv_timer_t *s_restart_tmr = NULL; /* one-shot 自动重开定时器 */
 
 /* ── 素材/车道查表（const，编译期定死）── */
 /* 障碍素材（C 数组，内存驻留→可实时缩放），随机选一张换图 */
@@ -183,6 +195,63 @@ static inline int enemy_cy_from_t(int t)
 static void enter_countdown(void);
 static void enter_playing(void);
 static void enter_result(void);
+
+/* 取消尚未触发的自动重开定时器。
+ * 手动重开 / 退出游戏时必须调用，否则面板已删而定时器仍在，回调里会碰野指针。*/
+static void restart_timer_cancel(void)
+{
+    if (s_restart_tmr)
+    {
+        lv_timer_del(s_restart_tmr);
+        s_restart_tmr = NULL;
+    }
+}
+
+/* one-shot 回调：结算停留结束，自动开下一局（等价于在结算界面按一次头部）*/
+static void restart_cb(lv_timer_t *t)
+{
+    (void)t;
+    s_restart_tmr = NULL; /* repeat_count=1：LVGL 在本回调返回后自动删除该定时器 */
+    enter_countdown();
+}
+
+/* 设置开场进度条填充比例 ratio∈[0,1]：1=满，0=空（做法复用打地鼠 timebar_set）。
+ * 同时按剩余比例切换颜色（正常绿 / 警告橙 / 危险红）。
+ * show=false 时整条隐藏 —— 赛车只在开场用它，开打/结算都要隐藏。*/
+static void timebar_set(float ratio, bool show)
+{
+    if (s_timebar_bg == NULL || s_timebar_fill == NULL)
+        return;
+
+    if (!show)
+    {
+        lv_obj_add_flag(s_timebar_bg, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_timebar_fill, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_clear_flag(s_timebar_bg, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_timebar_fill, LV_OBJ_FLAG_HIDDEN);
+
+    if (ratio < 0.0f)
+        ratio = 0.0f;
+    if (ratio > 1.0f)
+        ratio = 1.0f;
+
+    /* 轨道总宽 = 屏宽 - 两侧边距；填充宽 = 轨道宽 × ratio */
+    int track_w = BSP_LCD_WIDTH - RACE_TIMEBAR_MARGIN * 2;
+    int fill_w = (int)(track_w * ratio + 0.5f);
+    lv_obj_set_width(s_timebar_fill, fill_w);
+
+    /* 按剩余比例切换填充颜色 */
+    uint32_t color;
+    if (ratio <= 1.0f / 6.0f)
+        color = RACE_TIMEBAR_DANGER_COLOR;
+    else if (ratio <= 1.0f / 3.0f)
+        color = RACE_TIMEBAR_WARN_COLOR;
+    else
+        color = RACE_TIMEBAR_OK_COLOR;
+    lv_obj_set_style_bg_color(s_timebar_fill, lv_color_hex(color), 0);
+}
 
 /* ═══════════════════════════════════════════════════════════════
  * 视觉辅助
@@ -259,6 +328,24 @@ static void enemy_render(enemy_t *e)
 static void engine_cb(lv_timer_t *t)
 {
     (void)t;
+
+    /* ── 开场进度条驱动（复用打地鼠做法，按 tick 平滑推进而非整秒跳字）──
+     * RACE_INTRO_MS 内从满(1)线性耗到空(0)，耗空瞬间即开打。
+     * 必须放在下面的 PLAYING 早退之前，否则倒计时期间引擎直接 return，进度条不动。*/
+    if (g.screen == RS_COUNTDOWN)
+    {
+        uint32_t e = lv_tick_get() - g.intro_t0;
+        if (e >= RACE_INTRO_MS)
+        {
+            timebar_set(0.0f, false); /* 耗空即隐藏：赛车不限时，开打后不再显示 */
+            enter_playing();
+        }
+        else
+        {
+            timebar_set(1.0f - (float)e / (float)RACE_INTRO_MS, true);
+        }
+        return; /* 倒计时期间不推进对局逻辑 */
+    }
 
     if (g.screen != RS_PLAYING || g.over)
         return;
@@ -393,9 +480,13 @@ static void clock_cb(lv_timer_t *t)
 }
 
 /* ═══════════════════════════════════════════════════════════════
- * 子界面：② 倒计时（3 → 2 → 1 → GO!）
+ * 子界面：② 倒计时（旧版：3 → 2 → 1 → GO! 大数字）
+ *
+ * ★ 已由「开场进度条」取代（见 enter_countdown + engine_cb 的 RS_COUNTDOWN 分支），
+ *   下面两个函数保留备用（想换回数字倒计时时直接调即可），当前无人调用。
+ *   加 __attribute__((unused)) 避免 -Wunused-function 编译报错。
  * ═══════════════════════════════════════════════════════════════ */
-static void countdown_render(void)
+__attribute__((unused)) static void countdown_render(void)
 {
     if (s_center == NULL)
         return;
@@ -408,7 +499,7 @@ static void countdown_render(void)
     lv_obj_clear_flag(s_center, LV_OBJ_FLAG_HIDDEN);
 }
 
-static void countdown_cb(lv_timer_t *t)
+__attribute__((unused)) static void countdown_cb(lv_timer_t *t)
 {
     (void)t;
     g.cd_value--;
@@ -427,25 +518,32 @@ static void countdown_cb(lv_timer_t *t)
     }
 }
 
+/* 开场：顶部进度条 RACE_INTRO_MS 内耗空即开打（取代原 3→2→1→GO 大数字）。
+ * 实际进度由 engine_cb 的 RS_COUNTDOWN 分支按 intro_t0 每帧平滑驱动。*/
 static void enter_countdown(void)
 {
+    restart_timer_cancel(); /* 手动/自动重开都从这里进，先撤掉挂起的自动重开 */
     g.screen = RS_COUNTDOWN;
     if (s_hint)
         lv_obj_add_flag(s_hint, LV_OBJ_FLAG_HIDDEN);
+    if (s_center)
+        lv_obj_add_flag(s_center, LV_OBJ_FLAG_HIDDEN); /* 不再显示 3/2/1/GO 数字 */
     /* 提前露出赛道氛围：玩家车贴底（默认中间道）*/
     g.player_lane = LANE_MID;
     player_refresh();
     if (s_player)
         lv_obj_clear_flag(s_player, LV_OBJ_FLAG_HIDDEN);
+    enemies_hide_all(); /* 清掉上一局残留的障碍，倒计时只留空赛道 */
 
-    g.cd_value = RACE_COUNTDOWN_FROM;
-    countdown_render(); /* 先显示 3 */
+    /* 旧数字倒计时定时器不再使用，若有残留一并删掉（防重开时两套并行）*/
     if (s_cd_tmr)
     {
         lv_timer_del(s_cd_tmr);
         s_cd_tmr = NULL;
     }
-    s_cd_tmr = lv_timer_create(countdown_cb, RACE_COUNTDOWN_STEP_MS, NULL);
+
+    g.intro_t0 = lv_tick_get();
+    timebar_set(1.0f, true); /* 进度条从满开始耗 */
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -471,6 +569,9 @@ static void enter_playing(void)
         lv_obj_clear_flag(s_player, LV_OBJ_FLAG_HIDDEN);
     if (s_center)
         lv_obj_add_flag(s_center, LV_OBJ_FLAG_HIDDEN);
+    /* 开场进度条只用于入场倒计时：正式开打后隐藏
+     * （赛车不限时、撞车才结束，游戏中没有"剩余时间"可显示）*/
+    timebar_set(0.0f, false);
     /* 游戏中不显示分数，得分仅在结算界面展示 */
 
     /* 启动对局定时器 */
@@ -508,14 +609,20 @@ static void enter_result(void)
     if (s_player)
         lv_obj_add_flag(s_player, LV_OBJ_FLAG_HIDDEN);
 
+    /* 结算界面「只显示背景图」：得分文字/操作提示/进度条一律不显示（得分只打串口）*/
     if (s_center)
-    {
-        char buf[48];
-        snprintf(buf, sizeof(buf), "得分 %d 分", g.score);
-        lv_label_set_text(s_center, buf);
-        lv_obj_clear_flag(s_center, LV_OBJ_FLAG_HIDDEN);
-    }
-    ESP_LOGI(TAG, "结算: 得分=%d", g.score);
+        lv_obj_add_flag(s_center, LV_OBJ_FLAG_HIDDEN);
+    if (s_hint)
+        lv_obj_add_flag(s_hint, LV_OBJ_FLAG_HIDDEN);
+    timebar_set(0.0f, false);
+
+    /* 停留 1 秒后自动重开一局（one-shot，触发一次后 LVGL 自动删除）*/
+    restart_timer_cancel();
+    s_restart_tmr = lv_timer_create(restart_cb, RACE_RESTART_DELAY_MS, NULL);
+    if (s_restart_tmr)
+        lv_timer_set_repeat_count(s_restart_tmr, 1);
+
+    ESP_LOGI(TAG, "结算: 得分=%d（%d ms 后自动重开）", g.score, RACE_RESTART_DELAY_MS);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -639,6 +746,32 @@ static void build_panel(void)
     lv_obj_align(s_center, LV_ALIGN_CENTER, 0, -10);
     lv_obj_add_flag(s_center, LV_OBJ_FLAG_HIDDEN);
 
+    /* ── 开场进度条（顶部，仅入场三秒倒计时用；做法复用打地鼠 game_whack.c）──
+     * 放在玩家车之后创建 → z 序在上，不会被赛道元素盖住。
+     * 结构：轨道(底色) + 填充(子对象，左对齐，宽度随剩余比例收缩)。*/
+    int tb_w = BSP_LCD_WIDTH - RACE_TIMEBAR_MARGIN * 2;
+    s_timebar_bg = lv_obj_create(s_panel);
+    lv_obj_set_size(s_timebar_bg, tb_w, RACE_TIMEBAR_H);
+    lv_obj_set_pos(s_timebar_bg, RACE_TIMEBAR_MARGIN, RACE_TIMEBAR_MARGIN);
+    lv_obj_set_style_bg_color(s_timebar_bg, lv_color_hex(RACE_TIMEBAR_BG_COLOR), 0);
+    lv_obj_set_style_bg_opa(s_timebar_bg, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_timebar_bg, 0, 0);
+    lv_obj_set_style_radius(s_timebar_bg, RACE_TIMEBAR_RADIUS, 0);
+    lv_obj_set_style_pad_all(s_timebar_bg, 0, 0);
+    lv_obj_clear_flag(s_timebar_bg, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_timebar_bg, LV_OBJ_FLAG_HIDDEN);
+
+    s_timebar_fill = lv_obj_create(s_timebar_bg);
+    lv_obj_set_size(s_timebar_fill, tb_w, RACE_TIMEBAR_H);
+    lv_obj_align(s_timebar_fill, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_set_style_bg_color(s_timebar_fill, lv_color_hex(RACE_TIMEBAR_OK_COLOR), 0);
+    lv_obj_set_style_bg_opa(s_timebar_fill, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_timebar_fill, 0, 0);
+    lv_obj_set_style_radius(s_timebar_fill, RACE_TIMEBAR_RADIUS, 0);
+    lv_obj_set_style_pad_all(s_timebar_fill, 0, 0);
+    lv_obj_clear_flag(s_timebar_fill, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_timebar_fill, LV_OBJ_FLAG_HIDDEN);
+
     /* ── 底部操作提示 ── */
     s_hint = lv_label_create(s_panel);
     lv_obj_set_style_text_font(s_hint, &font_cn_16, 0);
@@ -757,6 +890,7 @@ void race_stop(void)
         lv_timer_del(s_cd_tmr);
         s_cd_tmr = NULL;
     }
+    restart_timer_cancel(); /* 退出时撤掉自动重开，防面板删后回调野指针 */
 
     lv_obj_del(s_panel); /* 子对象（背景/玩家/障碍/文字/闪烁）随父一并删除 */
     s_panel = NULL;
@@ -770,6 +904,8 @@ void race_stop(void)
     s_player = NULL;
     s_center = NULL;
     s_hint = NULL;
+    s_timebar_bg = NULL;
+    s_timebar_fill = NULL;
     for (int i = 0; i < RACE_MAX_ENEMIES; i++)
     {
         g.enemies[i].obj = NULL;
