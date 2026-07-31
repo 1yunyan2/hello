@@ -1,7 +1,0 @@
-# 音频测试工程分区表
-# 简化版：去掉 OTA 双分区（测试工程不需要），保留 model 分区供 esp-sr 模型加载使用
-# Name,   Type, SubType, Offset,  Size, Flags
-nvs,      data, nvs,     0x9000,  0x6000,
-phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, 0x10000, 0x300000,
-model,    data, spiffs,  ,        0x800000,

@@ -13,4 +13,4 @@ set(PROJECT_VER "1.0.0")
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(Echo)
-# spiffs_create_partition_image(assets assetsss/gif FLASH_IN_PROJECT)
+# spiffs_create_partition_image(assets assets/gif FLASH_IN_PROJECT)
