@@ -30,7 +30,8 @@ build/
 *.map
 flasher_args.json # Generated in build directory
 sdkconfig.old
-sdkconfig
+# sdkconfig 纳入版本管理：历史上多次出现编译开关(如 LV_USE_GIF/LV_FONT_MONTSERRAT_48)
+# 被悄悄关掉导致编译失败却无法 diff 追溯，故取消忽略。见 BUG-027、2026-07-28 GIF 编译错误。
 
 # ESP-IDF dependencies
 # For older versions or manual component management

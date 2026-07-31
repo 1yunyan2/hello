@@ -1,6 +1,6 @@
 dependencies:
   espressif/dl_fft:
-    component_hash: 2f319e72f3ab6f673c83849d6a14b68c21165d4dce24e12af7c13714ba35a6e0
+    component_hash: a955ca29581de2177ddf25759273bd83f082b3c805e735fe6ee105858643989b
     dependencies:
     - name: idf
       require: private
@@ -8,7 +8,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com
       type: service
-    version: 0.5.0
+    version: 0.6.0
   espressif/esp-dsp:
     component_hash: 42dce32d46ac93dc11f60d368e29a830e9661c7345d794b8a45c343479cae636
     dependencies:
@@ -38,7 +38,7 @@ dependencies:
       type: service
     version: 2.3.1
   espressif/esp_audio_codec:
-    component_hash: af4663830bc73eca58febcc34a976d003465e78ed57458aa00a14b231e392ca1
+    component_hash: 694d210da7a148dfb43b1b08581404b7093ec33c5e566a8cf721397b44e791c7
     dependencies:
     - name: idf
       require: private
@@ -46,9 +46,9 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 2.4.1
+    version: 2.6.1
   espressif/esp_codec_dev:
-    component_hash: 0d9e9bc288156eb55f79338d312e1ebf8c9dfbd5e7d13ef0f20ccb031b4e15cf
+    component_hash: 4779f31a3ba3f9b38aee1afe6ccb9ba8f6108dc3a6e77d39d7d714e9a215371b
     dependencies:
     - name: idf
       require: private
@@ -56,13 +56,13 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 1.5.4
+    version: 1.6.2
   espressif/esp_lvgl_port:
-    component_hash: b6360960f47b6776462e7092861b3ea66477ffb762a01baa0aecbb3d74cd50f4
+    component_hash: fb6c1fdfe70d4ca39a035d63ca394a35f17ec84ce16ff98ecb13a54155d75da4
     dependencies:
     - name: idf
       require: private
-      version: '>=5.1'
+      version: '>=5.2'
     - name: lvgl/lvgl
       registry_url: https://components.espressif.com
       require: public
@@ -70,9 +70,9 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 2.7.2
+    version: 2.8.0~1
   espressif/esp_websocket_client:
-    component_hash: c5a067a9fddea370c478017e66fac302f4b79c3d4027e9bdd42a019786cceb92
+    component_hash: dc00233af846f3a744ada283a300e0d586040aadc3ee67361645ecdce4523672
     dependencies:
     - name: idf
       require: private
@@ -80,7 +80,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 1.6.1
+    version: 1.8.0
   espressif/zlib:
     component_hash: 64ea2fd6754c5a05951f1ddb312ac835cd782e68cb5bd9dfcd1c3a107c8fbfbc
     dependencies:
@@ -135,6 +135,6 @@ direct_dependencies:
 - lvgl/lvgl
 - ningzixi/weather
 - xianjielianmeng/remote_udp_logger
-manifest_hash: 68f989acf89888f71d0f79e252bc1438e8faabbd1393220c44be0eaad7a7c95d
+manifest_hash: 1a4060f2b4f1e38de85976a3d03edd266382b0ce3f97fd80b9f39ec1cc9f4c5b
 target: esp32s3
 version: 2.0.0
