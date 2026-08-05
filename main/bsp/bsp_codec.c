@@ -2,6 +2,7 @@
 #include "esp_codec_dev_defaults.h"
 #include "driver/i2s_std.h"
 #include "driver/i2c_master.h"
+// #include "bsp_pca9536.h" // 【暂时停用】PCA9536 IO 扩展器：P0 → PA_EN 控制功放开关（防爆音）
 #include "wake_word/custom_wake_word.h"
 #include "esp_heap_caps.h"
 #include <math.h>
@@ -28,9 +29,10 @@ static const char *TAG = "BSP_CODEC";
 //       ES8311 上电（esp_codec_dev_open）时 VMID/DAC 的电压阶跃会被常开功放
 //       放大成"啵"的一声。软件侧只能用"静音→等稳→渐升音量"减轻 unmute 爆音。
 //       根治需硬件改版：PA_CTRL 接 MCU 空闲 GPIO（候选 GPIO19/20，若不走原生 USB）。
-#define BSP_CODEC_ANTIPOP_VMID_MS 200 // open 后等待 VMID/DAC 偏置稳定的时间（毫秒）
-#define BSP_CODEC_ANTIPOP_STEPS 5     // 音量渐升步数（0 → 目标音量分几步爬）
-#define BSP_CODEC_ANTIPOP_STEP_MS 50  // 每步之间的间隔（毫秒），总爬升时长 = 步数×间隔
+// 【暂时停用】音量渐升软启动宏定义，调用处已注释，这里一并注释避免 unused 警告
+// #define BSP_CODEC_ANTIPOP_VMID_MS 200 // open 后等待 VMID/DAC 偏置稳定的时间（毫秒）
+// #define BSP_CODEC_ANTIPOP_STEPS 5     // 音量渐升步数（0 → 目标音量分几步爬）
+// #define BSP_CODEC_ANTIPOP_STEP_MS 50  // 每步之间的间隔（毫秒），总爬升时长 = 步数×间隔
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 私有硬件初始化函数（仅在本文件内使用，外部不可见）
@@ -158,6 +160,23 @@ void bsp_board_codec_init(bsp_board_t *bsp_board)
 
     // 保存总线句柄到 BSP 单例，供其它 I2C 从机（如 PCA9536 IO 扩展器）共享复用
     bsp_board->i2c_bus = bus_handle;
+
+    // ── 防爆音关键步骤：ES8311 上电【之前】先关功放 ──────────────────────────
+    // PCA9536 的 P0 → PA_EN → NS4150 CTRL（高=开功放，低=关断）。
+    // PCA9536 上电默认全引脚为输入(高阻)，PA_EN 被 R5/R25 分压悬在 ~1.65V 不确定态，
+    // 必须此刻把 P0 配为输出并拉低，明确关断功放，挡住下面 ES8311 上电时 VMID/DAC
+    // 建立的电压阶跃（否则被放大成"啵"）。功放重新打开在 audio_init() 末尾。
+    // 【暂时停用 PCA9536】以下功放软关断逻辑整段注释，功放电平由硬件分压自行决定
+    // if (bsp_pca9536_init(bsp_board) == ESP_OK)
+    // {
+    //     bsp_pca9536_set_direction(BSP_PCA9536_P0, BSP_PCA9536_DIR_OUTPUT); // P0 配为输出
+    //     bsp_pa_disable();                                                  // 拉低 = 关功放
+    //     ESP_LOGI(TAG, "[防爆音] 功放已关断(PA_EN=0)，等 ES8311 稳定后再开");
+    // }
+    // else
+    // {
+    //     ESP_LOGW(TAG, "[防爆音] PCA9536 初始化失败，功放无法软件控制");
+    // }
 
     // [PCBA 诊断] 裸 I2C 回读 ES8311 chip ID 寄存器，判断 I2C 通信是否真实可靠
     // R0xFD 出厂值 = 0x83 (CHIP_ID1)；R0xFE 出厂值 = 0x11 (CHIP_ID2)
@@ -374,9 +393,10 @@ void audio_feed_task(void *arg)
             if (++diag_iter >= DIAG_PRINT_EVERY)
             {
                 uint32_t rms = diag_samples ? (uint32_t)sqrt((double)diag_sumsq / diag_samples) : 0;
-                // 同步打印 buffer 前 8 个原始采样的十六进制，证明读到的字节真是 0x00 而不是统计 bug
-                ESP_LOGI(TAG, "[PCM诊断] peak=%ld rms=%lu samples=%lu | 原始bytes[0..7]=%04X %04X %04X %04X %04X %04X %04X %04X",
-                         (long)diag_peak, (unsigned long)rms, (unsigned long)diag_samples,
+                // 【诊断】peak/rms 原始值顶在 32768（int16 边界）时看不出削波冲了多少倍，
+                // 额外打印 /100 缩放值，方便直接读出信号相对满幅的比例，原始值保留用于对照。
+                ESP_LOGI(TAG, "[PCM诊断] peak=%ld(/100=%ld) rms=%lu(/100=%lu) samples=%lu | 原始bytes[0..7]=%04X %04X %04X %04X %04X %04X %04X %04X",
+                         (long)diag_peak, (long)(diag_peak / 100), (unsigned long)rms, (unsigned long)(rms / 100), (unsigned long)diag_samples,
                          (uint16_t)buffer[0], (uint16_t)buffer[1], (uint16_t)buffer[2], (uint16_t)buffer[3],
                          (uint16_t)buffer[4], (uint16_t)buffer[5], (uint16_t)buffer[6], (uint16_t)buffer[7]);
                 diag_iter = 0;
@@ -625,9 +645,12 @@ void audio_init(bsp_board_t *bsp_board)
     // ── 步骤 3：设置麦克风增益（ADC PGA 增益，0~100，>50 饱和失真）──────────
     // 增益过小：语音信号弱，VAD 和 MultiNet 识别率下降（必须大声才能触发）
     // 增益过大>50：产生饱和失真，同样影响识别率
-    // 43→46：配合 AFE AGC(WAKENET) 使用，硬件增益提升语音底线幅度，
-    //        AGC 再做软件自适应补偿，无需大喊即可达到模型所需置信度
-    esp_codec_dev_set_in_gain(bsp_board->codec_dev, 48);
+    // 43→46→40→30：两轮真实对话日志交叉验证（[音量]诊断打点），40 时凡说话音量
+    //   提高到 40%+（振幅>13000）必然触发硬削波（peak 顶满 32768，原始字节连续
+    //   钉死 0x7FFF/0x8000），导致 enc_output 缓冲区打满、本地丢帧、发送断续，
+    //   云端拼不出完整语句需反复重试。低音量段（1~8%）两次日志均未削波，故降到
+    //   30 保守收窄安全边界，如仍削波或识别率下降需回头看 PCM 诊断日志再调。
+    esp_codec_dev_set_in_gain(bsp_board->codec_dev, 45);
 
     // ── 步骤 4：读取目标音量（从 NVS 读回上次保存值，无则用默认 50）─────────
     // 此处读 NVS 决定初始值，避免初始化用默认值覆盖云端设过的音量（回环问题）。
@@ -643,20 +666,37 @@ void audio_init(bsp_board_t *bsp_board)
         nvs_close(nvs);
     }
 
-    // ── 步骤 4.5：防爆音第二步——等偏置稳定后音量渐升到目标值 ────────────────
-    // 先等 VMID/DAC 偏置电压充电完成（阶跃已被静音挡住大半），再分多步小台阶
-    // 爬升音量，每步之间留间隔，把"咔哒"一声摊平成人耳不敏感的缓慢淡入。
-    // 渐升过程同样直接调 esp_codec_dev_set_out_vol，跳过 NVS 写入
-    // （目标值本来就读自 NVS，重复写回是无意义的 Flash 损耗）。
-    vTaskDelay(pdMS_TO_TICKS(BSP_CODEC_ANTIPOP_VMID_MS));
-    for (int step = 1; step <= BSP_CODEC_ANTIPOP_STEPS; step++)
-    {
-        int vol = init_volume * step / BSP_CODEC_ANTIPOP_STEPS; // 整数等分爬升
-        esp_codec_dev_set_out_vol(bsp_board->codec_dev, vol);
-        vTaskDelay(pdMS_TO_TICKS(BSP_CODEC_ANTIPOP_STEP_MS));
-    }
+    // 【暂时停用】音量渐升软启动整段注释：POP 声本质是断电/上电电压瞬态，
+    // 音量设0照样会响，纯软件音量爬升治标不治本（结论见 2026-06-12 记录，
+    // 最终硬件方案是 NMOS 延时开关）。直接一次性设到目标音量。
+    // vTaskDelay(pdMS_TO_TICKS(BSP_CODEC_ANTIPOP_VMID_MS));
+    // for (int step = 1; step <= BSP_CODEC_ANTIPOP_STEPS; step++)
+    // {
+    //     int vol = init_volume * step / BSP_CODEC_ANTIPOP_STEPS; // 整数等分爬升
+    //     esp_codec_dev_set_out_vol(bsp_board->codec_dev, vol);
+    //     vTaskDelay(pdMS_TO_TICKS(BSP_CODEC_ANTIPOP_STEP_MS));
+    // }
+    esp_codec_dev_set_out_vol(bsp_board->codec_dev, init_volume);
 
-    ESP_LOGI(TAG, "ES8311 初始化完成（增益=48, 音量=%d，防爆音软启动已生效）", init_volume);
+    // ── 防爆音最后一步：此刻才打开功放 ───────────────────────────────────────
+    // 至此 ES8311 已 open、VMID 稳定、音量渐升到位，输出端电压平稳，再开功放不会
+    // 有"啵"声。功放从 bsp_board_codec_init() 起一直关断，这里是开机流程中唯一
+    // 打开它的地方（★功放最后一个开、第一个关★）。
+    // 【暂时停用 PCA9536】以下开功放逻辑整段注释，功放不再由软件控制
+    // if (bsp_pca9536_init(bsp_board) == ESP_OK)
+    // {
+    //     bsp_pca9536_set_direction(BSP_PCA9536_P0, BSP_PCA9536_DIR_OUTPUT); // P0 配为输出
+    //     bsp_pa_enable();                                                   // 拉高 = 开启功放
+    //     ESP_LOGI(TAG, "[防爆音] 功放已开启(PA_EN=1)");
+    // }
+    // else
+    // {
+    //     ESP_LOGW(TAG, "[防爆音] PCA9536 初始化失败，功放无法软件控制");
+    // }
+    // 注：软件防爆音（VMID等待+音量渐升+软件开功放）已整段停用，见上方注释说明。
+    //     实测音量设 0 照样爆音，根因是上电电压瞬态，需硬件 NMOS 延时开关解决。
+    //     故此处不再宣称"软启动已生效"，避免排查爆音问题时被日志误导。
+    ESP_LOGI(TAG, "ES8311 初始化完成（麦克风增益=45, 音量=%d，软件防爆音已停用）", init_volume);
 
     // ── 步骤 5：创建麦克风采集任务 ────────────────────────────────────────────
     // 任务立即开始从 I2S DMA 读取 PCM 数据并投喂给 AFE/MultiNet
