@@ -5,6 +5,7 @@
  */
 
 #include "application.h"
+#include "heap_forensic.h" // 【堆损坏排查·2026-07-29】纯诊断，不参与业务
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -31,6 +32,13 @@ void app_main(void)
         ESP_LOGE("BOOT", "PSRAM异常(仅%u字节可用)，自动重启以完成初始化", (unsigned)psram_free);
         esp_restart();
     }
+    /* 【堆损坏排查·2026-07-29】曾在此启动 heap tracing 记录分配调用栈，已停用：
+     * CONFIG_HEAP_TRACING_STANDALONE 会给每次 malloc/free 加记录开销，把 MultiNet
+     * FST 编译从约 5s 拖到 46s（与 BUG-027 记录的堆毒化拖慢同源），代价过大。
+     * sdkconfig 已还原为 CONFIG_HEAP_TRACING_OFF；heap_forensic.c/h 保留备用，
+     * 需要时重开配置并取消下面一行注释即可。 */
+    // heap_forensic_start(2000);
+
     application_init();
     // apppp_main();
     while (1)

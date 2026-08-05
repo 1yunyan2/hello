@@ -100,3 +100,25 @@ esp_err_t bsp_pca9536_read_pin(uint8_t pin, bool *out_level);
  * @return ESP_OK 成功；ESP_ERR_INVALID_ARG 空指针；其它为 I2C 失败
  */
 esp_err_t bsp_pca9536_read_all(uint8_t *out_mask);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 功放（NS4150）开关封装 —— 本板 P0 的唯一用途
+//   硬件：PCA9536.P0 → PA_EN → NS4150.CTRL（高=出声，低=静音）
+//   使用原则（防爆音）：★功放最后一个开、第一个关★
+//     开机：bsp_pa_disable() → ES8311上电 → 等VMID稳定 → bsp_pa_enable()
+//     关机：bsp_pa_disable() → 等50ms → 关ES8311/断电
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @brief 打开功放（PA_EN=1，NS4150 开始工作）
+ * @note 必须在 ES8311 上电并等 VMID 稳定之后调用，否则上电阶跃会被放大成爆音
+ * @return ESP_OK 成功；其它为 I2C 失败
+ */
+esp_err_t bsp_pa_enable(void);
+
+/**
+ * @brief 关闭功放（PA_EN=0，NS4150 关断静音）
+ * @note 用于开机上电前静音保护、运行期静音、关机断电前 pop 抑制
+ * @return ESP_OK 成功；其它为 I2C 失败
+ */
+esp_err_t bsp_pa_disable(void);

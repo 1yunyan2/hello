@@ -9,6 +9,7 @@
 #include "esp_heap_caps.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h" // 【诊断打点】esp_timer_get_time() 微秒级计时
 #include <string.h>
 
 #define TAG "[AP] Encoder"
@@ -45,6 +46,14 @@ struct audio_encoder
     int pending_check_cnt;       ///< 每 8 帧采样一次 pending 字节
     size_t pending_bytes_cached; ///< 上次采样的 pending 字节数（节流 vRingbufferGetInfo）
     int drop_cnt;                ///< enc_output 丢帧累计（每 1 秒汇总打印）
+    // ── 【诊断打点，纯统计不影响逻辑】编码吞吐与积压水位 ──────────────────────
+    // 目的：定性"说完话延迟数秒才发出"的瓶颈——是编码本身慢，还是每帧 vTaskDelay(1) 压了吞吐。
+    // 判读：若 enc_avg < 20ms 而 loop_avg ≈ 20ms+，说明卡在让步而非编码算力。
+    int64_t diag_enc_us_sum;   ///< 累计纯编码耗时（esp_audio_enc_process 前后差）
+    int64_t diag_loop_us_sum;  ///< 累计整轮耗时（含 ringbuf 读 + 编码 + 让步）
+    int64_t diag_last_loop_us; ///< 上一轮循环结束时间戳，用于算整轮间隔
+    int diag_frame_cnt;        ///< 本统计周期内已编码帧数（满 50 帧打印一次并清零）
+    size_t diag_pend_peak;     ///< 本统计周期内 enc_input 积压峰值（字节）
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -135,8 +144,18 @@ void audio_encoder_task(void *arg)
         write_ptr = (uint8_t *)in_frame.buffer;
         frame_remaining = frame_size_total;
 
+        // 【诊断打点】纯编码耗时：只包住 esp_audio_enc_process，不含 ringbuf 与让步
+        int64_t diag_t0 = esp_timer_get_time();
+
         // 调用 OPUS 编码器处理一帧
         esp_audio_enc_process(audio_encoder->enc, &in_frame, &out_frame);
+
+        // 【诊断打点】累计纯编码耗时 + 整轮间隔（两帧之间的墙钟差 = 实际吞吐倒数）
+        int64_t diag_t1 = esp_timer_get_time();
+        audio_encoder->diag_enc_us_sum += (diag_t1 - diag_t0);
+        if (audio_encoder->diag_last_loop_us != 0)
+            audio_encoder->diag_loop_us_sum += (diag_t1 - audio_encoder->diag_last_loop_us);
+        audio_encoder->diag_last_loop_us = diag_t1;
 
         // 将编码结果写入输出缓冲区（NOSPLIT：整帧原子写入；超时 0：满了立即丢帧）
         BaseType_t ret = xRingbufferSend(
@@ -162,6 +181,32 @@ void audio_encoder_task(void *arg)
             audio_encoder->pending_check_cnt = 0;
             vRingbufferGetInfo(audio_encoder->input_buffer, NULL, NULL, NULL, NULL,
                                &audio_encoder->pending_bytes_cached);
+            // 【诊断打点】记录本周期积压峰值（每 8 帧采样一次，够反映趋势）
+            if (audio_encoder->pending_bytes_cached > audio_encoder->diag_pend_peak)
+                audio_encoder->diag_pend_peak = audio_encoder->pending_bytes_cached;
+        }
+
+        // ── 【诊断打点】每 50 帧（约 1 秒音频）汇总一次吞吐与积压 ─────────────
+        // enc_avg  : 单帧纯编码耗时，反映 OPUS 算力开销
+        // loop_avg : 两帧之间实际间隔，= 1/吞吐；20ms 表示刚好实时，>20ms 即净积压
+        // pend_peak: enc_input 积压峰值，除以 32 得毫秒音频（16kHz×2B = 32B/ms）
+        if (++audio_encoder->diag_frame_cnt >= 50)
+        {
+            int cnt = audio_encoder->diag_frame_cnt;
+            int enc_avg_us = (int)(audio_encoder->diag_enc_us_sum / cnt);
+            int loop_avg_us = (int)(audio_encoder->diag_loop_us_sum / cnt);
+            ESP_LOGW(TAG,
+                     "[编码诊断] enc_avg=%d.%02dms loop_avg=%d.%02dms 吞吐=%dfps "
+                     "积压峰值=%dB(%dms音频)",
+                     enc_avg_us / 1000, (enc_avg_us % 1000) / 10,
+                     loop_avg_us / 1000, (loop_avg_us % 1000) / 10,
+                     loop_avg_us > 0 ? (1000000 / loop_avg_us) : 0,
+                     (int)audio_encoder->diag_pend_peak,
+                     (int)(audio_encoder->diag_pend_peak / 32));
+            audio_encoder->diag_frame_cnt = 0;
+            audio_encoder->diag_enc_us_sum = 0;
+            audio_encoder->diag_loop_us_sum = 0;
+            audio_encoder->diag_pend_peak = 0;
         }
         if (audio_encoder->pending_bytes_cached >= 48000) // 1.5s × 16kHz × 2B
         {
@@ -345,6 +390,12 @@ void audio_encoder_start(audio_encoder_t *audio_encoder)
     audio_encoder->pending_check_cnt = 0;
     audio_encoder->pending_bytes_cached = 0;
     audio_encoder->drop_cnt = 0;
+    // 【诊断打点】统计量同样清零，避免 stop→start 后跨会话累计失真
+    audio_encoder->diag_enc_us_sum = 0;
+    audio_encoder->diag_loop_us_sum = 0;
+    audio_encoder->diag_last_loop_us = 0;
+    audio_encoder->diag_frame_cnt = 0;
+    audio_encoder->diag_pend_peak = 0;
 
     // ── 步骤 4：设置运行标志，创建任务 ───────────────────────────────────────
     audio_encoder->is_running = true;

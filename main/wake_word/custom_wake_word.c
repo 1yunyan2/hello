@@ -21,6 +21,7 @@
 #include "bsp/bsp_board.h"
 #include "object.h"
 #include "esp_heap_caps.h"
+#include "esp_memory_utils.h" // esp_ptr_internal()：诊断 input_buffer 落在内部 RAM 还是 SPIRAM
 #include "freertos/ringbuf.h"
 static const char *TAG = "BSP_WakeWord";
 // 前向声明 afe_fetch_task，解决编译错误 "implicit declaration of function 'afe_fetch_task'"
@@ -95,6 +96,18 @@ static size_t input_buffer_len = 0;  // 缓冲区当前有效采样点数
 static RingbufHandle_t s_mn_pcm_buf = NULL;    // afe_fetch_task → multinet_detect_task 的 PCM 管道
 static TaskHandle_t s_mn_detect_handle = NULL; // MultiNet 检测任务句柄
 static void multinet_detect_task(void *arg);   // 前向声明
+
+// ─── MultiNet detect() 崩溃诊断状态（已提 issue，诊断打印已注释停用，见下方）───
+// 现象：空闲监听、从未唤醒，随机 10s~1h 内必崩于 esp-sr 的 ctc_decoder.c
+//       （ctc_beam_search_with_fst / ctc_path_copy，EXCVADDR 为 0x0/0x8/-4 等）。
+// 已排除：模型句柄 NULL、内存耗尽、堆损坏、栈溢出迹象、SPIRAM/SIMD 对齐、
+//         唤醒词/FST、并发访问、esp-sr 2.3.1/2.4.7 版本差异。已提交上游 issue。
+// 下方两个静态变量仅供诊断打印使用，打印已注释停用（怀疑拖慢 detect() 响应节奏，
+// 导致唤醒/识别变迟钝），如需重新排查取消 multinet_detect_task 内对应注释即可。
+/*
+static TickType_t s_mn_state_log_tick = 0; // 诊断快照限频计时
+static uint32_t s_detecting_frames = 0;    // 连续 DETECTING 帧数
+*/
 
 // ─── 语言检测 ─────────────────────────────────────────────────────────────
 // UTF-8 中文汉字首字节范围：0xE4 ~ 0xE9（覆盖 CJK 统一汉字主区）
@@ -302,7 +315,7 @@ static esp_err_t load_model_for_lang(const char *lang)
     //   中文(cn)：0.18（正常音量 prob 集中 0.25~0.37，0.18 保留召回余量；
     //             原 0.12 过松，TTS 残留经 AEC 后的 prob≈0.22 会误触发自激）
     //   英文(en)：0.4（BPE 路径长，prob 天然偏低，0.4 才能正常触发）
-    float threshold = (strcmp(lang, ESP_MN_ENGLISH) == 0) ? 0.4f : 0.18f;
+    float threshold = (strcmp(lang, ESP_MN_ENGLISH) == 0) ? WAKEWORD_THRESHOLD_EN : WAKEWORD_THRESHOLD_CN;
     multinet_iface->set_det_threshold(multinet_model_data, threshold);
 
     ESP_LOGW(TAG, "已加载语言模型: %s", mn_name);
@@ -401,11 +414,23 @@ esp_err_t wake_word_init(wake_word_detected_cb_t cb)
     // 清零缓冲区长度（防止旧数据干扰）
     input_buffer_len = 0;
 
-    // 从 SPIRAM 分配三个音频缓冲区（原为静态数组，合计 ~10KB 内部 SRAM）
-    // s_aec_ref + s_aec_interleaved + input_buffer = 2KB + 4KB + 4KB
+    // AEC 两个缓冲仍留在 SPIRAM（只在本文件内被 CPU 普通读写，不交给库做 SIMD 搬运）
+    // 实际占用：s_aec_ref 2KB + s_aec_interleaved 4KB
     s_aec_ref = heap_caps_malloc(AEC_MAX_FEED_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_aec_interleaved = heap_caps_malloc(AEC_MAX_FEED_SAMPLES * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    input_buffer = heap_caps_malloc(AUDIO_BUFFER_MAX * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    // ── input_buffer：SPIRAM → 内部 RAM（崩溃排查实验，非既定优化）──────────
+    // 本缓冲是唯一被交到 esp-sr 手里的内存（detect(model_data, input_buffer)），
+    // 而库内部用汇编 SIMD 搬运数据（崩溃 backtrace 中出现 dl_tie728_memcpy）。
+    // 128-bit 向量指令要求 16 字节对齐，而原来的 MALLOC_CAP_8BIT 只声明「按字节访问」，
+    // 分配器无义务返回 16 对齐地址；SPIRAM 经 cache+SPI，未对齐访问比内部 RAM 更易出事。
+    // ⚠️ 对齐嫌疑证据不足：崩溃 EXCVADDR=0x0/0x8 是「指针为 NULL」，而非「地址未对齐」
+    //    （后者应为 EXCCAUSE=9 LoadStoreAlignment）。此改动的目的是**排除法**——
+    //    不论崩与不崩都能收敛排查范围，而非断定这就是根因。
+    // 代价：16KB 内部 RAM（AUDIO_BUFFER_MAX 8192 × 2B，崩溃时实测内部 RAM 余约 90KB）。
+    // 若最终证明与对齐无关，可改回 MALLOC_CAP_SPIRAM 以省回这 16KB。
+    input_buffer = heap_caps_aligned_alloc(16, AUDIO_BUFFER_MAX * sizeof(int16_t),
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_aec_ref || !s_aec_interleaved || !input_buffer)
     {
         ESP_LOGE(TAG, "音频缓冲区分配失败（SPIRAM 不足）");
@@ -416,6 +441,14 @@ esp_err_t wake_word_init(wake_word_detected_cb_t cb)
         buffer_mutex = NULL;
         return ESP_FAIL;
     }
+
+    // 【诊断】打印实际地址与对齐情况：若原 SPIRAM 版本本就 16 对齐，则对齐嫌疑当场排除
+    ESP_LOGW(TAG, "[诊断] input_buffer=%p 16字节对齐=%s 位置=%s 大小=%dB 内部RAM余=%u",
+             input_buffer,
+             (((uintptr_t)input_buffer % 16) == 0) ? "是" : "否",
+             esp_ptr_internal(input_buffer) ? "内部RAM" : "SPIRAM",
+             (int)(AUDIO_BUFFER_MAX * sizeof(int16_t)),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
     // 扫描 SPIFFS "model" 分区，建立模型文件列表
     models = esp_srmodel_init("model");
@@ -600,13 +633,13 @@ esp_err_t wake_word_init(wake_word_detected_cb_t cb)
     // 启动 MultiNet 检测任务（低优先级：detect 慢但不阻塞 AFE 链路）
     // 此时模型和 FST 均已就绪，detect_task 可立即开始工作
     xTaskCreatePinnedToCoreWithCaps(multinet_detect_task, "mn_detect",
-                                    4096, // 栈大小（detect 有一定调用深度）
+                                    8192, // 栈大小（detect 有一定调用深度）
                                     NULL,
                                     4, // 优先级 3：低于 afe_fetch(5)，detect 慢时让路
                                     &s_mn_detect_handle,
                                     1, // 同 CPU1，共享缓存
                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    PRINT_TASK_CREATED(TAG, "mn_detect", 4096, 0); // 栈在PSRAM
+    PRINT_TASK_CREATED(TAG, "mn_detect", 8192, 0); // 栈在PSRAM
 
     return ESP_OK;
 }
@@ -959,7 +992,41 @@ static void multinet_detect_task(void *arg)
             bool wake_triggered = false;
             if (input_buffer_len >= (size_t)mn_chunksize && is_running)
             {
+                // ── 【诊断代码已注释，2026-07-30】─────────────────────────────────
+                // 排查 esp-sr LoadProhibited 崩溃（已提 issue，详见 memory）时加过
+                // 堆完整性检查 + mn_state/栈/内存快照打印。用户反馈怀疑这些诊断代码
+                // （尤其 heap_caps_check_integrity_all 全量扫描）拖慢了 detect() 的
+                // 响应节奏，导致「唤醒词难唤醒、说话难发送」，故整体注释停用。
+                // 目标已从「排查崩溃根因」转为「崩溃发生时不让用户感知到」，不再需要
+                // 持续采集这些取证数据。如需重新验证根因，取消下方注释即可恢复。
+                /*
+                if (!heap_caps_check_integrity_all(true))
+                {
+                    ESP_LOGE(TAG, "[取证] ❌ detect() 调用前堆已损坏！凶手在 detect() 之外（其他任务）");
+                }
+                */
+
                 esp_mn_state_t mn_state = multinet_iface->detect(multinet_model_data, input_buffer);
+
+                /*
+                if (!heap_caps_check_integrity_all(true))
+                {
+                    ESP_LOGE(TAG, "[取证] ❌ detect() 调用后堆损坏！越界写发生在 detect() 内部");
+                }
+
+                s_detecting_frames = (mn_state == ESP_MN_STATE_DETECTING) ? (s_detecting_frames + 1) : 0;
+                if ((xTaskGetTickCount() - s_mn_state_log_tick) > pdMS_TO_TICKS(5000))
+                {
+                    UBaseType_t stack_left = uxTaskGetStackHighWaterMark(NULL); // 单位：字节
+                    ESP_LOGW(TAG, "[MN诊断] mn_state=%d DETECTING=%lu帧 栈剩余=%u/8192 内部RAM=%u PSRAM=%u buf_len=%u/%d",
+                             (int)mn_state, (unsigned long)s_detecting_frames,
+                             (unsigned)stack_left,
+                             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                             (unsigned)input_buffer_len, mn_chunksize);
+                    s_mn_state_log_tick = xTaskGetTickCount();
+                }
+                */
 
                 if (mn_state == ESP_MN_STATE_DETECTED)
                 {
@@ -979,14 +1046,20 @@ static void multinet_detect_task(void *arg)
                 {
                     multinet_iface->clean(multinet_model_data);
                 }
+                // 注：此处曾加过「DETECTING 滞留 10s 强制 clean」兜底（假设 beam 状态累积
+                // 导致槽位耗尽）。已烧录实测无效——照崩，且日志中该兜底从未触发。
+                // 假设已被证伪，代码已回滚，勿重复尝试。
 
                 if (wake_triggered)
                 {
                     is_running = false;
                     input_buffer_len = 0;
                 }
-                else
+                else if (input_buffer_len >= (size_t)mn_chunksize)
                 {
+                    // ★ 保留 >= 防御：input_buffer_len 是 size_t（无符号），一旦它小于
+                    //   mn_chunksize，减法会回绕成约 4.29e9，memmove 按天文数字长度拷贝
+                    //   → 必崩。当前控制流下不会发生，留作后续改动的护栏。
                     size_t remaining = input_buffer_len - (size_t)mn_chunksize;
                     memmove(input_buffer, &input_buffer[mn_chunksize], remaining * sizeof(int16_t));
                     input_buffer_len = remaining;
@@ -1099,8 +1172,8 @@ void wake_word_suspend_feed(void)
  */
 void bsp_wake_word_stop_for_ota(void)
 {
-    is_running = false;        // 停 detect：不再识别唤醒词、不再 MultiNet overflow
-    s_feed_suspended = true;   // 断 feed：custom_wake_word_feed 入口 return，停止麦克风投喂
+    is_running = false;      // 停 detect：不再识别唤醒词、不再 MultiNet overflow
+    s_feed_suspended = true; // 断 feed：custom_wake_word_feed 入口 return，停止麦克风投喂
     ESP_LOGW(TAG, "OTA：唤醒词引擎已停（detect 关闭 + 麦克风投喂挂起），让出 CPU1");
 }
 
@@ -1119,8 +1192,16 @@ void bsp_wake_word_stop_for_ota(void)
  */
 void wake_word_set_det_threshold(float threshold)
 {
+    // 【P1 修复】必须持锁：本函数由 session 任务（CPU0）调用，而 multinet_detect_task
+    // 在 CPU1 上正跑 detect()，两者操作同一个 multinet_model_data。esp-sr 为闭源 .a，
+    // 无法确认 set_det_threshold 内部是否只写一个 float，不能靠「大概率原子」来赌。
+    // 加锁后与同文件 wake_word_start() / wake_word_stop() 的保护规范保持一致。
     if (multinet_iface && multinet_model_data)
+    {
+        xSemaphoreTake(buffer_mutex, portMAX_DELAY);
         multinet_iface->set_det_threshold(multinet_model_data, threshold);
+        xSemaphoreGive(buffer_mutex);
+    }
 }
 
 void wake_word_start(void)
@@ -1138,7 +1219,7 @@ void wake_word_start(void)
         // 上一轮残留的 beam 状态会污染本轮检测，与 overflow 不同步叠加加速解码器越界崩溃。
         multinet_iface->clean(multinet_model_data);
         // 确保恢复正常阈值（防止 TTS 被打断或异常关闭后阈值卡在 0.55）
-        multinet_iface->set_det_threshold(multinet_model_data, 0.18f);
+        multinet_iface->set_det_threshold(multinet_model_data, WAKEWORD_THRESHOLD_CN);
     }
     is_running = true;
     xSemaphoreGive(buffer_mutex);

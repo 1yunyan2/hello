@@ -24,6 +24,7 @@
 #include "websocket_client.h"
 #include "esp_websocket_client.h"
 #include "esp_log.h"
+#include "esp_timer.h" // 【诊断】[WS接收] 回调持锁耗时打点用 esp_timer_get_time()
 #include "esp_crt_bundle.h"
 #include "esp_mac.h"
 #include "esp_heap_caps.h"
@@ -336,7 +337,30 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
                 if (data->payload_len > 15)
                 {
                     binary_data_t bin = {.ptr = s_audio_rx_buf, .size = (size_t)data->payload_len};
+
+                    // ── 【诊断打点，纯统计不影响逻辑】接收回调阻塞时长 ──────────────
+                    // 本回调运行在 esp_websocket_client 的接收任务里，且**持有
+                    // client->lock**。下游 audio_processor_write() 内部最多重试 30×100ms
+                    // = 3 秒才放弃（dec_input 满时），这 3 秒内锁一直不放。
+                    // 与此同时 ws_sender 若调 send_bin，会在
+                    // esp_websocket_client.c:711 用 portMAX_DELAY 抢同一把锁 → 永久阻塞。
+                    //
+                    // 判读：本条耗时若经常 >100ms，即证实接收侧长期持锁，
+                    //       与 [WS发送] 只见"进入"不见"返回"互为印证。
+                    static int64_t diag_rx_last_us = 0;
+                    int64_t diag_rx_t0 = esp_timer_get_time();
+
                     protocol->callback(protocol->handler_args, PROTOCOL_EVENT, PROTOCOL_EVENT_AUDIO, &bin);
+
+                    int64_t diag_rx_dt = esp_timer_get_time() - diag_rx_t0;
+                    // 限频 2 秒；但只要单次超过 50ms 就立即打印（异常优先于限频）
+                    if (diag_rx_dt > 50000 || (diag_rx_t0 - diag_rx_last_us) >= 2000000)
+                    {
+                        diag_rx_last_us = diag_rx_t0;
+                        ESP_LOGW(TAG, "[WS接收] 回调持锁 耗时=%d.%02dms size=%d",
+                                 (int)(diag_rx_dt / 1000), (int)((diag_rx_dt % 1000) / 10),
+                                 (int)data->payload_len);
+                    }
                 }
 
                 // 送完后，立刻清零，准备迎接下一帧
@@ -393,8 +417,15 @@ static void protocol_websocket_event_handler(void *handler_args, esp_event_base_
             // 如果收到了完整的消息
             if (s_text_rx_offset >= s_text_rx_total_len && s_text_rx_total_len > 0)
             {
+                /* 【堆损坏排查·2026-07-29 已排除，暂停用】
+                 * 下一行写 '\0' 曾因"最像事故指纹"（Bad tail 被写成 0x00000000）被列为嫌疑。
+                 * 实测排除：日志中从未出现「收到文本帧分片」，即本工程实际未走分片路径，
+                 * offset==total_len 恒落在 malloc(total_len+1) 的最后一个合法字节内，不越界。
+                 * 真凶是 Tmr Svc 栈溢出（详见 ui_port.c main_gif_apply_index 处注释）。 */
+                // HEAP_PROBE("HEAPCHK", "文本帧写\\0前");
                 // 添加null终止符以便打印和解析
                 s_text_rx_buf[s_text_rx_offset] = '\0';
+                // HEAP_PROBE("HEAPCHK", "文本帧写\\0后");
 
                 ESP_LOGI(TAG, "收到文本帧: %s", s_text_rx_buf);
                 cJSON *root = cJSON_Parse(s_text_rx_buf);

@@ -229,6 +229,28 @@ void audio_processor_read_ref_pcm(audio_processor_t *audio_processor,
 bool audio_processor_is_playing(audio_processor_t *audio_processor);
 
 /**
+ * @brief 【诊断用】查询编码器输出缓冲（enc_output）当前积压的字节数
+ *
+ * 上行链路的"待发送 OPUS 帧"水位，用于定位「编码器在产出但一帧都没发出去」的场景：
+ *   - 持续接近 ENC_OUTPUT_BUF_SIZE(32768) → 编码器在写、ws_sender 没在读
+ *     （ws_sender 未被调度，或读取路径本身有问题）
+ *   - 维持低位                            → 消费正常，问题不在上行发送侧
+ *
+ * 与被注释掉的 audio_processor_get_pending_bytes() 的区别：
+ *   那个查的是 **下行** dec_input+dec_output（判断扬声器是否播完），
+ *   本函数查的是 **上行** enc_output，两者不是一回事，不可互相替代。
+ *
+ * 实现：非阻塞读取 vRingbufferGetInfo 的第 6 个出参（items_waiting）。
+ *
+ * @param audio_processor 音频处理器实例指针（允许为 NULL，NULL 返回 0）
+ * @return size_t         enc_output 当前积压字节数
+ *
+ * @note 调用者：session.c → ws_sender_task() 的 [ws心跳] 诊断打点
+ * @note 纯统计接口，不影响任何业务逻辑；线程安全，可在任意任务上下文调用
+ */
+size_t audio_processor_get_enc_output_pending(audio_processor_t *audio_processor);
+
+/**
  * @brief 解除静音：允许 play_task 重新向 I2S 写入 PCM 数据
  *
  * 与 audio_processor_flush_output() 配合使用。打断 TTS 后 flush 会置位 mute_output，

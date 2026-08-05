@@ -1,10 +1,10 @@
 dependencies:
-  espressif/esp-sr: ^2.3.1
+  espressif/esp-sr: "2.3.1"  # include/esp32s3/esp_mn_iface.h 有本地改动（4/13），hash 校验会拦编译；回滚=取消本行注释+删 components/espressif__esp-sr
   espressif/esp_codec_dev: ^1.5.4
   espressif/esp_audio_codec: ^2.4.0
   espressif/esp_websocket_client: ^1.6.0
   # espressif/servo: ^0.1.0  # 已收编到 components/servo（2026-07-10）：改 init 初始 duty=0 不输出脉冲，防上电甩动；回滚=取消本行注释+删 components/servo
   lvgl/lvgl: ^9.5.0
   espressif/esp_lvgl_port: ^2.7.0
-  ningzixi/weather: ^1.1.0
+  ningzixi/weather: ^1.1.0  # weather.c 有本地改动（6/15），hash 校验会拦编译；回滚=取消本行注释+删 components/ningzixi__weather
   xianjielianmeng/remote_udp_logger: ^0.1.1

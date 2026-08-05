@@ -72,6 +72,11 @@ static esp_err_t auth_http_event_handler(esp_http_client_event_t *evt)
         memcpy(new_buffer + wrapper->response_len, evt->data, evt->data_len);
         wrapper->response = new_buffer;
         wrapper->response_len = new_len;
+        /* 【堆损坏排查·2026-07-29 已验证无问题，暂停用】本处 realloc 按精确长度分配、
+         * 响应体不带 '\0'，曾怀疑下游按 C 字符串处理会越界。实测：下游用的是
+         * cJSON_ParseWithLength（带长度，不依赖 '\0'），整条 Auth 链路全程堆干净。
+         * 保留注释，需再查时取消注释即可。 */
+        // HEAP_PROBE("HEAPCHK", "auth响应realloc后");
         break;
     }
 
@@ -162,9 +167,19 @@ void auth_perform(auth_t *auth, const char *device_token)
         esp_http_client_set_post_field(client, post_body, strlen(post_body));
 
         ESP_LOGI(TAG, "Auth 第 %d/%d 次尝试...", attempt + 1, max_retries);
+        /* 【堆损坏排查·2026-07-29 已验证无问题，暂停用】
+         * 曾怀疑 TLS 握手打穿 ws_reconn 的 6144B 栈。实测水位：
+         *   入口5628 → Auth前4140 → 握手前3884 → 握手后2828 → 建连后2828
+         * 最低仍剩 2828B（用了一半多点），TLS 握手【没有】打穿栈；堆也全程干净。
+         * 结论：ws_reconn 与 Auth/TLS 链路排除嫌疑。 */
+        // HEAP_PROBE("HEAPCHK", "http_perform前");
+        // PRINT_STACK_AT(TAG, "http_perform前");
         ret = esp_http_client_perform(client);
+        // PRINT_STACK_AT(TAG, "http_perform后");
+        // HEAP_PROBE("HEAPCHK", "http_perform后");
         status_code = esp_http_client_get_status_code(client);
         esp_http_client_cleanup(client);
+        // HEAP_PROBE("HEAPCHK", "http_cleanup后");
         PRINT_MEM_INFO(TAG, "Auth HTTP 请求完成");
 
         if (ret == ESP_OK && (status_code == 200 || status_code == 201))
@@ -199,7 +214,10 @@ void auth_perform(auth_t *auth, const char *device_token)
     // 说明：利用 cJSON 解析返回数据（兼容多层结构格式），提取到 token 后立即缓存至 NVS 中作为兜底机制。
     // API：cJSON_ParseWithLength, cJSON_GetObjectItem, strdup, nvs_open, nvs_set_str, nvs_commit, nvs_close, cJSON_Delete
     // 数据：修改 wrapper->auth.access_token，并在 NVS 写入。
+    /* 【已验证无问题，暂停用】此处用 WithLength 是对的（响应体无 '\0'，不会越界读） */
+    // HEAP_PROBE("HEAPCHK", "cJSON解析前");
     cJSON *resp_json = cJSON_ParseWithLength(wrapper->response, wrapper->response_len);
+    // HEAP_PROBE("HEAPCHK", "cJSON解析后");
     if (resp_json)
     {
         cJSON *token_item = cJSON_GetObjectItem(resp_json, "accessToken");
@@ -219,12 +237,17 @@ void auth_perform(auth_t *auth, const char *device_token)
             nvs_handle_t h;
             if (nvs_open("net_config", NVS_READWRITE, &h) == ESP_OK)
             {
+                /* 【已验证无问题，暂停用】nvs 写 Flash 会关 Cache，期间 SPIRAM 不可访问，
+                 * 曾怀疑关 Cache 窗口内的并发访问写坏堆。实测此前后堆均干净。 */
+                // HEAP_PROBE("HEAPCHK", "nvs写token前");
                 nvs_set_str(h, "access_token", wrapper->auth.access_token);
                 nvs_commit(h);
                 nvs_close(h);
+                // HEAP_PROBE("HEAPCHK", "nvs写token后");
             }
         }
         cJSON_Delete(resp_json);
+        // HEAP_PROBE("HEAPCHK", "cJSON_Delete后");  // 【已验证无问题，暂停用】
     }
 }
 

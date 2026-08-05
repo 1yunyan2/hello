@@ -202,3 +202,29 @@ esp_err_t bsp_pca9536_read_all(uint8_t *out_mask)
     *out_mask = in_val & 0x0F; // 仅低 4 位有效
     return ESP_OK;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 功放（NS4150）开关封装 —— P0 → PA_EN → NS4150.CTRL（本板 P0 的唯一用途）
+//   高 = 功放工作（出声）    低 = 功放关断（静音）
+//   使用原则（防爆音）：★功放最后一个开、第一个关★
+// ═══════════════════════════════════════════════════════════════════════════════
+
+esp_err_t bsp_pa_enable(void)
+{
+    esp_err_t err = bsp_pca9536_write_pin(BSP_PCA9536_P0, true); // 高 = 功放工作
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "开功放失败: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+esp_err_t bsp_pa_disable(void)
+{
+    esp_err_t err = bsp_pca9536_write_pin(BSP_PCA9536_P0, false); // 低 = 功放关断
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "关功放失败: %s", esp_err_to_name(err));
+    }
+    return err;
+}

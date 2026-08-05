@@ -696,6 +696,25 @@ bool audio_processor_is_playing(audio_processor_t *audio_processor)
     // return (dec_in_pending + dec_out_pending) > 0;
 }
 
+/**
+ * @brief 【诊断用】查询 enc_output 当前积压字节数（上行待发送 OPUS）
+ *
+ * 见 audio_processor.h 中的接口说明。实现与 audio_processor_is_playing() 同款：
+ * vRingbufferGetInfo 的第 6 个出参即 items_waiting（已写入未读出的字节数），
+ * 该 API 非阻塞、内部加锁，可在任意任务上下文调用。
+ *
+ * 判读：持续逼近 ENC_OUTPUT_BUF_SIZE(32768) 说明编码器在写但无人读走。
+ */
+size_t audio_processor_get_enc_output_pending(audio_processor_t *audio_processor)
+{
+    if (audio_processor == NULL || audio_processor->enc_output == NULL)
+        return 0;
+
+    size_t enc_out_pending = 0; // 编码器输出侧（已编码待发送 OPUS 帧）积压
+    vRingbufferGetInfo(audio_processor->enc_output, NULL, NULL, NULL, NULL, &enc_out_pending);
+    return enc_out_pending;
+}
+
 void audio_processor_unmute_output(audio_processor_t *audio_processor)
 {
     if (audio_processor == NULL)

@@ -210,13 +210,22 @@ void bsp_wake_word_stop_for_ota(void);
  */
 void wake_word_start(void);
 
+// ─── MultiNet 检测阈值常量（P2：统一散落各处的魔数）──────────────────────
+// 原先 custom_wake_word.c:315(0.2f)、:1206(0.18f)、session.c:691(0.4f)、:944(0.18f)
+// 四处硬编码且互相不一致，注释还写着已废弃的 0.12f，改动时极易漏改其中一处。
+// 统一定义在此，所有调用方引用宏，不再写字面量。
+#define WAKEWORD_THRESHOLD_CN 0.18f      // 中文常态（LISTENING）：正常音量 prob 集中 0.25~0.37，留召回余量
+#define WAKEWORD_THRESHOLD_EN 0.4f       // 英文常态：BPE 路径长，prob 天然偏低，需更高阈值才正常触发
+#define WAKEWORD_THRESHOLD_PLAYING 0.4f  // TTS 播放期：抬高门槛防 AEC 残留自激误触（可上调至 0.55f）
+
 /**
  * @brief 动态调整 MultiNet 检测概率阈值
  *
- * TTS 播放期间建议设为 0.55f（防 AGC 放大 AEC 残留误触发）；
- * TTS 结束后恢复为 0.18f（正常唤醒灵敏度）。
+ * TTS 播放期间用 WAKEWORD_THRESHOLD_PLAYING（防 AGC 放大 AEC 残留误触发）；
+ * TTS 结束后恢复 WAKEWORD_THRESHOLD_CN（正常唤醒灵敏度）。
  *
  * @param threshold 概率阈值（0.0~1.0），越高越难触发
+ * @note 内部持 buffer_mutex，可从任意任务安全调用（与 CPU1 的 detect() 互斥）
  */
 void wake_word_set_det_threshold(float threshold);
 
