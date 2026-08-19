@@ -13,6 +13,7 @@
 //   PC 端 ser.write(128KB) 必然超过 15s write_timeout 而 Write timeout。
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h" // 把 printf/ESP_LOG 也接到驱动上,避免 TX 抢 FIFO
+#include "hal/usb_serial_jtag_ll.h"     // 产线握手期直读 RX FIFO(此时 USJ 驱动还没装)
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "bsp/bsp_config.h"
@@ -22,8 +23,12 @@ static const char *TAG = "PROD_BURNER";
 esp_flash_t *ext_flash = NULL;
 static wl_handle_t s_wl_handle = WL_INVALID_HANDLE;
 
-#define BURNER_CHUNK (128 * 1024)           // 128KB 缓冲区，适配 2MB 空闲 PSRAM
-#define TOTAL_FLASH_SIZE (32 * 1024 * 1024) // 32MB 全量大小
+#define BURNER_CHUNK (128 * 1024)                    // 128KB 缓冲区，适配 2MB 空闲 PSRAM
+#define TOTAL_FLASH_SIZE_FALLBACK (32 * 1024 * 1024) // 探测失败时的兜底值
+// ⭐ 探测到的外挂 flash 真实容量（16MB/32MB 板混用，不能写死）。
+// 由 bsp_flash_init() 在 esp_flash_get_size() 后赋值，产线烧录/提取函数
+// 统一读它，而不是旧的 TOTAL_FLASH_SIZE 固定宏（曾导致 16MB 板越界擦写）。
+static uint32_t s_real_flash_size = TOTAL_FLASH_SIZE_FALLBACK;
 // USJ 驱动软件环形缓冲;RX 给大点是因为 host 一次能塞 128KB,
 // 缓冲越大,esp_flash_write 那段时间的 USB 反压发生越晚,吞吐越平稳。
 #define USJ_RX_BUF_SIZE (16 * 1024)
@@ -84,7 +89,7 @@ void start_production_burning(void)
     xTaskCreate(erase_progress_task, "erase_prog", 3072, NULL, 1, NULL);
     PRINT_TASK_CREATED(TAG, "erase_prog", 3072, 1); // xTaskCreate → 栈在内部SRAM
 
-    esp_flash_erase_region(ext_flash, 0, TOTAL_FLASH_SIZE);
+    esp_flash_erase_region(ext_flash, 0, s_real_flash_size);
 
     s_erase_in_progress = false;
     int64_t erase_total_ms = (esp_timer_get_time() - s_erase_start_us) / 1000;
@@ -96,7 +101,7 @@ void start_production_burning(void)
     fflush(stdout);
 
     uint32_t offset = 0;
-    while (offset < TOTAL_FLASH_SIZE)
+    while (offset < s_real_flash_size)
     {
         int received = 0;
         while (received < BURNER_CHUNK)
@@ -119,7 +124,8 @@ void start_production_burning(void)
         fflush(stdout);
     }
 
-    ESP_LOGI(TAG, "✅ 32MB 资源同步成功！设备即将重启...");
+    ESP_LOGI(TAG, "✅ %luMB 资源同步成功！设备即将重启...",
+             (unsigned long)(s_real_flash_size / 1024 / 1024));
     heap_caps_free(buffer);
     vTaskDelay(pdMS_TO_TICKS(1000));
     esp_restart(); // 重启后进入正常挂载逻辑
@@ -144,7 +150,7 @@ void start_production_dump(void)
     esp_log_level_set("*", ESP_LOG_NONE);
 
     uint32_t offset = 0;
-    while (offset < TOTAL_FLASH_SIZE)
+    while (offset < s_real_flash_size)
     {
         // 1. 从 Flash 读取一块数据
         esp_flash_read(ext_flash, buffer, offset, 128 * 1024);
@@ -241,6 +247,7 @@ void bsp_flash_init(void)
     // 这里直接 return，不再像旧逻辑那样无条件硬等 10 秒产线窗口。
     uint32_t flash_size;
     esp_flash_get_size(ext_flash, &flash_size);
+    s_real_flash_size = flash_size; // ⭐ 产线烧录/提取统一用探测到的真实容量，不再写死 32MB
     const esp_partition_t *fat_partition;
 
     ESP_ERROR_CHECK(esp_partition_register_external(ext_flash, 0, flash_size, "ext_storage",
@@ -251,11 +258,26 @@ void bsp_flash_init(void)
     // --- 步骤 2.5: 强制烧录窗口（挂载前先开短窗口监听 PC 命令）---
     // 见顶部 BURN_FORCE_WINDOW_MS 说明。窗口内收到 START/DUMP 即强制进产线，
     // 跳过挂载（产线本就要整盘擦写，无需先挂载）。无命令则结束、继续正常挂载。
-    // 此阶段不安装 USJ 驱动，用默认 secondary console 读 stdin（与下方产线一致）。
+    //
+    // ⚠️⚠️ 绝对不能用 fgetc(stdin) 读命令！本项目 sdkconfig 是：
+    //        CONFIG_ESP_CONSOLE_UART_DEFAULT=y            ← 主 console = UART0
+    //        CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y ← USB-JTAG 仅"次要"
+    //      secondary console 是**单向的**：printf 输出会镜像到 USB-JTAG（所以
+    //      电脑能看到日志），但 stdin 只绑定主 console(UART0)。板子是 USB 线连
+    //      电脑、UART0 根本没接线，于是 fgetc(stdin) 永远读不到 PC 发来的 START。
+    //      症状：固件把窗口喊满整整 N 秒（日志重复刷 ESP32_READY_CMD_WAIT），
+    //      一次都没识别到命令，最后误判"无命令"转去正常挂载启动。
+    //      → 必须用 usb_serial_jtag_ll_read_rxfifo() 直接读 USB-JTAG 硬件 FIFO。
+    //      此处不能用 usb_serial_jtag_read_bytes()：那需要先 install 驱动，而驱动
+    //      要留到真正进产线后再装（装早了 ISR 会干扰 I2C 时序，见 BUG-015）。
     int force_mode = 0; // 0:不强制 1:烧录 2:提取
 #if BURN_FORCE_WINDOW_MS > 0
     {
-        char fcmd[32];
+        // ⚠️ fcmd 必须跨轮询持续累积，不能每次循环都清空！
+        // USB 串口数据经常被拆成多批到达（比如 "START\n" 拆成 "ST" + "ART\n"
+        // 两次 10ms 轮询才收全），若每轮都 memset 重置，半个命令字会被直接丢弃。
+        char fcmd[32] = {0};
+        int flen = 0;
         int fwait = 0;
         while (fwait < BURN_FORCE_WINDOW_MS)
         {
@@ -263,18 +285,16 @@ void bsp_flash_init(void)
             {
                 printf("\nESP32_READY_CMD_WAIT\n"); // 3.py 握手锚点，勿删
                 printf("NEED_BURN\n");
+                printf("FLASH_SIZE:%lu\n", (unsigned long)flash_size); // 3.py 容量校验用
                 fflush(stdout);
             }
-            memset(fcmd, 0, sizeof(fcmd));
-            int len = 0;
-            while (len < (int)(sizeof(fcmd) - 1))
-            {
-                int c = fgetc(stdin);
-                if (c == EOF)
-                    break;
-                fcmd[len++] = (char)c;
-            }
-            if (len > 0)
+            // 直接读 USB-JTAG 硬件 RX FIFO（一次最多 64B，命令字足够）
+            uint8_t rxbuf[64];
+            int n = usb_serial_jtag_ll_read_rxfifo(rxbuf, sizeof(rxbuf));
+            for (int i = 0; i < n && flen < (int)(sizeof(fcmd) - 1); i++)
+                fcmd[flen++] = (char)rxbuf[i];
+
+            if (flen > 0)
             {
                 if (strstr(fcmd, "START"))
                 {
@@ -285,6 +305,12 @@ void bsp_flash_init(void)
                 {
                     force_mode = 2;
                     break;
+                }
+                // 缓冲区快满还没匹配到完整命令，多半是脏数据，清空避免溢出丢字节
+                if (flen >= (int)(sizeof(fcmd) - 1))
+                {
+                    memset(fcmd, 0, sizeof(fcmd));
+                    flen = 0;
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -323,33 +349,33 @@ void bsp_flash_init(void)
     ESP_LOGI(TAG, "📢 产线模式开启！发送 'START' 烧录，发送 'DUMP' 提取...");
 
     char cmd[32] = {0};
+    int clen = 0;
     uint32_t wait_ms = 0;
     int mode = force_mode; // 0:继续监听 1:烧录 2:提取（强制时直接带入，跳过监听循环）
 
     // 旧逻辑这里是 10 秒超时窗口；现在挂载已确认失败、没有可启动的文件系统，
     // 故改为持续监听（死循环里轮询命令字），等 burner 随时接管。
+    // ⚠️ cmd 同上必须跨轮询累积，不能每次循环 memset，否则分片到达的命令字
+    // 会被硬拆丢弃（见上面强制窗口那段的详细说明）。
     while (mode == 0)
     {
         // 每 2s 喊话一次，够 Python 同步且不刷屏
         if (wait_ms % 2000 == 0)
         {
-            printf("\nESP32_READY_CMD_WAIT\n"); // Python 握手锚点，勿删
-            printf("NEED_BURN\n");              // 兼容旧约定：告知 burner.py 可发数据
+            printf("\nESP32_READY_CMD_WAIT\n");                    // Python 握手锚点，勿删
+            printf("NEED_BURN\n");                                 // 兼容旧约定：告知 burner.py 可发数据
+            printf("FLASH_SIZE:%lu\n", (unsigned long)flash_size); // 3.py 容量校验用
             fflush(stdout);
         }
 
-        // 不依赖 USJ 驱动，直接读 HW RX FIFO（最多 64 字节，足够检测命令字）
-        memset(cmd, 0, sizeof(cmd));
-        int len = 0;
-        while (len < (int)(sizeof(cmd) - 1))
-        {
-            int c = fgetc(stdin);
-            if (c == EOF)
-                break;
-            cmd[len++] = (char)c;
-        }
+        // 不依赖 USJ 驱动，直接读 USB-JTAG HW RX FIFO（最多 64 字节，足够检测命令字）
+        // 同上：绝不能用 fgetc(stdin)，stdin 绑的是没接线的 UART0，收不到 PC 命令。
+        uint8_t rxbuf[64];
+        int n = usb_serial_jtag_ll_read_rxfifo(rxbuf, sizeof(rxbuf));
+        for (int i = 0; i < n && clen < (int)(sizeof(cmd) - 1); i++)
+            cmd[clen++] = (char)rxbuf[i];
 
-        if (len > 0)
+        if (clen > 0)
         {
             if (strstr(cmd, "START"))
             {
@@ -360,6 +386,11 @@ void bsp_flash_init(void)
             {
                 mode = 2;
                 break;
+            }
+            if (clen >= (int)(sizeof(cmd) - 1))
+            {
+                memset(cmd, 0, sizeof(cmd));
+                clen = 0;
             }
         }
         vTaskDelay(pdMS_TO_TICKS(10));
