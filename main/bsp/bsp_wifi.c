@@ -4,6 +4,7 @@
 #include "esp_heap_caps.h"
 #include "freertos/timers.h" /* WiFi 断线去抖软件定时器 */
 #include "ui/ui_port.h"      /* ui_show_unbinding(): 解绑前显示静态提示页，避免 GIF 卡冻帧 */
+#include "ui/reminder.h"     /* reminder_on_offline_mode(): 进离线时停 SNTP + 定时天气拉取 */
 #include "esp_timer.h"       /* [DIAG] esp_timer_get_time()：微秒级时间戳，定位扫描各阶段耗时 */
 #include "esp_netif.h"       /* [DNS诊断] esp_netif_get_dns_info()：拿到 IP 后打印设备实际 DNS 服务器 */
 #include "udp_logger.h"      /* 纯电池调试用：拿到 IP 后把日志同时广播到 UDP，见 GOT_IP 分支 */
@@ -18,6 +19,7 @@
 #include "esp_mac.h"              /* esp_read_mac（蓝牙名派生）*/
 #if CONFIG_BT_NIMBLE_ENABLED
 #include "services/gap/ble_svc_gap.h" /* ble_svc_gap_device_name_set */
+#include "esp_rom_sys.h"
 #endif
 // ─── 模块常量 ─────────────────────────────────────────────────────────────────
 #define CLEAR_WIFI_BUTTON_PIN GPIO_NUM_0 ///< 清除 WiFi 凭证的长按按键（Boot 按钮）
@@ -61,6 +63,12 @@ static volatile bool s_need_save_channel_hint = false;
 static volatile bool s_need_send_prov_report = false;
 /// @brief 当前已重连次数（超过 MAX_RETRY_COUNT 后置位 WIFI_FAIL_BIT）
 static int s_retry_num = 0;
+/// @brief 运行态离线模式标志：运行态重连额度耗尽后置位，**本次开机周期内永不清除**。
+/// 置位后：不再 esp_wifi_connect()、不再启动复位看门狗、不再 esp_restart()，
+/// 且已 esp_wifi_stop() 关射频；所有网络功能靠 bsp_wifi_is_offline_mode() 自行拦截。
+/// 恢复联网需用户手动关机重开（冷启动后本变量自然复位为 false）。
+/// volatile：由 sys_evt 事件回调置位，被多个业务任务读取。
+static volatile bool s_offline_mode = false;
 /// @brief 配网态连接尝试计数：BluFi 配网期间专用，与 s_retry_num（运行态）隔离。
 /// REQ_CONNECT_TO_AP 触发连接后每次断线 +1，达到 PROV_MAX_RETRY_COUNT 判定配网失败；
 /// App 重新下发凭证（RECV_STA_SSID/PASSWD）时清零，让二次配网干净开始。
@@ -138,9 +146,28 @@ static void wifi_debounce_timer_cb(TimerHandle_t xTimer)
 static void wifi_reset_watchdog_cb(TimerHandle_t xTimer)
 {
     (void)xTimer;
+    // ★ 离线模式保险：进入离线模式时已 xTimerStop 本定时器，但 xTimerStop 是"投递
+    //   命令到定时器服务队列"而非立即生效，若本回调恰好已被排入队列，stop 拦不住它，
+    //   仍会走到下面 esp_restart() → 离线模式失效（设备照样重启）。故此处再判一次，
+    //   把这个竞态窗口彻底堵死。
+    if (s_offline_mode)
+        return;
+
     ESP_LOGE(TAG, "WiFi 重连 %d 次全部失败，且缓冲 %d ms 内仍未恢复 → 软复位刷新设备",
              MAX_RETRY_COUNT, WIFI_RESET_WATCHDOG_MS);
     esp_restart(); // 内存干净重来；不返回
+}
+
+// ─── bsp_wifi_is_offline_mode ────────────────────────────────────────────────
+
+/**
+ * @brief 查询设备是否已进入运行态离线模式（接口说明见 bsp_board.h）
+ *
+ * @return true = 已离线，所有网络功能必须跳过
+ */
+bool bsp_wifi_is_offline_mode(void)
+{
+    return s_offline_mode;
 }
 
 // ─── clear_wifi_and_restart ──────────────────────────────────────────────────
@@ -658,9 +685,18 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
         //   （2304B）导致解绑必崩。据 s_is_resetting 直接返回，让重启流程干净收尾。
         if (s_is_resetting)
         {
-            ESP_LOGW(TAG, "解绑/重置进行中，忽略断线事件（即将重启）");
+            // ESP_LOGW(TAG, "解绑/重置进行中，忽略断线事件（即将重启）");
+            esp_rom_printf("[WIFI return \n");
             return;
         }
+
+        // ★离线模式拦截（必须放在最前）：进入离线模式时会调 esp_wifi_disconnect() +
+        //   esp_wifi_stop()，这两个调用本身还会再抛一次 STA_DISCONNECTED 事件。若不在
+        //   此短路，事件会重新落回下方"重连额度耗尽"分支 → 再次 stop → 再抛事件，
+        //   形成递归自激。离线后本事件已无任何处理意义（不重连、不去抖、不重启），
+        //   直接返回即可。
+        if (s_offline_mode)
+            return;
 
         wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
         ESP_LOGW(TAG, "[DIAG] WIFI_EVENT_STA_DISCONNECTED @ %lld us，reason=%d",
@@ -785,34 +821,63 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base,
             }
             else
             {
-                // ── 运行态重连额度耗尽：启动复位看门狗，而非永久放弃 ──────────────
-                // 【旧行为的坑】原来这里置 WIFI_FAIL_BIT。但该位只有开机首连时的
-                //   xEventGroupWaitBits 在等；运行态（已 GOT_IP 过、wifi_main 早已返回）
-                //   置位后无人接管，s_retry_num 又只在 GOT_IP 清零 → 此后再无任何代码
-                //   调 esp_wifi_connect()，设备永久卡死，只能人工软重启（用户实测现象）。
-                //   典型触发：reason=1 驱动 1 秒内连抖 5 次瞬间烧光额度，而 AP 稍后自愈。
-                // 【新行为】不置 WIFI_FAIL_BIT：① 仍继续 esp_wifi_connect() 让驱动保持
-                //   重连，AP 回来即 GOT_IP 自愈（GOT_IP 会清 s_retry_num + 停本定时器）；
-                //   ② 启动 WIFI_RESET_WATCHDOG_MS 的 one-shot 看门狗，缓冲期满仍未恢复
-                //   才 esp_restart() 刷新（内存干净重来，规避无限重连的 SRAM 碎片/泄漏）。
-                //   看门狗已在运行则不重启计时（xTimerStart 对已运行定时器会复位周期，
-                //   会把复位时点无限往后推，故仅首次达上限时启动一次）。
-                esp_wifi_connect(); // 继续尝试，AP 回来能自愈
+                // ══ 运行态重连额度耗尽：进入永久离线模式 ══════════════════════════
+                // 【演进史】本分支先后有三代行为，坑都踩过一遍，务必别改回去：
+                //   一代：置 WIFI_FAIL_BIT 永久放弃 → 该位只有开机首连的 wifi_main 在等，
+                //         运行态置位后无人接管，s_retry_num 又只在 GOT_IP 清零 → 此后
+                //         再无代码调 esp_wifi_connect()，设备"静默卡死"，且 WS/MQTT/天气
+                //         等任务仍在空转重试，白耗内存。
+                //   二代：继续 esp_wifi_connect() + 8s 复位看门狗 → 到期 esp_restart()。
+                //         能自愈，但断网环境下会陷入"重连失败→重启→再重连失败"的循环，
+                //         设备反复重启、本地功能（游戏/GIF/闹钟）全被打断，用户体验差。
+                //   三代（当前）：判定彻底掉网，进入**永久离线模式**——既不重连也不重启，
+                //         主动关停 WiFi 并置位全局标志，让所有网络消费者提前返回退出，
+                //         把设备干净地降级成"纯本地机"，本地功能全部照常可用。
+                //         恢复联网需用户手动关机重开（冷启动后 s_offline_mode 复位）。
+                //
+                // 【与一代的本质区别】一代是"被动卡死"（标志无人接管、任务照样空转）；
+                //   本代是"主动关停"：① 有明确的 s_offline_mode 标志供全局查询；
+                //   ② ws_reconn / mqtt_reconn 等重连任务会读到标志后**真正退出并自删**，
+                //   不再空转占用 6KB 内部 SRAM / 3KB PSRAM；③ 射频已关，功耗更低。
+                //
+                // 【为什么在 sys_evt 上下文只做轻量操作】本回调跑在 sys_evt 任务上，栈仅
+                //   2304B。故这里只做：置标志 + 停定时器 + wifi 关停 + 打日志，绝不做
+                //   NVS 写 / UI 调用 / 建任务等重活（解绑必崩就是栈溢出踩的坑）。
+                s_offline_mode = true;
+
+                // ① 停掉复位看门狗：否则它到期仍会 esp_restart()，离线模式直接失效。
+                //    （回调内另有 s_offline_mode 短路兜底，防 xTimerStop 的投递延迟竞态）
                 if (s_wifi_reset_timer != NULL)
-                {
-                    if (xTimerIsTimerActive(s_wifi_reset_timer) == pdFALSE)
-                    {
-                        xTimerStart(s_wifi_reset_timer, 0);
-                        ESP_LOGE(TAG, "WiFi 重连已达上限 (%d)，启动 %d ms 复位看门狗（期间仍尝试自愈）",
-                                 MAX_RETRY_COUNT, WIFI_RESET_WATCHDOG_MS);
-                    }
-                }
-                else
-                {
-                    // 定时器未创建（理论上 wifi_main 已创建，此为兜底）：退化为立即复位
-                    ESP_LOGE(TAG, "WiFi 重连已达上限 (%d)，复位定时器缺失，立即软复位", MAX_RETRY_COUNT);
-                    esp_restart();
-                }
+                    xTimerStop(s_wifi_reset_timer, 0);
+
+                // ② 停掉断线去抖定时器并立即清 WIFI_BIT：已判定彻底掉网，无需再等
+                //    1.5s 去抖确认，让上层（WS/MQTT）尽快感知网络不可用。
+                if (s_wifi_debounce_timer != NULL)
+                    xTimerStop(s_wifi_debounce_timer, 0);
+                if (bsp_board != NULL)
+                    xEventGroupClearBits(bsp_board->board_status, WIFI_BIT);
+
+                // ③ 关闭 UDP 日志 socket：断网后它已失效，且离线不会再有 GOT_IP 重建。
+                // udp_logger_stop();
+
+                // ④ 彻底关停 WiFi：disconnect 停掉驱动层自动重连，stop 关射频省电。
+                //    注意不做 esp_wifi_deinit()——deinit 会释放驱动内部资源，与仍可能
+                //    在途的事件回调存在竞态，且离线后也不再需要那点内存，得不偿失。
+                //    这两个调用会各再抛一次 STA_DISCONNECTED 事件，已由本函数开头的
+                //    s_offline_mode 短路拦截，不会递归回到这里。
+                esp_wifi_disconnect();
+                esp_wifi_stop();
+
+                // ⑤ 通知提醒系统停掉 SNTP 轮询与定时天气拉取。
+                //    该函数刻意做得极轻（esp_sntp_stop + 一次字段赋值 + 一条日志），
+                //    可安全在 sys_evt 的 2304B 小栈上调用；闹钟/倒计时不受影响。
+                reminder_on_offline_mode();
+
+                ESP_LOGE(TAG, "WiFi 重连 %d 次全部失败 → 已进入【离线模式】：停止一切重连，"
+                              "关闭射频与全部联网功能（对话/MQTT/天气/OTA）",
+                         MAX_RETRY_COUNT);
+                ESP_LOGE(TAG, "本地功能（GIF/舵机/震动/触摸/游戏/唤醒词/闹钟/本地音频）不受影响；"
+                              "恢复联网请手动关机后重新开机");
             }
         }
 
@@ -1184,6 +1249,15 @@ void bsp_board_wifi_main(bsp_board_t *bsp_board)
         ESP_LOGI(TAG, "设备未配网，启动 BluFi 配网...");
         ESP_LOGI(TAG, "📱 配网入口 → 蓝牙名: %s（用 EspBlufi App 或小程序扫描）", service_name);
         // 配网入口仅靠蓝牙广播 + 串口打印设备 ID；不再显示配网二维码（已删除该逻辑）。
+
+        // ── 显示配网提示图（仅未配网分支，必须在 BT controller 拉起之前）────────
+        // 首次配网全程原本是黑屏，用户无从判断设备状态；这里先点屏贴一张静态
+        // "设备未连接 / 连接 APP" 提示图（pw.bin）。
+        // ★安全性：只贴静态图，flush 完整屏后 LVGL 彻底静默（无 GIF 解码、无动画
+        //   timer），不会在 BLE 使能窗口内并发刷屏抢内部资源（对比 BUG-026：真正
+        //   危险的是 GIF 轮播那类持续负载，它仍留在配网之后的 ui_init()）。
+        // ★已配网分支不调用本函数，开机顺序与改动前完全一致。
+        ui_show_provision_image();
 
         // ★WiFi 与 BLE 的初始化顺序：必须【先 esp_wifi_start()，再拉起 BT controller】。
         //   根因（实测 coex_hook_check_wifi_sleep 野指针 LoadProhibited）：ESP32-S3 的

@@ -350,6 +350,7 @@ void bsp_board_lcd_disp_on(bsp_board_t *bsp_board);
  * @note 前置条件：bsp_board_lcd_init() 已完成 LEDC 配置
  */
 void bsp_board_lcd_set_brightness(uint8_t percent);
+uint8_t bsp_board_lcd_get_brightness(void);
 
 /**
  * @brief 背光亮度线性渐变（阻塞，从 from_pct 渐变到 to_pct）
@@ -382,6 +383,37 @@ void bsp_board_lcd_fade_brightness(uint8_t from_pct, uint8_t to_pct);
  */
 bool bsp_board_lcd_fade_step(uint8_t from_pct, uint8_t to_pct, uint32_t elapsed_ms, uint32_t total_ms);
 
+/**
+ * @brief 背光渐变——非阻塞单步版【伽马校正 + 全 10 位精度】，感知亮度线性
+ *
+ * 与上面 bsp_board_lcd_fade_step() 参数/返回值完全一致，可直接替换调用；区别在于
+ * 内部不经过 101 级百分比、且按人眼感知（t^2.2）分配亮度，消除"暗端一顿一顿、
+ * 亮端没变化"的可见跳变。详细推导见 bsp_lcd.c 中的函数注释。
+ *
+ * @param from_pct   起始亮度百分比 0~100
+ * @param to_pct     目标亮度百分比 0~100
+ * @param elapsed_ms 距渐变开始已过的毫秒数
+ * @param total_ms   渐变总耗时（毫秒）
+ * @return true=已到达终点（本次已设为 to_pct），false=仍在渐变中
+ * @note 非阻塞。调用者：ui_port.c ui_boot_fade_timer_cb（开机 logo 渐亮/渐暗/渐亮三段）
+ */
+bool bsp_board_lcd_fade_step_fine(uint8_t from_pct, uint8_t to_pct, uint32_t elapsed_ms, uint32_t total_ms);
+
+/**
+ * @brief 感知亮度线性的背光渐变——【阻塞版，时长可传】（2026-08-20 新增）
+ *
+ * 把上面那个非阻塞单步版包成阻塞循环（每 10ms 推进一步），并支持传入总时长。
+ * 相比旧的 bsp_board_lcd_fade_brightness()：步数从固定 16 步（每 125ms 才跳一档，
+ * 肉眼可见"断层"）加密到每 10ms 一步，且带伽马校正，暗端不再跳。
+ * 旧函数保持原样不动，其余调用方行为不受影响。
+ *
+ * @param from_pct 起始亮度百分比 0~100
+ * @param to_pct   目标亮度百分比 0~100
+ * @param total_ms 本段渐变总耗时（毫秒），传 0 则直接跳到 to_pct
+ * @note 阻塞。调用者：standby.c 进/退低功耗的三段式转场（渐暗→暗中换画面→渐亮）
+ */
+void bsp_board_lcd_fade_brightness_fine(uint8_t from_pct, uint8_t to_pct, uint32_t total_ms);
+
 // ========== 3. 在 API 声明区添加 ==========
 /**
  * @brief 初始化躯体三轴舵机
@@ -396,6 +428,20 @@ void bsp_board_servo_init(bsp_board_t *bsp_board);
  * @param step_ms   步进延时，数值越大动作越慢 (推荐使用 SERVO_SPEED_xxx 宏)
  */
 void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms);
+
+/**
+ * @brief 抢占式平滑运动：拿到通道锁【之后】才清打断标志，随即插值
+ *
+ * 与 bsp_servo_move_smooth 的唯一差别是加锁成功后多清一次打断标志，消除
+ * 「清标志 → (窗口) → 拿锁」之间被其它任务插入的竞态。详细缘由见 bsp_servo.c
+ * 中本函数的实现注释。
+ *
+ * @param channel   舵机通道 (CH_HEAD, CH_L_ARM, CH_R_ARM)
+ * @param target    目标角度 (0.0 ~ 180.0，自动受限于内部软限位)
+ * @param step_ms   步进延时，数值越大动作越慢 (推荐使用 SERVO_SPEED_xxx 宏)
+ * @note 仅供「抢占后立即接管」的场景，普通动作一律用 bsp_servo_move_smooth。
+ */
+void bsp_servo_move_smooth_preempt(uint8_t channel, float target, uint32_t step_ms);
 
 /**
  * @brief 读取指定舵机通道的当前角度（LEDC 寄存器推算值，非物理传感器反馈）
@@ -644,6 +690,24 @@ void bsp_battery_power_off(void);
  * @note 调用者：UI 状态栏（顶部 WiFi 图标刷新）
  */
 int bsp_wifi_get_rssi(void);
+
+/**
+ * @brief 查询设备是否已进入"运行态离线模式"
+ *
+ * 运行态（已配网、已 GOT_IP 过之后）WiFi 断线重连达 MAX_RETRY_COUNT 次仍失败时，
+ * bsp_wifi 内部置位本标志并彻底关停 WiFi（disconnect + stop 关射频），不再重连、
+ * 也不再软复位重启。标志一旦置位，**本次开机周期内永不清除**——恢复联网需用户
+ * 手动关机再开机（冷启动后静态变量自然复位）。
+ *
+ * 所有依赖网络的功能（WebSocket 会话 / MQTT / 天气 / OTA / UDP 日志）必须在发起
+ * 请求前调用本函数拦截，离线时直接返回，避免任务空转与 SRAM 反复申请释放。
+ *
+ * @return true = 已进入离线模式（网络功能必须跳过）；false = 正常
+ *
+ * @note 调用者：session.c / mqtt_protocol.c / reminder.c / bsp_ota.c
+ * @note 区别于瞬时的 WIFI_BIT（随抖动变化），本标志是"判定彻底掉网"后的持久状态
+ */
+bool bsp_wifi_is_offline_mode(void);
 
 /**
  * @brief 启动后台采样任务（周期 BSP_BAT_TASK_INTERVAL_MS）

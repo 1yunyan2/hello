@@ -52,8 +52,24 @@
 
 /* ── 闹钟响铃参数 ── */
 #define ALARM_RING_INTERVAL_MS 5000 ///< 闹钟响铃间隔（每 5 秒重复播报一次）
-#define ALARM_RING_MAX_COUNT 3      // 时间超过这个次数还没关闭，就自动关闭（15秒）
+#define ALARM_RING_MAX_COUNT 4      // 时间超过这个次数还没关闭，就自动关闭（20秒）
 #define ALARM_RING_TIMEOUT_SEC 30   ///< 闹钟响铃超时（秒），超时自动关闭
+/* 闹钟每次响铃的震动时长（毫秒）。
+ * 2026-08-11：原先调用 bsp_motor_pulse()，那是固定 30ms 的触摸级轻反馈，
+ * 用作闹钟提醒太短促、几乎感觉不到，故独立成宏并改走 bsp_motor_pulse_level()。
+ * 调用点在 reminder 自己的任务上下文（非 LVGL 线程），阻塞该时长不影响 UI/音频。 */
+#define ALARM_RING_VIBRATE_MS 200    ///< 闹钟单次响铃震动时长（毫秒）
+#define ALARM_RING_VIBRATE_LEVEL 100 ///< 闹钟响铃震动强度（0~100）
+
+/* ── 倒计时到期震动参数 ──
+ * 闹钟是「每 5s 短震一次、共 3 次」的间歇提醒（见上面 ALARM_RING_* 三个宏），
+ * 倒计时不同：到期只提醒一次，故改为一次性长震，时长由下面这个宏控制。
+ * 实现走 bsp_motor_pulse_level()（内含 vTaskDelay 阻塞），调用点在 reminder_task
+ * 自己的任务里，阻塞 3 秒不影响 LVGL/音频线程。
+ * 2026-08-10：由 2000 加长到 3000（需求：改到长震动三秒）。注意调用点已改为
+ * 「先 trigger_cb 切页、再震动」，故加长震动不会推迟界面切换。 */
+#define TIMER_EXPIRE_VIBRATE_MS 3000   ///< 倒计时到期长震时长（毫秒）
+#define TIMER_EXPIRE_VIBRATE_LEVEL 100 ///< 倒计时到期震动强度（0~100）
 
 /* ── 天气拉取时间（宏定义，修改此处即可调整播报时段） ── */
 #define WEATHER_MORNING_HOUR 7         ///< 早间天气播报 — 小时（24h 制）
@@ -219,7 +235,7 @@ typedef struct
     char precip[8];     ///< 当前小时累计降水量（mm，如"0.5"，不含单位）
     char feels[8];      ///< 体感温度整数（如"26"，不含单位）
     char wind[24];      ///< 风向+风力（如"西北风2级"）
-    bool valid; ///< 数据是否有效（true=已获取成功）
+    bool valid;         ///< 数据是否有效（true=已获取成功）
 } weather_data_t;
 
 /**
@@ -253,6 +269,24 @@ esp_err_t reminder_init(reminder_trigger_cb_t cb);
  * @brief 销毁提醒系统（释放所有资源）
  */
 void reminder_deinit(void);
+
+/**
+ * @brief 通知提醒系统"设备已进入离线模式"，停掉一切联网动作
+ *
+ * 设备判定永久掉网（WiFi 重连额度耗尽、射频已关）后调用。本函数只做两件事：
+ *   1. `esp_sntp_stop()` —— 否则 SNTP 会一直按周期向 NTP 服务器发 UDP 包，射频已关
+ *      发不出去，纯属空转（不会崩，但无意义）；
+ *   2. 关闭定时天气拉取 —— 避免每个拉取时间点都白跑一遍 DNS/connect 超时。
+ *
+ * **不影响本地功能**：闹钟、倒计时照常触发；日历若当前用的是 NVS 兜底时间则已自行
+ * 暂停（日期可能偏差），与本函数无关；天气页继续显示 NVS 里的上次缓存数据。
+ *
+ * 幂等：重复调用无副作用。离线状态本次开机周期内不会解除，故无对应的"恢复"接口——
+ * 恢复联网需用户手动关机重开。
+ *
+ * @note 调用者：bsp_wifi.c 进入离线模式时
+ */
+void reminder_on_offline_mode(void);
 
 /**
  * @brief 获取提醒系统当前状态

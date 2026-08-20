@@ -460,6 +460,16 @@ esp_err_t bsp_ota_trigger(const bsp_ota_req_t *req)
         ESP_LOGE(TAG, "url 为空");
         return ESP_ERR_INVALID_ARG; // 参数错误
     }
+    // 离线模式拦截：射频已关、网络彻底不可用，OTA 下载必然失败。若放行，
+    // esp_https_ota 会先关停唤醒词/触摸/电池任务腾内存（见 :297 注释），失败后
+    // 这些功能未必能干净恢复，还可能触发回滚重启 → 把"能用的本地功能"也搞没了。
+    // 故在最前面直接拒绝。恢复联网需用户手动关机重开。
+    if (bsp_wifi_is_offline_mode())
+    {
+        ESP_LOGW(TAG, "离线模式，拒绝 OTA 升级请求");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     const char *version = req->version;
 
     // 版本号比较：拒绝同版本/降级

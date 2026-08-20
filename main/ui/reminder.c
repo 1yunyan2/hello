@@ -20,6 +20,7 @@
 
 #include "reminder.h"
 #include "object.h"
+#include "bsp/bsp_board.h" /* bsp_wifi_is_offline_mode()：离线时跳过天气 HTTP 拉取 */
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_sntp.h"
@@ -73,6 +74,8 @@ static const char *TAG = "REMINDER";
  * ═══════════════════════════════════════════════════════════════════ */
 #define NVS_SAVE_CMD_ALARMS 0x01
 #define NVS_SAVE_CMD_CALENDARS 0x02
+/* [FIX-14] 天气结果缓存也走异步队列：见 nvs_save_weather_data() 处的说明 */
+#define NVS_SAVE_CMD_WEATHER 0x03
 #define NVS_SAVE_CMD_EXIT 0xFF
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -137,12 +140,21 @@ typedef struct
     TaskHandle_t task_handle;
     SemaphoreHandle_t mutex;
     bool sntp_synced;
+    /// @brief 当前系统时间是否来自 NVS 兜底（而非真实 SNTP 同步）。
+    /// true 表示时间"大致可用但日期未必准"：闹钟照常触发（只看时分，兜底下依然准点），
+    /// 但日历**暂停触发**（日历要看年月日，断电多久日期就差多久，会在错误的日子误报）。
+    /// SNTP 一旦同步成功即置回 false，日历自动恢复。
+    bool time_from_nvs;
     bool initialized;
 } reminder_ctx_t;
 
 static reminder_ctx_t s_ctx = {0};
 
 #define NVS_NAMESPACE "reminder"
+
+/// @brief "系统时间是否有效"的判定门槛（Unix epoch 秒）：2020-01-01 00:00:00 UTC。
+/// 小于该值说明 RTC 掉电后未被任何来源设置过（停在 1970），需要用 NVS 兜底值回填。
+#define REMINDER_TIME_VALID_EPOCH 1577836800LL
 
 /* ═══════════════════════════════════════════════════════════════════
  * 3. NVS 持久化
@@ -190,7 +202,10 @@ static void nvs_save_calendars_immediate(void)
     ESP_LOGI(TAG, "日历数据已保存，共 %d 条", s_ctx.calendar_count);
 }
 
-/* [FIX-6] NVS 保存任务支持闹钟/日历/退出三种命令 */
+/* 定义在下方（天气小节），此处前置声明供 nvs_save_task 分发使用 */
+static void nvs_save_weather_data_immediate(void);
+
+/* [FIX-6][FIX-14] NVS 保存任务支持闹钟/日历/天气/退出四种命令 */
 static void nvs_save_task(void *arg)
 {
     PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
@@ -210,6 +225,9 @@ static void nvs_save_task(void *arg)
                 break;
             case NVS_SAVE_CMD_CALENDARS:
                 nvs_save_calendars_immediate();
+                break;
+            case NVS_SAVE_CMD_WEATHER:
+                nvs_save_weather_data_immediate();
                 break;
             default:
                 ESP_LOGW(TAG, "NVS 保存任务收到未知命令: 0x%02X", cmd);
@@ -315,13 +333,100 @@ use_defaults:
     s_ctx.weather_cfg.city_name[sizeof(s_ctx.weather_cfg.city_name) - 1] = '\0'; /* [FIX-10] */
 }
 
+/**
+ * @brief 缓存最近一次成功获取的天气**结果**到 NVS
+ *
+ * 【与 weather_cfg 的区别】weather_cfg 存的是**配置**（城市、播报时段），本函数存的是
+ * **实测数据**（温度/天气/湿度/风力…）。此前只存配置不存结果，导致断网开机时天气页
+ * 空白（"等待天气数据 / 湿度—% / 降水量—mm"）。
+ *
+ * 每次成功获取都覆盖，NVS 里始终是"最后一次联网拿到的天气"。
+ *
+ * 【★ 必须由 nvs_save_task 调用，禁止在 reminder_task 里直接调】
+ * reminder_task 的栈分配在 PSRAM（见 reminder_init 的 MALLOC_CAP_SPIRAM）。
+ * NVS 写入最终会走 spi_flash_disable_interrupts_caches_and_other_cpu()，
+ * 关闭 flash cache 的同时 PSRAM 也不可访问；此时若当前任务的栈在 PSRAM，
+ * 返回地址和局部变量全部读不到，IDF 会主动断言拦下：
+ *     assert failed: spi_flash_disable_interrupts_caches_and_other_cpu
+ *     cache_utils.c:152 (esp_task_stack_is_sane_cache_disabled())
+ * nvs_save_task 的栈是 MALLOC_CAP_INTERNAL，才是安全的执行上下文。
+ * 这与 [FIX-5] 把日历保存改异步是同一个原因。
+ *
+ * @note 调用者：nvs_save_task()，且调用时已持有 s_ctx.mutex
+ */
+static void nvs_save_weather_data_immediate(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK)
+        return;
+    nvs_set_blob(handle, "weather_dat", &s_ctx.weather_data, sizeof(weather_data_t));
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+/* [FIX-14] 天气结果保存改为异步：投队列交给内部 SRAM 栈的 nvs_save_task 执行 */
+static void nvs_save_weather_data(void)
+{
+    uint8_t cmd = NVS_SAVE_CMD_WEATHER;
+    if (s_save_queue)
+        xQueueSend(s_save_queue, &cmd, 0);
+}
+
+/**
+ * @brief 从 NVS 读回上次缓存的天气结果（开机时调用，供断网时显示）
+ *
+ * 读不到（首次开机、尚未成功获取过）则保持 valid=false，UI 显示空占位，与旧行为一致。
+ *
+ * @note 调用者：reminder_init()
+ */
+static void nvs_load_weather_data(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK)
+        return;
+    size_t len = sizeof(weather_data_t);
+    if (nvs_get_blob(handle, "weather_dat", &s_ctx.weather_data, &len) == ESP_OK &&
+        len == sizeof(weather_data_t))
+    {
+        ESP_LOGI(TAG, "已从 NVS 载入上次天气缓存：%s %s°C",
+                 s_ctx.weather_data.text, s_ctx.weather_data.temp);
+    }
+    nvs_close(handle);
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * 4. SNTP 时间同步
  * ═══════════════════════════════════════════════════════════════════ */
+/**
+ * @brief 把当前系统时间写入 NVS，作为下次断网开机的时间兜底
+ *
+ * 【为什么需要】ESP32 掉电后 RTC 清零，若开机时没网（SNTP 同步不上），系统时间会停在
+ * 1970-01-01，导致 poll_timer_callback 里所有依赖时间的功能全部失效。设备第一次一定
+ * 是配网成功的，所以 NVS 里必然存过一份"最后一次联网时的时间"，可以拿它当起点。
+ *
+ * 【覆盖规则】只在**真正 SNTP 同步成功**时调用（有更准的来源才覆盖）。离线兜底恢复的
+ * 时间**绝不写回 NVS**——那是不断劣化的估算值，写回去会把好数据一次次冲旧。
+ *
+ * @note 调用者：sntp_sync_notification_cb()（SNTP 同步成功回调）
+ */
+static void nvs_save_last_time(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK)
+        return;
+    int64_t now = (int64_t)time(NULL);
+    nvs_set_i64(handle, "last_time", now);
+    nvs_commit(handle);
+    nvs_close(handle);
+    ESP_LOGI(TAG, "已保存联网时间到 NVS（供下次断网开机兜底）");
+}
+
 static void sntp_sync_notification_cb(struct timeval *tv)
 {
     ESP_LOGI(TAG, "SNTP 时间同步完成");
     s_ctx.sntp_synced = true;
+    s_ctx.time_from_nvs = false; /* 拿到真实时间，兜底标记撤销 → 日历恢复触发 */
+    nvs_save_last_time();        /* 有更准的来源，覆盖 NVS 旧值 */
 }
 
 static void sntp_time_sync_init(void)
@@ -347,6 +452,41 @@ static void sntp_time_sync_init(void)
              REMINDER_MOCK_YEAR, REMINDER_MOCK_MON, REMINDER_MOCK_DAY,
              REMINDER_MOCK_HOUR, REMINDER_MOCK_MIN);
 #else
+    /* ── 开机时间兜底：先用 NVS 里"上次联网时的时间"回填系统时钟 ──────────────
+     * 设备首次必然配网成功，故 NVS 里一定存过时间。断网开机时若不回填，系统时间会
+     * 停在 1970，poll_timer_callback 里闹钟/日历/天气全部失效（见 sntp_synced 判断）。
+     * 回填后 RTC 从这个起点继续走，闹钟（只看时分）可正常准点触发。
+     * 注意：只在系统时间明显无效（早于 2020 年）时才回填——若 RTC 里已有本次开机
+     * SNTP 同步过的真实时间，绝不能用 NVS 旧值把它覆盖回去。
+     * 回填得到的时间标记 time_from_nvs=true，日历据此暂停触发（日期可能已偏差）。 */
+    {
+        time_t sys_now = time(NULL);
+        if (sys_now < REMINDER_TIME_VALID_EPOCH) /* 系统时钟还停在 1970 */
+        {
+            nvs_handle_t handle;
+            if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) == ESP_OK)
+            {
+                int64_t saved = 0;
+                if (nvs_get_i64(handle, "last_time", &saved) == ESP_OK &&
+                    saved > REMINDER_TIME_VALID_EPOCH)
+                {
+                    struct timeval tv = {.tv_sec = (time_t)saved, .tv_usec = 0};
+                    settimeofday(&tv, NULL);
+                    s_ctx.sntp_synced = true;  /* 有可用时间 → 放行闹钟等时间相关功能 */
+                    s_ctx.time_from_nvs = true; /* 但标记为兜底 → 日历暂停触发 */
+
+                    struct tm t;
+                    time_t st = (time_t)saved;
+                    localtime_r(&st, &t);
+                    ESP_LOGW(TAG, "无网络，已用 NVS 兜底时间回填：%04d-%02d-%02d %02d:%02d"
+                                  "（闹钟可用；日历因日期可能偏差暂停触发）",
+                             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min);
+                }
+                nvs_close(handle);
+            }
+        }
+    }
+
     ESP_LOGI(TAG, "初始化 SNTP 时间同步... 时区=%s", REMINDER_TZ);
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "ntp.aliyun.com");
@@ -530,6 +670,10 @@ static esp_err_t weather_fetch_and_notify(void)
 
     s_ctx.weather_data.valid = true;
     xSemaphoreGive(s_ctx.mutex);
+
+    /* ★ 缓存本次结果到 NVS：断网开机时读出来直接显示，避免天气页空着
+     *   （"等待天气数据 / 湿度—% / 降水量—mm"）。每次成功获取都覆盖，保持最新。 */
+    nvs_save_weather_data();
 
     weather_info_free(info); // 必须释放
     return ESP_OK;
@@ -721,8 +865,18 @@ static void poll_timer_callback(void *arg)
         }
     }
 
-    /* ── 日历事件检查 ── */
-    if (current_min != s_ctx.last_cal_check_min)
+    /* ── 日历事件检查 ──
+     * ★ 兜底时间下暂停触发：日历匹配的是"年/月/日+时分"（下方 cal->year/month/day），
+     *   而 NVS 兜底时间只是"上次联网时刻 + 本次开机后经过的时长"，掉电期间流逝的时间
+     *   完全丢失——断电一晚日期可能还对，断电三天日期就差三天，日历会在错误的日子误报
+     *   或彻底错过。闹钟只看时分（每天循环），兜底下依然准点，故不受此限制。
+     *   SNTP 一旦同步成功，time_from_nvs 置回 false，日历自动恢复触发。 */
+    if (s_ctx.time_from_nvs)
+    {
+        /* 仍推进检查时间戳，避免恢复联网后一次性补触发一大批过期事件 */
+        s_ctx.last_cal_check_min = current_min;
+    }
+    else if (current_min != s_ctx.last_cal_check_min)
     {
         /* [FIX-3] */
         if (xSemaphoreTake(s_ctx.mutex, 0) == pdTRUE)
@@ -839,8 +993,27 @@ static void reminder_task(void *arg)
         case REM_EVT_TIMER_EXPIRE:
             ESP_LOGI(TAG, "倒计时 #%d 到期: %s", evt.id, evt.message);
             s_ctx.state = REMINDER_STATE_NOTIFYING;
+            /* ⚠️【顺序：先切页，再震动】2026-08-10 修正。
+             *
+             * 原实现把 bsp_motor_pulse_level 放在 trigger_cb 之前，而该函数内含
+             * vTaskDelay 整段阻塞（现为 TIMER_EXPIRE_VIBRATE_MS = 3 秒）。
+             * trigger_cb 里要调 ui_show_countdown_expired() 切界面，于是变成
+             * 「震完 3 秒才切页」—— 实测日志：到期 1081709 → 震动结束 1083729
+             * → 画面才动，用户感知就是"震动早就停了界面才变"。
+             *
+             * 改为 trigger_cb 在前：切页几乎与到期同刻发生，随后震动 3 秒，
+             * 画面与震动同时进行（需求：切页可以比震动早，绝不能等震动结束）。
+             * ui_show_countdown_expired() 内部只等最多 100ms 的 LVGL 锁，
+             * 不会明显推迟震动起始时刻。 */
             if (s_ctx.trigger_cb)
                 s_ctx.trigger_cb(REMINDER_TYPE_TIMER, evt.message, false);
+
+            /* 到期长震一次（时长/强度见 reminder.h 的 TIMER_EXPIRE_VIBRATE_* 宏）。
+             * bsp_motor_pulse_level 内含 vTaskDelay 阻塞，本处在 reminder_task 自己的
+             * 任务上下文，阻塞 3 秒不影响 LVGL 刷屏与音频链路。 */
+            ESP_LOGI(TAG, "到期震动开始: 强度=%d 时长=%dms", TIMER_EXPIRE_VIBRATE_LEVEL, TIMER_EXPIRE_VIBRATE_MS);
+            bsp_motor_pulse_level(TIMER_EXPIRE_VIBRATE_LEVEL, TIMER_EXPIRE_VIBRATE_MS);
+            ESP_LOGI(TAG, "到期震动结束");
             s_ctx.state = REMINDER_STATE_IDLE;
             break;
 
@@ -854,6 +1027,15 @@ static void reminder_task(void *arg)
             break;
 
         case REM_EVT_WEATHER_FETCH:
+            // ★ 离线模式拦截（本模块最关键的一处）：weather_fetch_and_notify() 是
+            //   **同步阻塞** HTTP。断网时它要走完 DNS 解析失败 → connect 超时的完整
+            //   链路（数秒），期间整个 reminder 任务被卡住，闹钟/倒计时/日历的到期
+            //   判定全部被拖延 → 本地提醒功能受连累。离线时直接跳过，保住本地功能。
+            if (bsp_wifi_is_offline_mode())
+            {
+                ESP_LOGW(TAG, "离线模式，跳过天气播报（本地闹钟/日历不受影响）");
+                break;
+            }
             ESP_LOGI(TAG, "执行天气播报");
             s_ctx.state = REMINDER_STATE_NOTIFYING;
             weather_fetch_and_notify();
@@ -955,6 +1137,7 @@ esp_err_t reminder_init(reminder_trigger_cb_t cb)
     nvs_load_alarms();
     nvs_load_calendars();
     nvs_load_weather_config();
+    nvs_load_weather_data(); /* 载入上次天气缓存，断网时天气页不再空白 */
 
     sntp_time_sync_init();
 
@@ -1007,11 +1190,44 @@ esp_err_t reminder_init(reminder_trigger_cb_t cb)
 
     s_ctx.initialized = true;
     ESP_LOGI(TAG, "提醒系统初始化完成");
+
+    /* ★ 离线拦截：下面两步都是同步阻塞 HTTP（IP 定位 + 天气拉取），断网时每一步都要
+     *   走完 DNS 解析失败 → connect 超时的完整链路（数秒），把开机流程白白拖慢。
+     *   离线时直接跳过：城市用 NVS 里的配置，天气用 NVS 里的上次缓存，均已在上面载入。 */
+    if (bsp_wifi_is_offline_mode())
+    {
+        ESP_LOGW(TAG, "离线模式，跳过 IP 定位与天气拉取（使用 NVS 缓存数据）");
+        return ESP_OK;
+    }
+
     // 3.5 IP 自动定位城市（WiFi 已连接，获取天气城市代码）
     reminder_auto_locate_city();
     // 3.6 定位成功后立即拉取一次天气数据（否则要等到定时播报才有数据）
     reminder_weather_fetch_now();
     return ESP_OK;
+}
+
+// ─── reminder_on_offline_mode ────────────────────────────────────────────────
+
+/**
+ * @brief 通知提醒系统进入离线模式（接口说明见 reminder.h）
+ */
+void reminder_on_offline_mode(void)
+{
+    if (!s_ctx.initialized)
+        return;
+
+#ifndef REMINDER_MOCK_TIME
+    /* 停掉 SNTP 轮询：射频已关，UDP 包发不出去，留着纯属周期性空转 */
+    esp_sntp_stop();
+#endif
+
+    /* 关闭定时天气拉取：避免 07:30/11:30/15:30/19:30 四个时间点各白跑一次超时链路。
+     * 天气页继续显示 NVS 里的上次缓存（nvs_load_weather_data 已在 init 载入）。 */
+    s_ctx.weather_cfg.schedule = WEATHER_SCHEDULE_DISABLED;
+
+    ESP_LOGW(TAG, "提醒系统已切到离线模式：SNTP 与定时天气拉取已停止；"
+                  "闹钟/倒计时照常，天气显示上次缓存数据");
 }
 
 void reminder_deinit(void)
