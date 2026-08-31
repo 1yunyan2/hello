@@ -20,6 +20,7 @@
 #include "freertos/FreeRTOS.h" // pdMS_TO_TICKS
 #include "freertos/task.h"     // vTaskDelay（错峰归中用）
 #include "freertos/semphr.h"   // 互斥锁，保证多任务调用线程安全
+#include "esp_timer.h"         // 【诊断·验证完可随诊断日志一并删除】esp_timer_get_time 测拿锁耗时
 #include "bsp/bsp_config.h"
 // 注意：robot_emotion_t 唯一定义在 interaction.h，此处不重复定义。
 // 注意：不 include servo_manager.h，避免与上层形成循环依赖。
@@ -344,18 +345,148 @@ void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms)
     // 每次循环移动 1 度，然后等待 step_ms 毫秒，产生匀速平滑效果
     float step_dir = (safe_target > current) ? 1.0f : -1.0f; // 确定运动方向
 
+    bool aborted = false;
     for (float a = current;
          (step_dir > 0) ? (a <= safe_target) : (a >= safe_target);
          a += step_dir)
     {
+        // 每步检查打断请求：远程控制抢占 / 进功能盘 flush 时立即停在当前角度，
+        // 不再走完整个行程（把打断延迟从「一整轮动作」降到「一个 step」≈几十 ms）。
+        // 与 bsp_servo_move_all_parallel 的 aborted 处理保持同一套语义。
+        if (bsp_servo_abort_requested())
+        {
+            aborted = true;
+            break;
+        }
         iot_servo_write_angle(LEDC_LOW_SPEED_MODE, channel, a);
         vTaskDelay(pdMS_TO_TICKS(step_ms)); // 每度等待 step_ms ms
     }
 
     // ── 步骤 6：兜底对齐（确保最终精准停在目标位置，消除循环步进的浮点累积误差）──
-    iot_servo_write_angle(LEDC_LOW_SPEED_MODE, channel, safe_target);
+    // ★被打断时【必须跳过】：否则这一笔会直接把目标角 PWM 写下去，舵机靠机械惯性
+    // 一路转到目标位，打断等于白做。被打断则停在当前插值角度，由后续动作从此处接管。
+    if (!aborted)
+    {
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, channel, safe_target);
+    }
 
     // ── 解锁：本次运动完成，释放通道 ─────────────────────────────────────────
+    xSemaphoreGive(s_ch_mutex[channel]);
+}
+
+/**
+ * @brief 抢占式平滑运动：拿到通道锁【之后】才清打断标志，随即插值
+ *
+ * 与 bsp_servo_move_smooth 的【唯一】差别：在 xSemaphoreTake 成功之后、插值之前，
+ * 多调一次 bsp_servo_clear_abort()。其余逻辑逐行相同。
+ *
+ * 【为什么需要它】抢占方（remote_control 的 rc_worker）原本的写法是：
+ *     bsp_servo_clear_abort();          // ① 清标志
+ *                                       // ② ← 窗口：此处可被抢占
+ *     bsp_servo_move_smooth(...);       // ③ 进函数后才拿锁
+ * ①③ 之间不是原子的。窗口 ② 里若 servo_manager worker 恰好取到新请求，它会先清标志、
+ * 再开始新动作并【持有通道锁】；等 rc_worker 走到 ③ 时锁已被占，只能阻塞等待，而拿到锁
+ * 时新动作可能又置了标志 → 插值首步 break → 手臂停在半路不动。窗口只有几个调度周期宽，
+ * 故表现为约 1/10 的偶发「下发后停住、再点一次才到位」（2026-08-05 实测）。
+ * 本函数把顺序倒过来：【先拿锁 → 再清标志 → 立即插值】，清标志时锁已在手，
+ * servo_manager worker 即使想开始新动作也拿不到锁，窗口消失。
+ *
+ * 【为什么不直接改 bsp_servo_move_smooth】那个函数被 servo_manager worker 自己调用，
+ * 若改成「进函数就清打断标志」，flush 打断机制会整个失效（worker 一进去就把上层刚置的
+ * 标志抹掉）。故只能给抢占方单开入口，原函数及其全部调用方保持不动。
+ *
+ * @param channel  舵机通道（CH_HEAD / CH_L_ARM / CH_R_ARM）
+ * @param target   目标绝对角（度，受软限位裁剪）
+ * @param step_ms  步进延时（毫秒/度），0 = 瞬间模式
+ * @note 仅供「抢占后立即接管」的场景使用（当前唯一调用方：remote_control 的 rc_worker）。
+ *       调用前应先确保被抢占方已让出锁（rc_worker 用 servo_manager_is_idle() 轮询）。
+ */
+void bsp_servo_move_smooth_preempt(uint8_t channel, float target, uint32_t step_ms)
+{
+    bsp_board_t *board = bsp_board_get_instance();
+
+    if (board == NULL || !board->servo_initialized)
+    {
+        ESP_LOGE(TAG, "舵机未就绪，拒绝执行动作指令!");
+        return;
+    }
+
+    if (channel >= 3 || s_ch_mutex[channel] == NULL)
+    {
+        ESP_LOGE(TAG, "无效通道 %d 或互斥锁未初始化!", channel);
+        return;
+    }
+
+    // 【诊断·2026-08-05·验证完即删】记录拿锁耗时：区分「卡在等锁」与「拿到锁但没走」
+    int64_t t_lock0 = esp_timer_get_time();
+    xSemaphoreTake(s_ch_mutex[channel], portMAX_DELAY);
+    int64_t lock_wait_ms = (esp_timer_get_time() - t_lock0) / 1000;
+
+    // ★与 bsp_servo_move_smooth 的唯一差别：锁已在手，此刻清标志不会被任何人插队。
+    //   清在读角度之前即可——后面的插值循环每步都会再查一次。
+    bsp_servo_clear_abort();
+
+    float safe_target = clamp_safe_angle(channel, target);
+
+    float current = 0.0f;
+    esp_err_t err = iot_servo_read_angle(LEDC_LOW_SPEED_MODE, channel, &current);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "读取通道 %d 角度失败!", channel);
+        xSemaphoreGive(s_ch_mutex[channel]);
+        return;
+    }
+
+    // 【诊断】进入运动前的全部关键量：等锁多久、当前角、目标角、限位后目标
+    ESP_LOGW(TAG, "[诊断] ch=%u 等锁=%lldms current=%.1f target=%.1f safe=%.1f step=%ums",
+             (unsigned)channel, lock_wait_ms, current, target, safe_target, (unsigned)step_ms);
+
+    if (fabs(safe_target - current) < 1.0f)
+    {
+        // 【诊断】死区提前返回——手臂不动的候选原因之一
+        ESP_LOGW(TAG, "[诊断] ch=%u 命中死区(|%.1f-%.1f|<1) 直接返回，未运动",
+                 (unsigned)channel, safe_target, current);
+        xSemaphoreGive(s_ch_mutex[channel]);
+        return;
+    }
+
+    if (step_ms == 0)
+    {
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, channel, safe_target);
+        xSemaphoreGive(s_ch_mutex[channel]);
+        return;
+    }
+
+    float step_dir = (safe_target > current) ? 1.0f : -1.0f;
+
+    bool aborted = false;
+    int steps = 0; // 【诊断】实际走了几步
+    float last_a = current;
+    for (float a = current;
+         (step_dir > 0) ? (a <= safe_target) : (a >= safe_target);
+         a += step_dir)
+    {
+        // 保留每步检查：本次运动仍可被【后续】的新指令/flush 打断（那是预期行为）。
+        if (bsp_servo_abort_requested())
+        {
+            aborted = true;
+            break;
+        }
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, channel, a);
+        steps++;
+        last_a = a;
+        vTaskDelay(pdMS_TO_TICKS(step_ms));
+    }
+
+    if (!aborted)
+    {
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, channel, safe_target);
+    }
+
+    // 【诊断】循环结果：走了几步、是否被打断、停在哪
+    ESP_LOGW(TAG, "[诊断] ch=%u 结束 steps=%d aborted=%d 停在=%.1f 兜底写入=%s",
+             (unsigned)channel, steps, (int)aborted, last_a, aborted ? "跳过" : "已写");
+
     xSemaphoreGive(s_ch_mutex[channel]);
 }
 

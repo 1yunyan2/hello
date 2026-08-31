@@ -205,8 +205,8 @@
 //   （13bit 需 40.96MHz > 40MHz XTAL 做不出）。10bit = 1024 级调光，肉眼足够。
 #define BSP_LCD_BK_LEDC_CLK LEDC_USE_XTAL_CLK ///< 与舵机统一的时钟源（XTAL 40MHz，枚举号 11）
 #define BSP_LCD_BK_LEDC_FREQ_HZ 5000          ///< 背光 PWM 频率 5kHz（无可闻噪声、无屏幕频闪）
-#define BSP_LCD_BK_LEDC_RES LEDC_TIMER_10_BIT ///< 10 位分辨率（占空范围 0~1023，与舵机一致）
-#define BSP_LCD_BK_DUTY_MAX 1023              ///< 10 位满占空（对应 100% 亮度）
+#define BSP_LCD_BK_LEDC_RES LEDC_TIMER_12_BIT ///< 12 位分辨率（占空范围 0~8191，与舵机一致）
+#define BSP_LCD_BK_DUTY_MAX 4095              ///< 12 位满占空（对应 100% 亮度）
 #define BSP_LCD_BK_DEFAULT_PCT 100            ///< 正常点亮亮度（%）
 #define BSP_LCD_BK_STANDBY_PCT 10             ///< 待机模式亮度（%）
 
@@ -221,6 +221,17 @@
 // 物理面板坐标由 esp_lcd 框架在 draw_bitmap 时按 swap_xy 自动换算。
 #define BSP_LCD_WIDTH 320  ///< LVGL 逻辑宽度（横屏旋转后视角）
 #define BSP_LCD_HEIGHT 240 ///< LVGL 逻辑高度（横屏旋转后视角）
+
+// ★ 面板自身扫描频率（ST7789 FRCTRL2 / 寄存器 0xC6 的 bits[4:0] RTNA）
+//   注意：这是「液晶多久把屏幕扫一遍」，不是 LVGL 的刷新周期
+//   (CONFIG_LV_DEF_REFR_PERIOD，那个是「我们多久送一次数据」)。
+//   本屏未引出 TE 引脚（[BUG-041]），写 GRAM 与扫描无法同步，撕裂无法根除；
+//   但撕裂画面会一直显示到下一遍扫描盖掉，提高扫描频率可缩短其存留时间：
+//     60Hz→16.7ms，111Hz→9.0ms，119Hz→8.4ms
+//   取值：0x00=119Hz 0x01=111Hz 0x03=99Hz 0x05=90Hz 0x07=82Hz
+//         0x09=75Hz  0x0B=69Hz  0x0D=64Hz 0x0F=60Hz(出厂默认) 0x1F=39Hz
+//   若出现闪烁/偏色/花屏，按上表往回退档；填 0x0F 即恢复默认行为。
+#define BSP_LCD_FRAME_RATE_REG 0x01 ///< 面板扫描频率寄存器值（0x01≈111Hz）
 
 // ─── 5. 运动与反馈外设引脚 ──────────────────────────────────────────────────
 // 所有运动外设通过 PWM 信号驱动
@@ -246,9 +257,9 @@
 #define BSP_MOTOR_DUTY_MAX 1023                 ///< 10 位满占空
 #define BSP_MOTOR_DEFAULT_STRENGTH 100          ///< 触摸反馈默认震动强度（%）
 
-#define BSP_SERVO_R_ARM_PIN 4 // 4 右臂舵机 PWM 引脚
-#define BSP_SERVO_HEAD_PIN 14 // 14 头部舵机 PWM 引脚
-#define BSP_SERVO_L_ARM_PIN 9 // 9 左臂舵机 PWM 引脚
+#define BSP_SERVO_R_ARM_PIN 9 // 左臂舵机 PWM 引脚
+#define BSP_SERVO_HEAD_PIN 14 // 头部舵机 PWM 引脚
+#define BSP_SERVO_L_ARM_PIN 4 // 右臂舵机 PWM 引脚
 // 舵机逻辑通道映射 (供上层调用)
 #define CH_HEAD 0  ///< 头部舵机逻辑通道编号（对应 LEDC_CHANNEL_0，引脚 GPIO38）
 #define CH_L_ARM 1 ///< 左臂舵机逻辑通道编号（对应 LEDC_CHANNEL_1，引脚 GPIO47）
