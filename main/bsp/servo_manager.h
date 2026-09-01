@@ -152,6 +152,24 @@ esp_err_t servo_manager_submit_abs_parallel_notify(const servo_abs_parallel_requ
 esp_err_t servo_manager_flush(void);
 
 /**
+ * @brief 清队并打断当前动作，可选择【打断后是否归中】。
+ *
+ * servo_manager_flush() 等价于 servo_manager_flush_ex(true)，语义完全不变。
+ *
+ * 【为何需要 center=false】归中服务的是「打断后没有后续动作接管」的场景
+ * （进功能盘 / 强制回主 / OTA 停止）——动作停在半路姿态难看，故带回中位。
+ * 但远程控制（app 下发舵机角度）是【有后续接管】的：打断空闲动作后，rc_worker
+ * 紧接着就要把手臂送到用户指定角度。此时归中不仅多余，还会与 rc_worker 抢同一把
+ * 通道锁，产生竞态——实测表现为「到位后又被慢速拉回 90°」「先归中再走到目标」
+ * 「归中走一半停住」三种随机现象（2026-08-05）。
+ * 同一思路见 remote_control_cancel(center_servo=false) 的注释。
+ *
+ * @param center true=打断后平滑归中 90°（原行为）；false=停在当前角度，交由调用方接管
+ * @return ESP_OK
+ */
+esp_err_t servo_manager_flush_ex(bool center);
+
+/**
  * @brief 查询 servo_manager 是否「真正空闲」（队列空 且 worker 当前无请求在执行/归中）
  *
  * 供 standby.c 进二级待机前判断舵机是否已彻底静止：相比「固定延时猜测」，本接口

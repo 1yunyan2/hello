@@ -67,6 +67,11 @@ static uint8_t *s_queue_storage = NULL;      // heap_caps_malloc(..., MALLOC_CAP
 // 在下一个循环边界 break 跳出；worker 归中后清回 false。atomic 保证跨核可见（plan R2）。
 static atomic_bool s_flush_req = ATOMIC_VAR_INIT(false);
 
+// flush「打断后是否归中」标志：servo_manager_flush_ex(center) 在置 s_flush_req 前写入。
+// true（默认/旧行为）=打断后平滑归中 90°；false=停在当前角度，由调用方接管后续运动。
+// 远程控制走 false：rc_worker 紧接着要把手臂送到用户指定角，归中会与它抢通道锁产生竞态。
+static atomic_bool s_flush_center = ATOMIC_VAR_INIT(true);
+
 // ★worker「真正空闲」标志（供 standby.c 进二级前判断舵机是否已彻底静止，见 servo_manager_is_idle）。
 //   根因：旧实现里 standby.c 只查 interaction_is_playing()==false + 固定等 200ms 就认为舵机
 //   已静止，但 servo_manager worker 的归中动作（bsp_servo_move_all_parallel 90/90/90）是在本
@@ -116,14 +121,14 @@ static void servo_exec_single(const servo_request_t *r)
             bsp_servo_move_smooth(r->channel, opposite, r->speed_ms); // 移动到相反位置
         }
         // 最后回中到90度位置
-        bsp_servo_move_smooth(r->channel, 90.0f, SERVO_SPEED_MID);
+        bsp_servo_move_smooth(r->channel, 90.0f, SERVO_SPEED_CENTER);
     }
     else
     {
         // 单次到位模式：移动到目标位置后回中
         bsp_servo_move_smooth(r->channel, primary, r->speed_ms);
         // 回中以保证一致性（UI 习惯），若不需要可改为不回中
-        bsp_servo_move_smooth(r->channel, 90.0f, SERVO_SPEED_MID);
+        bsp_servo_move_smooth(r->channel, 90.0f, SERVO_SPEED_CENTER);
     }
 }
 
@@ -186,6 +191,9 @@ static bool servo_exec_parallel(const servo_parallel_request_t *p)
             (loop < axes[1]->count) ? prim[1] : 90.0f,
             (loop < axes[2]->count) ? prim[2] : 90.0f,
             speed);
+        // ★段间补检：理由同 servo_exec_abs_parallel，见该函数内注释。
+        if (atomic_load(&s_flush_req) || bsp_servo_abort_requested())
+            return true;
 
         // 后半段：仅 oscillate 时三轴同时到 opposite（往返）
         if (any_osc)
@@ -195,6 +203,8 @@ static bool servo_exec_parallel(const servo_parallel_request_t *p)
                 (loop < axes[1]->count && axes[1]->oscillate) ? opp[1] : ((loop < axes[1]->count) ? prim[1] : 90.0f),
                 (loop < axes[2]->count && axes[2]->oscillate) ? opp[2] : ((loop < axes[2]->count) ? prim[2] : 90.0f),
                 speed);
+            if (atomic_load(&s_flush_req) || bsp_servo_abort_requested())
+                return true;
         }
     }
 
@@ -232,6 +242,13 @@ static bool servo_exec_abs_parallel(const servo_abs_parallel_request_t *p)
             (loop < axes[1]->count) ? axes[1]->angle_1 : 90.0f,
             (loop < axes[2]->count) ? axes[2]->angle_1 : 90.0f,
             speed);
+        // ★段间补检（2026-08-05）：move_all_parallel 内部被 abort 打断后【静默返回】，
+        //   若只靠循环顶部那一次检查，count=1（绝大多数情绪动作）时外层只跑一轮，
+        //   两个 move 都被打断也照样走到函数末尾 return false ⇒ worker 误判「正常跑完」，
+        //   使 s_flush_center 失效（!aborted 恒真）而强行归中，抢走 rc_worker 要的通道锁。
+        //   实测表现：下发指令后当前动作立刻停住、但目标位置到不了，第二次下发才行。
+        if (atomic_load(&s_flush_req) || bsp_servo_abort_requested())
+            return true;
 
         // 后半段：三轴同时到 angle_2（本轴 count 用完后回 90°）
         bsp_servo_move_all_parallel(
@@ -239,6 +256,8 @@ static bool servo_exec_abs_parallel(const servo_abs_parallel_request_t *p)
             (loop < axes[1]->count) ? axes[1]->angle_2 : 90.0f,
             (loop < axes[2]->count) ? axes[2]->angle_2 : 90.0f,
             speed);
+        if (atomic_load(&s_flush_req) || bsp_servo_abort_requested())
+            return true;
     }
 
     return false;
@@ -279,13 +298,36 @@ static void servo_worker_task(void *arg)
              * - 正常跑完：标志本就为 false，直接归中。 */
             if (item.kind == REQ_KIND_PARALLEL || item.kind == REQ_KIND_ABS_PARALLEL)
             {
+                // ★2026-08-05：被打断时是否归中，取决于「打断方有没有后续动作接管」。
+                //   center=false（远程控制）：直接停在当前角度，【不清打断标志、不归中】。
+                //   清标志的活儿交给打断方（rc_submit 延时后清），worker 抢着清会把标志
+                //   在被打断方看到之前抹掉；归中则会与 rc_worker 抢通道锁 → 实测出现
+                //   「到位后又被拉回 90°」「先归中再到目标」等随机现象。
+                //   注意 aborted=false（正常跑完）时不受影响，照常归中。
+                bool do_center = !aborted || atomic_load(&s_flush_center);
+                // ★清标志与「是否归中」是两件独立的事，【不能绑在一起】。
+                //   被打断就必须清：否则标志留成 true，接管方（rc_worker）的
+                //   bsp_servo_move_smooth 插值循环首步即读到 abort → break，一度不走，
+                //   表现为「下发后当前动作停住，目标位置 100% 到不了」。
+                //   曾把这段挂在 do_center 下，导致 center=false 时连标志也一起跳过 —— 那正是
+                //   把「偶发失败」变成「必然失败」的原因（2026-08-05 实测十次全中）。
+                //   归中路径同样依赖它先清（见下方 if：否则归中自己也会被立即打断）。
                 if (aborted)
                 {
-                    // 先清两个打断标志，再归中——否则归中的插值/外层循环也会被立即打断，归不了中。
                     atomic_store(&s_flush_req, false);
                     bsp_servo_clear_abort();
                 }
-                bsp_servo_move_all_parallel(90.0f, 90.0f, 90.0f, SERVO_SPEED_MID);
+                if (do_center)
+                {
+                    /* 【2026-09-01】速度由 SERVO_SPEED_MID(15ms/度) 改为独立的
+                     * SERVO_SPEED_CENTER(当前 30ms/度)：用户反馈归中太快、显得机械。
+                     * 单列一个宏而不是直接改 MID —— MID 是"大多数情绪动作"的速度，
+                     * 动它会把所有情绪的手感一起改掉。调速只需改 bsp_config.h 那一处。
+                     * 本行是【所有并行/绝对角度请求】归中的唯一出口：无论正常播完
+                     * 还是被 servo_manager_flush() 打断（进功能盘、闹钟/番茄钟到期）
+                     * 都走这里，故改这一行即覆盖用户能感知到的全部归中。 */
+                    bsp_servo_move_all_parallel(90.0f, 90.0f, 90.0f, SERVO_SPEED_CENTER);
+                }
             }
 
             // 完成通知：带 done 信号量的请求（情绪动作）执行完毕后唤醒等待方。
@@ -428,8 +470,16 @@ esp_err_t servo_manager_submit_abs_parallel_notify(const servo_abs_parallel_requ
  * 当前设计下情绪只入队一条且 interaction take 带超时兜底，故安全（plan R4）。 */
 esp_err_t servo_manager_flush(void)
 {
+    return servo_manager_flush_ex(/*center=*/true); // 保持原语义：打断后归中
+}
+
+esp_err_t servo_manager_flush_ex(bool center)
+{
     if (!s_inited)
         return ESP_ERR_INVALID_STATE; // 初始化无效
+    // ★须在置打断标志【之前】写：worker 可能在几十 us 内就走到归中判断处，
+    //   晚写会被读到上一轮的残值。
+    atomic_store(&s_flush_center, center);
     atomic_store(&s_flush_req, true); // 通知 servo_exec 外层循环在轮边界跳出
     bsp_servo_request_abort();        // ★ 通知 bsp 插值步循环立即停（几十 ms 内），不等整轮
     xQueueReset(s_queue);             // 清掉所有未执行请求
