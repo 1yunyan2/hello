@@ -214,9 +214,14 @@ void wake_word_start(void);
 // 原先 custom_wake_word.c:315(0.2f)、:1206(0.18f)、session.c:691(0.4f)、:944(0.18f)
 // 四处硬编码且互相不一致，注释还写着已废弃的 0.12f，改动时极易漏改其中一处。
 // 统一定义在此，所有调用方引用宏，不再写字面量。
-#define WAKEWORD_THRESHOLD_CN 0.18f      // 中文常态（LISTENING）：正常音量 prob 集中 0.25~0.37，留召回余量
-#define WAKEWORD_THRESHOLD_EN 0.4f       // 英文常态：BPE 路径长，prob 天然偏低，需更高阈值才正常触发
-#define WAKEWORD_THRESHOLD_PLAYING 0.4f  // TTS 播放期：抬高门槛防 AEC 残留自激误触（可上调至 0.55f）
+// ⚠️【2026-08-25 实测修正】原注释写「正常音量 prob 集中 0.25~0.37」是错的，
+//   该结论曾导致阈值被压到 0.18，误唤醒高居不下。实测真唤醒 prob = 0.87 / 0.66
+//   （日志 "听到唤醒词了! prob=" 两次样本），识别质量本身健康。
+//   唤不醒的真因是音频丢帧（见 custom_wake_word.c 的 VAD 门控注释），不是分数不够。
+//   故阈值可以抬到 0.5：真词 0.66~0.87 仍有余量，而噪声蒙到 0.18 的误触被挡在门外。
+#define WAKEWORD_THRESHOLD_CN 0.5f      // 中文常态（LISTENING）：实测真词 0.66~0.87，0.5 留召回余量
+#define WAKEWORD_THRESHOLD_EN 0.4f      // 英文常态：BPE 路径长，prob 天然偏低，需更高阈值才正常触发
+#define WAKEWORD_THRESHOLD_PLAYING 0.5f // TTS 播放期：抬高门槛防 AEC 残留自激误触（与常态齐平，可再上调）
 
 /**
  * @brief 动态调整 MultiNet 检测概率阈值

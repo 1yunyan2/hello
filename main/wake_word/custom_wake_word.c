@@ -23,6 +23,7 @@
 #include "esp_heap_caps.h"
 #include "esp_memory_utils.h" // esp_ptr_internal()：诊断 input_buffer 落在内部 RAM 还是 SPIRAM
 #include "freertos/ringbuf.h"
+#include "esp_timer.h" // esp_timer_get_time()：统计单次 detect() 耗时（唤醒率诊断）
 static const char *TAG = "BSP_WakeWord";
 // 前向声明 afe_fetch_task，解决编译错误 "implicit declaration of function 'afe_fetch_task'"
 static void afe_fetch_task(void *arg);
@@ -96,6 +97,163 @@ static size_t input_buffer_len = 0;  // 缓冲区当前有效采样点数
 static RingbufHandle_t s_mn_pcm_buf = NULL;    // afe_fetch_task → multinet_detect_task 的 PCM 管道
 static TaskHandle_t s_mn_detect_handle = NULL; // MultiNet 检测任务句柄
 static void multinet_detect_task(void *arg);   // 前向声明
+
+// ─── 【唤醒率诊断 2026-08-25】丢帧 / detect 节奏计数 ──────────────────────
+// 【排查的问题】唤醒率低 + 误唤醒率高，且换过「你好」「小熊小熊」「自定义词」
+//   三轮结果都一样 —— 词层面已被排除，怀疑问题出在送进 detect() 的音频本身。
+//
+// 【怀疑链】multinet_detect_task 优先级 4，而 afe_fetch_task / audio_feed_task
+//   都是优先级 5 且同钉 CPU1（本文件 afe_fetch_task 注释原话：「设计上占满 CPU1」）。
+//   detect 抢不到时间片 → s_mn_pcm_buf 积压 → 下方 xRingbufferSend 零超时丢帧 →
+//   CTC 累积解码的路径被打断 → 正样本 prob 被压到 0.25~0.37（正常应 0.7+）→
+//   阈值被迫压到 0.18 才唤得动 → 噪声同样过线 → 低召回与高误报同时出现。
+//
+// 【判定标准】
+//   · s_diag_drop_frames > 0        → 丢帧坐实，怀疑链成立
+//   · 5 秒内 detect 次数 << 156     → detect 被饿死（理论 16000Hz / 512 = 31.25 次/秒）
+//   · 全为 0 且 detect 次数正常     → 本假设被证伪，转查音频质量（AGC 削波）
+//
+// ⚠️ 只做计数与打印，绝不加 heap_caps_check_integrity_all() —— 那个全量堆扫描正是
+//    上一轮把 detect() 拖慢、被整体注释停用的元凶（见下方 multinet_detect_task 内注释）。
+static volatile uint32_t s_diag_drop_frames = 0;      // 【累计】xRingbufferSend 失败（队列满）而丢弃的帧数
+static volatile uint32_t s_diag_lock_timeout = 0;     // 【累计】拿 buffer_mutex 超时、整批 PCM 被丢弃的次数
+static volatile uint32_t s_diag_overflow = 0;         // 【累计】input_buffer 溢出清空 + clean() 的次数
+static volatile uint32_t s_diag_detect_cnt = 0;       // 【本周期】detect() 实际调用次数
+static volatile uint32_t s_diag_detect_us_max = 0;    // 【本周期】单次 detect() 最大耗时（微秒）
+static volatile uint64_t s_diag_detect_us_sum = 0;    // 【本周期】detect() 累计耗时（微秒），用于算均值
+static volatile uint32_t s_diag_gated_frames = 0;     // 【累计】被 VAD 门控挡下、未喂 detect 的静音帧数
+static volatile uint32_t s_diag_gate_open_cnt = 0;    // 【累计】VAD 闸门开启次数（≈ 检测到语音的段数）
+static volatile uint32_t s_diag_gate_timeout_cnt = 0; // 【累计】闸门因超时被强制关闭的次数（噪声顶穿门控的直接指标）
+
+// ─── 【VAD 门控 2026-08-25】只在检测到语音时才喂 detect ────────────────────
+// 【解决的问题】实测主界面空闲态 detect 只能跑 81~98 次/5秒（需求 156），
+//   约 40% 的音频帧在 xRingbufferSend 处被丢弃 —— 恰恰是用户唤醒的场景。
+//   对照组：功能页（GIF 不播）detect = 154~159/156、零丢帧。差异来源是主界面
+//   GIF 持续解码 + LCD DMA 抢 PSRAM 带宽，把 detect 的单帧耗时从 21ms 拖到 45ms，
+//   而帧周期只有 32ms → 持续性欠账 → 队列必满 → 丢帧 → CTC 路径被打断。
+//
+// 【为什么门控有效】音频流是恒定 31.25 帧/秒，但人说话的时间占比不足 5%。
+//   静音帧对唤醒词检测毫无价值，却和语音帧一样占满 detect 的处理配额。
+//   静音时不喂，detect 在真正需要工作时就有整块余量把词处理完整。
+//   —— 这是治本手段：不论谁在抢 PSRAM 带宽，静音不入队就不会积压。
+//
+// 【为什么必须有 pre-roll】VAD 判定天然滞后于开口瞬间（要累积几帧能量才敢报
+//   SPEECH）。若从报 SPEECH 那一刻才开始喂，"你好小熊"的"你"字头会被削掉，
+//   CTC 拼不出完整路径。故用环形缓冲一直滚动保存最近 VAD_PREROLL_MS 的音频，
+//   闸门开启瞬间先按时序把这段历史倒进队列，再接着推当前帧。
+//
+// 【为什么还要 hangover】VAD 会在词尾能量下降时提前报静音，直接关闸会切掉尾音。
+//   故语音结束后继续喂 VAD_HANGOVER_MS 才关闸。
+//
+// ⚠️ 本门控【只作用于 MultiNet detect 这条路】。上传云端的 s_enhanced_pcm_hook
+//    必须拿到完整音频流，绝不能一起门控，否则会话 ASR 会缺字。
+#define VAD_PREROLL_MS 320                                  // 词头保护：保留多少毫秒历史音频
+#define VAD_HANGOVER_MS 600                                 // 词尾保护：静音后继续喂多久才关闸
+#define VAD_PREROLL_SAMPLES (16000 / 1000 * VAD_PREROLL_MS) // 5120 采样 ≈ 10KB
+#define VAD_HANGOVER_SAMPLES (16000 / 1000 * VAD_HANGOVER_MS)
+
+/* ★★【2026-08-25 闸门超时保护】防止环境噪声把门控顶穿 ★★
+ *
+ * 【修的问题】原本关闸的唯一条件是「连续静音累计满 VAD_HANGOVER_MS(600ms)」。
+ *   环境一吵，VAD 就持续报 SPEECH，静音计数永远攒不满 → 闸门再也关不上 →
+ *   所有帧照常灌进 detect，门控退化成「全帧投喂」，等于没做。
+ *   实测日志铁证：丢帧=10917 而门控挡下仅=1110（相差 10 倍），
+ *   同时 detect=89/156、耗时avg=56797us —— 完全退回未加门控前的饥饿状态。
+ *
+ * 【为什么用时长而不是别的判据】唤醒词最长一两秒。闸门连续开启超过 3 秒，
+ *   必定不是有人在念唤醒词，而是环境底噪/持续人声把 VAD 顶住了。
+ *   此时强制关闸，让 pre-roll 重新开始滚动，等真正的语音再开。
+ *
+ * 【为什么不在这里调 clean()】关闸发生在 afe_fetch_task（优先级 5，AFE 主循环）里，
+ *   而 multinet_iface->clean() 需要 buffer_mutex —— 那把锁在 wake_word_update()
+ *   里会被持有长达约 2 秒（模型切换 + FST 重建 + NVS 写）。在 AFE 主循环上等它
+ *   会直接把 fetch 停住 → AFE FEED ringbuffer 溢出 → 唤醒和上行音频一起废
+ *   （见本文件 afe_fetch_task 提前启动那段注释，以及 BUG-039/BUG-042）。
+ *   解码器状态交给 multinet_detect_task 自己在 TIMEOUT 时 clean，那里持锁是安全的。 */
+#define VAD_GATE_MAX_OPEN_MS 3000 // 闸门最长连续开启时长，超时强制关闸
+#define VAD_GATE_MAX_OPEN_SAMPLES (16000 / 1000 * VAD_GATE_MAX_OPEN_MS)
+
+static int16_t *s_preroll_buf = NULL;      // pre-roll 环形缓冲（SPIRAM，wake_word_init 分配）
+static size_t s_preroll_head = 0;          // 环形写指针（采样为单位）
+static size_t s_preroll_filled = 0;        // 当前已存有效采样数（≤ VAD_PREROLL_SAMPLES）
+static bool s_vad_gate_enabled = false;    // 门控总开关：pre-roll 分配失败时退化为「全喂」旧行为
+static bool s_vad_gate_open = false;       // 闸门状态：true = 正在把音频喂给 detect
+static size_t s_vad_silence_samples = 0;   // 闸门开着时累计的连续静音采样数（用于 hangover 判定）
+static size_t s_vad_gate_open_samples = 0; // 闸门本次已连续开启的采样数（用于超时强制关闸）
+
+/**
+ * @brief 把一帧音频滚动写入 pre-roll 环形缓冲（只在闸门关闭的静音期调用）
+ *
+ * 环形覆盖最老的数据，始终保留最近 VAD_PREROLL_SAMPLES 个采样。
+ * 用两段 memcpy 而非逐样本循环，避免在 afe_fetch_task（优先级 5）里做无谓开销。
+ *
+ * @param data    AFE 输出的降噪 PCM
+ * @param samples 本帧采样点数
+ * @note 调用者：afe_fetch_task（静音且闸门关闭时）
+ */
+static void preroll_push(const int16_t *data, size_t samples)
+{
+    if (!s_preroll_buf || samples == 0)
+        return;
+
+    // 单帧就超过环形容量：只保留该帧最后 VAD_PREROLL_SAMPLES 个采样
+    if (samples >= VAD_PREROLL_SAMPLES)
+    {
+        memcpy(s_preroll_buf, data + (samples - VAD_PREROLL_SAMPLES),
+               VAD_PREROLL_SAMPLES * sizeof(int16_t));
+        s_preroll_head = 0;
+        s_preroll_filled = VAD_PREROLL_SAMPLES;
+        return;
+    }
+
+    // 第一段：从写指针写到缓冲尾部
+    size_t first = VAD_PREROLL_SAMPLES - s_preroll_head;
+    if (first > samples)
+        first = samples;
+    memcpy(&s_preroll_buf[s_preroll_head], data, first * sizeof(int16_t));
+
+    // 第二段：绕回缓冲头部
+    size_t rest = samples - first;
+    if (rest > 0)
+        memcpy(s_preroll_buf, data + first, rest * sizeof(int16_t));
+
+    s_preroll_head = (s_preroll_head + samples) % VAD_PREROLL_SAMPLES;
+    s_preroll_filled += samples;
+    if (s_preroll_filled > VAD_PREROLL_SAMPLES)
+        s_preroll_filled = VAD_PREROLL_SAMPLES;
+}
+
+/**
+ * @brief 闸门开启瞬间，把 pre-roll 里的历史音频按时序倒进 detect 队列（补词头）
+ *
+ * 环形缓冲里最老的数据位于 (head - filled) 处，可能跨越尾部，故分两段发送。
+ * 倒完即清空：这段音频已经进入队列，留着会在下次开闸时被重复喂入。
+ *
+ * @note 调用者：afe_fetch_task（VAD 由静音跳变为语音时）
+ */
+static void preroll_flush_to_queue(void)
+{
+    if (!s_preroll_buf || s_preroll_filled == 0)
+        return;
+
+    size_t start = (s_preroll_head + VAD_PREROLL_SAMPLES - s_preroll_filled) % VAD_PREROLL_SAMPLES;
+    size_t first = VAD_PREROLL_SAMPLES - start;
+    if (first > s_preroll_filled)
+        first = s_preroll_filled;
+
+    if (xRingbufferSend(s_mn_pcm_buf, &s_preroll_buf[start], first * sizeof(int16_t), 0) != pdTRUE)
+        s_diag_drop_frames++;
+
+    size_t rest = s_preroll_filled - first;
+    if (rest > 0)
+    {
+        if (xRingbufferSend(s_mn_pcm_buf, s_preroll_buf, rest * sizeof(int16_t), 0) != pdTRUE)
+            s_diag_drop_frames++;
+    }
+
+    s_preroll_filled = 0;
+    s_preroll_head = 0;
+}
 
 // ─── MultiNet detect() 崩溃诊断状态（已提 issue，诊断打印已注释停用，见下方）───
 // 现象：空闲监听、从未唤醒，随机 10s~1h 内必崩于 esp-sr 的 ctc_decoder.c
@@ -450,6 +608,21 @@ esp_err_t wake_word_init(wake_word_detected_cb_t cb)
              (int)(AUDIO_BUFFER_MAX * sizeof(int16_t)),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
+    // ── VAD 门控 pre-roll 环形缓冲（约 10KB SPIRAM）─────────────────────────
+    // 【分配失败不致命】s_vad_gate_enabled 保持 false，门控整体退化为旧的
+    //   「每帧都喂」行为：丢帧问题依旧，但绝不会因为缺了词头保护而把唤醒词切坏。
+    //   宁可维持已知的旧问题，也不引入新的、更难查的截词问题。
+    s_preroll_buf = heap_caps_malloc(VAD_PREROLL_SAMPLES * sizeof(int16_t),
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_preroll_head = 0;
+    s_preroll_filled = 0;
+    s_vad_gate_open = false;
+    s_vad_silence_samples = 0;
+    s_vad_gate_enabled = (s_preroll_buf != NULL);
+    ESP_LOGW(TAG, "VAD 门控: %s（pre-roll %d ms / hangover %d ms，静音帧不再喂 detect）",
+             s_vad_gate_enabled ? "已启用" : "pre-roll 分配失败，退化为全帧投喂",
+             VAD_PREROLL_MS, VAD_HANGOVER_MS);
+
     // 扫描 SPIFFS "model" 分区，建立模型文件列表
     models = esp_srmodel_init("model");
     //=-1 是 esp_srmodel_init 在分区未挂载或缺失时的错误标志
@@ -502,16 +675,16 @@ esp_err_t wake_word_init(wake_word_detected_cb_t cb)
     // 精确控制各子模块开关
     afe_cfg->wakenet_init = false;             // 不用 WakeNet，MultiNet 做唤醒词
     afe_cfg->aec_init = true;                  // ★ 开启 AEC 回声消除（需要 "MR" 格式参考信号）
-    afe_cfg->aec_mode = AEC_MODE_SR_LOW_COST;  // 低功耗 AEC（SR 场景推荐）
+    afe_cfg->aec_mode = AEC_MODE_SR_HIGH_PERF; // 高性能 AEC（SR 场景推荐）
     afe_cfg->se_init = false;                  // 单麦无需 BSS/MASE 多麦阵列处理
-    afe_cfg->ns_init = true;                   // ★ 开启 NS 噪声抑制（核心功能）
+    afe_cfg->ns_init = false;                  // ★ 开启 NS 噪声抑制（核心功能）
     afe_cfg->afe_ns_mode = AFE_NS_MODE_WEBRTC; // WebRTC NS 模式，兼顾降噪效果和语音质量
     // ★ 开启 AGC（自动增益控制）：AFE_AGC_MODE_WAKENET 专为唤醒词优化。
     // 问题根因：WebRTC NS 会同时抑制噪声和安静的语音，导致 MultiNet 置信度极低（必须大喊才识别）。
     // WAKENET AGC 在 NS 输出后自适应补偿增益：放大安静人声，同时限制底噪放大幅度。
     // 效果：普通音量说"你好小熊"的置信度提升，阈值 0.3 可覆盖更多正常发音。
-    afe_cfg->agc_init = true;
-    afe_cfg->agc_mode = AFE_AGC_MODE_WAKENET;                 // WAKENET AGC 模式，专为唤醒词场景设计，配合 WebRTC NS 使用
+    afe_cfg->agc_init = false;
+    // afe_cfg->agc_mode = AFE_AGC_MODE_WAKENET;                 // WAKENET AGC 模式，专为唤醒词场景设计，配合 WebRTC NS 使用
     afe_cfg->vad_init = true;                                 //! ★ 开启 VAD 语音活动检测（核心功能）
     afe_cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM; // 尽量用 PSRAM 省内部 SRAM
     afe_cfg->vad_mode = VAD_MODE_1;                           // VAD 模式 1：适合唤醒词场景，快速响应，适度误触；
@@ -904,8 +1077,82 @@ static void afe_fetch_task(void *arg)
         // 队列满时直接丢弃：detect 暂时跟不上不影响 AFE 链路，只轻微影响识别率。
         if (is_running && multinet_model_data != NULL && s_mn_pcm_buf != NULL)
         {
-            // 0 超时 = 非阻塞，绝不阻塞 fetch 循环
-            xRingbufferSend(s_mn_pcm_buf, res->data, res->data_size, 0);
+            // ── 【VAD 门控 2026-08-25】静音不喂 detect，只在有语音时入队 ──────
+            // 机理与 pre-roll/hangover 的必要性见文件上方 s_preroll_buf 处的大段注释。
+            // 0 超时 = 非阻塞，绝不阻塞 fetch 循环；返回非 pdTRUE 即队列满丢帧。
+            size_t frame_samples = res->data_size / sizeof(int16_t);
+            bool is_speech = (res->vad_state == VAD_SPEECH);
+
+            /* ★【闸门超时保护】必须在下面所有分支【之前】判定 ★
+             * 放在 is_speech 分支之后是无效的：环境噪声下每一帧都是 SPEECH，
+             * 会不断把闸门续开，超时判据永远轮不到执行。
+             * 累计的是「闸门开启后经过的全部帧」（语音帧 + hangover 静音帧），
+             * 超过 VAD_GATE_MAX_OPEN_SAMPLES 即认定是噪声顶住了 VAD，强制关闸。
+             * 关闸后本帧落入下方「静音且闸门关闭」或「语音帧重新开闸」分支：
+             *   · 若确实是噪声 → 下一帧仍是 SPEECH，会立刻重新开闸，但 pre-roll
+             *     已被 flush 清空、重新滚动，detect 至少获得了一次喘息与状态重置的机会；
+             *   · 若是真人在长时间说话 → 同样重新开闸，唤醒词该检出照常检出。
+             * 因此本保护【不会】让设备变聋，只是防止无限期单向灌入。 */
+            if (s_vad_gate_enabled && s_vad_gate_open)
+            {
+                s_vad_gate_open_samples += frame_samples;
+                if (s_vad_gate_open_samples > VAD_GATE_MAX_OPEN_SAMPLES)
+                {
+                    s_vad_gate_open = false;
+                    s_vad_silence_samples = 0;
+                    s_vad_gate_open_samples = 0;
+                    s_diag_gate_timeout_cnt++;
+                    // 不在此调 multinet clean()：需 buffer_mutex，会阻塞 AFE 主循环，
+                    // 详见 VAD_GATE_MAX_OPEN_MS 宏定义处的说明。
+                }
+            }
+
+            if (!s_vad_gate_enabled)
+            {
+                // 退化路径：pre-roll 分配失败时保持旧行为（每帧都喂），
+                // 宁可继续丢帧，也不能因为没有词头保护而把唤醒词整个切坏。
+                if (xRingbufferSend(s_mn_pcm_buf, res->data, res->data_size, 0) != pdTRUE)
+                    s_diag_drop_frames++;
+            }
+            else if (is_speech)
+            {
+                // 语音帧：闸门若原本关着，先把 pre-roll 历史倒进去补词头，再推当前帧
+                if (!s_vad_gate_open)
+                {
+                    s_vad_gate_open = true;
+                    s_vad_gate_open_samples = 0; // 新一段语音：重置本次开启时长
+                    s_diag_gate_open_cnt++;
+                    preroll_flush_to_queue();
+                }
+                s_vad_silence_samples = 0;
+                if (xRingbufferSend(s_mn_pcm_buf, res->data, res->data_size, 0) != pdTRUE)
+                    s_diag_drop_frames++;
+            }
+            else if (s_vad_gate_open)
+            {
+                // 静音但闸门还开着：hangover 窗口内继续喂，防止 VAD 提前报静音切掉词尾
+                s_vad_silence_samples += frame_samples;
+                if (s_vad_silence_samples <= VAD_HANGOVER_SAMPLES)
+                {
+                    if (xRingbufferSend(s_mn_pcm_buf, res->data, res->data_size, 0) != pdTRUE)
+                        s_diag_drop_frames++;
+                }
+                else
+                {
+                    // hangover 用尽：关闸，本帧转存 pre-roll 供下一段语音补头
+                    s_vad_gate_open = false;
+                    s_vad_silence_samples = 0;
+                    s_vad_gate_open_samples = 0; // 正常关闸也要清零，供下次开闸重新计时
+                    preroll_push(res->data, frame_samples);
+                    s_diag_gated_frames++;
+                }
+            }
+            else
+            {
+                // 静音且闸门关闭：只滚动存入 pre-roll，不占用 detect 的处理配额
+                preroll_push(res->data, frame_samples);
+                s_diag_gated_frames++;
+            }
         }
         else
         {
@@ -937,8 +1184,52 @@ static void multinet_detect_task(void *arg)
     ESP_LOGI(TAG, "MultiNet 检测任务启动（优先级 4，CPU1）");
     PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
 
+    TickType_t diag_tick = xTaskGetTickCount(); // 【诊断】唤醒链路健康度打印的周期起点
+
     while (1)
     {
+        /* ── 【唤醒率诊断 2026-08-25】每 5 秒打印一次唤醒链路健康度 ─────────────
+         * ★★【VAD 门控上线后，判读标准已改变，别按旧标准误读】★★
+         *   门控生效后静音帧不再喂 detect，所以 **detect 次数远低于 156 是正常的、
+         *   恰恰是门控在工作的证据**，不再代表「被饿死」。新的判读方式：
+         *
+         *   门控挡下  持续快速增长（安静时接近 156/5秒）→ 门控生效中 ✅
+         *   丢帧      停止增长（数值冻结不动）          → 丢帧问题已解决 ✅
+         *   开闸      ≈ 环境中出现声音的段数；你每说一句话至少 +1
+         *   detect    安静时接近 0、说话时明显上跳      → 配额已让给真正的语音 ✅
+         *   锁超时/溢出 > 0                            → 仍有音频被丢，需继续查
+         *   耗时max   > 32000us                        → 单次 detect 超一帧周期
+         *
+         * 【判定门控是否奏效】说唤醒词时看「听到唤醒词了! prob=」：
+         *   · prob 稳定在 0.6~0.9 且唤醒可靠   → 丢帧就是主因，修复成立
+         *   · 开闸次数正常涨但 prob 仍低/无输出 → 门控没解决问题，音频质量另有原因
+         *   · 开闸次数几乎不涨                  → VAD 太不敏感，需放宽 vad_mode
+         *
+         * 【失败模式】若出现「说了但完全没反应、开闸也没涨」，说明 VAD 把你的声音
+         *   判成静音了 —— 把 VAD_PREROLL_MS 调大或 afe_cfg->vad_mode 放宽一档。
+         *   若出现「唤醒词老是差一点、prob 比以前低」，是词头被切 → 加大 VAD_PREROLL_MS。 */
+        if ((xTaskGetTickCount() - diag_tick) >= pdMS_TO_TICKS(5000))
+        {
+            uint32_t diag_cnt = s_diag_detect_cnt;
+            ESP_LOGW(TAG,
+                     "[唤醒诊断] 丢帧=%lu 门控挡下=%lu 开闸=%lu次 超时关闸=%lu次 | 锁超时=%lu 溢出=%lu | detect=%lu/156(5秒) 耗时avg=%luus max=%luus",
+                     (unsigned long)s_diag_drop_frames,
+                     (unsigned long)s_diag_gated_frames,
+                     (unsigned long)s_diag_gate_open_cnt,
+                     (unsigned long)s_diag_gate_timeout_cnt,
+                     (unsigned long)s_diag_lock_timeout,
+                     (unsigned long)s_diag_overflow,
+                     (unsigned long)diag_cnt,
+                     (unsigned long)(diag_cnt ? (uint32_t)(s_diag_detect_us_sum / diag_cnt) : 0),
+                     (unsigned long)s_diag_detect_us_max);
+
+            // 只清「本周期」三项；丢帧/锁超时/溢出保留累计值，便于看长期增长趋势
+            s_diag_detect_cnt = 0;
+            s_diag_detect_us_sum = 0;
+            s_diag_detect_us_max = 0;
+            diag_tick = xTaskGetTickCount();
+        }
+
         // 1. 动态计算等待时间：如果池子里有货，就不排队，立刻处理下一帧
         int mn_chunksize = (multinet_iface && multinet_model_data) ? multinet_iface->get_samp_chunksize(multinet_model_data) : 512;
 
@@ -968,6 +1259,7 @@ static void multinet_detect_task(void *arg)
                     // 但读取仍在继续，积累的是「模型没在工作时的废音频」，并非用户有效语音。
                     // 因此整段清空才是正确处理——保留这段废数据反而会污染 is_running 恢复后的检测。
                     ESP_LOGW(TAG, "MultiNet buffer overflow，清空重来");
+                    s_diag_overflow++; // 【诊断】溢出即「正在说的词被腰斩」，计入唤醒率排查
                     input_buffer_len = 0;
                     // 【关键修复 BUG-019】拼接缓冲被丢弃时，MultiNet 内部 CTC beam 状态
                     // 也必须同步重置。MultiNet 是累积式解码器：detect() 增量喂数据并在内部
@@ -979,6 +1271,12 @@ static void multinet_detect_task(void *arg)
                         multinet_iface->clean(multinet_model_data);
                 }
                 xSemaphoreGive(buffer_mutex);
+            }
+            else
+            {
+                // 【诊断】拿锁超时：本批 PCM 没能进 input_buffer 就被下面 Return 掉了，
+                // 效果等同丢帧，同样会打断 CTC 路径。
+                s_diag_lock_timeout++;
             }
             vRingbufferReturnItem(s_mn_pcm_buf, item);
         }
@@ -1006,7 +1304,17 @@ static void multinet_detect_task(void *arg)
                 }
                 */
 
+                // 【诊断 2026-08-25】统计 detect() 的调用节奏与耗时。
+                // 理论节奏：16000Hz / 512 采样 = 31.25 次/秒（5 秒 ≈ 156 次）。
+                // 实际次数明显偏低 → 本任务(prio4)在 CPU1 上被两个 prio5 任务饿死；
+                // 单次耗时 > 32ms → detect 本身就跟不上实时帧率，积压必然导致丢帧。
+                int64_t diag_t0 = esp_timer_get_time();
                 esp_mn_state_t mn_state = multinet_iface->detect(multinet_model_data, input_buffer);
+                uint32_t diag_dt = (uint32_t)(esp_timer_get_time() - diag_t0);
+                s_diag_detect_cnt++;
+                s_diag_detect_us_sum += diag_dt;
+                if (diag_dt > s_diag_detect_us_max)
+                    s_diag_detect_us_max = diag_dt;
 
                 /*
                 if (!heap_caps_check_integrity_all(true))
@@ -1141,6 +1449,15 @@ void wake_word_stop(void)
     input_buffer_len = 0;
     is_running = false;
     xSemaphoreGive(buffer_mutex);
+
+    // 【VAD 门控】复位闸门与 pre-roll：停引擎期间 afe_fetch_task 不再入队，
+    // 若不清，pre-roll 里会留着停机前那段音频，下次开闸时被当成"词头"倒进队列，
+    // 用一段几秒前的陈旧音频污染新的一轮检测。
+    s_vad_gate_open = false;
+    s_vad_silence_samples = 0;
+    s_vad_gate_open_samples = 0;
+    s_preroll_head = 0;
+    s_preroll_filled = 0;
 }
 
 // 解绑/重启前调用：将 s_afe_data 置 NULL，使 custom_wake_word_feed 立即
