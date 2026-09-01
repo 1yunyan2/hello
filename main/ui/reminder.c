@@ -20,7 +20,9 @@
 
 #include "reminder.h"
 #include "object.h"
-#include "bsp/bsp_board.h" /* bsp_wifi_is_offline_mode()：离线时跳过天气 HTTP 拉取 */
+#include "bsp/bsp_board.h"   /* bsp_wifi_is_offline_mode()：离线时跳过天气 HTTP 拉取 */
+#include "session/session.h" /* session_get_state()：对话进行中不触发闹钟/倒计时（对话优先） */
+#include "ui/standby.h"      /* standby_is_deep_active/standby_request_wake：待机中到期先亮屏 */
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_sntp.h"
@@ -529,16 +531,81 @@ static void ring_timer_callback(void *arg)
     xQueueSend(s_ctx.evt_queue, &evt, 0);
 }
 
+/* ★【2026-08-25 新增】本次 trigger_cb 是否为"本轮响铃的第一次"。
+ *
+ * 仅在 alarm_ring_start() 调 trigger_cb 的那一小段内为 true，供 application.c
+ * 判断"能否安全操作 UI"（第一次不持 s_ctx.mutex，后续 tick 持锁）。
+ * 与 s_ctx.state 彻底解耦——详见 reminder.h 中 reminder_is_first_ring_callback()
+ * 的说明：两个语义此前挤在同一个 state 上，导致"响铃画面已出、state 却还没置
+ * RINGING"的空窗，头部触摸因此进不了关闹钟分支。 */
+static volatile bool s_first_ring_cb = false;
+
+bool reminder_is_first_ring_callback(void)
+{
+    return s_first_ring_cb;
+}
+
 static void alarm_ring_start(uint8_t alarm_id, const char *message)
 {
-    s_ctx.state = REMINDER_STATE_RINGING;
     s_ctx.ringing_alarm_id = alarm_id;
     s_ctx.ring_count = 0;
 
     ESP_LOGW(TAG, "闹钟 #%d 开始响铃: %s", alarm_id, message);
 
+    /* ★★【2026-08-25 修复：state 置 RINGING 必须在 trigger_cb 之【后】】★★
+     *
+     * 【修的问题】"闹钟响了但屏幕不切到闹钟页，只有空闲 GIF + 舵机动一下"，偶发。
+     *
+     * 【根因链】application.c 的 on_reminder_trigger() 用 s_alarm_ring_page_shown
+     *   这个门闩保证"只有第一次响铃（不持锁那次）才切页"（那是死锁修复，不能去掉），
+     *   它的兜底复位条件写的是：
+     *       if (reminder_get_state() != REMINDER_STATE_RINGING)
+     *           s_alarm_ring_page_shown = false;
+     *   而本函数原先【第一行】就把 state 置成了 RINGING，紧接着才回调 →
+     *   第一次响铃回调进来时 state 已是 RINGING，**复位条件永远不成立**。
+     *   与此同时 alarm_ring_stop() 走"响满次数自动关闭"这条路时**不发任何回调**，
+     *   于是标志一旦置 true 就再也没人清：
+     *     · 若上一次闹钟是被用户触摸关掉的（走 REM_EVT_ALARM_DISMISS，有回调且
+     *       此时 state 已 IDLE）→ 标志被清 → 下次能正常切页；
+     *     · 若上一次闹钟是响满自动结束的 → 标志残留 true → **下次闹钟不切页**。
+     *   这正是"有时候切、有时候不切"的偶发根源（中间若恰好有倒计时/日历回调
+     *   进来也会顺带清掉标志，让现象更加随机）。
+     *
+     * 【改法】把置位挪到 trigger_cb 之后。这样第一次响铃回调进来时 state 仍是
+     *   IDLE/NOTIFYING，复位条件成立 → 清标志 → 正常切页；而后续的
+     *   REM_EVT_ALARM_RING_TICK 回调进来时 state 已是 RINGING，门闩照常拦住，
+     *   死锁修复的语义完全不变。
+     *
+     * 【为何安全】本函数由 reminder_task 的 REM_EVT_ALARM_TRIGGER 分支调用，
+     *   全程不持 s_ctx.mutex；trigger_cb 期间 state 短暂不是 RINGING，只影响
+     *   两处判断且均无害：poll_timer_callback 的"响铃中跳过"（同一分钟已由
+     *   last_alarm_check_min 拦住，不会重复触发）、触摸关闹钟分支（此刻画面刚
+     *   切出来，用户来不及触摸）。下面 FIX-4 的错误回退路径不受影响。 */
+    /* ★★【2026-08-25 二次修正：state 恢复为「回调之前就置位」】★★
+     *
+     * 【上一轮为什么把它挪到回调之后】当时 application.c 借用
+     *   `reminder_get_state() != RINGING` 来判断"是不是本轮第一次回调"，
+     *   若先置 RINGING 那个判据就永远不成立，导致门闩永久卡住、闹钟偶发不切页。
+     *
+     * 【但那样修出了新问题】state 置位被推迟到 trigger_cb 之后，而 trigger_cb 里
+     *   要跑完 ui_show_alarm_ringing()（取 LVGL 锁最多 500ms + 整页渲染）。
+     *   这段时间【响铃画面已经显示出来了，state 却还不是 RINGING】，于是
+     *   ui_port 的「响铃中任意触摸关闭闹钟」分支进不去 —— 实测现象＝
+     *   **闹钟结束界面上头部触摸完全无反应**（耳朵走别的路径故仍可用）。
+     *   我当时在注释里写"此刻画面刚切出来，用户来不及触摸"，这个判断是错的：
+     *   画面一出来正是用户要摸的时候。
+     *
+     * 【现在的正解】把"是否第一次回调"拆成独立标志 s_first_ring_cb（见上方），
+     *   state 则恢复成【回调之前】就置位。两个语义各用各的标志，互不牵制：
+     *     · state=RINGING 立刻生效 → 触摸关闹钟分支全程可用；
+     *     · s_first_ring_cb 只在本次回调期间为真 → 门闩判断依旧准确。 */
+    s_ctx.state = REMINDER_STATE_RINGING;
+
+    s_first_ring_cb = true; /* 仅本次回调期间为真，供 application 判断可否碰 UI */
     if (s_ctx.trigger_cb)
         s_ctx.trigger_cb(REMINDER_TYPE_ALARM, message, true);
+    s_first_ring_cb = false;
+
     s_ctx.ring_count++;
 
     if (s_ctx.ring_timer == NULL)
@@ -818,6 +885,95 @@ static void poll_timer_callback(void *arg)
                 int64_t elapsed_sec = (now_us - t->start_time_us) / 1000000;
                 if (elapsed_sec >= (int64_t)t->duration_sec)
                 {
+                    /* ★★【2026-08-25 新增：对话优先，对话中不触发倒计时】★★
+                     *
+                     * 【需求】对话进行中屏幕只显示对话 GIF，不允许任何提醒抢屏或震动。
+                     *
+                     * 【★ 为什么屏蔽点必须放在这里，而不是放到事件处理层 ★】
+                     *   这是本改动最关键的一点。下面那两句是【不可逆】的：
+                     *     t->active = false;              ← 倒计时被标记为"已用掉"
+                     *     xQueueSend(...REM_EVT_TIMER_EXPIRE...);
+                     *   若改在 reminder_task 的 REM_EVT_TIMER_EXPIRE 分支、或在
+                     *   application.c 的 on_reminder_trigger() 里丢弃，此刻 active
+                     *   早已被清成 false —— 这次倒计时就【彻底消失、永不补发】，
+                     *   用户专注一轮番茄钟会被静默作废且毫不知情。
+                     *
+                     *   放在这里 continue 则完全不同：不投递事件、也【不推进任何状态】，
+                     *   t->active 保持 true，下一拍（1 秒后）本判断依然成立 →
+                     *   对话一结束就立即正常触发。等于零成本实现了"延后到对话结束"，
+                     *   代码比"丢弃"还少一行。
+                     *
+                     * 【画面语义无违和】到期画面文案是「倒计时结束!」，本就是过去式，
+                     *   晚几分钟看到不会让人误以为计时不准。 */
+                    /* ★★【2026-08-25 改：提醒优先级最高，到点直接掐断对话】★★
+                     *
+                     * 【需求变更】此前是"对话优先"——对话中扣住提醒不发（continue 等待）。
+                     *   现改为【提醒优先】：到点就把正在进行的对话立即关掉（含正在播的 TTS），
+                     *   然后照常走震动 + 切到期画面的正常流程。
+                     *
+                     * 【为什么不再 continue 等待】旧做法有个躲不掉的代价：闹钟只匹配
+                     *   「时:分」那 60 秒，对话一旦超过 1 分钟，这次闹钟就【永久丢失】。
+                     *   改为打断对话后，提醒一定会准点发生，该缺陷随之消失。
+                     *
+                     * 【为什么可以在这里调】session_interrupt_for_reminder() 内部只做
+                     *   两次 xQueueSend，不碰 flash/NVS/LVGL、不阻塞，因此在 PSRAM 栈的
+                     *   reminder_task 上调用是安全的（详见该函数注释与本文件
+                     *   nvs_save_weather_data 处的 PSRAM 栈铁律）。
+                     *
+                     * 【不再 continue】打断是异步的（投队列后会话任务才真正收尾），
+                     *   但本次到期【照常投递】，不必等会话关完 —— 震动与切页各走各的路径，
+                     *   会话收尾期间 UI 已经可以显示提醒画面，不存在互斥。 */
+                    if (session_get_state() != SESSION_IDLE)
+                        session_interrupt_for_reminder();
+
+                    /* ★★【2026-08-25 新增：闹钟响铃期间，整个倒计时提醒排队等候】★★
+                     *
+                     * 【需求】闹钟与倒计时撞在一起时，要先把闹钟响完，再完整地做一次
+                     *   倒计时提醒（震动 + 到期画面），而不是两者混在一起。
+                     *
+                     * 【原来错在哪】此前是在 UI 层（ui_show_countdown_expired）拦画面，
+                     *   那是【丢弃】不是【推迟】：事件已经投递、t->active 已被清成 false，
+                     *   于是 ①震动照常长震 3 秒，与闹钟震动混叠；②画面被拦掉后再也不补，
+                     *   这一次番茄钟等于白算；③s_cd.state 还停在 EXPIRED，用户下次主动
+                     *   进倒计时页会先看到"结束界面"、几秒后才跳回设定界面（即实测第 9 条）。
+                     *
+                     * 【正确做法】守卫上移到这里，与上面"对话优先"完全同一手法：
+                     *   不投递、不推进任何状态，t->active 保持 true，下一拍重判仍成立。
+                     *   闹钟一停（alarm_ring_stop 把 state 置回 IDLE），下一拍（≤1 秒）
+                     *   倒计时就完整触发：3 秒长震 + 切到期画面，一样都不少。
+                     *
+                     * 【时序代价】倒计时提醒会比真正到期晚十几秒（等闹钟响满 4 次）。
+                     *   到期画面文案是「倒计时结束!」，过去式，不会让人误以为计时不准。 */
+                    if (s_ctx.state == REMINDER_STATE_RINGING)
+                        continue;
+
+                    /* ★★【2026-08-25 新增：深度待机中先亮屏，本拍不投递】★★
+                     *
+                     * 【为什么不能"投递了再让 UI 去唤醒"】曾经这么改过，直接崩：
+                     *   投递后 reminder_task 会走 on_reminder_trigger →
+                     *   ui_show_countdown_expired → standby_wake → 读 NVS 恢复音量 →
+                     *   spi_flash_disable_interrupts_caches_and_other_cpu() 关 cache。
+                     *   而【reminder_task 的栈在 PSRAM】（见本文件 nvs_save_weather_data
+                     *   处那条铁律），关 cache 后 PSRAM 不可访问、栈失联，IDF 断言 abort：
+                     *     assert failed: esp_task_stack_is_sane_cache_disabled()
+                     *                    @ cache_utils.c:152
+                     *   栈指针 0x3c8c0d10 落在 0x3C 段（PSRAM）即铁证。
+                     *
+                     * 【正确做法】本任务只调 standby_request_wake()——它只做一次原子
+                     *   置位，不碰 flash/NVS/LVGL，PSRAM 栈上完全安全；真正的唤醒由
+                     *   standby_task（栈在内部 SRAM）在下一拍执行。
+                     *
+                     * 【为什么 continue 而不是投递】与上面的对话守卫同一手法：不投递、
+                     *   也不推进 t->active，下一拍本判断依然成立。等屏幕亮起来
+                     *   （唤醒转场约 2 秒）之后再正常投递，此时 ui_show_countdown_expired
+                     *   走的就是"不在待机"的正常路径，既不会踩 PSRAM 栈，也不会留下
+                     *   "待机时钟 + 功能页"的叠加态。代价是到期提醒延后约 2~3 秒。 */
+                    if (standby_is_deep_active())
+                    {
+                        standby_request_wake(STANDBY_WAKE_SRC_COUNTDOWN_EXPIRE);
+                        continue;
+                    }
+
                     evt.type = REM_EVT_TIMER_EXPIRE;
                     evt.id = i;
                     strncpy(evt.message, t->message, REMINDER_MSG_MAX_LEN - 1);
@@ -851,6 +1007,29 @@ static void poll_timer_callback(void *arg)
             {
                 if (alarm_should_trigger(&s_ctx.alarms[i], &now_tm))
                 {
+                    /* ★★【2026-08-25 改：提醒优先级最高，到点直接掐断对话】★★
+                     * 与上面倒计时段完全同一原则，理由见那里的完整注释。
+                     *
+                     * ⭐【本改动顺带根治了"闹钟丢失"】旧做法是对话中 continue 等待，
+                     *   而闹钟只匹配「时:分」那 60 秒（见 alarm_should_trigger），
+                     *   对话一旦超过 1 分钟这次闹钟就【永久丢失】——那是"对话优先"
+                     *   决策下无法绕开的代价。现在改为打断对话，闹钟必定准点响，
+                     *   该缺陷自然消失。 */
+                    if (session_get_state() != SESSION_IDLE)
+                        session_interrupt_for_reminder();
+
+                    /* 深度待机中：同倒计时段——只发异步唤醒请求，本拍不投递、
+                     * 不推进 last_alarm_check_min，等屏幕亮起后下一拍正常响铃。
+                     * ⚠️ 绝不可在本任务里直接调 standby_wake()：reminder_task 栈在
+                     * PSRAM，而它内部读 NVS 要关 flash cache → 栈失联 → 断言 abort。
+                     * 完整说明见上面倒计时段的对应注释。
+                     * 【时限】唤醒约 2 秒，通常仍落在同一分钟内，不影响本次响铃； */
+                    if (standby_is_deep_active())
+                    {
+                        standby_request_wake(STANDBY_WAKE_SRC_ALARM_RING);
+                        continue;
+                    }
+
                     evt.type = REM_EVT_ALARM_TRIGGER;
                     evt.id = i;
                     strncpy(evt.message, s_ctx.alarms[i].message, REMINDER_MSG_MAX_LEN - 1);
@@ -1343,6 +1522,44 @@ bool reminder_get_current_time(uint8_t *hour, uint8_t *minute, uint8_t *second)
 /* ═══════════════════════════════════════════════════════════════════
  * 10. 对外接口 — 闹钟
  * ═══════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief 若新设闹钟的时间正是"当前这一分钟"，抑制它在本分钟内触发（顺延到明天）
+ *
+ * 【修的问题】"现在 1:01，我设一个 1:01 的闹钟，偶发不响"。
+ *
+ * 【原来的真实行为】触发扫描的外层闸是 `current_min != last_alarm_check_min`，
+ *   而 last_alarm_check_min 只在【闹钟真正响过】时才推进，平时几乎恒为"开"。
+ *   所以设一个当前分钟的闹钟，下一拍（≤1 秒）就会立刻响 —— 这既不是用户预期，
+ *   又与"上一次刚在本分钟响过导致闸门关闭"的情形叠加，表现出忽响忽不响的偶发感。
+ *
+ * 【本函数做什么】保存闹钟时若其 时:分 恰好等于当前 时:分，就把
+ *   last_alarm_check_min 推到当前分钟，关掉本分钟剩余时间的扫描闸门。
+ *   于是本分钟内不会触发；跨到下一分钟后 tm_min 不再匹配，自然顺延到
+ *   下一天的同一时刻 —— 与主流闹钟产品一致："设一个正在发生的时间＝明天这个点"。
+ *
+ * 【为何复用 last_alarm_check_min 而不新增变量】它本来就是"本分钟已处理过"的
+ *   语义载体，此处正是同一含义，不必再引入一个会与它打架的新状态。
+ *
+ * @note 调用方必须已持有 s_ctx.mutex。
+ */
+static void alarm_suppress_if_current_minute(const alarm_entry_t *entry)
+{
+    if (entry == NULL || !s_ctx.sntp_synced)
+        return;
+
+    time_t now = time(NULL);
+    struct tm now_tm;
+    localtime_r(&now, &now_tm);
+
+    if (now_tm.tm_hour == entry->hour && now_tm.tm_min == entry->minute)
+    {
+        s_ctx.last_alarm_check_min = now_tm.tm_hour * 60 + now_tm.tm_min;
+        ESP_LOGI(TAG, "闹钟设为当前分钟(%02d:%02d)，本分钟内不触发，顺延到明天",
+                 entry->hour, entry->minute);
+    }
+}
+
 int reminder_alarm_add(const alarm_entry_t *entry)
 {
     if (entry == NULL)
@@ -1362,6 +1579,8 @@ int reminder_alarm_add(const alarm_entry_t *entry)
     s_ctx.alarms[new_id].id = new_id;
     /* [FIX-12] 不强制 enabled=true，由调用方决定 */
     s_ctx.alarm_count++;
+
+    alarm_suppress_if_current_minute(entry); /* 设为当前分钟 → 顺延到明天，不当场响 */
 
     nvs_save_alarms();
     xSemaphoreGive(s_ctx.mutex);
@@ -1437,6 +1656,8 @@ esp_err_t reminder_alarm_update(uint8_t alarm_id, const alarm_entry_t *entry)
     updated.id = alarm_id;
     /* [FIX-12] 不强制 enabled=true，保留调用方传入的开关状态 */
     s_ctx.alarms[alarm_id] = updated;
+
+    alarm_suppress_if_current_minute(&updated); /* 设为当前分钟 → 顺延到明天，不当场响 */
 
     nvs_save_alarms();
     xSemaphoreGive(s_ctx.mutex);
@@ -1540,6 +1761,57 @@ esp_err_t reminder_timer_get_remain(uint8_t timer_id, uint32_t *out_remain)
     int64_t remain = (int64_t)s_ctx.timers[timer_id].duration_sec - elapsed;
     *out_remain = (remain > 0) ? (uint32_t)remain : 0;
     xSemaphoreGive(s_ctx.mutex);
+    return ESP_OK;
+}
+
+/**
+ * @brief 查询最近一个倒计时的剩余秒数（2026-08-25 新增，供低功耗临期判断）
+ *
+ * 语义与返回值见 reminder.h。实现要点：
+ *   · 只读遍历，不改任何状态，不投递任何事件；
+ *   · 剩余秒数算法与 reminder_timer_get_remain() 完全一致（保持口径统一）；
+ *   · ★ 互斥量用【短超时】而非 portMAX_DELAY —— 调用方是 standby_task，
+ *     处在低功耗判定的关键路径上，绝不能被 reminder 的锁长时间卡住。
+ *     拿不到锁就返回 INVALID_STATE，由调用方按"查不到就照常进待机"处理，
+ *     退化行为与本次改动之前完全一致，无害。
+ */
+esp_err_t reminder_get_nearest_expire_sec(uint32_t *out_sec)
+{
+    if (out_sec == NULL)
+        return ESP_ERR_INVALID_ARG;
+    if (!s_ctx.initialized || s_ctx.mutex == NULL)
+        return ESP_ERR_INVALID_STATE;
+
+    if (xSemaphoreTake(s_ctx.mutex, pdMS_TO_TICKS(10)) != pdTRUE)
+        return ESP_ERR_INVALID_STATE; /* 拿不到锁：放弃本次查询，不阻塞调用方 */
+
+    int64_t now_us = esp_timer_get_time();
+    bool found = false;
+    uint32_t min_remain = 0;
+
+    for (uint8_t i = 0; i < REMINDER_MAX_TIMERS; i++)
+    {
+        const timer_entry_t *t = &s_ctx.timers[i];
+        if (!t->active)
+            continue;
+
+        int64_t elapsed = (now_us - t->start_time_us) / 1000000;
+        int64_t remain = (int64_t)t->duration_sec - elapsed;
+        uint32_t r = (remain > 0) ? (uint32_t)remain : 0;
+
+        if (!found || r < min_remain)
+        {
+            min_remain = r;
+            found = true;
+        }
+    }
+
+    xSemaphoreGive(s_ctx.mutex);
+
+    if (!found)
+        return ESP_ERR_NOT_FOUND; /* 当前没有任何倒计时在跑 */
+
+    *out_sec = min_remain;
     return ESP_OK;
 }
 

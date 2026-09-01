@@ -36,7 +36,8 @@
 #include "protocol/mqtt_protocol.h"
 #include "wake_word/custom_wake_word.h"
 #include "bsp/bsp_board.h"
-#include "ui/ui_port.h" /* ui_set_neutral_gif_state()：会话状态切换中性 GIF */
+#include "ui/ui_port.h"  /* ui_set_neutral_gif_state()：会话状态切换中性 GIF */
+#include "ui/reminder.h" /* reminder_get_state()：提醒进行中独占，不许唤醒词开新对话 */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
@@ -167,6 +168,13 @@ static TickType_t s_wait_silence_start = 0;
 // 改为：进保护期时只置位本标志，保护期 500ms 到期后再调 wake_word_stop()，
 // 此时 wait_ms 已正确计完，即使再卡也不影响保护期长度。
 static bool s_pending_wake_word_stop = false;
+
+/* ★【2026-08-25】会话关闭后"在途鬼魂事件"的去重计数（见 protocol_event_handler 开头）。
+ * s_ghost_evt_id  : 上一条被忽略的事件 id，-1 = 尚无（下一条必打日志）
+ * s_ghost_evt_cnt : 当前这个 id 已忽略的条数，用于收尾时汇总成一行
+ * 只在 WS 接收回调与会话启动路径读写，无跨核并发，普通变量足够。 */
+static int s_ghost_evt_id = -1;
+static uint32_t s_ghost_evt_cnt = 0;
 // WebSocket服务器URI地址
 static char s_ws_uri[128] = DEFAULT_WS_URI;
 // deviceToken（App绑定时下发的长期凭证）
@@ -622,7 +630,32 @@ static void protocol_event_handler(void *handler_args, esp_event_base_t base,
         event_id != PROTOCOL_EVENT_DISCONNECTED &&
         event_id != PROTOCOL_EVENT_ERROR)
     {
-        ESP_LOGW(TAG, "会话已关闭，忽略迟到的云端事件 id=%d（在途数据）", (int)event_id);
+        /* ★【2026-08-25 去重：同一 id 只打首条，其余累计计数】★
+         *
+         * 【修的问题】主动打断对话（如闹钟到点掐断会话）后，云端并不知情，仍按原计划
+         *   推流；TCP 管道里已在途的 tts_start / transcript / 音频帧会陆续到达，
+         *   每条都在这里打一行 WARN。实测一次打断刷出十几条，两个害处：
+         *     ① 本函数跑在 WebSocket 接收回调里，而【该回调是持锁的】
+         *        （日志可见 "[WS接收] 回调持锁 耗时=0.48ms"）。十几条串行写串口
+         *        会实打实拉长持锁时间，量产若接串口做产测会拖慢协议层；
+         *     ② 量产现场排查全靠串口日志，这十几行会把同一时刻真正有价值的错误冲掉。
+         *
+         * 【为什么不直接降成 LOGD】那样量产现场抓到的日志里就彻底没有这条线索了。
+         *   在途数据的【首条】是有诊断价值的（能看出打断后云端还在推什么），
+         *   重复的才是噪音。故保留首条、压掉重复。
+         *
+         * 【计数何时归零】下次会话真正开始时（session_on_wake_word 成功路径）重置，
+         *   见 s_ghost_evt_id / s_ghost_evt_cnt 的定义处。 */
+        if ((int)event_id != s_ghost_evt_id)
+        {
+            s_ghost_evt_id = (int)event_id;
+            s_ghost_evt_cnt = 1;
+            ESP_LOGW(TAG, "会话已关闭，忽略迟到的云端事件 id=%d（在途数据）", (int)event_id);
+        }
+        else
+        {
+            s_ghost_evt_cnt++; /* 同一 id 重复到达：只累计，不刷屏 */
+        }
         return;
     }
 
@@ -1545,6 +1578,56 @@ wake_result_t session_on_wake_word(const char *display)
         return WAKE_IGNORED;
     }
 
+    /* ★★【2026-08-25 新增：功能层不开对话（对话 ↔ 功能层双向互斥）】★★
+     *
+     * 【需求】功能盘 / 功能页 / 闹钟编辑 / 游戏 这四个非主界面视图独占屏幕与交互，
+     *   期间不允许语音唤醒开启对话——否则对话状态 GIF 与功能页画面会互相抢屏。
+     *
+     * 【为什么用逻辑守卫，而不是进功能层时 wake_word_stop() 停引擎】
+     *   ① 本函数已有 OTA 锁 / 离线 / LISTENING / 非 IDLE / drain 五条同款早退，
+     *      加一条零新概念，风格统一；
+     *   ② WAKE_IGNORED 在 application.c 里已定义为"不震动、不播提示音"，语义现成；
+     *   ③ 不碰 esp-sr 引擎启停，避开 MultiNet 已知崩溃风险区；
+     *   ④ 最关键——停引擎一旦遇上"功能层因任何异常没能正常退出"，设备就
+     *      【永久失聪】；逻辑守卫只要视图恢复就自动恢复，不会把自己锁死。
+     *
+     * 【★ 为什么加 s_state == SESSION_IDLE 这个前提 ★】
+     *   视图守卫的目标是"不许在功能层【开启新会话】"，而【不是】"不许打断
+     *   已经在进行的会话"。若不加这个前提，万一出现"对话中视图被异常改动"的
+     *   状态，用户将再也无法用唤醒词打断 TTS，只能干等它播完。加上之后：
+     *     · 空闲 + 功能层 → 拒绝开新对话（核心需求，正常路径）；
+     *     · 已在对话中   → 不受视图影响，打断/连麦逻辑一律照旧（安全兜底）。
+     *
+     * 【必须与 ui_port.c 的触摸屏蔽成对】ui_dispatch_touch_event 已把"对话中屏蔽
+     *   触摸"从"仅主界面"扩大到"全部视图"，其安全性正建立在本守卫之上——功能层
+     *   开不起对话，"对话中"就只可能发生在主界面，用户不会被困在功能页里。
+     *   改动其中任一处时，务必同时复核另一处。 */
+    if (s_state == SESSION_IDLE && ui_get_current_view() != UI_VIEW_MAIN)
+    {
+        ESP_LOGW(TAG, "当前处于功能层（视图 %d），忽略唤醒词: [%s]",
+                 (int)ui_get_current_view(), display ? display : "");
+        return WAKE_IGNORED;
+    }
+
+    /* ★★【2026-08-25 新增：提醒进行中独占，不许唤醒词开新对话】★★
+     *
+     * 【为什么必须有】既然已经定了"提醒优先级最高、到点可以把对话直接掐断"
+     *   （见 reminder.c 中 session_interrupt_for_reminder 的调用点），那么反过来
+     *   提醒期间就【不能】再被对话抢走——否则两边互相打断：闹钟掐掉对话、
+     *   用户一喊唤醒词又把闹钟顶掉，形成拉锯。单向优先才是自洽的。
+     *
+     * 【覆盖范围】RINGING（闹钟正在响，最多 4 次十几秒）与 NOTIFYING
+     *   （倒计时到期提示中）两态，正是"提醒正在发生"的完整窗口。
+     *
+     * 【不会永久失聪】这两个状态都有明确终点：闹钟响满自动 stop、倒计时提示
+     *   走完即回 IDLE；触摸也能随时关掉闹钟。状态一回 IDLE 唤醒词立即恢复。 */
+    if (s_state == SESSION_IDLE && reminder_get_state() != REMINDER_STATE_IDLE)
+    {
+        ESP_LOGW(TAG, "提醒进行中（state=%d），忽略唤醒词: [%s]",
+                 (int)reminder_get_state(), display ? display : "");
+        return WAKE_IGNORED;
+    }
+
     // LISTENING 期间（用户说话中）完全忽略唤醒词触发。
     // wake_word_stop() 已在进入 LISTENING 时调用，此处兜底防竞态窗口误打断。
     // 连麦等待期（s_is_continuous_turn=true）属于 LISTENING 中的特殊子状态，仍需响应。
@@ -1637,6 +1720,16 @@ wake_result_t session_on_wake_word(const char *display)
         audio_processor_flush_output(s_processor);
         return WAKE_IGNORED; // 需用户再说一次，本次不算成功唤醒，不播提示音
     }
+
+    /* ★【2026-08-25】新会话开始：把上一轮"在途鬼魂事件"的去重计数收尾并归零。
+     * 放在这里而不是 session_close()：关闭那一刻在途数据往往还没到齐
+     * （实测 CANCEL 之后 5 秒仍有 transcript 陆续到达），此时汇总会漏计；
+     * 而下一次唤醒时管道必然早已排空，数字才是完整的。 */
+    if (s_ghost_evt_cnt > 1)
+        ESP_LOGW(TAG, "上一轮会话关闭后共忽略 %lu 条在途数据（id=%d）",
+                 (unsigned long)s_ghost_evt_cnt, s_ghost_evt_id);
+    s_ghost_evt_id = -1;
+    s_ghost_evt_cnt = 0;
 
     ESP_LOGI(TAG, "会话开始 [%s]", display);
     s_state = SESSION_LISTENING;
@@ -1776,6 +1869,30 @@ void session_debug_kill_ws(void)
  *
  * 本函数只投递事件立即返回（异步关闭），由 bsp_ota 在下载前调用后短暂等待。
  */
+void session_interrupt_for_reminder(void)
+{
+    /* 提醒优先级高于对话：到点立即掐断会话（含正在播的 TTS）。
+     *
+     * 【为什么只投队列】本函数由 reminder_task 调用，而【该任务栈在 PSRAM】。
+     * 一旦在这里做任何会关 flash cache 的事（读写 NVS 等），关 cache 期间 PSRAM
+     * 一并失联 → 栈读不到 → IDF 断言 abort（本项目已实测复现过一次）。
+     * 故与 session_stop_for_ota 一样，全部工作都交给会话任务异步执行。
+     *
+     * 【与 OTA 版的唯一区别】不置 s_ota_locked —— 提醒结束后唤醒词必须还能
+     * 正常拉起新会话；OTA 那个锁是一去不回的（靠重启复位），语义完全不同。 */
+    if (s_state == SESSION_IDLE)
+        return; // 本就没有会话，无需打断（幂等早退，省两次入队）
+
+    if (s_session_evt_queue != NULL)
+    {
+        session_evt_t evt = SESSION_EVT_ABORT; // 通知服务端停止推流
+        xQueueSend(s_session_evt_queue, &evt, 0);
+        evt = SESSION_EVT_CLOSE; // 安全关闭并销毁 processor
+        xQueueSend(s_session_evt_queue, &evt, 0);
+        ESP_LOGW(TAG, "闹钟/倒计时到点，立即中断当前对话（含正在播放的 TTS）");
+    }
+}
+
 void session_stop_for_ota(void)
 {
     s_ota_locked = true; // 先锁定：即使此刻有唤醒词也不会再拉起会话

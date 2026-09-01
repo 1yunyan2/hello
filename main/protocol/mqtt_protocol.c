@@ -19,8 +19,9 @@
 #include "bsp/bsp_ota.h"
 // 舵机控制直接走 bsp/bsp_board.h 的 bsp_servo_move_smooth（绝对角度定位），无需 servo_manager.h
 #include "auth.h"
-#include "session/session.h" // session_debug_kill_ws() — MQTT 远程伪造 WS 断连测试
-#include "ui/standby.h"      // standby_notify_activity() — 远程舵机控制视为活动，刷新待机倒计时
+#include "session/session.h"   // session_debug_kill_ws() — MQTT 远程伪造 WS 断连测试
+#include "ui/standby.h"        // standby_notify_activity() — 远程舵机控制视为活动，刷新待机倒计时
+#include "ui/remote_control.h" // remote_control_submit_servo/gif() — 远程手动控制（异步入队 + 30s 冻结窗口）
 #include "object.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h" // esp_timer_get_time() — ota-status 时间戳
@@ -254,6 +255,16 @@ static void mqtt_reconnect_task(void *arg)
     //   必须留在循环里继续退避等待，直到成功调用 start 为止。
     while (1)
     {
+        // ── 离线模式拦截：退出重连循环，不再空转 ──────────────────────────
+        // WiFi 已判定永久掉网（射频已关）。继续留在循环里只会每 5~60s 打一次
+        // "服务器不可达，跳过 MQTT 重连"刷屏，白占 3KB PSRAM 栈 + 内部 TCB。
+        // break 出去后走下方统一收尾（清句柄 + vTaskDeleteWithCaps 回收栈）。
+        if (bsp_wifi_is_offline_mode())
+        {
+            ESP_LOGW(MQTT_TAG, "已进入离线模式，停止 MQTT 重连并退出重连任务");
+            break;
+        }
+
         // 指数退避：5s → 10s → 20s → 40s → 60s（上限）
         s_mqtt_reconnect_attempts++;
         int shift = s_mqtt_reconnect_attempts - 1;
@@ -265,6 +276,14 @@ static void mqtt_reconnect_task(void *arg)
 
         ESP_LOGW(MQTT_TAG, "MQTT 第 %d 次重连，%d 秒后执行...", s_mqtt_reconnect_attempts, delay_ms / 1000);
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
+
+        // ★ 退避 sleep 期间（最长 60s）可能刚好进入离线模式，此处复查一次，
+        //   避免醒来后还傻乎乎地走完整个 start 流程。
+        if (bsp_wifi_is_offline_mode())
+        {
+            ESP_LOGW(MQTT_TAG, "退避期间已进入离线模式，停止 MQTT 重连并退出重连任务");
+            break;
+        }
 
         // ★ 检查服务器可达性：不可达时跳过本次，继续退避等待下一轮
         if (!auth_is_server_reachable())
@@ -620,22 +639,30 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 }
                 else if (cJSON_IsString(type_item) && strcmp(type_item->valuestring, "servo") == 0)
                 {
-                    // ★ 舵机控制指令处理
+                    // ★ 远程舵机控制指令（app 3D 形象上「点哪动哪」的单轴手动摆动）
                     // JSON 格式: {"type":"servo","servo":"head","angle":90}
-                    //   servo: 舵机名（字符串，固定三选一，与前端约定）
-                    //          "head"      → CH_HEAD  头部
-                    //          "left_arm"  → CH_L_ARM 左臂
-                    //          "right_arm" → CH_R_ARM 右臂
-                    //   angle: 目标角度（0~180，超出由 bsp_servo 内部软限位裁剪）
-                    // 速度写死为 SERVO_SPEED_MID（15ms/度），JSON 不携带 speed、不携带 direction。
-                    // servo_manager_submit_angle 为非阻塞入队操作（与 volume 同属轻量指令），
-                    // 故可直接在 MQTT 事件回调中调用，无需像 unbind/ota 那样另起异步任务。
+                    //   servo : 舵机名（字符串，固定三选一，与前端约定）
+                    //           "head"      → CH_HEAD  头部
+                    //           "left_arm"  → CH_L_ARM 左臂
+                    //           "right_arm" → CH_R_ARM 右臂
+                    //   angle : 【相对中位的偏移角】-90~+90（度），0 = 中位（正前方）。
+                    //           内部换算成舵机物理绝对角：-90→0°, 0→90°, +90→180°。
+                    //           前端用正负表达左右更直观，故协议层保持偏移语义。
+                    //           超出范围由 bsp_servo 内部软限位裁剪。
+                    // 一条指令只控一个舵机（app 是点击式交互，不存在多轴同时下发）。
+                    //
+                    // 【2026-07-31 改】不再在本回调里直接调 bsp_servo_move_smooth：
+                    //   该函数内含 vTaskDelay（插值平滑），单次最长阻塞约 1.3s，用户在 app 上
+                    //   快速连点会堵死 MQTT 事件循环 → keepalive 超时断连。
+                    //   改为 remote_control_submit_servo() 只入队（微秒级），由 rc_worker
+                    //   任务异步执行；同时该函数内部承担状态屏蔽、待机唤醒、30s 冻结窗口管理。
+                    //   与 unbind/ota 的「回调入队 + 异步任务」模式对齐。
                     cJSON *servo_item = cJSON_GetObjectItem(root, "servo");
-                    cJSON *offset_item = cJSON_GetObjectItem(root, "offset");
-                    if (cJSON_IsString(servo_item) && servo_item->valuestring && cJSON_IsNumber(offset_item))
+                    cJSON *angle_item = cJSON_GetObjectItem(root, "angle");
+                    if (cJSON_IsString(servo_item) && servo_item->valuestring && cJSON_IsNumber(angle_item))
                     {
                         const char *servo_name = servo_item->valuestring;
-                        float offset = (float)offset_item->valuedouble;
+                        float angle = (float)angle_item->valuedouble;
 
                         // 舵机名 → 通道宏映射（固定协议，与前端约定一致）
                         int channel = -1;
@@ -652,25 +679,36 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         }
                         else
                         {
-                            ESP_LOGW(MQTT_TAG, "收到舵机指令: servo=%s(ch=%d) angle=%.1f", servo_name, channel, offset);
-                            // 远程控制舵机属于「真实的功能运行」，必须刷新待机倒计时，
-                            // 否则运动中途（bsp_servo_move_smooth 最长阻塞约 1.3s）若跨过 60s 空闲阈值，
-                            // 会被 enter_standby() 把头部强行归中，打断本次远程控制。
-                            // 在分发前打点：先刷计时再运动，确保整段运动都在「活动窗口」内。
-                            // 注意：MQTT 心跳/保活不会走到这里，故心跳天然不算活动，符合省电预期。
-                            standby_notify_activity();
-                            float absolute_angle = 90.0f + offset; // 转换：0→90, +30→120, -30→60
-                            // 直接调底层 bsp_servo_move_smooth：按绝对角度定位，自带软限位/平滑/去抖，停位即止。
-                            // 不经 servo_manager_submit_angle —— 其内部"拆幅度+方向再回中"逻辑会导致到位后回弹、
-                            // 且把绝对角度塞进 amplitude enum 会造成角度大小错乱。
-                            // 注意：此函数内部含 vTaskDelay（平滑插值，最长约 1.3s），会阻塞 MQTT 回调线程；
-                            //       MQTT 指令频率低，单条可接受，若后续需连发再改异步。
-                            bsp_servo_move_smooth((uint8_t)channel, absolute_angle, SERVO_SPEED_MID);
+                            // 待机刷新（含深度待机自动亮屏）、对话/游戏中屏蔽、30s 冻结窗口
+                            // 均由 remote_control 模块内部统一处理，此处不再重复打点。
+                            remote_control_submit_servo((uint8_t)channel, angle);
                         }
                     }
                     else
                     {
                         ESP_LOGE(MQTT_TAG, "舵机指令缺少有效的 servo(字符串)/angle(数字) 字段");
+                    }
+                }
+                else if (cJSON_IsString(type_item) && strcmp(type_item->valuestring, "gif") == 0)
+                {
+                    // ★ 远程 GIF 显示指令（app 上用户手动选一张图，设备切过去循环播放）
+                    // JSON 格式: {"type":"gif","file":"1_3.gif"}
+                    //   file: GIF【文件名】（不含路径），设备内部拼成 "S:/gif/<file>"。
+                    //
+                    // 【为何发文件名而不是编号】固件【不维护】任何「编号 → 文件名」映射表：
+                    //   映射关系由 app / 后端持有，这样后续往外挂 flash 新增 GIF 素材时，
+                    //   固件无需改代码、无需重新烧录固件（只需重打包外挂 flash 或后续做
+                    //   在线下载）。若把表写死在固件里，每加一张图就要给全部设备推一次
+                    //   固件 OTA，不现实。
+                    // 文件名安全校验（后缀/路径穿越/长度）在 remote_control_submit_gif 内完成。
+                    cJSON *file_item = cJSON_GetObjectItem(root, "file");
+                    if (cJSON_IsString(file_item) && file_item->valuestring)
+                    {
+                        remote_control_submit_gif(file_item->valuestring);
+                    }
+                    else
+                    {
+                        ESP_LOGE(MQTT_TAG, "GIF 指令缺少有效的 file(字符串) 字段");
                     }
                 }
                 else
@@ -693,6 +731,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         //   stop 已挪到 mqtt_reconnect_task 任务上下文中执行。
 
         // 创建退避重连任务（如果尚未在运行）
+        // ★ 离线模式下仍然创建：该任务开头的 esp_mqtt_client_stop() 是**必须执行**的
+        //   ——它只能在非 MQTT 任务上下文调用（本回调就在 MQTT 任务里，直接调必失败，
+        //   见 BUG-023），不停就等于把 IDF 内置 25s 自动重连一直留着空转。任务停完
+        //   客户端后会在循环开头读到离线标志，立刻 break 退出并 WithCaps 自删，
+        //   只多活几毫秒，换来的是 MQTT 客户端被干净关停。
         if (s_mqtt_reconnect_handle == NULL)
         {
             xTaskCreatePinnedToCoreWithCaps(mqtt_reconnect_task, "mqtt_reconn",
@@ -723,12 +766,22 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
  */
 void protocol_mqtt_start(void)
 {
+    // 离线模式防御：正常时序下本函数在开机 WiFi 就绪后调用，此时不可能已离线；
+    // 保留此判断是防止将来有人改成"延迟启动/重试启动"时误在离线态拉起 MQTT 客户端
+    // （那会白建 client + heartbeat_task，且 heartbeat_task 是常驻任务不会退出）。
+    if (bsp_wifi_is_offline_mode())
+    {
+        ESP_LOGW(MQTT_TAG, "离线模式，跳过 MQTT 客户端启动");
+        return;
+    }
+
     mqtt_credentials_load();
 
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = s_mqtt_uri,
         .credentials.username = s_mqtt_user,
         .credentials.authentication.password = s_mqtt_pass,
+        .session.keepalive = 60, // 心跳间隔 60s
     };
     s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);

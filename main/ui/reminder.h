@@ -51,8 +51,8 @@
 #define REMINDER_MSG_MAX_LEN 64   ///< 提醒消息最大长度（UTF-8 字节）
 
 /* ── 闹钟响铃参数 ── */
-#define ALARM_RING_INTERVAL_MS 5000 ///< 闹钟响铃间隔（每 5 秒重复播报一次）
-#define ALARM_RING_MAX_COUNT 4      // 时间超过这个次数还没关闭，就自动关闭（20秒）
+#define ALARM_RING_INTERVAL_MS 3000 ///< 闹钟响铃间隔（每 3 秒重复播报一次）
+#define ALARM_RING_MAX_COUNT 4      // 时间超过这个次数还没关闭，就自动关闭（12秒）
 #define ALARM_RING_TIMEOUT_SEC 30   ///< 闹钟响铃超时（秒），超时自动关闭
 /* 闹钟每次响铃的震动时长（毫秒）。
  * 2026-08-11：原先调用 bsp_motor_pulse()，那是固定 30ms 的触摸级轻反馈，
@@ -295,6 +295,27 @@ void reminder_on_offline_mode(void);
 reminder_state_t reminder_get_state(void);
 
 /**
+ * @brief 查询"本次响铃是否是第一次回调"（2026-08-25 新增）
+ *
+ * 【为什么需要这个接口】application.c 的 on_reminder_trigger() 必须区分两种回调来源，
+ * 因为它们的加锁情况完全不同、只有前者能安全地去碰 UI：
+ *   · alarm_ring_start()      —— 本轮第一次，**不持 s_ctx.mutex**，可以切页；
+ *   · REM_EVT_ALARM_RING_TICK —— 后续每次，**持有 s_ctx.mutex**，绝不能抢 LVGL 锁
+ *                                （否则与 alarm_ring_stop 抢同一把锁形成死锁）。
+ *
+ * 【原先是怎么判的、为什么不行】原先借用 `reminder_get_state() != RINGING` 当判据，
+ * 这迫使 alarm_ring_start() 把 state 的置位推迟到 trigger_cb 之后才能生效。
+ * 但那样会留下一个空窗：响铃画面已经画出来了，state 却还不是 RINGING，
+ * 于是 ui_port 的「响铃中任意触摸关闭闹钟」分支进不去 —— 实测现象＝
+ * **闹钟结束界面上头部触摸完全无反应**（耳朵走别的路径故仍可用）。
+ * 两个语义挤在一个 state 上，必然顾此失彼，故拆出本接口专司其职。
+ *
+ * @return true=当前这次回调是本轮响铃的第一次（可安全操作 UI）
+ * @note 调用者：application.c on_reminder_trigger()
+ */
+bool reminder_is_first_ring_callback(void);
+
+/**
  * @brief 查询 SNTP 是否已同步（系统时间是否有效）
  * @return true=时间有效，false=尚未同步
  */
@@ -373,6 +394,26 @@ esp_err_t reminder_timer_cancel(uint8_t timer_id);
  * @brief 查询剩余秒数
  */
 esp_err_t reminder_timer_get_remain(uint8_t timer_id, uint32_t *out_remain);
+
+/**
+ * @brief 查询「最近一个还在计时的倒计时」还有多少秒到期（2026-08-25 新增）
+ *
+ * 【为什么需要】低功耗的 enter_deep_standby() 是一段长达 8~10 秒的阻塞流程
+ * （背光渐变 + 舵机归中 + 压音量读 NVS + 取基准电压延时），而倒计时到期检测
+ * 是 1 秒一拍。若到期恰好落在这段流程里，两条链路会并发抢背光/舵机/音量，
+ * 实测表现为「屏幕只变暗、界面卡死」。standby_task 用本接口在进待机【之前】
+ * 先问一句「最近的提醒还有多久」，临期就本轮不睡，从源头避免两者重叠。
+ *
+ * @param out_sec 出参：最小剩余秒数（仅在返回 ESP_OK 时有效）
+ * @return ESP_OK=至少有一个倒计时在跑，out_sec 已填；
+ *         ESP_ERR_NOT_FOUND=当前没有任何倒计时在跑；
+ *         ESP_ERR_INVALID_ARG=out_sec 为 NULL；
+ *         ESP_ERR_INVALID_STATE=模块未初始化或互斥量不可用
+ *
+ * @note 只读，不改变任何状态；内部持 s_ctx.mutex，可在任意任务调用。
+ * @note 调用者：standby.c standby_task()（进深度待机前的临期检查）
+ */
+esp_err_t reminder_get_nearest_expire_sec(uint32_t *out_sec);
 
 /* ═══════════════════════════════════════════════════════════════════
  * 7. 对外接口 — 日历事件操作

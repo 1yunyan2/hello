@@ -25,9 +25,30 @@
 #include <stdatomic.h> // atomic_bool 播放中标志（跨核安全）
 #include "bsp/bsp_board.h"
 #include "ui/ui_port.h"
-#include "object.h" // PRINT_TASK_CREATED / PRINT_TASK_STACK_HWM
+#include "ui/remote_control.h" // remote_control_is_active：收尾 flush 不得打断远程接管运动
+#include "object.h"              // PRINT_TASK_CREATED / PRINT_TASK_STACK_HWM
+#include "audio/offline_audio.h" // 离线音频播放（情绪音效 → 外挂 flash /S/voice/）
+#include <stdio.h>               // snprintf 拼音频绝对路径
 
 static const char *TAG = "INTERACTION";
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 【2026-08-31 问题3】情绪音效（离线提示音）总开关
+ *
+ * 需求：暂时去除情绪的声音。置 0 后，触摸触发情绪时【不再播放】/S/voice/ 下的
+ * 离线音效，GIF、震动、舵机三项全部不受影响，照常执行。
+ *
+ * 【为什么用宏而不是删代码】用户明确说是"暂时"。情绪矩阵里 20 条 .audio_file
+ * 字段全部保留原样（见下方 s_emotion_matrix），要恢复只需把本宏置回 1，
+ * 一行开关即可，不必再去逐条补回文件名。
+ *
+ * 【影响范围】只管情绪音效这一条链路。以下不受本开关影响：
+ *   · 唤醒提示音、闹钟/倒计时的震动提醒 —— 走的是别的模块，与此无关；
+ *   · application.c 的 OFFLINE_AUDIO_BOOT_TEST 开机自测 —— 已是 0，本就不播。
+ * 即：全项目 offline_audio_play() 的调用点只有两处，另一处已关，故本宏置 0 后
+ * 离线提示音链路整体静默。
+ * ═══════════════════════════════════════════════════════════════════════════ */
+#define IA_EMOTION_AUDIO_ENABLE 0
 
 // ─── 情绪播放状态（供 ui_port 自动循环/触摸路由读取，跨核 atomic）──────────────
 // true = 正在执行某动作（情绪/对话状态/空闲）。置位早于 GIF/震动，清位在动作完成后。
@@ -69,7 +90,7 @@ static TaskHandle_t s_ia_worker = NULL; ///< worker 任务句柄
 /// OTA 停止标志：置 true 后 worker 丢弃一切请求、不再切 GIF/驱动舵机/震动。
 /// 用于 OTA 升级期间彻底静默 interaction（GIF+舵机+震动）。置位后不清除（OTA 必重启）。
 static volatile bool s_ia_stopped_for_ota = false;
-static bool s_ia_inited = false;        // 初始化完成
+static bool s_ia_inited = false; // 初始化完成
 
 // ==========================================
 // 1. 数据结构：严格对齐情绪矩阵表头
@@ -529,12 +550,28 @@ static void interaction_play_blocking(robot_emotion_t target_emotion)
     // 在 LVGL 线程真正切图，安全。gif_path 为 NULL 的情绪（如无 GIF）会被内部忽略。
     ui_request_emotion_gif(cmd->gif_path);
 
-    // ── 3. 音频播放（方波占位，真实文件接入后f替换）──────────────────────────
-    // 注：lv_gif_set_src 会访问 SPIFFS（SPI flash），ia_worker 栈在 SPIRAM，
-    //     禁用 cache 时 SPIRAM 不可访问，因此不能在此任务中调用屏幕动画。
-    // TODO: audio_player_play_file(cmd->audio_file);
-    ESP_LOGI(TAG, "🔊 音效槽: %s（当前使用方波占位）", cmd->audio_file);
-    // play_square_wave_beep(); // 播放方波占位音频
+    // ── 3. 音频播放（情绪音效 → 外挂 flash /S/voice/）──────────────────────────
+    // audio_file 是情绪矩阵里的文件名（如 "doubt.mp3"），拼成绝对路径后交给
+    // offline_audio_play 异步播放：它内部另起独立解码任务（栈/缓冲全在 SPIRAM），
+    // 不阻塞本 ia_worker，也不碰云端对话解码实例。
+    // 仲裁由 offline_audio 内部处理：对话中（非 IDLE）会被拒绝、播放中会被顶掉，
+    // 与情绪触摸在 play_random_emotion 处的屏蔽策略一致，双重保险。
+#if IA_EMOTION_AUDIO_ENABLE
+    if (cmd->audio_file && cmd->audio_file[0] != '\0')
+    {
+        char audio_path[64];
+        snprintf(audio_path, sizeof(audio_path), "/S/voice/%s", cmd->audio_file);
+        esp_err_t aret = offline_audio_play(audio_path);
+        if (aret != ESP_OK)
+            ESP_LOGW(TAG, "🔊 情绪音效播放未启动: %s (ret=%d)", audio_path, aret);
+        else
+            ESP_LOGI(TAG, "🔊 情绪音效: %s", audio_path);
+    }
+#else
+    /* 【2026-08-31 问题3】情绪音效已由 IA_EMOTION_AUDIO_ENABLE 关闭（暂时去除）。
+     * 矩阵里的 .audio_file 字段保留不动，置回 1 即恢复。 */
+    (void)cmd->audio_file;
+#endif
 
     // ── 4. 震动马达 ──────────────────────────────────────────────────────────
     // 按情绪表配置的震动序列逐段播放（强度/时长/间隔每段独立；NULL=无震动）。
@@ -581,7 +618,15 @@ static void interaction_play_blocking(robot_emotion_t target_emotion)
     // 先 flush 再清标志再恢复：清掉情绪期间可能残留的旧舵机请求（理论上已空，
     // 但兜底防现象2「恢复后 GIF 切好几遍舵机才动」）。flush 必须在 ui_resume 之前——
     // 否则会把 resume 刚入队的新舵机请求一起清掉。
-    servo_manager_flush();
+    //
+    // ★远程控制活跃时【必须跳过】(2026-08-05)：本情绪动作往往正是被远程指令打断的那条，
+    //   打断后 rc_worker 已经拿到通道锁开始把舵机送往用户指定角度。此处 flush 内部会调
+    //   bsp_servo_request_abort()，把 rc 刚清干净的打断标志重新置上 → rc 的插值走两步就
+    //   break，手臂停在半路（实测 steps=2 aborted=1 停在 35.0°，目标 0°）。
+    //   而正常收尾时 resume_loop 早于 rc 运动完成，两者不重叠，故表现为「时灵时不灵」。
+    //   远程控制期间也不需要这个归中兜底：rc 马上要把舵机放到用户要的位置，归中纯属多余。
+    if (!remote_control_is_active())
+        servo_manager_flush();
     atomic_store(&s_ia_playing, false);
     ui_resume_main_gif_loop();
 }
@@ -605,14 +650,16 @@ static void interaction_play_custom_blocking(const ia_custom_action_t *act)
     // 对话状态动作 is_idle=false（不可被打断，与情绪同级）。is_idle 与 keep_screen 解耦。
     atomic_store(&s_ia_is_idle, act->is_idle);
     atomic_store(&s_ia_playing, true);
-    ESP_LOGI("GIFDBG", "custom动作 开始 idle=%d gif=%s keep=%d",
-             act->is_idle, act->gif_path ? act->gif_path : "(NULL)", act->keep_screen);
-    // 【堆探针·已停用】根因（lv_gif_get_size 栈上 24KB 打穿栈）已由 gif_read_canvas_size
-    //   修复；全堆扫描太重会触发看门狗，暂注释保留，需再排查堆损坏时取消注释。
-    // if (!heap_caps_check_integrity_all(true))
+    // ESP_LOGI("GIFDBG", "custom动作 开始 idle=%d gif=%s keep=%d",
+    //          act->is_idle, act->gif_path ? act->gif_path : "(NULL)", act->keep_screen);
+    /* 【堆探针·2026-07-29 已验证无问题，暂停用】
+     * 实测这四个探针（进入前/flush后/切图后/震动后）在事故日志里【全部同时报同一地址】，
+     * 且「进入前」就已经报 → 说明本函数只是撞上别处留下的损坏，自身不是凶手。
+     * 整条 GIF+舵机+震动链路据此排除嫌疑。需再查时取消注释即可。 */
+    // if (!heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true))
     //     ESP_LOGE("HEAPCHK", "★堆损坏@custom进入前(上一动作遗留)");
     servo_manager_flush();
-    // if (!heap_caps_check_integrity_all(true))
+    // if (!heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true))
     //     ESP_LOGE("HEAPCHK", "★堆损坏@servo_manager_flush()之后");
 
     // 切图（跨线程安全）：状态动作走高优先级 ui_request_state_gif（is_state=true），
@@ -624,13 +671,13 @@ static void interaction_play_custom_blocking(const ia_custom_action_t *act)
         else
             ui_request_emotion_gif(act->gif_path);
     }
-    // if (!heap_caps_check_integrity_all(true))
-    //     ESP_LOGE("HEAPCHK", "★堆损坏@切图之后");
+    // if (!heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true))
+    //     ESP_LOGE("HEAPCHK", "★堆损坏@切图之后");   // 【已验证无问题，暂停用】
 
     // 震动（逐段阻塞播放；NULL/0 直接返回）
     trigger_vibration_motor(act->vib_seq, act->vib_seq_len);
-    // if (!heap_caps_check_integrity_all(true))
-    //     ESP_LOGE("HEAPCHK", "★堆损坏@震动之后");
+    // if (!heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true))
+    //     ESP_LOGE("HEAPCHK", "★堆损坏@震动之后");   // 【已验证无问题，暂停用】
 
     // 三轴舵机绝对角度并行动作（与情绪同一执行体，执行完 worker 统一归中 90°）
     servo_abs_parallel_request_t preq = {
@@ -649,13 +696,20 @@ static void interaction_play_custom_blocking(const ia_custom_action_t *act)
         ESP_LOGW(TAG, "状态动作舵机请求入队失败（队列满？），跳过本次动作");
     }
 
-    // if (!heap_caps_check_integrity_all(true))
-    //     ESP_LOGE("HEAPCHK", "★堆损坏@舵机动作之后");
-    servo_manager_flush(); // 归中（含打断兜底）
+    // if (!heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true))
+    //     ESP_LOGE("HEAPCHK", "★堆损坏@舵机动作之后");  // 【已验证无问题，暂停用】
+    /* ia_worker 栈在 PSRAM（见 interaction_manager_init 的 MALLOC_CAP_SPIRAM），
+     * 溢出踩不到内部 SRAM 堆；实测水位剩 7676B/8192B，极宽裕 → 排除。 */
+    // WARN_TASK_STACK_LOW("HEAPCHK", NULL, 1024);
+    // ★远程控制活跃时跳过：理由同 interaction_play_blocking 收尾处的详细注释——
+    //   本 flush 会重新置上打断标志，打断 rc_worker 正在进行的接管运动。
+    //   空闲动作走的正是本函数，故「空闲时下发指令也会停住」同源于此。
+    if (!remote_control_is_active())
+        servo_manager_flush(); // 归中（含打断兜底）
     atomic_store(&s_ia_is_idle, false);
     atomic_store(&s_ia_playing, false);
-    ESP_LOGI("GIFDBG", "custom动作 结束 keep=%d → %s", act->keep_screen,
-             act->keep_screen ? "停在GIF" : "恢复循环");
+    // ESP_LOGI("GIFDBG", "custom动作 结束 keep=%d → %s", act->keep_screen,
+    //          act->keep_screen ? "停在GIF" : "恢复循环");
     if (!act->keep_screen)
         ui_resume_main_gif_loop(); // 仅非 keep_screen 才恢复待机循环；对话中 keep_screen=true 停在状态 GIF（D.3）
 }

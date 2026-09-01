@@ -33,6 +33,18 @@ typedef enum
  */
 void ui_init(void);
 
+/**
+ * @brief 点亮屏幕并全屏显示首次配网提示图（pw.bin）
+ *
+ * 函数含义：自包含地完成 LCD + LVGL 初始化，贴一张静态配网提示图后开背光。
+ * 调用时机：【仅首次配网】——bsp_board_wifi_main() 检测到设备未配网、在
+ *           esp_wifi_start() 与 BLE controller 拉起【之前】调用。已配网开机
+ *           路径完全不经过本函数，UI 仍按原顺序在 WiFi 之后初始化。
+ * @note 只贴静态图、不播 GIF，贴完 LVGL 即静默，故可安全早于 BLE（见 BUG-026）。
+ * @note 内部各步均带幂等早退，配网完成后 ui_init() 可正常继续。
+ */
+void ui_show_provision_image(void);
+
 /* ═══════════════════════════════════════════════════════════════
  * 数据更新接口
  * ═══════════════════════════════════════════════════════════════ */
@@ -88,6 +100,28 @@ void ui_function_menu_enter(void);
  */
 void ui_function_menu_exit(void);
 
+/**
+ * @brief 倒计时到期：强制切到番茄时钟页并显示到期画面（2026-08-10 新增）
+ *
+ * 供 reminder 到期回调调用。无论当前在哪个界面，都会切到番茄时钟页显示
+ * 红色 00:00 + 「倒计时结束」，停留 3 秒后自动回到预设选择界面。
+ * 不改变 GIF、不操作舵机。
+ *
+ * @note 内部自行 lvgl_port_lock，可从非 LVGL 线程（reminder_task）调用。
+ */
+void ui_show_countdown_expired(void);
+
+/**
+ * @brief 闹钟响铃：强制切到闹钟页并显示响铃画面（2026-08-10 新增）
+ *
+ * 与 ui_show_countdown_expired() 同构。无论当前在哪个界面，都会切到闹钟页
+ * 显示红色时间 + 「闹钟响铃」，停留 3 秒后自动回到常规闹钟页。
+ * 不改变 GIF、不操作舵机。
+ *
+ * @note 内部自行 lvgl_port_lock，可从非 LVGL 线程（reminder_task）调用。
+ */
+void ui_show_alarm_ringing(void);
+
 /* ═══════════════════════════════════════════════════════════════
  * 功能盘（单层横向大图标）导航接口
  * ═══════════════════════════════════════════════════════════════ */
@@ -110,8 +144,18 @@ void ui_func_layer_exit_to_main(void);
  * @brief 强制从任意视图（含闹钟编辑）返回主界面
  * 函数含义：供待机模块在进入低功耗时调用，确保界面不卡在某菜单/编辑页
  * 调用时机：standby 进入一级待机（enter_standby）时
+ *
+ * @return true=已复位到主界面（或本就在主界面）；
+ *         false=取 LVGL 锁超时，本次【什么都没做】，界面仍停在原视图
+ *
+ * ⚠️【调用方必须检查返回值】2026-08-25 起本函数改为有返回值。原先取锁失败只是
+ *   静默 return，导致 enter_deep_standby() 以为界面已复位、继续把待机时钟叠上去，
+ *   实测出现「闹钟编辑页 + 低功耗时间页同框」（闹钟响铃结束会进闹钟编辑页，
+ *   它用独立的 s_edit_panel，不受 ui_standby_clock_show 的清理覆盖）。
+ *   返回 false 时调用方应当【整轮放弃】当前动作、下一拍重试，
+ *   而不是带着"半复位"的界面继续往下走。
  */
-void ui_force_back_to_main(void);
+bool ui_force_back_to_main(void);
 
 /**
  * @brief 在功能菜单文字面板上显示「标题 + 正文」（带 LVGL 锁）
@@ -189,6 +233,34 @@ void ui_request_state_gif(const char *gif_path);
 void ui_notify_first_online(void);
 
 /**
+ * @brief 通知 UI「全部初始化已完成」，开机 logo 可以让位给正常主界面轮播
+ *
+ * 开机期间 logo GIF 会循环播放以覆盖不定长的初始化耗时（实测 8~21s 浮动），
+ * 直到本函数置位 s_boot_ready 才切入 s_main_gif_table 轮播。
+ *
+ * 【跨线程】由 main 任务调用（非 LVGL 线程）：仅做单字标志写入 + 设 pending 标记，
+ * 真正切图延后一拍在 LVGL 线程执行，无需持 LVGL 锁。
+ */
+void ui_notify_boot_ready(void);
+
+/**
+ * @brief 查询开机背光渐变（logo 渐亮/渐暗/切图后渐亮）是否正在进行中
+ *
+ * 用途：让"直接把背光拍到某个亮度"的调用方（典型是 bsp_board_lcd_on()）在渐变
+ * 期间避让，不要中途改写背光。
+ *
+ * 【为什么需要】配网结束路径上，ui_init() 内部已启动 UI_BOOT_FADE_IN 渐亮，
+ * 返回后 application.c 又调 bsp_board_lcd_on() 把背光直接拍到 100%；而渐变
+ * timer 下一拍（4ms 后）按自己的时间进度算出较低亮度又写回去 —— 用户看到的就是
+ * 渐亮途中"突然亮一下再暗回来"的回弹。已配网设备因时序不同不出现，故仅首次配网可见。
+ *
+ * 【线程安全】只读一个枚举变量，任意线程可调，无需持 LVGL 锁。
+ *
+ * @return true=渐变进行中（调用方不应改写背光）；false=空闲，可自由设置亮度
+ */
+bool ui_is_boot_fading(void);
+
+/**
  * @brief 情绪播放完毕后恢复主界面自动随机 GIF + 舵机循环（跨线程安全）
  *
  * 由 interaction worker 在情绪播完、清 is_playing 标志后调用。仅设 pending 标记
@@ -212,6 +284,33 @@ void ui_pause_main_gif(void);
  * 与 ui_pause_main_gif() 成对。内部加 LVGL 锁碰 gif_obj，取锁超时安全跳过。
  */
 void ui_resume_main_gif(void);
+
+/**
+ * @brief 显示「低功耗常亮时钟」（进深度待机，背光渐暗前调用，跨线程安全）
+ *
+ * 二级低功耗的终点由「渐变全黑 + 关显示控制器」改为「渐变到 10% + 常驻显示时间」，
+ * 本函数负责其中的画面部分：隐藏并定格主界面 GIF，把功能盘里现成的时间页
+ * （s_time_page 整组）叠在主界面之上显示。刻意【不改 s_view】（保持 UI_VIEW_MAIN），
+ * 避免踩功能层空闲定时器自动复活 GIF 等坑，详见 ui_port.c 实现处注释。
+ *
+ * @note 必须在 ui_pause_main_gif() 之后、背光渐暗之前调用（先掐断 GIF 解码占用，
+ *       再渲染时钟，沿用「先关 GIF 再降亮度」的既有契约）。
+ * @note 内部自持 LVGL 锁，取锁超时安全跳过（退化为停留在定格 GIF，无残影）。
+ * @note 与 ui_standby_clock_hide() 成对。
+ */
+void ui_standby_clock_show(void);
+
+/**
+ * @brief 隐藏「低功耗常亮时钟」（退深度待机，背光渐亮前调用，跨线程安全）
+ *
+ * 收起时间页整组与共享面板，并把 gif_obj unhide。GIF 的「从定格帧恢复播放 +
+ * 恢复轮播排队」仍由 ui_resume_main_gif() 负责，本函数不重复。
+ *
+ * @note 必须在背光渐亮【之前】调用：此刻背光仍是 10%，切换过程用户基本看不见；
+ *       等渐亮起来时画面已是动着的 GIF，无「时钟先亮再突然跳成 GIF」的突兀感。
+ * @note 与 ui_standby_clock_show() 成对。
+ */
+void ui_standby_clock_hide(void);
 
 /* ═══════════════════════════════════════════════════════════════
  * 对话状态中性 GIF 接口

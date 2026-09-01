@@ -155,3 +155,22 @@ void session_debug_kill_ws(void);
  * @note 线程安全：可从任意任务（如 OTA 下载任务）调用。
  */
 void session_stop_for_ota(void);
+
+/**
+ * @brief 为「闹钟/倒计时到点」立即中断当前对话（2026-08-25 新增）
+ *
+ * 【语义】提醒的优先级高于对话：到点就把正在进行的会话立刻掐断——含正在播放的
+ * TTS（大模型说到一半也立即停），随后由 reminder 照常走震动 + 切提醒画面的正常流程。
+ *
+ * 【与 session_stop_for_ota 的区别】只投递 ABORT + CLOSE，**不置 OTA 锁定标志**：
+ * 提醒结束后设备要能正常被唤醒词重新拉起会话，而 OTA 那个锁是一去不回的
+ * （靠重启复位）。除此之外两者走的是同一条异步关闭路径。
+ *
+ * 【线程安全】只做一次 xQueueSend，不碰 flash / NVS / LVGL，**不阻塞**，
+ * 因此【栈在 PSRAM 的 reminder_task 也可以安全调用】——这正是它必须做成
+ * "只投队列"的原因（详见 reminder.c 中 nvs_save_weather_data 处的 PSRAM 栈铁律）。
+ *
+ * @note 幂等：会话本就不在进行时投递事件无副作用。
+ * @note 调用者：reminder.c poll_timer_callback（闹钟/倒计时到点）
+ */
+void session_interrupt_for_reminder(void);
