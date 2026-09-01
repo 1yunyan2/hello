@@ -144,6 +144,17 @@ extern const lv_image_dsc_t jt1, jt3, jt4, jt5, jt6, jt7;
 #define JUMP_DIST_MIN_PX 55
 #define JUMP_DIST_MAX_PX 200
 
+/* ── 蓄力震动（替代原「按下震一下」）──
+ * 需求：跳一跳不再在按下瞬间震一下，改为【按住蓄力全程持续震动】，
+ * 强度随蓄力百分比线性上升，松手起跳/作废立刻停。
+ *   · MIN_LEVEL：刚按下时的强度（%），太低马达转不起来，建议 ≥30
+ *   · MAX_LEVEL：蓄满（JUMP_HOLD_MAX_MS）时的强度（%）
+ *   · STEP     ：强度量化步长（%），只有跨过一档才真正写 LEDC，
+ *                避免 30fps 每帧都写寄存器（听感上也更像"逐级加力"）*/
+#define JUMP_CHARGE_VIB_MIN_LEVEL 30
+#define JUMP_CHARGE_VIB_MAX_LEVEL 100
+#define JUMP_CHARGE_VIB_STEP 10
+
 /* ── 台子 Y 轴随机偏移（双轴散落效果）── */
 #define JUMP_GAP_Y_MAX 50 /* 下一台相对当前台 Y 轴最大偏移 px（上下各±50）*/
 

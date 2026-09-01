@@ -807,6 +807,59 @@ static void player_render_topple(int ang_deci, int dir, int fall_h)
 
 static void sparks_hide(void); /* 前置声明 */
 
+/* ══════════════════════════════════════════════════
+ * 蓄力震动（替代原来的「按下震一下」）
+ *
+ * 【为什么用 bsp_motor_set 而不是 bsp_motor_pulse】
+ * 本组函数全部在 engine_cb（LVGL timer，跑在 taskLVGL 线程）里调用，
+ * 而 bsp_motor_pulse()/bsp_motor_pulse_level() 内含 vTaskDelay 阻塞，
+ * 在 LVGL 线程里调会把整条渲染流水线卡住（同 [BUG-038] 打地鼠锤子被吃掉的坑）。
+ * 故这里只用非阻塞的 bsp_motor_set()：开由蓄力帧驱动、关由各退出点显式调用。
+ *
+ * 【必须保证"关"不会漏】马达是持续输出，一旦漏关就一直震。所有出口都调
+ * charge_vib_stop()：起跳(do_jump)、未蓄力/作废分支、非 PH_IDLE 相位、
+ * 离开 JS_PLAYING、进结算、退出游戏(jump_stop)。
+ * s_vib_level 缓存当前档位，等值不重复写 LEDC 寄存器。
+ * ══════════════════════════════════════════════════ */
+static int s_vib_level = 0; /* 当前马达强度档位（%），0=停 */
+
+/* 设置蓄力震动强度（0~100，0=停）。等值直接返回，不重复写寄存器 */
+static void charge_vib_set_level(int level)
+{
+    if (level < 0)
+        level = 0;
+    if (level > 100)
+        level = 100;
+    if (level == s_vib_level)
+        return;
+    s_vib_level = level;
+    bsp_motor_set((uint8_t)level);
+}
+
+/* 停止蓄力震动（幂等，可在任意出口无条件调用）*/
+static void charge_vib_stop(void)
+{
+    charge_vib_set_level(0);
+}
+
+/* 按蓄力百分比 0~100 更新震动强度：
+ * MIN_LEVEL 线性升到 MAX_LEVEL，并按 STEP 量化，降低 LEDC 写入频率。*/
+static void charge_vib_update(int pct)
+{
+    if (pct < 0)
+        pct = 0;
+    if (pct > 100)
+        pct = 100;
+    int lv = JUMP_CHARGE_VIB_MIN_LEVEL +
+             (JUMP_CHARGE_VIB_MAX_LEVEL - JUMP_CHARGE_VIB_MIN_LEVEL) * pct / 100;
+#if JUMP_CHARGE_VIB_STEP > 1
+    lv = lv / JUMP_CHARGE_VIB_STEP * JUMP_CHARGE_VIB_STEP; /* 量化到整档 */
+    if (lv < JUMP_CHARGE_VIB_MIN_LEVEL)
+        lv = JUMP_CHARGE_VIB_MIN_LEVEL;
+#endif
+    charge_vib_set_level(lv);
+}
+
 static void player_hide(void)
 {
     if (s_player)
@@ -1272,6 +1325,7 @@ static void do_jump(uint32_t held_ms)
 
     platform_render_one(0, 0); /* 恢复台子压扁 */
     sparks_hide();             /* 起跳：收起蓄力光斑 */
+    charge_vib_stop();         /* 起跳：立刻断掉蓄力震动（松手即停）*/
     /* ★【2026-08-31 问题1】原有的起跳 bsp_motor_pulse() 已删除：一次触摸震两次。
      * 跳一跳靠「按住蓄力、松手起跳」，而触摸层 bsp_touch.c 已在左右耳【按下沿】
      * 统一震过一次；本函数走的是【松手】路径，再震就成了第二次
@@ -1345,13 +1399,20 @@ static void engine_cb(lv_timer_t *t)
 {
     (void)t;
     if (g.screen != JS_PLAYING)
+    {
+        charge_vib_stop(); /* 离开对局（选难度/结算）一律断震，防漏关一直震 */
         return;
+    }
 
     /* 注意：不再每帧扫描触发挂起台子（旧 platforms_drop_trigger 会在落台瞬间误触发
      * 第三块从天而降，与落台同帧浮动）。改由 trigger_next_drop 在开局/镜头停稳后调用。*/
 
     /* 台子入场/回弹已挪到 drop_tick_cb（高频 timer），此处不再推进，
      * 否则同一帧被推进两次，掉落速度翻倍。*/
+
+    /* 非蓄力相位（飞行/坠落/倒下/镜头）一律断震：蓄力震动只属于 PH_IDLE 按住期 */
+    if (g.phase != PH_IDLE)
+        charge_vib_stop();
 
     switch (g.phase)
     {
@@ -1374,7 +1435,8 @@ static void engine_cb(lv_timer_t *t)
             player_render(0, 0, 0);
 #endif
             platform_render_one(0, 0);
-            sparks_hide(); /* 未蓄力：无光斑 */
+            sparks_hide();     /* 未蓄力：无光斑 */
+            charge_vib_stop(); /* 未蓄力/本次按住作废：无震动 */
         }
         else
         {
@@ -1395,6 +1457,8 @@ static void engine_cb(lv_timer_t *t)
             platform_render_one(0, pct);
             sparks_update(pct, sink);
 #endif
+            /* ★ 蓄力震动：强度随蓄力百分比上升（替代原来的按下震一下）*/
+            charge_vib_update(pct);
         }
         break;
     }
@@ -1724,6 +1788,7 @@ static void select_render(void)
 static void enter_select(void)
 {
     g.screen = JS_SELECT;
+    charge_vib_stop(); /* 引擎 timer 即将 pause，先断震防漏关 */
     if (s_engine_tmr)
         lv_timer_pause(s_engine_tmr);
     player_hide();
@@ -1778,6 +1843,7 @@ static void enter_result(void)
 {
     g.screen = JS_RESULT;
     g.charge_valid = false; /* 进结算即作废，结算界面按左右不产生蓄力 */
+    charge_vib_stop();      /* 引擎 timer 马上被 pause，必须在这里断震，否则漏关一直震 */
     if (s_engine_tmr)
         lv_timer_pause(s_engine_tmr);
     if (s_drop_tmr)
@@ -1977,6 +2043,9 @@ void jump_touch(touch_event_t event)
 
 void jump_stop(void)
 {
+    /* 退出兜底放在取锁【之前】：断震只写 LEDC 寄存器、不碰 LVGL 对象，
+     * 万一取锁失败提前 return，马达也不会被落在"一直震"的状态。*/
+    charge_vib_stop();
     if (!lvgl_port_lock(200))
         return;
     /* 刷新周期恢复必须放在 !s_panel 提前返回【之前】：面板已被别处销毁而加速态
