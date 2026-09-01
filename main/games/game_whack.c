@@ -29,6 +29,7 @@
 #include "game_whack.h"
 #include "whack_sprites.h"
 #include "ui/ui_port.h"
+#include "ui/font_loader.h"
 #include "esp_lvgl_port.h"
 #include "lvgl.h"
 #include "esp_log.h"
@@ -39,7 +40,6 @@
 #include "bsp/bsp_board.h"
 
 LV_FONT_DECLARE(font_cn_16);
-LV_FONT_DECLARE(font_cn_32); /* 32px 中文大字库（含游戏用字），用于居中大文字 */
 
 static const char *TAG = "WHACK";
 
@@ -687,7 +687,7 @@ static void enter_select(void)
     /* 还原居中文字属性（结算时扩了宽度/换行模式）*/
     if (s_center)
     {
-        lv_obj_set_style_text_font(s_center, &font_cn_32, 0);
+        lv_obj_set_style_text_font(s_center, font_cn_32_get(), 0);
         lv_obj_set_width(s_center, LV_SIZE_CONTENT);
         lv_label_set_long_mode(s_center, LV_LABEL_LONG_CLIP);
         lv_obj_align(s_center, LV_ALIGN_CENTER, 0, -10);
@@ -798,7 +798,7 @@ static void enter_result(void)
     /* 结算文字已按需求注释掉（不显示任何文字）
     if (s_center)
     {
-        lv_obj_set_style_text_font(s_center, &font_cn_32, 0);
+        lv_obj_set_style_text_font(s_center, font_cn_32_get(), 0);
         lv_obj_set_width(s_center, BSP_LCD_WIDTH - 20);
         lv_label_set_long_mode(s_center, LV_LABEL_LONG_WRAP);
         char buf[160];
@@ -885,29 +885,35 @@ static void build_panel(void)
     lv_obj_set_style_bg_color(s_panel, lv_color_hex(WHACK_BG_COLOR), 0);
 #endif
 
-    /* ── HUD（顶部一行）── */
+    /* ── HUD / 居中大文字 / 底部提示 ──
+     * 三者全代码库只有 add_flag(HIDDEN)，无任何 clear_flag 使其显示：
+     *   - s_hud：744行注释明写"HUD 文字已注释，始终隐藏"
+     *   - s_center：whack_start() 固定 DIFF_NORMAL 直接 enter_countdown()，
+     *     enter_select()/select_render() 是死路径不会触发
+     *   - s_hint：同样全程隐藏
+     * 用户从未看到过这三个标签的文字。注释掉创建，避免 s_center 首建时触发
+     * font_cn_32_get() 同步读盘阻塞（实测卡顿130ms+）。三变量保持 NULL，
+     * 其余引用处 if(s_hud)/if(s_center)/if(s_hint) 判断会自动跳过，不受影响。
     s_hud = lv_label_create(s_panel);
     lv_obj_set_style_text_font(s_hud, &font_cn_16, 0);
     lv_obj_set_style_text_color(s_hud, lv_color_hex(0x00C800), 0);
-    /* 下移到时间条(顶部, 高WHACK_TIMEBAR_H)下方，避免重叠 */
     lv_obj_align(s_hud, LV_ALIGN_TOP_MID, 0, WHACK_TIMEBAR_MARGIN + WHACK_TIMEBAR_H + 4);
     lv_obj_add_flag(s_hud, LV_OBJ_FLAG_HIDDEN);
 
-    /* ── 居中大文字（难度/倒计时/结算共用）── 用 32px 大字库，模仿赛车 ── */
     s_center = lv_label_create(s_panel);
-    lv_obj_set_style_text_font(s_center, &font_cn_32, 0);
+    lv_obj_set_style_text_font(s_center, font_cn_32_get(), 0);
     lv_obj_set_style_text_color(s_center, lv_color_hex(0x00C800), 0);
     lv_obj_set_style_text_align(s_center, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(s_center, LV_ALIGN_CENTER, 0, -10);
     lv_obj_add_flag(s_center, LV_OBJ_FLAG_HIDDEN);
 
-    /* ── 底部操作提示 ── */
     s_hint = lv_label_create(s_panel);
     lv_obj_set_style_text_font(s_hint, &font_cn_16, 0);
     lv_obj_set_style_text_color(s_hint, lv_color_hex(0x00C800), 0);
     lv_obj_set_style_text_align(s_hint, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(s_hint, LV_ALIGN_BOTTOM_MID, 0, -8);
     lv_obj_add_flag(s_hint, LV_OBJ_FLAG_HIDDEN);
+    */
 
     /* ── 结算半透明遮罩（默认隐藏，结算时显示暗化背景）── */
     s_dim = lv_obj_create(s_panel);

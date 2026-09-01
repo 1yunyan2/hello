@@ -160,7 +160,7 @@ extern const lv_image_dsc_t jt1, jt3, jt4, jt5, jt6, jt7;
 
 /* ── 摔倒判定（PH_TOPPLE）：踩到台缘但落脚面不够，先站稳再朝台外倾倒 ── */
 /* 棋子「有效落脚半宽」= 缩放后图片半宽 × 此百分比。占比越大越易判摔倒（更难）。*/
-#define JUMP_FOOT_W_PCT 50      /* 落脚面占棋子图宽的百分比（50%）*/
+#define JUMP_FOOT_W_PCT 50 /* 落脚面占棋子图宽的百分比（50%）*/
 /* 摔倒区间边界：棋子中心超出台缘的量 overshoot 落在 (0, 脚底半宽×此倍率/100) 算摔倒；
  * 超过则重心彻底出台缘，走完全坠落 PH_FALL。倍率>100 可放大「摔倒」出现概率。*/
 #define JUMP_TOPPLE_RANGE_PCT 100 /* 摔倒区上界 = 脚底半宽 × 100% */
@@ -172,12 +172,54 @@ extern const lv_image_dsc_t jt1, jt3, jt4, jt5, jt6, jt7;
 #define JUMP_CAM_SMOOTH_FRAMES 12 /* 平滑帧数，约0.4s @30fps */
 
 /* ── 台子从天而降入场动画 ── */
-#define JUMP_DROP_HEIGHT 90      /* 入场起始离目标的高度 px（从这么高掉下来）*/
-#define JUMP_DROP_GRAVITY 3      /* 掉落重力加速度（每帧 drop_vy += 此值）*/
-#define JUMP_DROP_INIT_VY 10     /* 掉落初始速度（暂时注释停用，恢复无初速）*/
-#define JUMP_DROP_BOUNCE 45      /* 触底回弹初始压扁量（0~100，越大弹得越狠）*/
-#define JUMP_DROP_BOUNCE_DECAY 8 /* 回弹压扁每帧衰减量（回弹消退速度）*/
-#define JUMP_DROP_BOUNCE_COEF 30 /* 图片模式弹起版：触底反弹速度保留系数 %（越大弹得越高，25%≈轻弹一下）*/
+/* 【2026-08-19 减轻掉落斜纹】台子入场/回弹改用独立高频 timer（game_jump.c 的
+ * drop_tick_cb），不再跟随 JUMP_ENGINE_MS。
+ *
+ * 原理：撕裂一直在发生（屏无 TE 引脚，SPI 写入与液晶扫描不同步，见 [BUG-041]），
+ * 肉眼看不看得见取决于【撕裂线两侧差多少】=【每帧位移量】：
+ *   · 落台压扁每帧只变 ~1px  → 只剩边缘锯齿（可接受）
+ *   · 台子下落每帧移 11~24px → 一道明显斜切
+ * 故把掉落帧率翻倍、重力同步减小：总距离/总时长基本不变，每帧只走一半。
+ * 只拆这一段跑高频，主引擎仍是 JUMP_ENGINE_MS，飞行/相机/蓄力手感一律不变。*/
+/* 【必须与游戏内 LVGL 刷新周期(game_jump.c 的 JUMP_REFR_PERIOD_MS)取同一个值】
+ * 两个定时器都由同一个 lv_timer_handler 驱动，同周期即同一轮里依次触发，是确定的
+ * 1:1，不会相位漂移。只提刷新率 → 多刷的是重复帧；只提步进率 → 值变了也要等下次
+ * 刷新才上屏。两者缺一都白搭（同 ui_port.c:7361 头部压扁已验证的结论）。*/
+#define JUMP_DROP_TICK_MS 10 /* 台子入场/回弹专用帧间隔 ms */
+/* 入场高度 90→60→40：撕裂阈值锁死在 JUMP_DROP_SPEED_PX=4，速度不能再提，
+ * 想让掉落更快只能缩短总距离（总时长 = 距离 ÷ 速度 × 帧间隔）：
+ *   60px → 15帧 × 20ms = 300ms
+ *   40px → 10帧 × 20ms = 200ms ← 当前取值
+ *   30px →  8帧 × 20ms = 160ms（再短「从天而降」感开始不足）*/
+#define JUMP_DROP_HEIGHT 70 /* 入场起始离目标的高度 px */
+
+/* ── 匀速下落速度：撕裂消不掉，就把每帧错位压到看不见的量级 ──────────────
+ * 【判据】撕裂可见度 = 每帧位移量（ui_port.c:7314 头部压扁实测结论）：
+ *   · 跳一跳蓄力压扁   1px/帧   → 看不出
+ *   · 头部压扁修复后   4.3px/帧 → 边缘毛刺，可接受
+ *   · 本处旧版重力加速 峰值24px/帧 → 一眼可见大斜切
+ *
+ * 【为什么去掉重力加速】看着有多明显取决于【最坏那一帧】而非平均值。重力下 vy
+ * 递增、最后几帧最快，峰值是平均的 3 倍，前面帧数的努力全被最后一帧作废。
+ * 匀速后峰值 = 平均，零成本砍掉全部峰值（同 ui_port.c:7381 改 linear 的理由）。
+ *
+ * 【调参阶梯】帧间隔约 20ms（16ms 周期 + lvgl_port timer_period_ms=10 的调度粒度）：
+ *   6 → 60px/6 = 10帧 × 20ms = 200ms   快，锯齿仍可见
+ *   4 → 60px/4 = 15帧 × 20ms = 300ms ← 当前取值，已优于头部压扁的 4.3px
+ *   3 → 60px/3 = 20帧 × 20ms = 400ms   更淡，掉落开始显肉
+ *   2 → 60px/2 = 30帧 × 20ms = 600ms   接近蓄力压扁那档(看不出)，但太慢
+ * 实拍后直接调本宏即可，逻辑不用动。*/
+#define JUMP_DROP_SPEED_PX 6 /* 匀速下落/弹起速度 px/帧（峰值=平均）*/
+
+/* 触底后向上弹起的高度 px（0=不弹，落到底直接落定）。
+ * 弹起同样走 JUMP_DROP_SPEED_PX 匀速，12px ≈ 上下各 3 帧，共 6 帧约 120ms。*/
+#define JUMP_DROP_BOUNCE_UP_PX 5
+
+#define JUMP_DROP_GRAVITY 1      /* 【匀速版不再使用】仅 cube3d 模式(JUMP_PLAT_USE_IMG=0)分支引用 */
+#define JUMP_DROP_INIT_VY 10     /* 挂起态占位速度（plat_pend_drop 用，实际由 plat_start_drop 覆盖）*/
+#define JUMP_DROP_BOUNCE 45      /* 触底回弹初始压扁量（仅 cube3d 模式）*/
+#define JUMP_DROP_BOUNCE_DECAY 8 /* 回弹压扁每帧衰减量（仅 cube3d 模式）*/
+#define JUMP_DROP_BOUNCE_COEF 35 /* 【匀速版不再使用】旧「速度反弹系数」，保留防其它引用编译失败 */
 
 /* ── 掉落 ── */
 #define JUMP_FALL_STEP_PX 10

@@ -30,6 +30,7 @@
 #include "game_race.h"
 #include "race_sprites.h"
 #include "ui/ui_port.h"
+#include "ui/font_loader.h"
 #include "esp_lvgl_port.h"
 #include "lvgl.h"
 #include "esp_log.h"
@@ -40,7 +41,6 @@
 #include <stdio.h>
 
 LV_FONT_DECLARE(font_cn_16);
-LV_FONT_DECLARE(font_cn_32); /* 32px 中文大字库（仅含游戏用字），用于居中大文字 */
 
 static const char *TAG = "RACE";
 
@@ -141,6 +141,20 @@ static lv_timer_t *s_cd_tmr = NULL;     /* 开局 3 秒倒计时 */
 #define RACE_RESTART_DELAY_MS 1000      /* 结算停留时长（ms）*/
 static lv_timer_t *s_restart_tmr = NULL; /* one-shot 自动重开定时器 */
 
+/* ── 撞车震动关闭定时器（2026-08-31 新增）──
+ * 【为什么必须用定时器而不是 bsp_motor_pulse_level()】
+ *   pulse 系接口内部是 set(强度) + vTaskDelay(时长) + set(0)，含阻塞。
+ *   撞车判定在 engine_cb 里，而 engine_cb 跑在 LVGL 线程 —— 阻塞会直接卡住渲染。
+ *   打地鼠曾因此踩坑：命中震动的 30ms vTaskDelay 把锤子动画整个吃光（BUG-038）。
+ *   故这里同样「只开不等」：撞车时 bsp_motor_set() 立即开震，关闭交给本定时器。
+ *
+ * 【为什么不像打地鼠那样交给引擎按时间片关】
+ *   打地鼠命中后游戏继续，引擎每帧都在跑，可以在引擎里检查时长到点关闭。
+ *   赛车撞车即进结算：engine_cb 开头就 `g.screen != RS_PLAYING → return`，
+ *   永远走不到关闭逻辑 → 马达会一直震。故必须用独立的 one-shot 定时器。
+ *   （也不能蹭 s_restart_tmr：那个是 1000ms，震动只要 200ms，会震得过长。）*/
+static lv_timer_t *s_motor_tmr = NULL;
+
 /* ── 素材/车道查表（const，编译期定死）── */
 /* 障碍素材（C 数组，内存驻留→可实时缩放），随机选一张换图 */
 static const lv_image_dsc_t *const s_obst[RACE_OBST_COUNT] = {&c1, &c2, &c3, &c4, &c5, &c6};
@@ -205,6 +219,43 @@ static void restart_timer_cancel(void)
         lv_timer_del(s_restart_tmr);
         s_restart_tmr = NULL;
     }
+}
+
+/* 停止撞车震动并回收定时器。
+ * 退出游戏 / 重开一局时必须调用，否则马达可能一直震（面板已删而马达还开着）。
+ * 幂等：没在震动时调用也安全。*/
+static void motor_stop_now(void)
+{
+    if (s_motor_tmr)
+    {
+        lv_timer_del(s_motor_tmr);
+        s_motor_tmr = NULL;
+    }
+    bsp_motor_set(0); /* 无条件关，兜底防漏关 */
+}
+
+/* one-shot 回调：撞车震动时长到，关闭马达 */
+static void motor_off_cb(lv_timer_t *t)
+{
+    (void)t;
+    s_motor_tmr = NULL; /* repeat_count=1：LVGL 在本回调返回后自动删除该定时器 */
+    bsp_motor_set(0);
+}
+
+/* 撞车时触发震动：非阻塞（只开，关闭交给 one-shot 定时器）*/
+static void motor_crash_vibrate(void)
+{
+    bsp_motor_set(RACE_CRASH_VIBRATE_LEVEL);
+
+    /* 若上一次震动定时器还在（极端情况：结算后立刻又撞），先撤旧的再建新的，
+     * 避免旧定时器提前把新震动关掉。*/
+    if (s_motor_tmr)
+        lv_timer_del(s_motor_tmr);
+    s_motor_tmr = lv_timer_create(motor_off_cb, RACE_CRASH_VIBRATE_MS, NULL);
+    if (s_motor_tmr)
+        lv_timer_set_repeat_count(s_motor_tmr, 1);
+    else
+        bsp_motor_set(0); /* 定时器创建失败：宁可不震，也不能让马达一直转 */
 }
 
 /* one-shot 回调：结算停留结束，自动开下一局（等价于在结算界面按一次头部）*/
@@ -368,7 +419,10 @@ static void engine_cb(lv_timer_t *t)
             e->checked = true;
             if (e->lane == g.player_lane)
             {
-                /* 撞车：进结算界面显示「游戏结束 + 得分」。*/
+                /* 撞车：震动反馈 + 进结算界面显示「游戏结束 + 得分」。
+                 * 震动是非阻塞的（只开马达，关闭交给 one-shot 定时器），
+                 * 故放在 enter_result() 之前不会拖慢切屏。*/
+                motor_crash_vibrate();
                 ESP_LOGI(TAG, "得分=%d", g.score);
                 enter_result();
                 return; /* 立即停止本帧后续更新 */
@@ -738,13 +792,19 @@ static void build_panel(void)
     lv_obj_set_pos(s_player, RACE_PLAYER_LANE_M - RACE_PLAYER_W / 2, RACE_PLAYER_TOP_Y);
     lv_obj_add_flag(s_player, LV_OBJ_FLAG_HIDDEN);
 
-    /* ── 居中大文字（倒计时/结算共用）── 用 32px 中文大字库 */
+    /* ── 居中大文字（倒计时/结算共用）── 数字倒计时已被开场进度条取代
+     * （见 enter_countdown() 注释"不再显示 3/2/1/GO 数字"），结算界面也改为
+     * 只显示背景图不显示文字（见 enter_result() 注释），s_center 全代码库
+     * 无任何 clear_flag(HIDDEN) 使其显示，用户从未看到过。注释掉创建，避免
+     * 首建时触发 font_cn_32_get() 同步读盘阻塞（实测卡顿130ms+）。s_center
+     * 保持 NULL，其余引用处 if(s_center) 判断会自动跳过，不受影响。
     s_center = lv_label_create(s_panel);
-    lv_obj_set_style_text_font(s_center, &font_cn_32, 0);
+    lv_obj_set_style_text_font(s_center, font_cn_32_get(), 0);
     lv_obj_set_style_text_color(s_center, lv_color_hex(0xFFD60A), 0);
     lv_obj_set_style_text_align(s_center, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(s_center, LV_ALIGN_CENTER, 0, -10);
     lv_obj_add_flag(s_center, LV_OBJ_FLAG_HIDDEN);
+    */
 
     /* ── 开场进度条（顶部，仅入场三秒倒计时用；做法复用打地鼠 game_whack.c）──
      * 放在玩家车之后创建 → z 序在上，不会被赛道元素盖住。
@@ -772,13 +832,15 @@ static void build_panel(void)
     lv_obj_clear_flag(s_timebar_fill, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_timebar_fill, LV_OBJ_FLAG_HIDDEN);
 
-    /* ── 底部操作提示 ── */
+    /* ── 底部操作提示 ── 全代码库只 add_flag(HIDDEN)，无 clear_flag 使其显示，
+     * 用户从未看到过。注释掉创建，s_hint 保持 NULL，其余 if(s_hint) 判断自动跳过。
     s_hint = lv_label_create(s_panel);
     lv_obj_set_style_text_font(s_hint, &font_cn_16, 0);
     lv_obj_set_style_text_color(s_hint, lv_color_white(), 0);
     lv_obj_set_style_text_align(s_hint, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(s_hint, LV_ALIGN_BOTTOM_MID, 0, -8);
     lv_obj_add_flag(s_hint, LV_OBJ_FLAG_HIDDEN);
+    */
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -869,6 +931,9 @@ void race_stop(void)
         lvgl_port_unlock();
         return;
     }
+
+    /* 退出时若正在震动，定时器随面板一起没人管了，这里兜底关闭防马达一直震 */
+    motor_stop_now();
 
     if (s_engine_tmr)
     {

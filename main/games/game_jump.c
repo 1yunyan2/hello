@@ -23,8 +23,8 @@
  */
 #include "game_jump.h"
 #include "jump_sprites.h"
-#include "cube3d.h"
 #include "ui/ui_port.h"
+#include "ui/font_loader.h"
 #include "esp_lvgl_port.h"
 #include "lvgl.h"
 #include "esp_log.h"
@@ -35,7 +35,6 @@
 #include "bsp/bsp_board.h"
 
 LV_FONT_DECLARE(font_cn_16);
-LV_FONT_DECLARE(font_cn_32);
 
 static const char *TAG = "JUMP";
 
@@ -101,6 +100,7 @@ typedef struct
     int drop;          /* 当前竖直入场偏移（>0=在目标上方，渲染时 sy 减去它）*/
     int drop_vy;       /* 掉落速度（每帧px，向下加速）*/
     int bounce;        /* 触底回弹压扁余量（0~100，渲染时加到 squash）*/
+    bool bounce_done;  /* 匀速入场：已完成那一次向上弹起，下次触底即落定（防无限弹）*/
     bool dropping;     /* 入场动画进行中 */
     bool drop_pending; /* 已生成但尚未起跌：台子多生成在屏幕右侧外，先挂起，
                         * 等它随相机滚入视野右缘再触发 plat_start_drop，
@@ -135,6 +135,13 @@ static struct
     jump_screen_t screen;
     jump_diff_t diff;
     jump_phase_t phase;
+
+    /* 本次按住是否「从合法时刻按下」：只有在 PH_IDLE 且下一块台已落稳时按下才置 true。
+     * 结算界面、棋子飞行/摔倒/下坠、镜头平移期间按下 → false，该次按住整段作废：
+     * 既不画蓄力压扁，松手也不起跳（不重新起算，必须松手后重新按）。
+     * 修复：旧逻辑只在「松手」时才查相位，导致非法时刻按下仍画压扁，
+     * 且短按松手时相位未回 IDLE 被丢弃、长按松手时已回 IDLE 却照常跳出。*/
+    bool charge_valid;
 
     int high_score, score;
 
@@ -206,6 +213,75 @@ static lv_obj_t *s_hud = NULL;
 static lv_obj_t *s_center = NULL;
 
 static lv_timer_t *s_engine_tmr = NULL;
+static lv_timer_t *s_drop_tmr = NULL; /* 台子入场/回弹专用高频 timer（见 drop_tick_cb）*/
+
+/* ── 【仅跳一跳】临时提高 LVGL 刷新频率，压小台子下落时的单次脏区 ──
+ *
+ * 【为什么必须改刷新周期，光改 JUMP_ENGINE_MS 没用】
+ * 引擎 timer 与 LVGL 刷新 timer 是两个独立 timer：engine_cb 改台子坐标只是
+ * 标记脏区（invalidate），真正出图由 LVGL 刷新 timer 按 CONFIG_LV_DEF_REFR_PERIOD
+ * 触发。两次刷新之间的多次 invalidate 会被【合并成一块脏区】，所以：
+ *     单次脏区跨度 = 台子速度 × 刷新周期
+ * 引擎周期根本不在这个式子里。把 JUMP_ENGINE_MS 改小、重力同步减半，
+ * 33ms 内的累计位移不变 → 合并后的脏区一模一样 → 完全无效。
+ *
+ * 【为什么脏区小就不撕】屏幕无 TE 引脚，刷新与扫描线不同步（见 [BUG-041]）。
+ * 单次 flush 耗时越长，扫描线在这期间扫过的区域越大，分界线就越明显。
+ * 落台压扁动画之所以只有边缘锯齿没有大斜纹，正是因为它每帧只变 0.3px。
+ *
+ * 【为什么在运行期改而不改 sdkconfig】CONFIG_LV_DEF_REFR_PERIOD 是全局的，
+ * 会影响 GIF/时间页/其它游戏，影响面不可控。LVGL 的刷新周期本身就是个普通
+ * lv_timer，进游戏时调快、退出时原样恢复，作用域被严格限制在跳一跳内。*/
+/* 【必须与 JUMP_DROP_TICK_MS 取同一个值】两个定时器都由同一个 lv_timer_handler
+ * 驱动，同周期即同一轮里依次触发，是确定的 1:1。只提刷新率 → 多刷的是重复帧；
+ * 只提步进率 → 值变了也要等下次刷新才上屏。两者缺一都白搭。
+ * 16ms 是下限：每帧脏区约 95x112≈10600px≈21KB，SPI 80MHz 传约 2ms，加渲染共
+ * 5~10ms，塞进 20ms 帧间隔有余量；再往 8ms 提会开始丢帧（同 ui_port.c:7372）。*/
+#define JUMP_REFR_PERIOD_MS 10 /* 游戏内 LVGL 刷新周期，与 JUMP_DROP_TICK_MS 保持一致 */
+
+/* 退出时要恢复成的原周期。注意：不能从 timer 句柄读回来——lv_timer_t 在公开头
+ * 文件里是不透明类型（period 字段位于 lv_timer_private.h），直接取 refr->period
+ * 编译不过。故改用 LVGL 的编译期配置值，它就是刷新 timer 创建时的初始周期。*/
+#ifdef LV_DEF_REFR_PERIOD
+#define JUMP_REFR_PERIOD_ORIG LV_DEF_REFR_PERIOD
+#else
+#define JUMP_REFR_PERIOD_ORIG 33
+#endif
+
+static bool s_refr_boosted = false; /* 当前是否处于加速态（退出时才需恢复）*/
+
+/* 进游戏：把 LVGL 刷新周期调快 */
+static void jump_refr_boost(void)
+{
+    if (s_refr_boosted)
+        return; /* 幂等：重复进入不重复设置 */
+    lv_display_t *disp = lv_display_get_default();
+    if (!disp)
+        return;
+    lv_timer_t *refr = lv_display_get_refr_timer(disp);
+    if (!refr)
+        return;
+    lv_timer_set_period(refr, JUMP_REFR_PERIOD_MS);
+    s_refr_boosted = true;
+    ESP_LOGI(TAG, "LVGL 刷新周期 %d → %dms（仅游戏内）",
+             JUMP_REFR_PERIOD_ORIG, JUMP_REFR_PERIOD_MS);
+}
+
+/* 退游戏：恢复原刷新周期（必须调用，否则全局帧率被游戏永久改掉）*/
+static void jump_refr_restore(void)
+{
+    if (!s_refr_boosted)
+        return;
+    lv_display_t *disp = lv_display_get_default();
+    if (disp)
+    {
+        lv_timer_t *refr = lv_display_get_refr_timer(disp);
+        if (refr)
+            lv_timer_set_period(refr, JUMP_REFR_PERIOD_ORIG);
+    }
+    s_refr_boosted = false;
+    ESP_LOGI(TAG, "LVGL 刷新周期恢复 %dms", JUMP_REFR_PERIOD_ORIG);
+}
 
 /* ── 结算后自动重开 ──
  * 需求：摔倒结算界面只留背景图，停 JUMP_RESTART_DELAY_MS 后自动重来一局，
@@ -514,28 +590,51 @@ static bool platforms_drop_update(void)
         any = true;
 
 #if JUMP_PLAT_USE_IMG
-        /* 重力始终向下：vy 每帧增大，drop 每帧减去 vy（drop 减小=台子向下落）*/
-        p->drop_vy += JUMP_DROP_GRAVITY;
-        p->drop -= p->drop_vy;
-
-        if (p->drop <= 0 && p->drop_vy > 0)
+        /* ── 【2026-08-19】匀速下落（原为重力加速）──────────────────────────
+         *
+         * 【为什么去掉重力加速】撕裂看着有多明显，取决于【最坏那一帧】而非平均值
+         * （同 ui_port.c:7382 头部压扁改 linear 的判据）。重力加速下最后几帧最快：
+         *   G=1 时 vy 走 1,2,3,…,13 → 平均 4.6px/帧，但峰值 13px/帧
+         * 峰值帧决定观感，等于前面几帧的努力全被最后一帧作废。
+         * 改成匀速后峰值 = 平均 = JUMP_DROP_SPEED_PX，零成本砍掉全部峰值。
+         *
+         * 【手感代价】台子变成匀速落下而非加速坠落。台子入场本就不需要真实
+         * 重力感，且触底仍有弹起，"从天而降"的观感保留。
+         *
+         * bounce_up：触底后先向上弹 JUMP_DROP_BOUNCE_UP_PX，再匀速落回。
+         * 用 drop_vy 的正负表示方向（正=向下落，负=向上弹），沿用原字段语义。*/
+        if (p->drop_vy < 0)
         {
-            /* 触底（drop穿过0且速度向下）：反弹，速度反向并衰减 */
-            p->drop = 0;
-            p->drop_vy = -(p->drop_vy * JUMP_DROP_BOUNCE_COEF / 100);
-            /* 弹力不足以弹起（<3px/帧）则直接落定，避免无限微颤 */
-            if (p->drop_vy > -3)
+            /* 弹起段：匀速向上（drop_vy 为负 → drop 增大 = 台子上升）。
+             * 到达弹起高度即翻为下落，下一帧走下面的下落段收尾。*/
+            p->drop -= p->drop_vy;
+            if (p->drop >= JUMP_DROP_BOUNCE_UP_PX)
             {
-                p->drop_vy = 0;
-                p->dropping = false;
+                p->drop = JUMP_DROP_BOUNCE_UP_PX;
+                p->drop_vy = JUMP_DROP_SPEED_PX;
+                p->bounce_done = true; /* 已弹过一次，下次触底直接落定 */
             }
         }
-        else if (p->drop <= 0 && p->drop_vy <= 0)
+        else
         {
-            /* 弹起后回落到0：落定 */
-            p->drop = 0;
-            p->drop_vy = 0;
-            p->dropping = false;
+            /* 下落段：匀速向下 */
+            p->drop_vy = JUMP_DROP_SPEED_PX;
+            p->drop -= p->drop_vy;
+            if (p->drop <= 0)
+            {
+                p->drop = 0;
+                /* 首次触底且允许弹起 → 转向上弹；否则（已弹过/关闭弹起）落定 */
+                if (!p->bounce_done && JUMP_DROP_BOUNCE_UP_PX > 0)
+                {
+                    p->drop_vy = -JUMP_DROP_SPEED_PX;
+                }
+                else
+                {
+                    p->drop_vy = 0;
+                    p->dropping = false;
+                    p->bounce_done = false; /* 复位，供该槽位下次入场复用 */
+                }
+            }
         }
 #else
         if (p->drop > 0)
@@ -794,12 +893,54 @@ static void sparks_update(int pct, int sink)
  *   数据滚动：[0]←[1]←[2]←新生成
  *   cam_target 更新为让新cur台对齐 JUMP_START_X/Y
  * ══════════════════════════════════════════════════ */
+/* ── 【临时取证开关】斜切纹成因验证（2026-08-19）──
+ * 目的：确认屏幕斜切纹是否只由「台子位移重绘」产生。
+ *   1 = 取证模式：台子入场不下落，直接静止就位（等价于调 plat_no_drop）
+ *   0 = 正常模式：从天而降 + 触底弹起（原逻辑）
+ * 观察结论：
+ *   · 静止出现完全无斜纹 → 斜纹由位移脏区产生，方向为「减小每帧位移/改原地压扁」
+ *   · 静止出现仍有斜纹   → 只要台子被重绘就撕裂，与位移无关，压扁方案同样无效
+ * 取证完毕后请改回 0。*/
+#define JUMP_DEBUG_NO_DROP 0
+
+/* ── 【临时调试开关】只出最容易撕裂的两张台子图 ──
+ * 1 = 台子只出 jt6 / jt7（用户实测：7 每次都撕、6 次之，是最坏的两张）
+ * 0 = 正常六张随机
+ * 用途：调 JUMP_DROP_SPEED_PX / TICK_MS 时把最坏情况锚定下来，避免运气好抽到
+ * jt3(62%) / jt4(68%) 这种本来就看不出的图，误判为「已经修好了」。
+ * 调参结束后改回 0。*/
+#define JUMP_DEBUG_WORST_IMGS 0
+
 /* 让台子进入「从天而降」入场状态（从目标上方 JUMP_DROP_HEIGHT 处掉落）*/
 static void plat_start_drop(platform_t *p)
 {
-    p->drop = JUMP_DROP_HEIGHT;
-    p->drop_vy = 0; /* 给初速让台子一开始就快速下落 */
+#if JUMP_DEBUG_NO_DROP
+    /* 取证模式：直接就位，不产生任何下落/弹起位移。
+     *
+     * ⚠️ 必须在这里补一次渲染：本函数是唯一把 drop_pending 清零的地方，而挂起期间
+     * platform_render_one 已把该台子置为 HIDDEN。正常下落靠 engine_cb 每帧的
+     * platforms_drop_update() → platform_render_one 把它重新显示出来，但取证模式
+     * dropping=false、drop=0、bounce=0，engine_cb 里 "dropping || drop>0 || bounce>0"
+     * 三项全不成立，没有任何人会再渲染它 → 台子永远隐藏（表现为「第二块台子没了」）。*/
+    p->drop = 0;
+    p->drop_vy = 0;
     p->bounce = 0;
+    p->dropping = false;
+    p->drop_pending = false;
+    for (int i = 0; i < PLAT_COUNT; i++)
+    {
+        if (&g.plats[i] == p)
+        {
+            platform_render_one(i, 0); /* 立即静止显示，产生一次性重绘（正是要观察的对象）*/
+            break;
+        }
+    }
+    return;
+#endif
+    p->drop = JUMP_DROP_HEIGHT;
+    p->drop_vy = JUMP_DROP_SPEED_PX; /* 匀速下落：正值=向下，全程恒定不再加速 */
+    p->bounce = 0;
+    p->bounce_done = false; /* 本次入场尚未弹起过 */
     p->dropping = true;
     p->drop_pending = false;
 }
@@ -810,6 +951,7 @@ static void plat_no_drop(platform_t *p)
     p->drop = 0;
     p->drop_vy = 0;
     p->bounce = 0;
+    p->bounce_done = false;
     p->dropping = false;
     p->drop_pending = false;
 }
@@ -822,6 +964,7 @@ static void plat_pend_drop(platform_t *p)
     p->drop = 0;
     p->drop_vy = JUMP_DROP_INIT_VY; // 掉落初速度
     p->bounce = 0;
+    p->bounce_done = false;
     p->dropping = false;
     p->drop_pending = true;
 }
@@ -947,10 +1090,22 @@ static void gen_platform(platform_t *dst, const platform_t *ref)
 #if JUMP_PLAT_USE_IMG
     /* 图片台子：从 jt1~jt7 随机选一张，避开与上一台相同（连续不重复）*/
     {
+#if JUMP_DEBUG_WORST_IMGS
+        /* 【调试】只出撕裂最严重的两张，把最坏情况锚定下来便于验证调参效果。
+         * 用户实测严重度排序：7 每次都撕 > 6 次之 > 5/1 再次 > 4/3 几乎看不出。
+         * 索引按 platform_render_one 的 imgs[] 顺序：0=jt1 1=jt3 2=jt4 3=jt5 4=jt6 5=jt7 */
+        static const uint8_t worst[] = {4, 5}; /* jt6 / jt7 */
+        int n = (int)(sizeof(worst) / sizeof(worst[0]));
+        int k = (int)(esp_random() % n);
+        if (worst[k] == ref->img_idx)
+            k = (k + 1) % n; /* 仍保持「连续不重复」*/
+        dst->img_idx = worst[k];
+#else
         int idx = (int)(esp_random() % JUMP_PLAT_IMG_COUNT);
         if (idx == ref->img_idx)
             idx = (idx + 1) % JUMP_PLAT_IMG_COUNT;
         dst->img_idx = (uint8_t)idx;
+#endif
     }
 #else
     /* 随机一种立体台子样式（避开与参考台同色，区分更明显）*/
@@ -988,7 +1143,11 @@ static void platforms_init(void)
     g.plats[0].depth = plat_w_to_edge(g.plats[0].w); /* 起始台正常厚度（cube 模式）*/
     g.plats[0].stripes = 0;                          /* 起始台无条带，干净（cube 模式）*/
     g.plats[0].pattern = 0;                          /* 起始台无花纹，干净（cube 模式）*/
-    g.plats[0].img_idx = 0;                          /* 起始台固定第0张图（图片模式）*/
+#if JUMP_DEBUG_WORST_IMGS
+    g.plats[0].img_idx = 4; /* 【调试】起始台也锚到 jt6，否则每局第一块仍是 jt1 */
+#else
+    g.plats[0].img_idx = 0; /* 起始台固定第0张图（图片模式）*/
+#endif
     g.plats[0].active = true;
     plat_no_drop(&g.plats[0]); /* 起始台直接就位，不掉落 */
 
@@ -1064,6 +1223,12 @@ static void do_jump(uint32_t held_ms)
     if (g.phase != PH_IDLE)
         return;
 
+    /* 本次按住起始于非法时刻（结算界面/棋子未落稳）→ 整段作废，不起跳。
+     * 这样短按与长按表现一致：都不跳。旧逻辑缺此判断，长按恰好在松手时
+     * 相位已回 IDLE，就会用「跨相位的整段时长」当蓄力值跳出去。*/
+    if (!g.charge_valid)
+        return;
+
     /* 手感保护：下一块目标台(plats[1])还在从天而降未落定时，不允许起跳，
      * 否则会对着尚在空中的台子做落点判定。等它落定(dropping=false)再跳。*/
     if (g.plats[1].dropping)
@@ -1103,10 +1268,15 @@ static void do_jump(uint32_t held_ms)
     g.fly_step256_x = g.fly_total_x * 256 / g.fly_steps;
     g.fly_step256_y = g.fly_total_y * 256 / g.fly_steps;
     g.phase = PH_FLY;
+    g.charge_valid = false; /* 本次蓄力已消费：飞行期间再按下也不算数 */
 
     platform_render_one(0, 0); /* 恢复台子压扁 */
     sparks_hide();             /* 起跳：收起蓄力光斑 */
-    bsp_motor_pulse();
+    /* ★【2026-08-31 问题1】原有的起跳 bsp_motor_pulse() 已删除：一次触摸震两次。
+     * 跳一跳靠「按住蓄力、松手起跳」，而触摸层 bsp_touch.c 已在左右耳【按下沿】
+     * 统一震过一次；本函数走的是【松手】路径，再震就成了第二次
+     * （表现为「触摸震一下、松手又震一下，中间蓄力不震」）。
+     * 需求是只保留按下那一次，故此处删除。蓄力过程本就无震动，不受影响。 */
     ESP_LOGI(TAG, "起跳 dist=%d target(%d,%d)", dist, tx, ty);
 }
 
@@ -1123,18 +1293,32 @@ static void trigger_next_drop(void)
 }
 
 /* ══════════════════════════════════════════════════
- * 物理引擎（30fps）
+ * 台子入场/回弹专用高频 timer（JUMP_DROP_TICK_MS）
+ *
+ * 【为什么要独立于主引擎】
+ * 撕裂一直都在发生（屏幕无 TE 引脚，SPI 写入与液晶扫描不同步，见 [BUG-041]），
+ * 肉眼看不看得见取决于【撕裂线两侧差多少】：
+ *   · 落台压扁动画每帧只变 ~1px  → 两半差 1px  → 只剩边缘锯齿（用户可接受）
+ *   · 台子下落每帧移动 11~24px   → 两半差 20px → 一道明显斜切
+ * 所以要减轻掉落撕裂，必须【降低每帧位移量】：帧数加倍、重力减半，
+ * 总距离和总时长不变，但每帧只走一半 → 撕裂幅度减半。
+ *
+ * 【为什么不直接把 JUMP_ENGINE_MS 改成 16】
+ * 它是全局引擎节拍，飞行速度、相机平滑(JUMP_CAM_SMOOTH_FRAMES)、蓄力、
+ * 落台压扁全都会快一倍，整个手感崩掉。故只把「台子入场/回弹」这一段
+ * 拆出来跑高频，主引擎 engine_cb 仍保持 JUMP_ENGINE_MS，其余手感一律不动。
+ *
+ * 【与 jump_refr_boost 的关系】两者缺一不可：
+ *   · LVGL 刷新周期不够快 → 多个物理帧被合并进一次刷新，位移又叠回去了；
+ *   · 物理帧位移不够小   → 刷新再快，每次刷新的变化量还是 20px。
  * ══════════════════════════════════════════════════ */
-static void engine_cb(lv_timer_t *t)
+static void drop_tick_cb(lv_timer_t *t)
 {
     (void)t;
     if (g.screen != JS_PLAYING)
         return;
 
-    /* 注意：不再每帧扫描触发挂起台子（旧 platforms_drop_trigger 会在落台瞬间误触发
-     * 第三块从天而降，与落台同帧浮动）。改由 trigger_next_drop 在开局/镜头停稳后调用。*/
-
-    /* 每帧推进台子入场/回弹动画，独立于 phase。
+    /* 推进台子入场/回弹动画，独立于 phase。
      * 图片模式下 slot0 有落台 bounce 时，棋子也跟随台面下移（视觉同步）。*/
     if (platforms_drop_update())
     {
@@ -1152,6 +1336,22 @@ static void engine_cb(lv_timer_t *t)
             }
         }
     }
+}
+
+/* ══════════════════════════════════════════════════
+ * 物理引擎（30fps）
+ * ══════════════════════════════════════════════════ */
+static void engine_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (g.screen != JS_PLAYING)
+        return;
+
+    /* 注意：不再每帧扫描触发挂起台子（旧 platforms_drop_trigger 会在落台瞬间误触发
+     * 第三块从天而降，与落台同帧浮动）。改由 trigger_next_drop 在开局/镜头停稳后调用。*/
+
+    /* 台子入场/回弹已挪到 drop_tick_cb（高频 timer），此处不再推进，
+     * 否则同一帧被推进两次，掉落速度翻倍。*/
 
     switch (g.phase)
     {
@@ -1159,7 +1359,14 @@ static void engine_cb(lv_timer_t *t)
     case PH_IDLE:
     {
         uint32_t held = bsp_touch_page_held_ms();
+        /* 闸门从「松手」前移到「按下」：手指松开的每一帧都刷新合法性快照，
+         * 于是下一次按下瞬间读到的就是「按下那一刻」台子是否已落稳。
+         * 手指按住期间不再更新，保证一次按住自始至终用同一个判定。*/
         if (held == 0)
+            g.charge_valid = !g.plats[1].dropping;
+
+        /* 非法时刻按下：整段按住无视觉反馈（不压扁、不显光斑），等同没按 */
+        if (held == 0 || !g.charge_valid)
         {
 #if JUMP_PLAT_USE_IMG
             player_render(0, 0, g.plats[0].bounce); /* 有残余落台回弹时棋子跟随 */
@@ -1536,10 +1743,19 @@ static void enter_playing(void)
     restart_timer_cancel(); /* 手动/自动重开都从这里进，先撤掉挂起的自动重开 */
     g.screen = JS_PLAYING;
     g.phase = PH_IDLE;
+    /* 开局清零：若玩家在结算界面按着不放跨到新局，该次按住仍作废，
+     * 必须松手后重新按下才算蓄力（PH_IDLE 分支在 held==0 那帧刷新）。*/
+    g.charge_valid = false;
     g.score = 0;
     g.high_score = highscore_load(); /* 高分三难度共享 */
     g.cam_delay_frames = 0;
 
+    /* 【2026-08-19 减少斜纹】此处台子对象【不做 hide→show】：上一局结算已让画面
+     * 定格（enter_result 不再隐藏台子），platforms_init 内的 platforms_render_all
+     * 直接把还显示着的对象改到新坐标即可。LVGL 只重绘"旧位置∪新位置"，
+     * 比"整批从隐藏变显示"的整块脏区小，撕裂相应减轻。
+     * 离场槽(3/4)在新局 active=false，platform_render_one 会把它们隐藏，
+     * 上一局残留的离场台子不会留在新局屏上 —— 这一步仍是必要的。*/
     platforms_init();
     g.player_wx = g.plats[0].world_cx;
     g.player_wy = g.plats[0].world_cy;
@@ -1553,21 +1769,44 @@ static void enter_playing(void)
     player_render(0, 0, 0);
     if (s_engine_tmr)
         lv_timer_resume(s_engine_tmr);
+    if (s_drop_tmr)
+        lv_timer_resume(s_drop_tmr); /* 与 enter_result 的 pause 配对 */
     ESP_LOGI(TAG, "开跳 难度=%s", s_diff[g.diff].name);
 }
 
 static void enter_result(void)
 {
     g.screen = JS_RESULT;
+    g.charge_valid = false; /* 进结算即作废，结算界面按左右不产生蓄力 */
     if (s_engine_tmr)
         lv_timer_pause(s_engine_tmr);
+    if (s_drop_tmr)
+        lv_timer_pause(s_drop_tmr); /* 掉落 timer 同步暂停，否则结算期仍在推进台子动画 */
+
+    /* 【2026-08-19 减少斜纹】结算不再隐藏台子，画面原样定格 1 秒。
+     *
+     * 原逻辑在这里把 5 个台子全部 add_flag(HIDDEN)，屏幕退化成纯背景，1 秒后
+     * enter_playing 再把台子整批 clear_flag 显示出来 —— 一次失败要触发【两次】
+     * 大面积重绘（清空 + 重建），而屏幕无 TE 引脚，大面积重绘必然撕裂（见 [BUG-041]）。
+     *
+     * 现在结算保持台子原样不动：
+     *   · 隐藏那一次重绘直接消失；
+     *   · 重开时台子对象不做 hide→show，只由 platforms_init 改坐标，
+     *     LVGL 只重绘"旧位置∪新位置"，比"整批从无到有"的脏区小。
+     *
+     * 棋子无需处理：PH_FALL/PH_TOPPLE 要等棋子掉到屏幕外(见 :1486/:1523 的
+     * wy_to_sy>=BSP_LCD_HEIGHT+... 判定)才会走到这里，此刻它早已不可见，
+     * 原来的 player_hide() 隐藏的是一个看不见的对象，一帧画面都没改变。
+     * 仍保留调用：只为清掉光斑等附带状态，且不产生任何可见重绘。*/
     player_hide();
+
+    /* 注意：active 仍要置 false（表示"本局已结束、这些台子不再参与逻辑"），
+     * 但【不再 add_flag(HIDDEN)】——对象继续显示在屏上，保持画面定格。
+     * platform_render_one 开头对 !active 的台子会强制隐藏，所以本局结束后
+     * 绝不能再触发它们的渲染；enter_playing 会重新把 active 置回 true。*/
     for (int i = 0; i < PLAT_COUNT; i++)
-    {
         g.plats[i].active = false;
-        if (g.plats[i].cube)
-            lv_obj_add_flag(g.plats[i].cube, LV_OBJ_FLAG_HIDDEN);
-    }
+
     /* 高分照常写 NVS（只是不再显示），先记下「打破前」的历史最高分：
      * highscore_save_if_better 会就地更新 g.high_score，取值须放在它之前。*/
     int prev_high = g.high_score;
@@ -1668,20 +1907,24 @@ static void build_panel(void)
         spark_respawn(i);
     }
 
-    /* HUD */
+    /* HUD / 居中大文字：全程只 add_flag(HIDDEN)，全代码库无任何 clear_flag 使其
+     * 显示（jump_start() 写死 DIFF_EASY 跳过 enter_select()，select_render() 是
+     * 死路径），用户从未看到过这两个标签的文字。注释掉创建，避免 s_center 首建
+     * 时触发 font_cn_32_get() 同步读盘阻塞（实测卡顿130ms+）。s_hud/s_center 保持
+     * NULL，其余引用处 if(s_hud)/if(s_center) 判断会自动跳过，不受影响。
     s_hud = lv_label_create(s_panel);
     lv_obj_set_style_text_font(s_hud, &font_cn_16, 0);
     lv_obj_set_style_text_color(s_hud, lv_color_hex(0x2C3E50), 0);
     lv_obj_align(s_hud, LV_ALIGN_TOP_MID, 0, 8);
     lv_obj_add_flag(s_hud, LV_OBJ_FLAG_HIDDEN);
 
-    /* 居中大文字 */
     s_center = lv_label_create(s_panel);
-    lv_obj_set_style_text_font(s_center, &font_cn_32, 0);
+    lv_obj_set_style_text_font(s_center, font_cn_32_get(), 0);
     lv_obj_set_style_text_color(s_center, lv_color_hex(0x2C3E50), 0);
     lv_obj_set_style_text_align(s_center, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(s_center, LV_ALIGN_CENTER, 0, -10);
     lv_obj_add_flag(s_center, LV_OBJ_FLAG_HIDDEN);
+    */
 }
 
 /* ══════════════════════════════════════════════════
@@ -1700,6 +1943,10 @@ void jump_start(void)
         lv_obj_clear_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
     if (!s_engine_tmr)
         s_engine_tmr = lv_timer_create(engine_cb, JUMP_ENGINE_MS, NULL);
+    /* 台子入场/回弹专用高频 timer：帧数加倍+重力减小 → 每帧位移减半 → 撕裂幅度减半 */
+    if (!s_drop_tmr)
+        s_drop_tmr = lv_timer_create(drop_tick_cb, JUMP_DROP_TICK_MS, NULL);
+    jump_refr_boost(); /* 提高 LVGL 刷新频率，让每个物理帧都能单独刷到（退出必恢复）*/
     g.diff = DIFF_EASY;
     enter_playing();
     lvgl_port_unlock();
@@ -1732,6 +1979,9 @@ void jump_stop(void)
 {
     if (!lvgl_port_lock(200))
         return;
+    /* 刷新周期恢复必须放在 !s_panel 提前返回【之前】：面板已被别处销毁而加速态
+     * 还留着时，这里若先 return，全局 LVGL 帧率就被永久钉在 16ms 了。*/
+    jump_refr_restore();
     if (!s_panel)
     {
         lvgl_port_unlock();
@@ -1741,6 +1991,11 @@ void jump_stop(void)
     {
         lv_timer_del(s_engine_tmr);
         s_engine_tmr = NULL;
+    }
+    if (s_drop_tmr)
+    {
+        lv_timer_del(s_drop_tmr);
+        s_drop_tmr = NULL;
     }
     restart_timer_cancel(); /* 退出时撤掉自动重开，防面板删后回调野指针 */
     lv_obj_del(s_panel);

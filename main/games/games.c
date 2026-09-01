@@ -18,6 +18,7 @@
 #include "esp_log.h"
 #include <stddef.h>
 #include <stdio.h>
+#include "esp_heap_caps.h" /* 【临时诊断】内部 SRAM 探针用，见 games_start/games_stop */
 
 static const char *TAG = "GAMES";
 
@@ -75,6 +76,18 @@ const char *games_get_name(game_id_t id)
     return g_games[id].name;
 }
 
+/* 【临时诊断 2026-08-19】games 内部 SRAM 探针，配对 ui_port.c 的 [MEMPROBE]。
+ * 与 ui_port.c 里那套是同一次排查，未合成一个公共函数是为了不给 games.c
+ * 增加对 ui_port.c 私有 static 的依赖——两边各自最小实现，定案后一起删。 */
+static void games_mem_probe(const char *stage, const char *game_name)
+{
+    ESP_LOGW(TAG, "[MEMPROBE] %-10s %-8s 内部SRAM free=%d largest=%d | PSRAM free=%d",
+             stage, game_name,
+             (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
 void games_start(game_id_t id)
 {
     if (id < 0 || id >= GAME_COUNT)
@@ -82,11 +95,14 @@ void games_start(game_id_t id)
         ESP_LOGW(TAG, "非法游戏 ID: %d", (int)id);
         return;
     }
+    /* before：进游戏前的基线，与 on_start() 后的 after 相减 = 该游戏启动净占用 */
+    games_mem_probe("before", g_games[id].name);
     s_current_game = (int)id;
     s_placeholder_name = g_games[id].name;
     ESP_LOGI(TAG, "进入游戏: %s", g_games[id].name);
     if (g_games[id].on_start)
         g_games[id].on_start();
+    games_mem_probe("after", g_games[id].name);
 }
 
 void games_handle_touch(touch_event_t event)
@@ -108,8 +124,15 @@ void games_stop(void)
 {
     if (s_current_game < 0 || s_current_game >= GAME_COUNT)
         return; /* 未在游戏中，幂等 */
+    /* 【临时诊断】这一对是本轮排查最想看的数据：三个游戏 on_stop 里都是
+     * lv_obj_del(s_panel) 整棵子树删除（非功能页那种只 hide），
+     * 理论上 stop_after 应比 stop_before 更高或持平（真正归还内存）。
+     * 若 stop_after 反而更低或涨得不够，说明 delete 没有完全归还，
+     * 需要去查该游戏是否还有 s_panel 之外的独立分配（如背景图缓存）。 */
+    games_mem_probe("stop_before", g_games[s_current_game].name);
     if (g_games[s_current_game].on_stop)
         g_games[s_current_game].on_stop();
+    games_mem_probe("stop_after", g_games[s_current_game].name);
     ESP_LOGI(TAG, "退出游戏: %s", g_games[s_current_game].name);
     s_current_game = -1;
     s_placeholder_name = NULL;
