@@ -562,6 +562,38 @@ uint32_t bsp_touch_last_page_hold_ms(void);
 uint32_t bsp_touch_page_held_ms(void);
 
 /**
+ * @brief 清除全部触摸按键的「持续按压闩锁」（consumed 标志）
+ *
+ * 用途：退出深度待机的转场结束后调用一次。
+ *
+ * 【为什么需要】唤醒待机的那一次触摸，在触摸层是正常发出了事件的（并因此置了
+ * consumed 闩锁），但上层 ui_dispatch_touch_event 判定「本次仅用于唤醒」后直接
+ * 丢弃了它。触摸层无从得知事件被丢弃，闩锁就此残留。叠加退待机转场约 2.6 秒
+ * 全程阻塞（扫描任务停摆、离手确认帧数累不够），表现为「用哪个位置唤醒，
+ * 哪个位置随后就按不动，其余位置正常」。
+ *
+ * @note 纯内存赋值，不阻塞、不读 NVS、不取锁，可在任意任务上下文安全调用
+ *       （包括栈在 PSRAM 的任务）。
+ * @note 幂等；非待机路径不会调用到，正常态 / 游戏 / 功能盘的闩锁行为不受影响。
+ * @note 调用者：standby.c standby_wake()（转场收尾，释放 s_waking 门闩之前）
+ */
+void bsp_touch_clear_latch(void);
+
+/**
+ * @brief 请求触摸任务在本轮末尾补一次震动（延后到 LVGL 锁已释放后执行）
+ *
+ * 供上层在「操作确认真正生效」时调用（如功能盘 home_jelly 真正推进了下标），
+ * 实现「震动跟随真实切换，而不是跟随触摸」。
+ *
+ * @note 只置标志、不阻塞：真正的 bsp_motor_pulse()（内含 30ms vTaskDelay）由
+ *       touch_scan_task 在事件分发完成、LVGL 锁已释放之后统一执行，避免持锁阻塞
+ *       LVGL 线程（同 BUG-038 的坑）。
+ * @note 与按下沿震动共用同一标志，同一轮内重复请求只震一次，天然去重。
+ * @note 仅可在任务上下文调用，不可在中断里用。
+ */
+void bsp_touch_request_vibrate(void);
+
+/**
  * @brief 震动马达单次脉冲（触觉反馈，默认强度，约 30ms）
  * @note 内部以 LEDC PWM 输出，强度由 BSP_MOTOR_DEFAULT_STRENGTH 决定
  */
@@ -582,6 +614,17 @@ void bsp_motor_set(uint8_t strength);
  * @note 内部含 vTaskDelay 阻塞，仅可在任务上下文调用
  */
 void bsp_motor_pulse_level(uint8_t strength, uint32_t ms);
+
+/**
+ * @brief 单独初始化震动马达的 LEDC PWM 通道（不含触摸硬件）
+ *
+ * 【为什么要单独暴露】开机震动反馈需要在 application_init() 最前面就能震，
+ * 而马达 LEDC 原本只在 bsp_touch_init() 里初始化，那是 touch_scan_task 创建时
+ * 才跑的（LCD 点亮之后），太晚。故拆出本函数供开机早期先行调用。
+ *
+ * 幂等：与 bsp_touch_init() 内部那次重复调用同参数，LEDC 重复配置安全无副作用。
+ */
+void bsp_motor_ledc_init(void);
 
 /**
  * @brief 震动 PWM 方波测试任务（仅调试用）
