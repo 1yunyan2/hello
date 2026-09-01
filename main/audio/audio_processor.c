@@ -166,16 +166,44 @@ static void audio_processor_play_task(void *arg)
                 // ③ 蓄水中 或 空窗期（wait_ms>=600 且 bytes_waiting==0）
                 //    都保持 prebuffering，持续灌静音维持 I2S 时钟稳定。
                 //    新 TTS 数据一到，下一轮就走 ① 或 ② 开闸。
+                /* ★★【2026-08-25 修复 TTS 中途截断】空窗期必须持续刷新计时起点 ★★
+                 *
+                 * 【原来的毛病】原注释断言「不重置 buffer_start_tick，wait_ms 持续累计
+                 *   无害，开闸只看 bytes_waiting」——这个判断是错的，实测代价很重：
+                 *   上一轮 TTS 播完后设备空闲几十秒，wait_ms 一路累计（实测日志里出现
+                 *   19080ms / 8590ms / 5530ms 这种值）。等下一轮 TTS 的第一个字节刚到，
+                 *   ② 分支的 wait_ms>=600 立刻成立 → 用 1920 B（仅 60ms 音频）就开闸。
+                 *   播两个字就把缓冲抽干 → 欠载 → 退回蓄水 600ms → 用户听到的就是
+                 *   「我叫 EchoP …(停顿)… al，是你的陪伴伙伴呀」这种词中间的硬截断。
+                 *   实测三次 TTS 全部走 ②（1920B/3840B/9600B），① 攒够 16384 那条
+                 *   从未命中过——蓄水期形同虚设。
+                 *
+                 * 【改法】只在【真正空窗】（bytes_waiting == 0，云端一个字节都没来）时
+                 *   刷新起点。这样 wait_ms 的语义回归为「从第一个字节到达起等了多久」：
+                 *     · 空窗期      → tick 持续刷新，wait_ms≈0，不会误开闸（本来也没数据）
+                 *     · 数据一到    → 停止刷新，开始真正计时，必须攒够 16384 或等满 600ms
+                 *   实测参照：日志里那次 600ms 后攒到 13440B 再开闸的播放是连贯的，
+                 *   正是本改动想让每一次都达到的状态。
+                 *
+                 * 【为什么不给 ② 加最低数据量门槛】那样在云端本身发得慢时会永远不开闸
+                 *   （死锁），600ms 的等待已经是合理上限。先用最小改动验证。 */
+                if (bytes_waiting == 0)
+                {
+                    buffer_start_tick = xTaskGetTickCount();
+                    prebuf_log_start_tick = xTaskGetTickCount();
+                }
+
                 size_t silence_written = 0;
                 i2s_channel_write(board->i2s_tx_handle, silence_buf, sizeof(silence_buf),
                                   &silence_written, pdMS_TO_TICKS(20));
                 // 空窗期降频让出 CPU0：
-                //   - 蓄水期（wait_ms < 600）：delay 10ms，与原行为一致，确保 IDLE0 喂狗
-                //   - 空窗期（wait_ms >= 600 且无数据）：delay 30ms，给 MultiNet 让出
+                //   - 蓄水期（已有数据但不够）：delay 10ms，快速响应后续到达的数据
+                //   - 空窗期（bytes_waiting == 0）：delay 30ms，给 MultiNet 让出
                 //     CPU 时间片，避免 play_task 高频自转挤占唤醒词推理。
-                vTaskDelay(pdMS_TO_TICKS((wait_ms >= 600 && bytes_waiting == 0) ? 30 : 10));
-                // ⚠️ 不重置 buffer_start_tick：wait_ms 持续累计无害，
-                //    开闸只看 bytes_waiting，永远不会因旧 tick 误触发。
+                // ★ 判据从「wait_ms >= 600 && bytes_waiting == 0」简化为只看 bytes_waiting：
+                //   上面刷新起点后 wait_ms 在空窗期恒等于 0，旧判据永远不成立，
+                //   会让空窗期一直按 10ms 高频自转，反而加重 CPU0 拥堵。
+                vTaskDelay(pdMS_TO_TICKS((bytes_waiting == 0) ? 30 : 10));
                 continue;
             }
         }
