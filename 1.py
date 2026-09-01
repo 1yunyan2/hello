@@ -33,7 +33,27 @@ except Exception:
 # === 路径与格式配置(按需改这里)===
 SOURCE_DIR = 'img_src'         # 原图目录(根目录下),放 PNG
 OUTPUT_DIR = 'assets/img'    # 成品 .bin 输出目录(会被 packer 打包)
-COLOR_FORMAT = 'RGB565A8'      # 颜色格式,与现有 .c 图片一致(带透明)
+COLOR_FORMAT = 'RGB565A8'      # 默认颜色格式,与现有 .c 图片一致(带透明)
+
+# === 按文件指定为不透明 RGB565(2026-08-12 新增)===
+# 背景:功能盘换图时可见"两张图斜切同框",根因是无 TE 引脚无法做垂直同步
+#      (详见 memory/bugs/BUG-041.md),撕裂**无法根除**,只能缩短可见窗口。
+# 手段:把写入 GRAM 的数据量和渲染耗时降下来 ——
+#      RGB565A8 = 3 字节/像素(2 色 + 1 alpha),绘制时要逐像素读 alpha 做混合;
+#      RGB565   = 2 字节/像素,直接 blit 覆盖,不做混合。
+#      100x100 图标:30012 → 20012 字节(-33%),渲染走快路径。
+# 前提:这些图标周围本就是纯黑底(s_menu_panel bg_opa=COVER 黑),
+#      去掉透明通道后圆角外变成黑色实心,与背景同色,视觉无差别。
+# ⚠️ 只列功能盘图标。游戏/背景图(c8/ds/pw 等)不要加进来——它们可能依赖透明叠加。
+OPAQUE_RGB565_FILES = {
+    'sj.png',    # 时间
+    'rl.png',    # 日历
+    'sz.png',    # 闹钟
+    'djs1.png',  # 倒计时
+    'tq.png',    # 天气
+    'sc.png',    # 赛车
+    'tyt.png',   # 跳一跳
+}
 # LVGL v9 官方转换脚本(项目自带,随 lvgl 组件下载)
 CONVERTER = os.path.join(
     'managed_components', 'lvgl__lvgl', 'scripts', 'LVGLImage.py'
@@ -87,26 +107,58 @@ def main() -> int:
 
     os.makedirs(out_abs, exist_ok=True)
 
-    print(f'\n🎨 转换中: {COLOR_FORMAT} → BIN  输出到 {OUTPUT_DIR}/\n')
+    # 分两批转换:功能盘图标走不透明 RGB565(见 OPAQUE_RGB565_FILES 说明),
+    # 其余图统一走默认的 RGB565A8。两批分别调 LVGLImage.py。
+    opaque = [fn for fn in pngs if fn in OPAQUE_RGB565_FILES]
+    normal = [fn for fn in pngs if fn not in OPAQUE_RGB565_FILES]
 
-    # 整个目录递归转(脚本一次只收一个 input,给目录即批量)
-    cmd = [
-        sys.executable, CONVERTER,
-        '--ofmt', 'BIN',
-        '--cf', COLOR_FORMAT,
-        '-o', out_abs,
-        src_abs,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print('❌ 转换失败')
-        if result.stdout:
-            print('--- stdout ---\n' + result.stdout)
-        if result.stderr:
-            print('--- stderr ---\n' + result.stderr)
+    # 提示清单里写了但 img_src/ 下不存在的文件名(改名/漏放时及早发现)
+    missing = OPAQUE_RGB565_FILES - set(pngs)
+    if missing:
+        print(f'⚠️  OPAQUE_RGB565_FILES 中这些文件在 {SOURCE_DIR}/ 下不存在,已忽略:')
+        for fn in sorted(missing):
+            print(f'   ❓ {fn}')
+        print()
+
+    def run_batch(files, cf, label):
+        """转换一批文件。
+
+        ⚠️ LVGLImage.py 的 input 参数**只接受一个路径**(见其 :1476 argparse 定义,
+           传多个会被 argparse 拒绝),所以这里逐个文件调用,不能一次传一批。
+        --background 0x000000:RGB565 无 alpha 通道,原 PNG 的透明像素需要一个底色
+           来合成。功能盘背景是纯黑(s_menu_panel bg_opa=COVER 黑),故合成到黑底,
+           圆角外与背景同色,视觉上看不出差别。 """
+        if not files:
+            return True
+        print(f'🎨 [{label}] {cf} → BIN  共 {len(files)} 张')
+        for fn in files:
+            cmd = [
+                sys.executable, CONVERTER,
+                '--ofmt', 'BIN',
+                '--cf', cf,
+                '-o', out_abs,
+            ]
+            if cf == 'RGB565':
+                cmd += ['--background', '0x000000'] # 透明像素合成到黑底
+            cmd.append(os.path.join(src_abs, fn))
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f'   ❌ {fn} 转换失败')
+                if result.stdout:
+                    print('--- stdout ---\n' + result.stdout)
+                if result.stderr:
+                    print('--- stderr ---\n' + result.stderr)
+                return False
+            print(f'   • {fn}')
+        print()
+        return True
+
+    print()
+    if not run_batch(opaque, 'RGB565', '功能盘图标·不透明'):
         return 1
-    if result.stdout.strip():
-        print(result.stdout.strip())
+    if not run_batch(normal, COLOR_FORMAT, '其余图·带透明'):
+        return 1
 
     # 列出转换结果
     bins = [f for f in sorted(os.listdir(out_abs)) if f.lower().endswith('.bin')]
