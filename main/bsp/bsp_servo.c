@@ -80,12 +80,182 @@ bool bsp_servo_abort_requested(void)
 #define R_ARM_MIN_ANGLE 0.0f   ///< 右臂向后最大极限角度（度）
 #define R_ARM_MAX_ANGLE 180.0f ///< 右臂向前最大极限角度（度），防止撞头
 
+/**
+ * 插值运动的固定帧间隔（毫秒）—— 所有平滑运动统一按此节拍写入 PWM。
+ *
+ * 【为什么是 20ms】
+ *   1. 与舵机 50Hz PWM 周期严格对齐：舵机每 20ms 才采样一个脉冲，写得比这更密纯属浪费；
+ *   2. tick=100Hz（CONFIG_FREERTOS_HZ=100，sdkconfig:1740）下 20ms = 恰好 2 个 tick，
+ *      pdMS_TO_TICKS 无截断误差。★对比旧版：step_ms=2/5 时 pdMS_TO_TICKS 整除后为 0，
+ *      FAST/VERY_FAST 实际【完全不延时】= 全速到位，平滑形同虚设；
+ *   3. 更新率恒定 50Hz，高于人眼闪烁融合阈值，慢速档不再有「一步一步走」的观感。
+ *
+ * 【速度语义不变】各档 SERVO_SPEED_xxx 仍是「毫秒/度」，总耗时 = 行程度数 × step_ms，
+ *   本宏只决定这段时间被切成多少帧，不改变快慢。例：VERY_SLOW(50) 走 30°：
+ *     旧 = 30 帧 × 50ms（每帧 1.0°，20Hz）｜新 = 75 帧 × 20ms（每帧 0.4°，50Hz），均 1500ms。
+ */
+#define SERVO_FRAME_MS 40U
+
+/**
+ * 运行时帧长覆盖（★抖动排查用，定位完可连同 bsp_servo_debug_set_frame_ms 一并删除）
+ *
+ * ★必须定义在 SERVO_FRAME_MS 宏【之后】：下面的 servo_frame_ms() 要用到它，
+ *   放在文件更靠前的位置会报 'SERVO_FRAME_MS' undeclared（2026-09-03 踩过）。
+ *
+ * 【为什么需要它】SERVO_FRAME_MS 是编译期宏，要对比两种帧长只能烧两次板，
+ *   靠记忆比较"这次比上次抖不抖"极不可靠。做成运行时变量后，同一次烧录里
+ *   就能让两种帧长交替出现，眼睛直接对比。
+ *
+ * 【为什么改帧长而不改速度】总耗时 = 行程 × step_ms，与帧长无关。
+ *   所以改帧长【不改变动作快慢】，只改变这段时间被切成多少帧，
+ *   即每帧位移 = 帧长 ÷ step_ms。对比时唯一变量就是每帧位移，
+ *   不会混入"变快了所以看不出抖"的干扰。
+ *
+ * 0 = 沿用编译期的 SERVO_FRAME_MS（默认，业务行为完全不变）。
+ */
+static _Atomic uint32_t s_frame_ms_override = 0;
+
+/** 取本次运动实际使用的帧长（override 为 0 时用编译期常量） */
+static inline uint32_t servo_frame_ms(void)
+{
+    uint32_t v = atomic_load(&s_frame_ms_override);
+    return (v == 0U) ? (uint32_t)SERVO_FRAME_MS : v;
+}
+
+void bsp_servo_debug_set_frame_ms(uint32_t frame_ms)
+{
+    atomic_store(&s_frame_ms_override, frame_ms);
+}
+
 // 单脉冲判定实验开关（2026-07-10 已测完，保留备查）：1=上电只发1~2个90°脉冲后永久断信号。
 // ★实验结论（铁证）：断信号后舵机仍一路走完 90° —— 本款舵机为"记忆型"（保持最后目标
 //   继续运动），断脉冲不失力。因此小步进/脉冲串等一切软件限速手段对上电归中【无效】，
 //   上电回正速度=舵机硬件全速（规格属性，不可调）。要慢速上电归中只能硬件换型
 //   （失力型模拟舵机 或 速度可编程的串行总线舵机）。
 #define SERVO_SINGLE_PULSE_TEST 0
+
+/* ══ 死区标定实验开关（2026-09-03 新增，★测完务必改回 0）════════════════════
+ *
+ * 【为什么要做这个实验】要治「慢速转动时的轻微抖动」，必须先知道舵机死区的真值。
+ *   死区 = 目标角与实际角相差多少度以内，舵机当没看见、电机不通电。
+ *   慢速时每帧位移小于死区，舵机就得攒好几帧才跨过去，一跨过就用硬件全速冲完，
+ *   于是运动变成「跳一下、停一会、再跳一下」，这就是抖动的观感来源。
+ *
+ *   跳动频率 = 运动速度 ÷ 死区。VERY_SLOW 是 20°/s：
+ *       死区 1.00° → 20 次/秒 ← 正好落在人眼最敏感的 10~30 次/秒，看得很清楚
+ *       死区 0.47° → 43 次/秒 ← 远离敏感区，就不该这么明显
+ *   MG90S 规格书写的是约 0.47°，本文件注释里沿用的是约 1°，差一倍结论完全相反。
+ *   ★所以这个数必须实测，它是后续一切方案的地基，不能靠猜。
+ *
+ * ══ 2026-09-03 往复法实测结果（模式 1）════════════════════════════════════
+ *   ★三个轴都要到 【3.0°】 才出现正常往复。硬件：左右臂 SG90（塑料齿），
+ *     头部 MG90S（金属齿）。两种型号阈值一致，且都是空载。
+ *
+ *   3° 是规格书 0.47° 的六倍多，这个差距不可能全是电气死区，**主要是齿隙**：
+ *   往复运动每次换向都要先让电机空转吃掉齿间空回，输出轴才跟着动，所以
+ *       往复法测到的 = 电气死区 + 齿隙        ← 已测得 ≈ 3.0°
+ *       单向法测到的 = 电气死区（不换向，齿轮始终贴同一侧，不吃齿隙）← 待测
+ *
+ *   ★为什么必须再测单向：真实的慢速运动是【朝一个方向连续走】的，中途不换向，
+ *     所以它根本不吃齿隙，受制的只有电气死区。拿 3° 去推算抖动会严重高估。
+ *     若电气死区真是 0.47°，VERY_SLOW(20°/s) 的跳动频率就是 43 次/秒，
+ *     远离人眼敏感区，那抖动就另有原因，整个排查方向要换。
+ *
+ * 【模式 1·往复放大法】以 90° 为基准来回往复，幅度逐级放大，第一个能被
+ *   【看见/听见/摸到】规律往复的幅度 = 电气死区 + 齿隙。
+ *
+ *   ★为什么不用"单向逐步推进、看它第几步动"：0.2° 换算到舵机臂上只有零点几毫米，
+ *     即便跨过死区跳了 1°，也不过 0.3mm，肉眼根本分辨不出来（2026-09-03 实测踩过这个坑）。
+ *     而人眼、耳朵、手指对【有节奏的往复】极其敏感，同样的微小幅度立刻就能察觉。
+ *
+ * 【模式 2·单向微步法】测纯电气死区，验证规格书的 0.47° 到底能不能达到。
+ *   ★关键设计：不靠"看位移大小"，靠"听节奏快慢"。人对时间节奏的分辨力，
+ *     远高于对零点几毫米位移的分辨力，这是模式 1 的教训换来的。
+ *
+ *   每组固定步间隔 250ms 单向微步推进，只改步长 δ：
+ *       δ ≥ 电气死区 → 每一步都跨得过门槛 → 每 250ms 响一次，节奏均匀密集
+ *       δ < 电气死区 → 要攒 k 步才跨过去 → 每 k×250ms 才响一次，节奏明显稀疏
+ *   ★所以你只需要判断一件事：这一组的咔咔声是不是【每 250ms 一次】。
+ *     从哪一档开始变成每 250ms 一次，那一档就是电气死区。
+ *
+ *   每组开头有个预置动作：先退 6° 再正向走回起点。这一进一退是为了让齿轮
+ *   【贴紧正向一侧】，后续微步全部同向，就绕开了齿隙，测到的才是纯电气死区。
+ *
+ * 【安全性】本模式下【故意不置 servo_initialized】，与上面 SERVO_SINGLE_PULSE_TEST
+ *   同一套路：一切上层舵机指令（情绪动作、空闲动作、待机归中）都会被
+ *   bsp_servo_move_smooth 的前置检查拒绝，观察窗口纯净，不会被业务动作干扰。
+ */
+#define SERVO_DEADBAND_CALIB_TEST 0
+
+/** 标定模式：1 = 往复放大法（测 死区+齿隙，已测得 3.0°）
+ *            2 = 单向微步法（测 纯电气死区，验证 0.47° 能否达到）★当前 */
+#define SERVO_CALIB_MODE 2
+
+// ── 模式 1（往复放大法）参数 ──────────────────────────────────────────────
+#define CALIB_BASE_DEG 90.0f ///< 往复基准角（中位，远离两端，避免任何限位干扰）
+#define CALIB_CYCLES 6       ///< 每个幅度往复几次。次数够多才能看出"有节奏"而非偶发
+#define CALIB_HALF_MS 400    ///< 往复半周期（毫秒）。400ms 一来一回=1.25Hz，最容易被眼睛捕捉
+
+/* 幅度序列（度）：从远小于死区，逐级放大到远大于死区。
+ * ★第一个能让你【看见/听见/摸到】规律往复的幅度 = 电气死区 + 齿隙。
+ * 2026-09-03 实测三轴均在 3.0° 这一档才正常往复，故在 2 与 3 之间补一档 2.5，
+ * 把阈值夹得更细——若 2.5 也动，说明真值落在 2.0~2.5 而非 2.5~3.0。 */
+#define CALIB_AMP_LIST {0.2f, 0.4f, 0.6f, 0.8f, 1.0f, 1.5f, 2.0f, 2.5f, 3.0f}
+
+// ── 模式 2（单向微步法）参数 ──────────────────────────────────────────────
+// ★单向法一次只测一个轴：判据是"听节奏"，三轴同响会糊成一片分辨不出。
+//   头部是 MG90S，左右臂是 SG90，两种型号都要各测一次再对比。
+#define CALIB_UNI_CHANNEL CH_HEAD    ///< 被测轴：先 CH_HEAD(MG90S)，再改 CH_L_ARM(SG90) 复测
+#define CALIB_UNI_BASE_DEG 80.0f     ///< 单向推进的起点（留出正向 48° 余量，不碰限位）
+#define CALIB_UNI_PREP_BACK_DEG 6.0f ///< 预置回退量：先退这么多再正向走回起点，把齿轮压向正侧
+// 步间隔 500ms（2026-09-03 由 250 放宽）：250ms=4Hz 太快，人来不及数清"响了几次"；
+// 500ms=2Hz 既能听出均匀节奏，跨不过死区时（每 1000/1500ms 一次）的稀疏感也更刺耳好认。
+#define CALIB_UNI_INTERVAL_MS 500      ///< 步间隔（毫秒）。这是判据基准，务必固定不要改
+#define CALIB_UNI_MAX_STEPS 16         ///< 每组最多走几步（小步长组靠它兜底，免得一组太长）
+#define CALIB_UNI_MAX_TRAVEL_DEG 12.0f ///< 每组最大总位移（大步长组靠它兜底，免得撞限位）
+
+/* 单向步长序列（度）：0.47 是 SG90/MG90S 规格书的死区带宽 5μs 换算值，是本次要验证的靶心。
+ *
+ * ★前两档是【对照组】，不是测量组，作用是先让你知道"该听到什么"：
+ *     0.0  阴性对照：连续写同一个角度，舵机【绝对不该动】。
+ *          若这组你也觉得"动了"，说明看到的是每组开头的预置动作或残余振动，
+ *          观察方法本身有问题，后面所有读数都不可信 —— 这一档专门用来暴露它。
+ *     3.0  阳性对照：已知必定每步都动（往复法实测 3° 一定动），
+ *          用它建立"每 500ms 响一次"到底是什么节奏感，作为后面各档的比对基准。
+ *
+ * ★2026-09-03 教训：上一轮只给未知档位，用户用"动没动"来判断，
+ *   而 16 步累计 3.2° 是肉眼可见的，导致每一档看起来都"动了"，无法分辨。
+ *   判据必须是【节奏疏密】而非【动没动】，对照组就是为了把这件事讲清楚。 */
+#define CALIB_UNI_STEP_LIST {0.0f, 3.0f, 0.2f, 0.3f, 0.47f, 0.6f, 0.8f, 1.0f, 1.5f, 2.0f}
+
+/* ══ 2026-09-03 单向法实测结果（模式 2，被测轴 CH_HEAD / MG90S）════════════
+ *   0.2° / 0.3° / 0.47° / 0.6°  → 听起来「连齿」，不是干净的一步一响
+ *   0.8° / 1.0° / 1.5° / 2.0°   → 正常，一点点地动，节奏干净
+ *   ⇒ ★纯电气死区（含最小可分辨步长）≈ 0.8°，落在 0.6~0.8 之间。
+ *
+ * 【与两个已知数对照】
+ *   规格书 0.47°（5μs 死区带宽）→ ❌ 达不到。实测要 0.8° 才吃得动，约为规格的 1.7 倍。
+ *   往复法 3.0°（死区+齿隙）    → 齿隙 ≈ 3.0 - 0.8 = 2.2°，且 SG90/MG90S 都一样。
+ *
+ * 【已排除：不是 duty 量化造成的】曾怀疑 0.2/0.3 那几档是 LEDC 取整不均匀导致，
+ *   实算否定：14bit@50Hz 分辨率 0.111°/级，0.2° 的实际步进在 0.111 与 0.222 间跳
+ *   （最大/最小 = 2.0，确实不均），但 0.47° 与 1.5° 的量化是【完全均匀】的
+ *   （每步恰好 0.444 / 1.444），却照样"连齿"；而 0.8° 的量化反倒没那么均匀
+ *   （0.778 与 0.667 混合），却听着正常。量化均匀度与好坏不相关 ⇒ 病因是物理的，
+ *   不是数值的。★别再回头查 duty 取整。
+ *
+ * 【"连齿"是什么】步长小于死区时，舵机攒好几步才跨过一次门槛，跨过时电机以硬件
+ *   全速冲完这一小段再停。于是电机在"起停—起停"之间反复冲击齿轮，齿面在齿隙内
+ *   来回磕碰，听感就是连续的齿轮咯噔声，而不是干净的一步一响。
+ *   ★这正是慢速运动抖动的现场还原：VERY_SLOW 每帧 0.4°、SLOW 每帧 0.67°，
+ *     全都落在 0.8° 门槛以下，所以业务动作跑慢档时必然复现同样的"连齿+抖动"。
+ *
+ * 【由此得到的硬结论】要让运动不抖，每帧位移必须 ≥ 0.8°。而每帧位移 = 20/step_ms，
+ *   于是 step_ms ≤ 25 才安全：
+ *       VERY_SLOW(50) 每帧 0.40° ✘ 抖  ｜ SLOW(30) 每帧 0.67° ✘ 抖
+ *       SLOWER(25)    每帧 0.80° ✔ 临界｜ MID(15)  每帧 1.33° ✔ 正常
+ *   ⇒ 软件在死区以下再怎么细分插值都是无效的（这也解释了 09-02 一阶低通为何失败）。
+ */
 
 // ==========================================
 // 私有函数：角度边界裁剪 (防止物理撞击)
@@ -138,6 +308,193 @@ static float clamp_safe_angle(uint8_t channel, float target_angle)
     }
     return safe_angle;
 }
+
+#if SERVO_DEADBAND_CALIB_TEST && (SERVO_CALIB_MODE == 1)
+/**
+ * @brief 死区标定实验任务（★验证完连同 SERVO_DEADBAND_CALIB_TEST 宏一并删除）
+ *
+ * 只做一件事：被测轴以 90° 为基准来回往复，幅度从 0.2° 逐级放大到 3.0°，
+ * 每个幅度往复 6 次（一来一回 0.8 秒），组间静默 1.5 秒便于分辨。全程约 50 秒。
+ * ★你要记的只有一个数：从哪个幅度开始，舵机才第一次动。那个幅度就是死区。
+ *
+ * @note 直接调 iot_servo_write_angle 而不走 bsp_servo_move_smooth，
+ *       绕开软限位、死区过滤、互斥锁与插值，确保写下去的就是我想要的裸角度。
+ * @note 普通 xTaskCreate（栈在内部 SRAM）：任务内要碰 LEDC 寄存器，
+ *       不能像某些业务任务那样把栈放 PSRAM。跑完 vTaskDelete(NULL) 自删，不驻留。
+ */
+static void servo_deadband_calib_task(void *arg)
+{
+    (void)arg;
+    static const float amps[] = CALIB_AMP_LIST;
+    const int amp_n = (int)(sizeof(amps) / sizeof(amps[0]));
+    const uint8_t chs[3] = {CH_HEAD, CH_L_ARM, CH_R_ARM}; // 三轴一起摆，并排放着好对比
+
+    ESP_LOGW(TAG, "════════ 死区标定实验（往复放大法·三轴同步）════════");
+    ESP_LOGW(TAG, "三轴同时摆  基准角=%.1f°  每组往复%d次  半周期%dms",
+             CALIB_BASE_DEG, CALIB_CYCLES, CALIB_HALF_MS);
+    ESP_LOGW(TAG, "★三种感官任选，灵敏度由低到高：");
+    ESP_LOGW(TAG, "★  ①【看】舵机臂有没有在规律地来回摆（幅度小时看不见很正常）");
+    ESP_LOGW(TAG, "★  ②【听】有没有节奏均匀的齿轮咔咔声（比眼睛灵敏得多）");
+    ESP_LOGW(TAG, "★  ③【摸】手指轻搭在舵机臂或外壳上，感受有没有规律的震动（最灵敏）");
+    ESP_LOGW(TAG, "★三轴并排，请分别记下【头/左臂/右臂各自从第几组开始动】");
+    ESP_LOGW(TAG, "★  三轴阈值一致 → 共性问题（电源或这批舵机的通病）");
+    ESP_LOGW(TAG, "★  只有某一轴偏大 → 那一颗的个体毛病，换掉即可");
+
+    // 三轴先到基准角，静置等停稳，再开始逐级往复
+    for (int c = 0; c < 3; c++)
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, chs[c], CALIB_BASE_DEG);
+    ESP_LOGW(TAG, "三轴已到基准角 %.1f°，静置 3 秒后开始，从最小幅度 0.2° 起", CALIB_BASE_DEG);
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    // ── 逐级放大幅度，每级往复若干次 ────────────────────────────────────────
+    // 【为什么用往复而不是单向递增】单向 0.2° 在舵机臂上只有零点几毫米位移，
+    //   肉眼根本分辨不出来；而往复运动人眼极其敏感，哪怕幅度同样只有零点几毫米，
+    //   只要它在有节奏地动，就能被看见、听见或摸到。这是本实验能成立的关键。
+    for (int i = 0; i < amp_n; i++)
+    {
+        const float amp = amps[i];
+        ESP_LOGW(TAG, "──── 第%d/%d组  幅度 %.1f°  （%.1f° ↔ %.1f°）持续约%.1f秒 ────",
+                 i + 1, amp_n, amp, CALIB_BASE_DEG, CALIB_BASE_DEG + amp,
+                 (float)(CALIB_CYCLES * CALIB_HALF_MS * 2) / 1000.0f);
+
+        for (int k = 1; k <= CALIB_CYCLES; k++)
+        {
+            // 三轴在同一时刻写同一个目标角，同摆同停，便于并排横向对比
+            for (int c = 0; c < 3; c++)
+                iot_servo_write_angle(LEDC_LOW_SPEED_MODE, chs[c], CALIB_BASE_DEG + amp);
+            vTaskDelay(pdMS_TO_TICKS(CALIB_HALF_MS));
+
+            for (int c = 0; c < 3; c++)
+                iot_servo_write_angle(LEDC_LOW_SPEED_MODE, chs[c], CALIB_BASE_DEG);
+            vTaskDelay(pdMS_TO_TICKS(CALIB_HALF_MS));
+        }
+
+        ESP_LOGW(TAG, "     ↑第%d组结束。刚才若在规律往复 → 有效死区 ≤ %.1f°", i + 1, amp);
+        vTaskDelay(pdMS_TO_TICKS(1500)); // 组间静默，便于分辨"上一组"和"下一组"
+    }
+
+    // ── 结果解读 ────────────────────────────────────────────────────────────
+    ESP_LOGW(TAG, "════════ 标定结束，请按下面解读 ════════");
+    ESP_LOGW(TAG, "★每一轴第一个出现规律往复的幅度 = 那一轴的有效死区（含齿隙）");
+    ESP_LOGW(TAG, "★三轴阈值接近  → 共性问题，指向电源或这批舵机的通病");
+    ESP_LOGW(TAG, "★某一轴明显偏大 → 那一颗的个体毛病，换掉即可");
+    ESP_LOGW(TAG, "★留意第4组(0.8°)：它正是 SLOWER 档跑 180° 时的每帧位移，");
+    ESP_LOGW(TAG, "★  该组不动就说明慢速运动时舵机每帧都跨不过门槛，只能攒几帧猛跳一次");
+    ESP_LOGW(TAG, "★注意：往复测法测到的是【死区+齿隙】，不是纯电气死区，两者要靠单向测法分离");
+    ESP_LOGW(TAG, "★测完把 SERVO_DEADBAND_CALIB_TEST 改回 0 才能恢复正常业务");
+
+    vTaskDelete(NULL); // 一次性任务，跑完自删，不占常驻栈
+}
+#endif // SERVO_DEADBAND_CALIB_TEST && MODE 1
+
+#if SERVO_DEADBAND_CALIB_TEST && (SERVO_CALIB_MODE == 2)
+/**
+ * @brief 单向微步标定任务：测【纯电气死区】，验证规格书 0.47° 能否达到
+ *        （★验证完连同 SERVO_DEADBAND_CALIB_TEST 宏一并删除）
+ *
+ * 【与模式 1 的本质区别】模式 1 是往复，每次换向都要吃齿隙，测到的是
+ *   「电气死区 + 齿隙」（已实测 3.0°）。本模式全程只朝一个方向推进，
+ *   齿轮始终贴在同一侧，齿隙不参与，测到的才是纯电气死区。
+ *
+ * 【判据：听节奏，不是看位移】每组步间隔固定 CALIB_UNI_INTERVAL_MS(250ms)，只改步长 δ：
+ *     δ ≥ 电气死区 → 每步都跨得过门槛 → 每 250ms 响一次，密集均匀
+ *     δ < 电气死区 → 攒 k 步才跨过去 → 每 k×250ms 响一次，明显稀疏
+ *   ★从哪一档开始变成「每 250ms 一次」，那一档就是电气死区。
+ *   这个判据把"分辨零点几毫米位移"换成了"分辨节奏快慢"，后者人类灵敏得多。
+ *
+ * @note 一次只测一个轴（CALIB_UNI_CHANNEL）：三轴同响会糊成一片，节奏判据失效。
+ *       头部 MG90S 测完，把宏改成 CH_L_ARM 再测一遍 SG90，两种型号对比。
+ * @note 直接调 iot_servo_write_angle，绕开软限位/死区过滤/互斥锁/插值，
+ *       确保写下去的就是我想要的裸角度。
+ */
+static void servo_unidir_calib_task(void *arg)
+{
+    (void)arg;
+    static const float steps[] = CALIB_UNI_STEP_LIST;
+    const int step_n = (int)(sizeof(steps) / sizeof(steps[0]));
+    const uint8_t ch = CALIB_UNI_CHANNEL;
+
+    ESP_LOGW(TAG, "════════ 单向微步标定（测纯电气死区）════════");
+    ESP_LOGW(TAG, "被测轴=%u（0=头MG90S 1=左臂SG90 2=右臂SG90）  起点=%.1f°  步间隔=%dms",
+             (unsigned)ch, CALIB_UNI_BASE_DEG, CALIB_UNI_INTERVAL_MS);
+    ESP_LOGW(TAG, "★★判据【不是】动没动，是【响了几次】★★");
+    ESP_LOGW(TAG, "★  不管步长多小，一组走完的累计位移都一样大，光看'动没动'分辨不出任何东西。");
+    ESP_LOGW(TAG, "★  要数的是：微步期间舵机响/震了几次。满 N 次(每%dms一次，均匀)=跨得过死区；",
+             CALIB_UNI_INTERVAL_MS);
+    ESP_LOGW(TAG, "★  明显不足 N 次(节奏稀疏、一顿一顿)=跨不过，要攒好几步才动一次。");
+    ESP_LOGW(TAG, "★  0.2° 在舵机臂上只有约 0.07mm，单步肉眼绝对看不见，【必须靠手指摸或耳朵听】");
+    ESP_LOGW(TAG, "★前两组是对照组：第1组步长0(绝对不该动)、第2组步长3°(必定每步都动)，");
+    ESP_LOGW(TAG, "★  先用它们校准你的感觉，再看后面的未知档位。");
+    ESP_LOGW(TAG, "★每组开头会先退%.0f°再正向走回起点（日志会打'预置中'），那是把齿轮压向正侧，",
+             CALIB_UNI_PREP_BACK_DEG);
+    ESP_LOGW(TAG, "★  是 6° 的大动作，比测试步长大三十倍，【千万别把它当成测试结果】。");
+    ESP_LOGW(TAG, "★  等日志打出'微步开始'再开始数。");
+
+    for (int i = 0; i < step_n; i++)
+    {
+        const float d = steps[i];
+
+        // 步数：总位移不超过 CALIB_UNI_MAX_TRAVEL_DEG，且不超过 CALIB_UNI_MAX_STEPS 步。
+        // 小步长受步数上限约束（免得一组拖太久），大步长受位移上限约束（免得撞限位）。
+        // ★d==0 是阴性对照组，不能拿它做除数，直接固定走满步数（反复写同一个角度）。
+        int n;
+        if (d <= 0.0f)
+        {
+            n = CALIB_UNI_MAX_STEPS;
+        }
+        else
+        {
+            n = (int)(CALIB_UNI_MAX_TRAVEL_DEG / d);
+            if (n > CALIB_UNI_MAX_STEPS)
+                n = CALIB_UNI_MAX_STEPS;
+            if (n < 2)
+                n = 2;
+        }
+
+        // ── 本组抬头：先播报参数，再区分对照组 / 测量组 ──────────────────────
+        ESP_LOGW(TAG, "──── 第%d/%d组  步长 %.2f°  共%d步  总位移%.1f°  持续%.1f秒 ────",
+                 i + 1, step_n, d, n, (float)n * d,
+                 (float)(n * CALIB_UNI_INTERVAL_MS) / 1000.0f);
+        if (d <= 0.0f)
+            ESP_LOGW(TAG, "     【阴性对照】步长为0，舵机绝对不该动。动了=你看错了对象");
+        else if (i == 1)
+            ESP_LOGW(TAG, "     【阳性对照】必定每步都动，记住这个节奏，后面拿它做基准");
+
+        // ── 预置：先退再正向走回起点，让齿轮贴紧【正向】一侧 ──────────────────
+        // ★这是单向法成立的前提：后续微步全部同向，齿隙已在这一步被吃掉，
+        //   不会混进测量结果。少了这一步，第一步的读数仍会包含齿隙。
+        // ★它是 6° 大动作，比测试步长大三十倍，最容易被误当成测试结果，
+        //   所以打日志明确划界，并留 1.5 秒静默把它和微步在时间上分开。
+        ESP_LOGW(TAG, "     预置中…（先退%.0f°再走回，把齿轮压向正侧，这不是测试内容）",
+                 CALIB_UNI_PREP_BACK_DEG);
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, ch, CALIB_UNI_BASE_DEG - CALIB_UNI_PREP_BACK_DEG);
+        vTaskDelay(pdMS_TO_TICKS(700));
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, ch, CALIB_UNI_BASE_DEG);
+        vTaskDelay(pdMS_TO_TICKS(1500)); // 等它彻底停稳，余振不会被误当成响应
+
+        ESP_LOGW(TAG, "     ★微步开始（%d步 × %dms），从现在起听节奏", n, CALIB_UNI_INTERVAL_MS);
+        for (int k = 1; k <= n; k++)
+        {
+            iot_servo_write_angle(LEDC_LOW_SPEED_MODE, ch, CALIB_UNI_BASE_DEG + (float)k * d);
+            vTaskDelay(pdMS_TO_TICKS(CALIB_UNI_INTERVAL_MS));
+        }
+
+        ESP_LOGW(TAG, "     ↑第%d组微步结束（步长%.2f°）。刚才响了几次？满%d次=跨得过门槛",
+                 i + 1, d, n);
+        vTaskDelay(pdMS_TO_TICKS(2000)); // 组间静默，便于分辨上一组和下一组
+    }
+
+    ESP_LOGW(TAG, "════════ 单向标定结束，请按下面解读 ════════");
+    ESP_LOGW(TAG, "★第一个「每%dms响一次」的步长 = 该轴纯电气死区", CALIB_UNI_INTERVAL_MS);
+    ESP_LOGW(TAG, "★把它与往复法的 3.0° 相减，差值就是齿隙（纯机械量，软件消不掉）");
+    ESP_LOGW(TAG, "★若 0.47° 那组就已经密集 → 规格达标，慢速抖动【另有原因】，方向要换");
+    ESP_LOGW(TAG, "★若要到 1.5° 以上才密集 → 电气死区本身就大，慢速走停是物理必然");
+    ESP_LOGW(TAG, "★换 CALIB_UNI_CHANNEL 为 CH_L_ARM 再测一遍，对比 SG90 与 MG90S");
+    ESP_LOGW(TAG, "★测完把 SERVO_DEADBAND_CALIB_TEST 改回 0 才能恢复正常业务");
+
+    vTaskDelete(NULL); // 一次性任务，跑完自删，不占常驻栈
+}
+#endif // SERVO_DEADBAND_CALIB_TEST && MODE 2
 
 // ==========================================
 // API: 舵机硬件生命周期初始化
@@ -227,7 +584,7 @@ void bsp_board_servo_init(bsp_board_t *bsp_board)
         //   均被丢弃，观察窗口纯净、不限时。测完改回正式逻辑（#else 分支）。
         for (int i = 0; i < 3; i++)
             iot_servo_write_angle(LEDC_LOW_SPEED_MODE, (uint8_t)i, 90.0f); // 开始输出 90°
-        vTaskDelay(pdMS_TO_TICKS(40)); // 40ms ≈ 保证输出 1~2 个完整 50Hz 脉冲
+        vTaskDelay(pdMS_TO_TICKS(40));                                     // 40ms ≈ 保证输出 1~2 个完整 50Hz 脉冲
         for (int i = 0; i < 3; i++)
         {
             ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)i, 0); // 永久断信号
@@ -237,6 +594,20 @@ void bsp_board_servo_init(bsp_board_t *bsp_board)
         ESP_LOGW(TAG, "★  只走一小段就停 = 失力型（脉冲串可行）｜一路走完90° = 记忆型（软件无解）");
         ESP_LOGW(TAG, "★  测试模式下舵机不再响应任何指令（未置 initialized），测完把宏改回 0");
         // 注意：不置 servo_initialized、不置 SERVO_READY —— 测试模式舵机全程静默
+#elif SERVO_DEADBAND_CALIB_TEST
+        // ══ 【死区标定实验，测完把 SERVO_DEADBAND_CALIB_TEST 改回 0】═════════════
+        // 与上面单脉冲实验同一套路：【故意不置 servo_initialized】，于是
+        // bsp_servo_move_smooth 的前置检查会拒绝一切上层指令（情绪动作、空闲动作、
+        // 待机归中），观察窗口纯净不受业务干扰。标定任务直接写裸角度。
+#if SERVO_CALIB_MODE == 1
+        xTaskCreate(servo_deadband_calib_task, "servo_calib", 4096, NULL, 5, NULL);
+        ESP_LOGW(TAG, "★死区标定模式1【往复放大法】已启动：测 电气死区+齿隙");
+#else
+        xTaskCreate(servo_unidir_calib_task, "servo_calib", 4096, NULL, 5, NULL);
+        ESP_LOGW(TAG, "★死区标定模式2【单向微步法】已启动：测 纯电气死区，靶心 0.47°");
+#endif
+        ESP_LOGW(TAG, "★标定期间舵机不再响应任何业务指令，请看后续标定日志");
+        // 注意：不置 servo_initialized、不置 SERVO_READY —— 标定模式全程独占舵机
 #else
         // ── 步骤 3：上电归中——三路直接持续输出 90° ─────────────────────────────
         //   - 正常开机：固件保证深度待机/关机前三轴已归中 90°（standby.c），物理就在 90°，
@@ -341,25 +712,44 @@ void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms)
         return;
     }
 
-    // ── 步骤 5：平滑插值运动（1°/step_ms，逐步逼近目标角度）────────────────
-    // 每次循环移动 1 度，然后等待 step_ms 毫秒，产生匀速平滑效果
-    float step_dir = (safe_target > current) ? 1.0f : -1.0f; // 确定运动方向
+    // ── 步骤 5：定帧线性插值运动（固定 SERVO_FRAME_MS 一帧，步长按速度自动缩放）────
+    // 【为什么不用「1°/step_ms」】旧写法每步固定走 1°，更新率 = 1000/step_ms：
+    //   VERY_SLOW(50ms/度) 时只有 20Hz，低于人眼闪烁融合阈值 → 肉眼可见「一步一步走」。
+    //   且 tick=100Hz 下 pdMS_TO_TICKS(2)/(5) 整除后为 0，FAST/VERY_FAST 实际不延时=全速。
+    // 【现在】固定 20ms 一帧（与 50Hz 舵机 PWM 周期对齐，=2 tick 可精确表达），
+    //   总耗时仍按 step_ms 语义计算（total_deg × step_ms），故各档速度观感不变，
+    //   变的只是把同一段行程切得更细：VERY_SLOW 由 1°/50ms 变为 0.4°/20ms，更新率 20→50Hz。
+    // 【2026-09-02 回退记录】此处曾改为一阶低通滤波（set += α(target-set)，对齐参考实现的
+    //   「方案三」），实测【无效】：慢速抖动依旧，且因收尾段每帧位移衰减到远小于舵机死区
+    //   （MG90S 约 ±1°），出现「中段快、末段原地磨蹭不动」的新问题，比线性更差，故回退。
+    float total_deg = fabsf(safe_target - current);
+    uint32_t total_ms = (uint32_t)(total_deg * (float)step_ms); // 维持原速度语义
+    const uint32_t frame_ms = servo_frame_ms(); // ★抖动排查：可被运行时覆盖，默认=SERVO_FRAME_MS
+    int frames = (int)(total_ms / frame_ms);
+    if (frames < 1)
+        frames = 1; // 行程极短时至少走一帧，保证必定到位
+
+    // ★用 vTaskDelayUntil 绝对定时（2026-09-03 抖动修复，理由详见
+    //   bsp_servo_move_all_parallel 插值循环处的完整注释）：
+    //   vTaskDelay 是相对延时，被抢占多久就多等多久，误差逐帧累积，
+    //   帧间隔抖动导致写入时刻相对 PWM 周期漂移，脉宽序列不匀 → 运动抖动。
+    TickType_t last_wake = xTaskGetTickCount();
+    const TickType_t frame_ticks = pdMS_TO_TICKS(frame_ms);
 
     bool aborted = false;
-    for (float a = current;
-         (step_dir > 0) ? (a <= safe_target) : (a >= safe_target);
-         a += step_dir)
+    for (int f = 1; f <= frames; f++)
     {
-        // 每步检查打断请求：远程控制抢占 / 进功能盘 flush 时立即停在当前角度，
-        // 不再走完整个行程（把打断延迟从「一整轮动作」降到「一个 step」≈几十 ms）。
+        // 每帧检查打断请求：远程控制抢占 / 进功能盘 flush 时立即停在当前角度，
+        // 不再走完整个行程（打断延迟 = 一帧 20ms，比旧版一个 step 更灵敏）。
         // 与 bsp_servo_move_all_parallel 的 aborted 处理保持同一套语义。
         if (bsp_servo_abort_requested())
         {
             aborted = true;
             break;
         }
-        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, channel, a);
-        vTaskDelay(pdMS_TO_TICKS(step_ms)); // 每度等待 step_ms ms
+        float t = (float)f / (float)frames; // 归一化进度 0~1
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, channel, current + t * (safe_target - current));
+        vTaskDelayUntil(&last_wake, frame_ticks); // 恒定帧间隔（绝对定时，不累积抢占误差）
     }
 
     // ── 步骤 6：兜底对齐（确保最终精准停在目标位置，消除循环步进的浮点累积误差）──
@@ -457,25 +847,35 @@ void bsp_servo_move_smooth_preempt(uint8_t channel, float target, uint32_t step_
         return;
     }
 
-    float step_dir = (safe_target > current) ? 1.0f : -1.0f;
+    // 定帧线性插值（与 bsp_servo_move_smooth 同一套算法，详见该函数步骤 5 注释）
+    float total_deg = fabsf(safe_target - current);
+    uint32_t total_ms = (uint32_t)(total_deg * (float)step_ms);
+    const uint32_t frame_ms = servo_frame_ms(); // ★抖动排查：可被运行时覆盖，默认=SERVO_FRAME_MS
+    int frames = (int)(total_ms / frame_ms);
+    if (frames < 1)
+        frames = 1;
+
+    // ★绝对定时（2026-09-03 抖动修复，理由详见 bsp_servo_move_all_parallel 处注释）
+    TickType_t last_wake = xTaskGetTickCount();
+    const TickType_t frame_ticks = pdMS_TO_TICKS(frame_ms);
 
     bool aborted = false;
-    int steps = 0; // 【诊断】实际走了几步
+    int steps = 0; // 【诊断】实际走了几帧
     float last_a = current;
-    for (float a = current;
-         (step_dir > 0) ? (a <= safe_target) : (a >= safe_target);
-         a += step_dir)
+    for (int f = 1; f <= frames; f++)
     {
-        // 保留每步检查：本次运动仍可被【后续】的新指令/flush 打断（那是预期行为）。
+        // 保留每帧检查：本次运动仍可被【后续】的新指令/flush 打断（那是预期行为）。
         if (bsp_servo_abort_requested())
         {
             aborted = true;
             break;
         }
+        float t = (float)f / (float)frames;
+        float a = current + t * (safe_target - current);
         iot_servo_write_angle(LEDC_LOW_SPEED_MODE, channel, a);
         steps++;
         last_a = a;
-        vTaskDelay(pdMS_TO_TICKS(step_ms));
+        vTaskDelayUntil(&last_wake, frame_ticks); // 绝对定时，同 bsp_servo_move_smooth
     }
 
     if (!aborted)
@@ -660,10 +1060,16 @@ void bsp_servo_move_all_parallel(float head_target, float larm_target, float rar
     iot_servo_read_angle(LEDC_LOW_SPEED_MODE, CH_L_ARM, &l_cur);
     iot_servo_read_angle(LEDC_LOW_SPEED_MODE, CH_R_ARM, &r_cur);
 
-    // 以三轴中行程最大的为总步数，保证同时到达
-    int max_steps = (int)fmaxf(fmaxf(fabsf(h_safe - h_cur), fabsf(l_safe - l_cur)), fabsf(r_safe - r_cur));
+    // 以三轴中行程最大的为基准算总耗时，再按 SERVO_FRAME_MS 拆帧，保证三轴同时到达。
+    // 【与旧版差异】旧版 max_steps = 最大行程度数（1°/步），延时 step_ms；
+    //   现改为按总耗时拆成 20ms 的定帧（详见 bsp_servo_move_smooth 步骤 5 注释）。
+    //   总耗时不变，更新率提升到 50Hz，消除慢速档肉眼可见的逐步跳变。
+    float max_deg = fmaxf(fmaxf(fabsf(h_safe - h_cur), fabsf(l_safe - l_cur)), fabsf(r_safe - r_cur));
+    uint32_t total_ms = (uint32_t)(max_deg * (float)step_ms);
+    const uint32_t frame_ms = servo_frame_ms(); // ★抖动排查：可被运行时覆盖，默认=SERVO_FRAME_MS
+    int max_steps = (int)(total_ms / frame_ms);
 
-    if (max_steps < 1 || step_ms == 0)
+    if (max_deg < 1.0f || max_steps < 1 || step_ms == 0)
     {
         iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_HEAD, h_safe);
         iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_L_ARM, l_safe);
@@ -673,7 +1079,27 @@ void bsp_servo_move_all_parallel(float head_target, float larm_target, float rar
         return;
     }
 
-    // 线性插值：每步同时写三轴，t 从 1/max_steps 到 1
+    // ── 线性插值：每步同时写三轴，t 从 1/max_steps 到 1 ────────────────────────
+    // 【2026-09-03 抖动修复】原实现有两个缺陷，是运动抖动的真凶：
+    //
+    //   缺陷①：用 vTaskDelay(frame_ms) 计时，它是【相对延时】——从"本次调用时刻"
+    //     再等 frame_ms。而三次 write_angle 本身耗时、且本任务随时可能被 LVGL/
+    //     音频/唤醒词抢占，于是每帧实际间隔 = frame_ms + 本帧被抢占的时间，
+    //     误差【逐帧累积】。帧间隔在 tick 边界上抖动 → 写入时刻相对 PWM 周期漂移
+    //     → 有的 PWM 周期收到两次更新（前一次被覆盖，该帧位移丢失）、有的一次没有
+    //     （位移重复）→ 实际吐出的脉宽序列不匀 → 舵机忠实跟随 → 肉眼可见抖动。
+    //     ★改用 vTaskDelayUntil：以【绝对时刻】递推，无论本帧被抢占多久，
+    //       下一帧的唤醒时刻都锚定在 last_wake + frame_ms，误差不累积。
+    //
+    //   缺陷②：三轴分三次 write_angle，中间可能被抢占，导致三轴的 duty 更新落到
+    //     不同的 PWM 周期，三轴不同步（表现为动作发散、互相错拍）。
+    //     ★改用 vTaskSuspendAll 包住三次写入，保证三轴 duty 在同一个 PWM 周期内一起生效。
+    //
+    //   ★这两条都与"每帧位移大小"无关，正好解释了为什么 A/B 对照（每帧 0.8° vs
+    //     0.2°）抖得一样、为什么空载照抖、为什么调死区参数全都无效。
+    TickType_t last_wake = xTaskGetTickCount();
+    const TickType_t frame_ticks = pdMS_TO_TICKS(frame_ms);
+
     bool aborted = false;
     for (int step = 1; step <= max_steps; step++)
     {
@@ -685,10 +1111,24 @@ void bsp_servo_move_all_parallel(float head_target, float larm_target, float rar
             break;
         }
         float t = (float)step / (float)max_steps;
-        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_HEAD, h_cur + t * (h_safe - h_cur));
-        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_L_ARM, l_cur + t * (l_safe - l_cur));
-        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_R_ARM, r_cur + t * (r_safe - r_cur));
-        vTaskDelay(pdMS_TO_TICKS(step_ms));
+        float ha = h_cur + t * (h_safe - h_cur);
+        float la = l_cur + t * (l_safe - l_cur);
+        float ra = r_cur + t * (r_safe - r_cur);
+
+        // ★三轴写入尽量不被打断：保证三路 duty 落在同一个 PWM 周期，一起生效。
+        //   用 vTaskSuspendAll（禁止任务调度）而【不用 taskENTER_CRITICAL】：
+        //   后者会关中断，而 iot_servo_write_angle 内的 SERVO_CHECK 宏在参数非法时
+        //   会调 ESP_LOGE —— 日志要拿锁、可能阻塞，在关中断的临界区里调用会崩。
+        //   vTaskSuspendAll 只挡住同核的任务切换，不关中断，日志路径依然安全，
+        //   而"三轴写入不被别的任务插队"这个目的同样达到。
+        vTaskSuspendAll();
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_HEAD, ha);
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_L_ARM, la);
+        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_R_ARM, ra);
+        xTaskResumeAll();
+
+        // ★绝对时刻递推，抢占不累积误差（替代原 vTaskDelay 的相对延时）
+        vTaskDelayUntil(&last_wake, frame_ticks);
     }
 
     // 兜底：未被打断时精准落在目标位置（被打断则停在当前插值角度，不强制到位）

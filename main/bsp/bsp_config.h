@@ -283,7 +283,7 @@
 #define SERVO_SPEED_VERY_FAST 2U  ///< 极快（2ms/度，适合快速抖动动作）
 #define SERVO_SPEED_FAST 5U       ///< 快速（5ms/度，适合挥手、点头等活泼动作）
 #define SERVO_SPEED_MID 15U       ///< 中速（15ms/度，适合大多数情绪动作）
-#define SERVO_SPEED_SLOWER 25U    ///< 较慢（25ms/度，适合委屈、犹豫等缓慢动作）
+#define SERVO_SPEED_SLOWER 20U    ///< 较慢（25ms/度，适合委屈、犹豫等缓慢动作）
 #define SERVO_SPEED_SLOW 30U      ///< 慢速（30ms/度，适合慵懒、委屈等缓慢动作）
 #define SERVO_SPEED_VERY_SLOW 50U ///< 极慢（50ms/度，适合细腻的情感表达）
 

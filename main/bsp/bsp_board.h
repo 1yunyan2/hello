@@ -463,6 +463,23 @@ bool bsp_servo_read_angle(uint8_t channel, float *out_angle);
 void bsp_servo_move_all_parallel(float head_target, float larm_target, float rarm_target, uint32_t step_ms);
 
 /**
+ * @brief 【★抖动排查临时接口，定位完即删】运行时覆盖插值帧长
+ *
+ * 用于在【同一次烧录】里对比不同帧长的抖动表现——SERVO_FRAME_MS 是编译期宏，
+ * 要对比只能烧两次板、靠记忆比较，极不可靠。
+ *
+ * ★关键：改帧长【不改变动作快慢】。总耗时 = 行程 × step_ms，与帧长无关；
+ *   帧长只决定这段时间被切成多少帧，即 每帧位移 = 帧长 ÷ step_ms。
+ *   所以对比时唯一变量就是每帧位移，不会混入"变快了所以看不出抖"的干扰。
+ *
+ * @param frame_ms 帧长（毫秒）。传 0 = 恢复使用编译期的 SERVO_FRAME_MS。
+ *                 建议只用 10 的整数倍：FreeRTOS tick=100Hz，vTaskDelay 粒度 10ms，
+ *                 非整数倍会被截断，导致实际帧长与设定值不符。
+ * @note 线程安全（atomic）。对正在进行的运动不生效，下一次运动才采用新值。
+ */
+void bsp_servo_debug_set_frame_ms(uint32_t frame_ms);
+
+/**
  * @brief 请求中止正在进行的舵机插值运动（立即停在当前角度）
  *
  * 置打断标志，bsp_servo_move_all_parallel / bsp_servo_move_smooth 的插值步循环

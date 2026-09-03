@@ -375,19 +375,85 @@ static void offline_audio_boot_test_start(void)
 }
 #endif // OFFLINE_AUDIO_BOOT_TEST
 
-// 舵机循环测试任务（独立运行，不阻塞 LVGL）
-// static void servo_test_task(void *arg)
-// {
-//     while (1)
-//     {
-//         bsp_servo_move_all_parallel(60.0f, 60.0f, 120.0f, SERVO_SPEED_MID); // 同步运动示例
-//         vTaskDelay(pdMS_TO_TICKS(500));
-//         bsp_servo_move_all_parallel(120.0f, 120.0f, 60.0f, SERVO_SPEED_MID); // 同步运动示例
-//         vTaskDelay(pdMS_TO_TICKS(500));
-//         bsp_servo_move_all_parallel(90.0f, 90.0f, 90.0f, SERVO_SPEED_MID); // 同步运动示例
-//         vTaskDelay(pdMS_TO_TICKS(1000));
-//     }
-// }
+/* ══ 舵机抖动 A/B 对照任务（★定位完连同 bsp_servo_debug_set_frame_ms 一并删除）══
+ *
+ * 【要回答的唯一问题】运动时的轻微抖动，到底是不是"每帧位移小于舵机死区"造成的？
+ *
+ * 【已知】厂家规格书：塑胶齿(臂)信号虚位 4~12μs、金属齿(头)≤6μs；本项目脉宽
+ *   500~2400μs 覆盖 180°（10.56μs/度），换算过来电气死区约 0.4~1.1°。
+ *   单向标定实测门槛 0.8°（=8.4μs），与规格吻合。
+ *
+ * 【2026-09-03 A/B 对照结论：死区模型已被推翻】
+ *   曾用 A组每帧0.80°（压在门槛上）对 B组每帧0.20°（远低于门槛）做对照，
+ *   实测【两组抖动无可分辨差异】，且全程空载。结合"负载已排除、PWM 分频精确"，
+ *   ⇒ "每帧位移小于电气死区"【不是】运动抖动的原因，该方向就此关闭，勿再重走。
+ *
+ * 【真凶与修复】改查写入定时，在 bsp_servo.c 插值循环找到两个缺陷：
+ *   ① vTaskDelay 是相对延时，被 LVGL/音频/唤醒词抢占后误差【逐帧累积】，
+ *      帧间隔漂移 → 写入时刻相对 PWM 周期漂移 → 某些周期收到两次更新（该帧位移
+ *      被覆盖丢失）、某些周期一次没有（位移重复）→ 脉宽序列不匀 → 抖动。
+ *   ② 三轴分三次写入，中间可被抢占，三路 duty 落到不同 PWM 周期 → 三轴错拍。
+ *   已分别改为 vTaskDelayUntil 绝对定时 + vTaskSuspendAll 包住三轴写入。
+ *   ★这两条都与每帧位移大小无关，正好解释了 A/B 为何无差别。
+ *
+ * 【本任务现在的用途】单纯的连续慢速大行程运动，用来验证上述定时修复的效果。
+ *   帧长不再覆盖（传 0 = 沿用 SERVO_FRAME_MS），保持与业务一致。
+ */
+#define SERVO_AB_STEP_MS SERVO_SPEED_VERY_SLOW ///< 慢速档(50ms/度)，抖动最明显的速度
+#define SERVO_AB_ANGLE_LO 40.0f                ///< 行程下限（避开端点，防堵转干扰判断）
+#define SERVO_AB_ANGLE_HI 140.0f               ///< 行程上限（100°行程，慢档约5秒走完，够看清）
+#define SERVO_AB_CH CH_HEAD                    ///< 单轴测试用哪一路（三轴同动会互相干扰观察）
+
+static void servo_test_task(void *arg)
+{
+    (void)arg;
+    bsp_servo_debug_set_frame_ms(0); // 沿用 SERVO_FRAME_MS，不覆盖
+
+    ESP_LOGW("SERVO_AB", "════ 三阶段抖动定位（不用信号发生器，只用本主控）════");
+    ESP_LOGW("SERVO_AB", "★阶段1【静止】写一次角度后【完全不再写】，保持5秒。");
+    ESP_LOGW("SERVO_AB", "★  LEDC硬件自己在输出恒定脉宽，全程零软件参与。");
+    ESP_LOGW("SERVO_AB", "★  这5秒里抖 ⇒ 舵机在恒定信号下自己抖，与代码彻底无关。");
+    ESP_LOGW("SERVO_AB", "★阶段2【粗步进】每500ms直接跳2°，一步到位不插值。");
+    ESP_LOGW("SERVO_AB", "★  跳完那一下之后的静止期抖不抖？抖 ⇒ 是舵机的整定振荡。");
+    ESP_LOGW("SERVO_AB", "★阶段3【正常插值】走业务同款慢速运动，作为对照基准。");
+
+    while (1)
+    {
+        // ══ 阶段 1：绝对静止——写一次就撒手，验证"恒定信号下抖不抖" ══════════
+        // ★这是本次测试的核心。等价于"用信号发生器送一路干净不变的PWM"：
+        //   写完这一笔后，软件再也不碰 LEDC，硬件持续输出同一个脉宽。
+        //   若此时仍抖，说明是舵机内部电位器反馈+模拟比较器的整定振荡，
+        //   属于廉价模拟舵机的固有特性，任何软件手段都消不掉。
+        // ⚠️ 先移到别处再回来：bsp_servo_move_smooth 有「差值<1° 直接返回」的死区过滤，
+        //    上一轮阶段3 结束时已停在 ANGLE_LO，这里若再写 ANGLE_LO 会被过滤掉、
+        //    根本不产生运动，第二轮起阶段1 就失去意义。故先去 90° 再回来。
+        bsp_servo_move_smooth(SERVO_AB_CH, 90.0f, SERVO_SPEED_MID);
+        vTaskDelay(pdMS_TO_TICKS(300));
+
+        ESP_LOGW("SERVO_AB", "【阶段1·静止】已写 %.0f°，接下来5秒【零写入】——现在抖吗？",
+                 SERVO_AB_ANGLE_LO);
+        bsp_servo_move_smooth(SERVO_AB_CH, SERVO_AB_ANGLE_LO, SERVO_SPEED_MID);
+        vTaskDelay(pdMS_TO_TICKS(5000)); // 全程不写 LEDC，纯硬件恒定输出
+
+        // ══ 阶段 2：粗步进——每步远大于死区，且步间完全静止 ══════════════════
+        // 若阶段1不抖、这里每跳一下之后的静止期也不抖，但连续插值时抖，
+        // 才说明问题真在"连续写入"上；否则就是舵机自身特性。
+        ESP_LOGW("SERVO_AB", "【阶段2·粗步进】每500ms跳2°，共10步——每跳之后静止时抖吗？");
+        for (int i = 1; i <= 10; i++)
+        {
+            // 直接用 INSTANT（瞬间模式）：内部只写一次 duty，不做任何插值
+            bsp_servo_move_smooth(SERVO_AB_CH, SERVO_AB_ANGLE_LO + (float)i * 2.0f, SERVO_SPEED_INSTANT);
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        vTaskDelay(pdMS_TO_TICKS(1500));
+
+        // ══ 阶段 3：正常插值运动——业务同款，作为对照 ════════════════════════
+        ESP_LOGW("SERVO_AB", "【阶段3·插值】业务同款慢速运动——和前两阶段比，抖得更明显吗？");
+        bsp_servo_move_smooth(SERVO_AB_CH, SERVO_AB_ANGLE_HI, SERVO_AB_STEP_MS);
+        bsp_servo_move_smooth(SERVO_AB_CH, SERVO_AB_ANGLE_LO, SERVO_AB_STEP_MS);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 3. 唤醒词回调
@@ -623,146 +689,146 @@ static void ww_init_task(void *arg)
 void application_init(void)
 {
 
-    /* GPIO14 上电默认弱上拉，左臂舵机线焊死在此脚会被误触发抖动进而拉低电源轨，
-     * 引发 ES8311/触摸 NACK 及其他舵机连锁失灵。必须在最开头先拉低占住该脚。
-     */
-    gpio_config_t io_conf_g14 = {
-        .pin_bit_mask = (1ULL << GPIO_NUM_14),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&io_conf_g14));
-    gpio_set_level(GPIO_NUM_14, 0); // 打开震动
-    bsp_motor_ledc_init();          /* 幂等：bsp_touch_init() 里还会再调一次，同参数重复配置安全 */
-    bsp_motor_pulse_level(BOOT_VIBRATE_LEVEL, BOOT_VIBRATE_MS);
+    //     /* GPIO14 上电默认弱上拉，左臂舵机线焊死在此脚会被误触发抖动进而拉低电源轨，
+    //      * 引发 ES8311/触摸 NACK 及其他舵机连锁失灵。必须在最开头先拉低占住该脚。
+    //      */
+    //     gpio_config_t io_conf_g14 = {
+    //         .pin_bit_mask = (1ULL << GPIO_NUM_14),
+    //         .mode = GPIO_MODE_OUTPUT,
+    //         .pull_up_en = GPIO_PULLUP_DISABLE,
+    //         .pull_down_en = GPIO_PULLDOWN_DISABLE,
+    //         .intr_type = GPIO_INTR_DISABLE,
+    //     };
+    //     ESP_ERROR_CHECK(gpio_config(&io_conf_g14));
+    //     gpio_set_level(GPIO_NUM_14, 0); // 打开震动
+    //     bsp_motor_ledc_init();          /* 幂等：bsp_touch_init() 里还会再调一次，同参数重复配置安全 */
+    //     bsp_motor_pulse_level(BOOT_VIBRATE_LEVEL, BOOT_VIBRATE_MS);
 
-    bsp_flash_init();
-    PRINT_INTERNAL_HEAP_STEP("bsp_flash_init");
-    HEAP_CHECK_STEP("bsp_flash_init");
-    debug_root_files();
-    scan_production_assets("/S"); // 扫描 /S 目录下的所有资源
-    if (access("/S/assets/gif/one.gif", F_OK) == 0)
-        printf("路径 A 物理存在！\n");
-    if (access("/S/gif/one.gif", F_OK) == 0)
-        printf("路径 B 物理存在！\n");
-    /* ── 步骤 1: BSP 单例 ──────────────────────────────────────────────────── */
+    //     bsp_flash_init();
+    //     PRINT_INTERNAL_HEAP_STEP("bsp_flash_init");
+    //     HEAP_CHECK_STEP("bsp_flash_init");
+    //     debug_root_files();
+    //     scan_production_assets("/S"); // 扫描 /S 目录下的所有资源
+    //     if (access("/S/assets/gif/one.gif", F_OK) == 0)
+    //         printf("路径 A 物理存在！\n");
+    //     if (access("/S/gif/one.gif", F_OK) == 0)
+    //         printf("路径 B 物理存在！\n");
+    //     /* ── 步骤 1: BSP 单例 ──────────────────────────────────────────────────── */
     bsp_board_t *bsp_board = bsp_board_get_instance();
 
-    /* ── 步骤 2: NVS Flash ─────────────────────────────────────────────────── */
-    bsp_board_nvs_init(bsp_board);
-    PRINT_INTERNAL_HEAP_STEP("bsp_board_nvs_init");
+    //     /* ── 步骤 2: NVS Flash ─────────────────────────────────────────────────── */
+    //     bsp_board_nvs_init(bsp_board);
+    //     PRINT_INTERNAL_HEAP_STEP("bsp_board_nvs_init");
 
-    /* ── 步骤 5: WiFi / BluFi 配网（阻塞直至获取 IP 或彻底失败后重启）───────
-     * ★LCD/UI 初始化必须放在此步【之后】：BLE controller 使能窗口内若 LVGL 正在
-     *   并发解码 GIF / SPI DMA 刷屏 / 投递舵机，会与 BT 抢内部资源，导致 BLE 初始化
-     *   随机崩溃（LoadProhibited 野 handle 或 ble_svc_gap_init 断言，见 BUG-026）。
-     *   配网不再显示二维码（已删除该逻辑），因此 UI 无需早于 WiFi，放回配网之后即可。*/
-    bsp_board_wifi_main(bsp_board);
-    PRINT_INTERNAL_HEAP_STEP("bsp_board_wifi_main");
-    /* ── 步骤 2.5: LCD + UI 初始化（WiFi/配网完成后再起，避开 BLE 初始化窗口）── */
-    bsp_board_lcd_init(bsp_board);
-    PRINT_INTERNAL_HEAP_STEP("bsp_board_lcd_init");
-    ui_init();
-    vTaskDelay(pdMS_TO_TICKS(100));
-    PRINT_INTERNAL_HEAP_STEP("ui_init");
-    if (lvgl_port_lock(1000))
-    {
-        /* ★背光渐变避让：ui_init() 内部可能已启动开机 logo 渐亮（UI_BOOT_FADE_IN）。
-         * 此时若走 bsp_board_lcd_on()，它会把背光直接拍到 100%，而渐变 timer 下一拍
-         * （4ms 后）按自身时间进度算出较低亮度又写回去 —— 表现为渐亮途中"突然亮一下
-         * 再暗回来"的回弹（仅首次配网路径可见，已配网设备时序不同不触发）。
-         * 故渐变进行中只开显示控制器、把背光完全交给渐变状态机推进。 */
-        if (ui_is_boot_fading())
-            bsp_board_lcd_disp_on(bsp_board); // 只开显示，不碰背光
-        else
-            bsp_board_lcd_on(bsp_board); // 无渐变：照旧开显示 + 点背光
-        lvgl_port_unlock();
-    }
+    //     /* ── 步骤 5: WiFi / BluFi 配网（阻塞直至获取 IP 或彻底失败后重启）───────
+    //      * ★LCD/UI 初始化必须放在此步【之后】：BLE controller 使能窗口内若 LVGL 正在
+    //      *   并发解码 GIF / SPI DMA 刷屏 / 投递舵机，会与 BT 抢内部资源，导致 BLE 初始化
+    //      *   随机崩溃（LoadProhibited 野 handle 或 ble_svc_gap_init 断言，见 BUG-026）。
+    //      *   配网不再显示二维码（已删除该逻辑），因此 UI 无需早于 WiFi，放回配网之后即可。*/
+    //     bsp_board_wifi_main(bsp_board);
+    //     PRINT_INTERNAL_HEAP_STEP("bsp_board_wifi_main");
+    //     /* ── 步骤 2.5: LCD + UI 初始化（WiFi/配网完成后再起，避开 BLE 初始化窗口）── */
+    //     bsp_board_lcd_init(bsp_board);
+    //     PRINT_INTERNAL_HEAP_STEP("bsp_board_lcd_init");
+    //     ui_init();
+    //     vTaskDelay(pdMS_TO_TICKS(100));
+    //     PRINT_INTERNAL_HEAP_STEP("ui_init");
+    //     if (lvgl_port_lock(1000))
+    //     {
+    //         /* ★背光渐变避让：ui_init() 内部可能已启动开机 logo 渐亮（UI_BOOT_FADE_IN）。
+    //          * 此时若走 bsp_board_lcd_on()，它会把背光直接拍到 100%，而渐变 timer 下一拍
+    //          * （4ms 后）按自身时间进度算出较低亮度又写回去 —— 表现为渐亮途中"突然亮一下
+    //          * 再暗回来"的回弹（仅首次配网路径可见，已配网设备时序不同不触发）。
+    //          * 故渐变进行中只开显示控制器、把背光完全交给渐变状态机推进。 */
+    //         if (ui_is_boot_fading())
+    //             bsp_board_lcd_disp_on(bsp_board); // 只开显示，不碰背光
+    //         else
+    //             bsp_board_lcd_on(bsp_board); // 无渐变：照旧开显示 + 点背光
+    //         lvgl_port_unlock();
+    //     }
 
-    /* ── 步骤 3: 音频硬件 + 采集任务（裸板无 ES8311，注释）──────────────── */
-    audio_init(bsp_board);
-    PRINT_INTERNAL_HEAP_STEP("audio_init");
+    //     /* ── 步骤 3: 音频硬件 + 采集任务（裸板无 ES8311，注释）──────────────── */
+    //     audio_init(bsp_board);
+    //     PRINT_INTERNAL_HEAP_STEP("audio_init");
 
-// ── 【调试】离线音频开机自测开关 ─────────────────────────────────────────────
-// 置 1：开机后把固件内嵌的测试音频落盘到外挂 flash /S/voice/，然后依次自动
-//       播放 test.mp3 和 test.p3，验证双分支解码链路 + heap 泄漏对账。
-//       验证完成后置回 0（内嵌音频与 CMakeLists 的 EMBED_FILES 可一并移除）。
-// 前置条件：bsp_flash_init（/S 已挂载）+ audio_init（codec 就绪）均已完成。
-#if OFFLINE_AUDIO_BOOT_TEST
-    offline_audio_boot_test_start();
-#endif
+    // // ── 【调试】离线音频开机自测开关 ─────────────────────────────────────────────
+    // // 置 1：开机后把固件内嵌的测试音频落盘到外挂 flash /S/voice/，然后依次自动
+    // //       播放 test.mp3 和 test.p3，验证双分支解码链路 + heap 泄漏对账。
+    // //       验证完成后置回 0（内嵌音频与 CMakeLists 的 EMBED_FILES 可一并移除）。
+    // // 前置条件：bsp_flash_init（/S 已挂载）+ audio_init（codec 就绪）均已完成。
+    // #if OFFLINE_AUDIO_BOOT_TEST
+    //     offline_audio_boot_test_start();
+    // #endif
 
-    /* ── 步骤 4: 唤醒词引擎（裸板无麦克风，注释）──────────────────────────── */
-    /* ★ 唤醒词初始化挪到 CPU1 执行，main 在 CPU0 上阻塞等待（详见 ww_init_task 注释）。
-     *   目的：main 阻塞期间不占 CPU0，taskLVGL 独占 CPU0 → 开机 logo GIF 全速不卡顿；
-     *   同时模型加载在 CPU1 上正常推进，不再被 GIF 挤成 26 秒。
-     *   优先级 4：低于 afe_fetch / audio_feed 的 5，保证实时音频链路不被抢。 */
-    ESP_LOGW(TAG, "[开机加速] 唤醒词初始化交给 CPU1（优先级4），main 在 CPU0 阻塞等待");
-    BaseType_t ww_ok = xTaskCreatePinnedToCore(
-        ww_init_task,                // 任务函数
-        "ww_init",                   // 任务名
-        8192,                        // 栈深（内部 SRAM，实测峰值仅需 2472B）
-        xTaskGetCurrentTaskHandle(), // 传入 main 句柄，完成后通知它
-        4,                           // 优先级 4 < AFE 的 5，不抢实时音频
-        NULL,                        // 不保留句柄（任务自删）
-        1);                          // ★ 钉在 CPU1
-    if (ww_ok != pdPASS)
-    {
-        // 兜底：任务建不起来（内存不足）时退回原地同步初始化，功能优先于流畅度
-        ESP_LOGE(TAG, "ww_init 任务创建失败，退回 main 内同步初始化（开机会卡顿）");
-        wake_word_init(wake_word_callback);
-        wake_word_start();
-    }
-    else
-    {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // 阻塞等唤醒词就绪，期间完全让出 CPU0
-        ESP_LOGW(TAG, "[开机加速] 唤醒词就绪，main 继续后续初始化");
-    }
-    PRINT_INTERNAL_HEAP_STEP("wake_word_init+start");
+    //     /* ── 步骤 4: 唤醒词引擎（裸板无麦克风，注释）──────────────────────────── */
+    //     /* ★ 唤醒词初始化挪到 CPU1 执行，main 在 CPU0 上阻塞等待（详见 ww_init_task 注释）。
+    //      *   目的：main 阻塞期间不占 CPU0，taskLVGL 独占 CPU0 → 开机 logo GIF 全速不卡顿；
+    //      *   同时模型加载在 CPU1 上正常推进，不再被 GIF 挤成 26 秒。
+    //      *   优先级 4：低于 afe_fetch / audio_feed 的 5，保证实时音频链路不被抢。 */
+    //     ESP_LOGW(TAG, "[开机加速] 唤醒词初始化交给 CPU1（优先级4），main 在 CPU0 阻塞等待");
+    //     BaseType_t ww_ok = xTaskCreatePinnedToCore(
+    //         ww_init_task,                // 任务函数
+    //         "ww_init",                   // 任务名
+    //         8192,                        // 栈深（内部 SRAM，实测峰值仅需 2472B）
+    //         xTaskGetCurrentTaskHandle(), // 传入 main 句柄，完成后通知它
+    //         4,                           // 优先级 4 < AFE 的 5，不抢实时音频
+    //         NULL,                        // 不保留句柄（任务自删）
+    //         1);                          // ★ 钉在 CPU1
+    //     if (ww_ok != pdPASS)
+    //     {
+    //         // 兜底：任务建不起来（内存不足）时退回原地同步初始化，功能优先于流畅度
+    //         ESP_LOGE(TAG, "ww_init 任务创建失败，退回 main 内同步初始化（开机会卡顿）");
+    //         wake_word_init(wake_word_callback);
+    //         wake_word_start();
+    //     }
+    //     else
+    //     {
+    //         ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // 阻塞等唤醒词就绪，期间完全让出 CPU0
+    //         ESP_LOGW(TAG, "[开机加速] 唤醒词就绪，main 继续后续初始化");
+    //     }
+    //     PRINT_INTERNAL_HEAP_STEP("wake_word_init+start");
 
-    /* ── 步骤 6: MQTT 客户端 ───────────────────────────────────────────────── */
-    protocol_mqtt_start();
-    PRINT_INTERNAL_HEAP_STEP("protocol_mqtt_start");
+    //     /* ── 步骤 6: MQTT 客户端 ───────────────────────────────────────────────── */
+    //     protocol_mqtt_start();
+    //     PRINT_INTERNAL_HEAP_STEP("protocol_mqtt_start");
 
-    /* ── 步骤 7: 会话模块（WebSocket 预连接）─────────────────────────────── */
-    //// session_init("ws://122.224.191.2:4888/ws/omni");
-    session_init("wss://ai.strailine-space.com/ws/omni");
-    PRINT_INTERNAL_HEAP_STEP("session_init");
+    //     /* ── 步骤 7: 会话模块（WebSocket 预连接）─────────────────────────────── */
+    //     //// session_init("ws://122.224.191.2:4888/ws/omni");
+    //     session_init("wss://ai.strailine-space.com/ws/omni");
+    //     PRINT_INTERNAL_HEAP_STEP("session_init");
 
-    // 6. 创建触摸扫描任务
-    // ⚠ 栈必须在内部 SRAM，不能放 SPIRAM！
-    //    本任务承载整个 UI 跳转链（含游戏初始化），其中 game_whack 读写 NVS 高分会
-    //    触发 spi_flash_disable_interrupts_caches_and_other_cpu()，期间 cache 被禁用，
-    //    SPIRAM 栈不可访问 → esp_task_stack_is_sane_cache_disabled() 断言 panic（BUG-010 家族）。
-    //    实测进游戏路径栈高水位剩 5888B，即峰值用量仅 2304B，故 4096 足够（留 ~1.7× 余量）。
-    //    内部 SRAM 净增 4KB，换来彻底消除「触摸任务里碰 flash 必崩」隐患。
-    esp_err_t ret = xTaskCreatePinnedToCoreWithCaps(
-        touch_scan_task,
-        "touch_scan",
-        4096,
-        NULL,
-        4, // 优先级略低于舵机和音频
-        NULL,
-        tskNO_AFFINITY,
-        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    //     // 6. 创建触摸扫描任务
+    //     // ⚠ 栈必须在内部 SRAM，不能放 SPIRAM！
+    //     //    本任务承载整个 UI 跳转链（含游戏初始化），其中 game_whack 读写 NVS 高分会
+    //     //    触发 spi_flash_disable_interrupts_caches_and_other_cpu()，期间 cache 被禁用，
+    //     //    SPIRAM 栈不可访问 → esp_task_stack_is_sane_cache_disabled() 断言 panic（BUG-010 家族）。
+    //     //    实测进游戏路径栈高水位剩 5888B，即峰值用量仅 2304B，故 4096 足够（留 ~1.7× 余量）。
+    //     //    内部 SRAM 净增 4KB，换来彻底消除「触摸任务里碰 flash 必崩」隐患。
+    //     esp_err_t ret = xTaskCreatePinnedToCoreWithCaps(
+    //         touch_scan_task,
+    //         "touch_scan",
+    //         4096,
+    //         NULL,
+    //         4, // 优先级略低于舵机和音频
+    //         NULL,
+    //         tskNO_AFFINITY,
+    //         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 
-    if (ret != pdPASS)
-    {
-        ESP_LOGE(TAG, "创建触摸扫描任务失败！");
-    }
-    else
-    {
-        ESP_LOGI(TAG, "触摸扫描任务创建完成");
-        PRINT_TASK_CREATED(TAG, "touch_scan", 4096, 1); // 栈在内部SRAM
-    }
+    //     if (ret != pdPASS)
+    //     {
+    //         ESP_LOGE(TAG, "创建触摸扫描任务失败！");
+    //     }
+    //     else
+    //     {
+    //         ESP_LOGI(TAG, "触摸扫描任务创建完成");
+    //         PRINT_TASK_CREATED(TAG, "touch_scan", 4096, 1); // 栈在内部SRAM
+    //     }
     // /* ── 步骤 8: 舵机硬件初始化（LEDC/PWM）──────────────────────────────── */
     bsp_board_servo_init(bsp_board);
     PRINT_INTERNAL_HEAP_STEP("bsp_board_servo_init");
 
     // /* ── 步骤 9: 舵机管理器（队列 + worker task，栈在 SPIRAM）─────────────── */
-    ret = servo_manager_init();
+    esp_err_t ret = servo_manager_init();
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "servo_manager_init 失败: %s", esp_err_to_name(ret));
@@ -805,70 +871,70 @@ void application_init(void)
      * 【安全性】ui_notify_boot_ready() 只写标志 + 启 esp_timer，不依赖下方任何模块；
      * 反过来下方模块也不读 boot 渐变状态，两者无耦合，提前调用无副作用。
      * ══════════════════════════════════════════════════════════════════════ */
-    ui_notify_boot_ready();
-    printf("log结束标志\n");
+    // ui_notify_boot_ready();
+    // printf("log结束标志\n");
 
-    // // 舵机测试任务（独立跑，不影响 LVGL 刷新）
-    // xTaskCreatePinnedToCoreWithCaps(
-    //     servo_test_task,
-    //     "servo_test",
-    //     4096,
-    //     NULL,
-    //     5,
-    //     NULL,
-    //     tskNO_AFFINITY,
-    //     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    // 舵机测试任务（独立跑，不影响 LVGL 刷新）
+    xTaskCreatePinnedToCoreWithCaps(
+        servo_test_task,
+        "servo_test",
+        4096,
+        NULL,
+        5,
+        NULL,
+        tskNO_AFFINITY,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
     /* ── 步骤 10.5: 无活动待机模块（依赖 LCD/唤醒词/舵机管理器均已就绪）──── */
     standby_init();
     PRINT_INTERNAL_HEAP_STEP("standby_init");
 
-    /* ── 步骤 10.6: app 远程手动控制模块（舵机角度 / GIF 显示 + 30s 冻结窗口）──
-     * 依赖：舵机（步骤 9）、LCD/UI（步骤 2.5）均已就绪 —— worker 任务一旦跑起来
-     * 就可能立刻调用 bsp_servo_move_smooth / ui_request_state_gif。
-     * 与 standby 模块无强依赖（当前 standby_init 停用也不影响本模块工作）。
-     * 初始化失败只是远程控制不可用（后续 submit 静默丢弃），不影响其他功能，故不 abort。 */
-    if (!remote_control_init())
-    {
-        ESP_LOGE(TAG, "remote_control_init 失败，app 远程舵机/GIF 控制将不可用");
-    }
-    PRINT_INTERNAL_HEAP_STEP("remote_control_init");
+    // /* ── 步骤 10.6: app 远程手动控制模块（舵机角度 / GIF 显示 + 30s 冻结窗口）──
+    //  * 依赖：舵机（步骤 9）、LCD/UI（步骤 2.5）均已就绪 —— worker 任务一旦跑起来
+    //  * 就可能立刻调用 bsp_servo_move_smooth / ui_request_state_gif。
+    //  * 与 standby 模块无强依赖（当前 standby_init 停用也不影响本模块工作）。
+    //  * 初始化失败只是远程控制不可用（后续 submit 静默丢弃），不影响其他功能，故不 abort。 */
+    // if (!remote_control_init())
+    // {
+    //     ESP_LOGE(TAG, "remote_control_init 失败，app 远程舵机/GIF 控制将不可用");
+    // }
+    // PRINT_INTERNAL_HEAP_STEP("remote_control_init");
 
-    /* ── 步骤 11: 电池 + 提醒系统（无感/次要功能，后置以让核心链路尽早就绪）──
-     * 挪动理由：电池监控纯 ADC 无依赖；reminder_init 内部会同步做一次 IP 定位
-     * （阻塞 HTTPS，实测 ~850ms）+ 天气拉取。这两块对用户「看到 GIF、能对话、能
-     * 触摸互动」毫无感知贡献，故整体后移到所有可见模块之后，不再拖慢舵机/触摸/
-     * 待机的就绪。二者都依赖 WiFi 已连（此处 WiFi 早已就绪，无依赖风险）。 */
-    esp_err_t bat_ret = bsp_battery_init();
-    if (bat_ret == ESP_OK)
-    {
-        bsp_battery_start_task(NULL); // 暂不接低电回调，UI 自身已带变色提示
-        // bsp_battery_start_log_task(); // 新增：每 5s 打印一次电池电压/电量，便于调试
-        xEventGroupSetBits(bsp_board->board_status, BATTERY_BIT);
-        ESP_LOGI(TAG, "电池监控已启动");
-    }
-    else
-    {
-        ESP_LOGW(TAG, "电池监控未启用 (%s)，UI 电量将显示 --%%", esp_err_to_name(bat_ret));
-    }
-    PRINT_INTERNAL_HEAP_STEP("bsp_battery_init");
-    reminder_init(on_reminder_trigger);
-    PRINT_INTERNAL_HEAP_STEP("reminder_init");
-    /* 注：ui_notify_boot_ready() 原本在这里，已提前到 touch_scan 任务创建之后
-     * （见上方"【2026-08-31 提前】"注释块）——GIF 不再等电池/天气这些无感知模块。 */
+    // /* ── 步骤 11: 电池 + 提醒系统（无感/次要功能，后置以让核心链路尽早就绪）──
+    //  * 挪动理由：电池监控纯 ADC 无依赖；reminder_init 内部会同步做一次 IP 定位
+    //  * （阻塞 HTTPS，实测 ~850ms）+ 天气拉取。这两块对用户「看到 GIF、能对话、能
+    //  * 触摸互动」毫无感知贡献，故整体后移到所有可见模块之后，不再拖慢舵机/触摸/
+    //  * 待机的就绪。二者都依赖 WiFi 已连（此处 WiFi 早已就绪，无依赖风险）。 */
+    // esp_err_t bat_ret = bsp_battery_init();
+    // if (bat_ret == ESP_OK)
+    // {
+    //     bsp_battery_start_task(NULL); // 暂不接低电回调，UI 自身已带变色提示
+    //     // bsp_battery_start_log_task(); // 新增：每 5s 打印一次电池电压/电量，便于调试
+    //     xEventGroupSetBits(bsp_board->board_status, BATTERY_BIT);
+    //     ESP_LOGI(TAG, "电池监控已启动");
+    // }
+    // else
+    // {
+    //     ESP_LOGW(TAG, "电池监控未启用 (%s)，UI 电量将显示 --%%", esp_err_to_name(bat_ret));
+    // }
+    // PRINT_INTERNAL_HEAP_STEP("bsp_battery_init");
+    // reminder_init(on_reminder_trigger);
+    // PRINT_INTERNAL_HEAP_STEP("reminder_init");
+    // /* 注：ui_notify_boot_ready() 原本在这里，已提前到 touch_scan 任务创建之后
+    //  * （见上方"【2026-08-31 提前】"注释块）——GIF 不再等电池/天气这些无感知模块。 */
 
-    /* ── 步骤 8: OTA 验证（必须在所有初始化完成后调用）──────────────────── */
-    // 若当前是刚 OTA 升级完首次启动，会进入 PENDING_VERIFY 状态：
-    //   - 调用 esp_ota_mark_app_valid_cancel_rollback() 防止 Bootloader 回滚
-    //   - 把 NVS 中的 pending_ver 提升为 committed_ver
-    // 若启动前期崩溃（未到这里），Bootloader 下次启动会自动回滚到旧固件
-    //
-    // ★ 位置说明：本段必须排在下面的诊断段【之前】。诊断段开启时要打十几秒日志，
-    //   放在它后面会让"防回滚标记"被无谓推迟同样长的时间（升级后这段时间内断电
-    //   就会被误判为启动失败而回滚），与诊断无因果关系，不该受它拖累。
-    ESP_LOGI(TAG, "当前固件版本: %s", bsp_ota_get_current_version());
-    bsp_ota_mark_valid();
-    ESP_LOGI(TAG, "后续版本使用变量");
+    // /* ── 步骤 8: OTA 验证（必须在所有初始化完成后调用）──────────────────── */
+    // // 若当前是刚 OTA 升级完首次启动，会进入 PENDING_VERIFY 状态：
+    // //   - 调用 esp_ota_mark_app_valid_cancel_rollback() 防止 Bootloader 回滚
+    // //   - 把 NVS 中的 pending_ver 提升为 committed_ver
+    // // 若启动前期崩溃（未到这里），Bootloader 下次启动会自动回滚到旧固件
+    // //
+    // // ★ 位置说明：本段必须排在下面的诊断段【之前】。诊断段开启时要打十几秒日志，
+    // //   放在它后面会让"防回滚标记"被无谓推迟同样长的时间（升级后这段时间内断电
+    // //   就会被误判为启动失败而回滚），与诊断无因果关系，不该受它拖累。
+    // ESP_LOGI(TAG, "当前固件版本: %s", bsp_ota_get_current_version());
+    // bsp_ota_mark_valid();
+    // ESP_LOGI(TAG, "后续版本使用变量");
 
 #if APP_BOOT_DIAG_ENABLE
     /* ── 诊断：全部初始化跑完后的内存全量快照 + 逐任务栈占用清单 ──────────────
