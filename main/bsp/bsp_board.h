@@ -480,6 +480,20 @@ void bsp_servo_move_all_parallel(float head_target, float larm_target, float rar
 void bsp_servo_debug_set_frame_ms(uint32_t frame_ms);
 
 /**
+ * @brief 【★抖动排查临时接口，定位完即删】切换插值使用的运动曲线
+ *
+ * 用于在【同一次烧录】里对比匀速与 S 曲线的抖动表现，避免烧两次靠记忆比较。
+ *
+ * ★两条曲线都满足 ŝ(0)=0、ŝ(1)=1，所以【总耗时与总行程完全不变】，
+ *   step_ms 语义、上层全部调用、归中时间预算均不受影响，
+ *   切换曲线只改变这段时间内的速度分配。
+ *
+ * @param curve_type 0 = 匀速（对照基准）；1 = S 曲线（jerk 受限，两端力不突变）
+ * @note 线程安全（atomic）。对正在进行的运动不生效，下一次运动才采用新值。
+ */
+void bsp_servo_debug_set_curve(int curve_type);
+
+/**
  * @brief 请求中止正在进行的舵机插值运动（立即停在当前角度）
  *
  * 置打断标志，bsp_servo_move_all_parallel / bsp_servo_move_smooth 的插值步循环

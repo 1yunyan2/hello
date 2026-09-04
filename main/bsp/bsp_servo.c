@@ -94,7 +94,7 @@ bool bsp_servo_abort_requested(void)
  *   本宏只决定这段时间被切成多少帧，不改变快慢。例：VERY_SLOW(50) 走 30°：
  *     旧 = 30 帧 × 50ms（每帧 1.0°，20Hz）｜新 = 75 帧 × 20ms（每帧 0.4°，50Hz），均 1500ms。
  */
-#define SERVO_FRAME_MS 40U
+#define SERVO_FRAME_MS 20U
 
 /**
  * 运行时帧长覆盖（★抖动排查用，定位完可连同 bsp_servo_debug_set_frame_ms 一并删除）
@@ -122,9 +122,300 @@ static inline uint32_t servo_frame_ms(void)
     return (v == 0U) ? (uint32_t)SERVO_FRAME_MS : v;
 }
 
+/**
+ * @brief 舵机电气死区（度）——每帧位移低于它，舵机当没看见，运动变成走走停停
+ *
+ * 2026-09-03 单向微步法实测：0.2/0.3/0.47/0.6° 均"连齿"，0.8° 起干净。
+ * 与厂家规格书吻合：塑胶齿信号虚位 4~12μs、金属齿 ≤6μs，
+ * 本项目脉宽 500~2400μs 覆盖 180°（10.56μs/度）⇒ 0.38~1.14°。
+ */
+#define SERVO_DEADBAND_DEG 0.8f
+
+/**
+ * @brief 死区安全倍率——每帧位移要达到死区的多少倍才算稳
+ *
+ * 【为什么不能只按 1.0 倍】2026-09-03 实测：
+ *     MID       每帧1.33° = 死区1.67倍 → 不抖
+ *     VERY_SLOW 每帧0.80° = 死区1.00倍 → 抖
+ *   死区 0.8° 是单向法测出的近似值，序列在 0.6 与 0.8 之间无中间档，
+ *   而规格书写明塑胶齿信号虚位是【4~12μs 的范围】(0.38~1.14°) 且沿行程变化。
+ *   压在 1.00 倍上，遇到虚位偏大的区段就掉下去 —— 这正是"前几步正常、
+ *   中间连齿"的成因。
+ * 【取 1.5】使每帧位移 ≥ 1.2°，越过规格书最坏情况 1.14°，全行程都有余量。
+ */
+#define SERVO_DEADBAND_MARGIN 1.5f
+
+/**
+ * @brief 按速度自动选取帧长，保证【每帧位移 ≥ 死区】
+ *
+ * 【为什么帧长不能固定】每帧位移 = 帧长 ÷ step_ms。固定帧长时，step_ms 越大
+ *   （越慢）每帧位移越小，慢档必然掉进死区 —— 这正是慢速抖动的根源：
+ *       帧长10ms：VERY_SLOW(50) 每帧仅 0.20°，是死区的 1/4
+ *   ★所以慢速必须【用更大的帧长】来把每帧位移顶回死区之上：
+ *       帧长 = step_ms × 死区，即 50 × 0.8 = 40ms ⇒ 每帧 0.80° 达标
+ *
+ * 【为什么这不改变动作快慢】总耗时 = 行程 × step_ms，与帧长无关。
+ *   帧长只决定这段时间被切成多少帧。所以本函数【只影响平滑度，不影响速度】，
+ *   上层 78 处调用与归中时间预算全部不受影响。
+ *
+ * 【约束】结果必须同时是：
+ *   · FreeRTOS tick(10ms) 的整数倍 —— 否则 vTaskDelayUntil 会被截断
+ *   · PWM 周期的整数倍 —— 否则我们的写入时刻相对舵机的采样时刻持续漂移，
+ *     且写得比采样还密时，多余的写入会被下一次直接覆盖，等于白写
+ *   ★PWM=50Hz(周期20ms) 时，20ms 的整数倍同时满足两者，故按 20ms 向上取整。
+ *     （2026-09-03 曾试 200Hz 让基准降到 10ms，但实测舵机发烫，已改回 50Hz）
+ *
+ * 【安全倍率】实测 MID(余量1.67) 不抖、VERY_SLOW(余量1.00) 抖，
+ *   原因是死区 0.8° 本身不准：规格书说塑胶齿信号虚位是 4~12μs 的【范围】
+ *   （0.38~1.14°）且沿行程变化，压在 1.00 倍余量上必然时好时坏。
+ *   故乘 SERVO_DEADBAND_MARGIN，让每帧位移越过规格书最坏情况 1.14°。
+ *
+ * @param step_ms 速度档（毫秒/度）
+ * @return 本次运动应使用的帧长（毫秒），SERVO_FRAME_MS~60 之间的 20 的整数倍
+ */
+static inline uint32_t servo_auto_frame_ms(uint32_t step_ms)
+{
+    uint32_t ov = atomic_load(&s_frame_ms_override);
+    if (ov != 0U)
+        return ov; // 排查用的手动覆盖优先
+
+    if (step_ms == 0U)
+        return SERVO_FRAME_MS;
+
+    // 需要的帧长 = step_ms × 死区 × 安全倍率，向上取整到 SERVO_FRAME_MS 的整数倍
+    float need = (float)step_ms * SERVO_DEADBAND_DEG * SERVO_DEADBAND_MARGIN;
+    uint32_t base = SERVO_FRAME_MS; // = PWM 周期，保证整数倍不错拍
+    uint32_t fm = (((uint32_t)(need + (float)base - 0.001f)) / base) * base;
+
+    if (fm < SERVO_FRAME_MS)
+        fm = SERVO_FRAME_MS; // 快档：每帧位移本就够大，用最小帧长求最高更新率
+    if (fm > 60U)
+        fm = 60U; // 上限：再大就更新率过低（<17Hz），反而看得见逐帧跳变
+    return fm;
+}
+
 void bsp_servo_debug_set_frame_ms(uint32_t frame_ms)
 {
     atomic_store(&s_frame_ms_override, frame_ms);
+}
+
+/* ══ 运动曲线（★抖动排查中，定位完再决定去留）══════════════════════════════
+ *
+ * 【为什么试 S 曲线】参考 agalakhov 的 gist《On S-Curve acceleration of stepper
+ *   and servo motors》：机械传动存在弹性，遵循胡克定律 F = k·Δx。
+ *   【力的突变会激起形变振荡，产生振动与噪声】；限制 jerk（加加速度，即力的变化率）
+ *   就能压住这个振荡。
+ *   ★这条机制与本项目现象吻合：静止不抖、粗步进后静止不抖、【只有持续运动才抖】。
+ *     弹性形变振荡正是只在有力变化时发生。故 S 曲线值得实测，
+ *     而不是像之前那样凭"曲线只改速度分配"就否掉。
+ *
+ * 【实现】七段 jerk 限制的连续形式。直接用其位置解析解（归一化到 τ∈[0,1]）：
+ *     匀速   ŝ(τ) = τ                      —— 对照基准，加速度处处为 0 但两端突变
+ *     S 曲线 ŝ(τ) = 6τ⁵ - 15τ⁴ + 10τ³       —— 起止的速度与加速度【均为 0】，
+ *                                             jerk 有界，无力的突变
+ *   后者即 smootherstep，是七段 jerk 限制曲线的平滑连续版本，
+ *   两端一阶、二阶导数都为 0，正是"力不突变"的数学表达。
+ *
+ * 【总耗时不变】两条曲线都满足 ŝ(0)=0、ŝ(1)=1，所以 step_ms 语义、
+ *   上层 78 处调用、归中时间预算全部不受影响，切换曲线只改这段时间内的速度分配。
+ */
+typedef enum
+{
+    SERVO_CURVE_LINEAR = 0,    ///< 匀速：速度恒定，起止加速度突变。作对照基准
+    SERVO_CURVE_SCURVE = 1,    ///< S 曲线：两端最柔，jerk 受限。通用默认
+    SERVO_CURVE_TRAPEZOID = 2, ///< 梯形：加速→匀速→减速三段，中段有稳定的匀速期
+    SERVO_CURVE_TRIANGLE = 3,  ///< 三角形：一路加速到中点再一路减速，无匀速期，最有冲劲
+} servo_curve_t;
+
+/** 各曲线的"形状函数"归一化位移 ŝ(τ)，均满足 ŝ(0)=0、ŝ(1)=1（总行程与总耗时不变）
+ *
+ *  S 曲线   6τ⁵-15τ⁴+10τ³        速度 30τ²(1-τ)²    峰值1.875倍，两端速度与加速度均为0
+ *  梯形     分段积分（见下）      加速p段/匀速/减速p段，峰值 1/(1-p)
+ *  三角形   τ<0.5: 2τ²           速度三角波          峰值2.0倍，中点最快
+ *           τ≥0.5: 1-2(1-τ)²
+ *
+ *  ★三者都会与匀速按 k 混合（见 servo_curve_map），把两端速度钳在死区之上。
+ */
+/** 梯形加速段占总时长比例（减速段同值，中间为匀速）
+ *  0.30 → 匀速段仅占 40%，且峰值 1.43 倍，与 S 曲线(1.875) 差异小，不易分辨
+ *  0.20 → 匀速段占 60%，峰值 1.25 倍 ★更能体现"中段有一段稳定匀速"这个特征 */
+#define SERVO_TRAPEZOID_ACC_RATIO 0.2f
+
+/**
+ * @brief S 曲线的速度下限比 k（0~1）：两端速度不低于平均速度的这个比例
+ *
+ * 【为什么必须有】纯 S 曲线速度 ŝ'(τ)=30τ²(1-τ)² 在两端【为 0】，
+ *   于是起止段每帧位移趋近 0，远低于死区，舵机走走停停 —— 实测抖动
+ *   【比匀速更重】（2026-09-03），与 09-02 一阶低通失败同因。
+ *   与匀速混合后，两端速度被钳在 k 倍平均速度，不再趋零。
+ *
+ * 【k 与观感/抖动的权衡（实测+计算）】
+ *       k      快慢比    两端每帧(MID)   两端是否掉死区(0.8°)
+ *       0.40   3.81:1    0.53°           掉 → 两端会抖，但S最明显
+ *       0.60   2.25:1    0.80°           临界
+ *       0.70   1.80:1    0.93°           不掉 → 但S已不易分辨
+ *       1.00   1.00:1    1.33°           不掉 → 完全等于匀速
+ *
+ * ★★ 结论：「S 明显」与「两端不抖」在本硬件上互斥 ★★
+ *   慢档平均速度本身就贴着死区下限，没有向下的余量留给曲线两端减速。
+ *   k=0.70 是理论上唯一能两头兼顾的值，代价是 S 效果弱到看不出。
+ *   ⇒ 要真正的加减速观感，只能整体提速到 MID 以上换取余量。
+ *
+ * 【当前取 0.40】为向他人演示 S 曲线的可见效果而设，快慢比 3.81:1 肉眼明显，
+ *   但两端每帧 0.53° 低于死区，起止会有顿挫 —— 这是刻意保留的演示配置，
+ *   不是最优值。若以「不抖」为目标，应改为 0.70 或 1.00。
+ */
+#define SERVO_CURVE_MIN_VEL_RATIO 0.50f
+
+/**
+ * ★演示模式开关（1=开）：绕过死区钳位，让三条曲线以【完整形态】运行。
+ *
+ * 【为什么需要它】servo_curve_min_ratio() 会按死区把两端速度钳住，
+ *   慢档算出的 k 高达 0.60~0.67，三条曲线都被压扁成接近匀速，
+ *   于是"梯形和三角看不出与匀速的区别"（2026-09-03 实测反馈）。
+ *   打开本开关后 k 固定为 SERVO_CURVE_DEMO_K，曲线形状完整呈现。
+ *
+ * 【代价】两端速度低于死区，起止会有明显顿挫 —— 这是【故意的】，
+ *   目的是先看清三种曲线的形状差异，再决定产品用哪一种。
+ * ⚠️ 观察完必须改回 0，否则慢档抖动会明显加重。
+ */
+#define SERVO_CURVE_DEMO_FULL 1
+
+/**
+ * 演示模式下的固定 k（0~1）。越小曲线越夸张：
+ *   0.00 → 完整曲线，两端速度真正为 0，形状最清晰但顿挫最重
+ *   0.15 → 快慢比约 7:1，形状清晰且起止不至于完全停死 ★推荐
+ *   0.40 → 快慢比约 4:1，较温和
+ */
+#define SERVO_CURVE_DEMO_K 0.15f
+
+/**
+ * 全局默认曲线 —— ★这是产品的正式形态，不是调试开关。
+ *
+ * 所有舵机动作默认走曲线（而非匀速），让运动有加减速、更像活物。
+ * 匀速（LINEAR）仅保留作对照基准与极端情况的退路。
+ *
+ * 【安全性】曲线两端速度会被 servo_curve_min_ratio() 按死区逐档钳位，
+ *   保证任何速度档下每帧位移都不低于死区，不会出现 2026-09-03 早期版本
+ *   "纯 S 曲线两端掉进死区反而更抖"的问题。
+ *
+ * 运行时可用 bsp_servo_debug_set_curve() 切换，便于同一次烧录里横向对比。
+ */
+static _Atomic int s_curve_type = (int)SERVO_CURVE_SCURVE;
+
+void bsp_servo_debug_set_curve(int curve_type)
+{
+    atomic_store(&s_curve_type, curve_type);
+}
+
+/**
+ * @brief 把归一化时间 τ 映射为归一化位移 ŝ
+ * @param t 归一化时间 0~1
+ * @return  归一化位移 0~1，保证 ŝ(0)=0、ŝ(1)=1（故总行程与总耗时不变）
+ */
+static inline float servo_curve_map(float t, float k)
+{
+    if (t <= 0.0f)
+        return 0.0f;
+    if (t >= 1.0f)
+        return 1.0f;
+
+    const int type = atomic_load(&s_curve_type);
+    if (type == (int)SERVO_CURVE_LINEAR)
+        return t; // 匀速：速度恒定，但起止瞬间加速度无穷大（力突变）
+
+    // ── 先算所选曲线的形状函数 ŝ(τ) ──────────────────────────────────────────
+    float ss;
+    if (type == (int)SERVO_CURVE_TRAPEZOID)
+    {
+        // 梯形：加速段 p、匀速段 1-2p、减速段 p。峰值速度 vp = 1/(1-p)
+        // 位置由速度分段积分而来，三段在交界处连续，且 ŝ(1)=1。
+        const float p = SERVO_TRAPEZOID_ACC_RATIO;
+        const float vp = 1.0f / (1.0f - p);
+        if (t < p)
+            ss = vp * t * t / (2.0f * p); // 加速段：抛物线
+        else if (t < 1.0f - p)
+            ss = vp * (t - p * 0.5f); // 匀速段：直线
+        else
+        {
+            float u = 1.0f - t;                     // 距终点的时间
+            ss = 1.0f - vp * u * u / (2.0f * p);    // 减速段：反向抛物线
+        }
+    }
+    else if (type == (int)SERVO_CURVE_TRIANGLE)
+    {
+        // 三角形：无匀速段，一路加速到中点再一路减速。峰值速度 2.0 倍，最有冲劲。
+        if (t < 0.5f)
+            ss = 2.0f * t * t;
+        else
+        {
+            float u = 1.0f - t;
+            ss = 1.0f - 2.0f * u * u;
+        }
+    }
+    else
+    {
+        // S 曲线 smootherstep：两端速度与加速度均为 0，最柔顺
+        ss = t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+    }
+
+    // ── 再与匀速按 k 混合，把两端速度钳在死区之上 ────────────────────────────
+    // 【为什么必须钳位】上面三条曲线的两端速度都【为 0】，
+    //   起止段每帧位移趋近 0，远低于死区 → 舵机走走停停，抖动【比匀速更重】
+    //   （2026-09-03 实测证实，与 09-02 一阶低通失败同因）。
+    // 【钳位做法】ŝ(τ) = k·τ + (1-k)·shape(τ)
+    //   混合后最低速度 = k（发生在两端），k 由 servo_curve_min_ratio()
+    //   按【死区绝对值】逐档反算，快档自动更明显、慢档自动更保守。
+    return k * t + (1.0f - k) * ss;
+}
+
+/**
+ * @brief 按「两端速度恰好等于死区」反算本次运动该用的 k
+ *
+ * 【为什么不用固定 k】k 是【相对量】（占平均速度的比例），而死区是【绝对量】（度）。
+ *   同一个 k 在不同速度档下换算出的绝对速度完全不同，导致：
+ *       固定 k=0.40 时  FAST 两端 1.60°(远超死区，白白浪费余量)
+ *                       VERY_SLOW 两端 0.48°(掉进死区，会抖)
+ *   ⇒ 固定 k 等于按最差档位削足适履：为了慢档不抖，快档的 S 效果被白白削弱。
+ *
+ * 【本函数做法】令 k × 每帧位移 = 死区，反解 k = 死区 ÷ 每帧位移。
+ *   这样每一档都【恰好】把两端速度压到死区上，一点不多一点不少：
+ *       档位        帧长   匀速每帧   反算k   快慢比
+ *       FAST        20ms    4.00°      0.20    8.50:1  ← 余量大，S 很明显
+ *       MID         20ms    1.33°      0.60    2.25:1
+ *       SLOW        40ms    1.33°      0.60    2.25:1
+ *       VERY_SLOW   60ms    1.20°      0.67    1.94:1  ← 余量小，S 较弱
+ *   快档自动拿到更强的 S 效果，慢档自动收敛到安全值，无需人工为每档调参。
+ *
+ * @param step_ms  速度档（毫秒/度）
+ * @param frame_ms 本次运动的帧长（来自 servo_auto_frame_ms）
+ * @return k，钳制在 [SERVO_CURVE_MIN_VEL_RATIO, 1.0]
+ */
+static inline float servo_curve_min_ratio(uint32_t step_ms, uint32_t frame_ms)
+{
+    if (step_ms == 0U)
+        return 1.0f;
+
+    // ★演示模式：关掉死区钳位，让曲线以【完整形态】跑（两端速度真正趋近 0）。
+    //   目的是看清 S / 梯形 / 三角三者的【形状差异】——钳位后 k 被抬到 0.6~0.67，
+    //   三条曲线都被压扁成接近匀速，自然看不出区别。
+    //   ⚠️ 代价：两端速度低于死区，起止会有明显顿挫。仅用于观察形状，不可用于产品。
+    if (SERVO_CURVE_DEMO_FULL)
+        return SERVO_CURVE_DEMO_K;
+
+    float per_frame = (float)frame_ms / (float)step_ms; // 匀速时的每帧位移（度）
+    if (per_frame <= 0.0f)
+        return 1.0f;
+
+    float k = SERVO_DEADBAND_DEG / per_frame; // 令 k×per_frame = 死区
+
+    // 下限：不低于本宏，避免快档 S 过猛显得"窜出去再急刹"（工业常规 1.5~1.8:1）
+    if (k < SERVO_CURVE_MIN_VEL_RATIO)
+        k = SERVO_CURVE_MIN_VEL_RATIO;
+    // 上限：每帧位移本就不足死区时，k≥1 意味着无余量做曲线，退化为匀速
+    if (k > 1.0f)
+        k = 1.0f;
+    return k;
 }
 
 // 单脉冲判定实验开关（2026-07-10 已测完，保留备查）：1=上电只发1~2个90°脉冲后永久断信号。
@@ -548,7 +839,7 @@ void bsp_board_servo_init(bsp_board_t *bsp_board)
     servo_config_t servo_cfg = {
         .max_angle = 180,             // 物理最大行程 180°
         .min_width_us = 500,          // 0° 对应脉宽 500μs（标准舵机规格）
-        .max_width_us = 2400,         // 180° 对应脉宽 2400μs
+        .max_width_us = 2500,         // 180° 对应脉宽 2500μs
         .freq = 50,                   // PWM 驱动频率 50Hz（标准模拟舵机要求）
         .timer_number = LEDC_TIMER_0, // 使用 LEDC 定时器 0（4 个可选，避免与 LED/蜂鸣器冲突）
         .channels = {
@@ -724,7 +1015,8 @@ void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms)
     //   （MG90S 约 ±1°），出现「中段快、末段原地磨蹭不动」的新问题，比线性更差，故回退。
     float total_deg = fabsf(safe_target - current);
     uint32_t total_ms = (uint32_t)(total_deg * (float)step_ms); // 维持原速度语义
-    const uint32_t frame_ms = servo_frame_ms(); // ★抖动排查：可被运行时覆盖，默认=SERVO_FRAME_MS
+    const uint32_t frame_ms = servo_auto_frame_ms(step_ms);     // ★按速度自动选帧长，保证每帧位移≥死区
+    const float curve_k = servo_curve_min_ratio(step_ms, frame_ms); // ★按死区反算S曲线两端速度，见该函数
     int frames = (int)(total_ms / frame_ms);
     if (frames < 1)
         frames = 1; // 行程极短时至少走一帧，保证必定到位
@@ -747,7 +1039,8 @@ void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms)
             aborted = true;
             break;
         }
-        float t = (float)f / (float)frames; // 归一化进度 0~1
+        // ★经运动曲线映射（匀速时原样返回 t，详见 servo_curve_map）
+        float t = servo_curve_map((float)f / (float)frames, curve_k);
         iot_servo_write_angle(LEDC_LOW_SPEED_MODE, channel, current + t * (safe_target - current));
         vTaskDelayUntil(&last_wake, frame_ticks); // 恒定帧间隔（绝对定时，不累积抢占误差）
     }
@@ -850,7 +1143,8 @@ void bsp_servo_move_smooth_preempt(uint8_t channel, float target, uint32_t step_
     // 定帧线性插值（与 bsp_servo_move_smooth 同一套算法，详见该函数步骤 5 注释）
     float total_deg = fabsf(safe_target - current);
     uint32_t total_ms = (uint32_t)(total_deg * (float)step_ms);
-    const uint32_t frame_ms = servo_frame_ms(); // ★抖动排查：可被运行时覆盖，默认=SERVO_FRAME_MS
+    const uint32_t frame_ms = servo_auto_frame_ms(step_ms); // ★按速度自动选帧长，保证每帧位移≥死区
+    const float curve_k = servo_curve_min_ratio(step_ms, frame_ms); // ★按死区反算S曲线两端速度，见该函数
     int frames = (int)(total_ms / frame_ms);
     if (frames < 1)
         frames = 1;
@@ -870,7 +1164,7 @@ void bsp_servo_move_smooth_preempt(uint8_t channel, float target, uint32_t step_
             aborted = true;
             break;
         }
-        float t = (float)f / (float)frames;
+        float t = servo_curve_map((float)f / (float)frames, curve_k); // ★经运动曲线映射
         float a = current + t * (safe_target - current);
         iot_servo_write_angle(LEDC_LOW_SPEED_MODE, channel, a);
         steps++;
@@ -1066,7 +1360,8 @@ void bsp_servo_move_all_parallel(float head_target, float larm_target, float rar
     //   总耗时不变，更新率提升到 50Hz，消除慢速档肉眼可见的逐步跳变。
     float max_deg = fmaxf(fmaxf(fabsf(h_safe - h_cur), fabsf(l_safe - l_cur)), fabsf(r_safe - r_cur));
     uint32_t total_ms = (uint32_t)(max_deg * (float)step_ms);
-    const uint32_t frame_ms = servo_frame_ms(); // ★抖动排查：可被运行时覆盖，默认=SERVO_FRAME_MS
+    const uint32_t frame_ms = servo_auto_frame_ms(step_ms); // ★按速度自动选帧长，保证每帧位移≥死区
+    const float curve_k = servo_curve_min_ratio(step_ms, frame_ms); // ★按死区反算S曲线两端速度，见该函数
     int max_steps = (int)(total_ms / frame_ms);
 
     if (max_deg < 1.0f || max_steps < 1 || step_ms == 0)
@@ -1110,7 +1405,8 @@ void bsp_servo_move_all_parallel(float head_target, float larm_target, float rar
             aborted = true;
             break;
         }
-        float t = (float)step / (float)max_steps;
+        // ★经运动曲线映射：匀速时原样返回，S 曲线时两端柔化（详见 servo_curve_map）
+        float t = servo_curve_map((float)step / (float)max_steps, curve_k);
         float ha = h_cur + t * (h_safe - h_cur);
         float la = l_cur + t * (l_safe - l_cur);
         float ra = r_cur + t * (r_safe - r_cur);

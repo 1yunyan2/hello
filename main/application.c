@@ -400,8 +400,11 @@ static void offline_audio_boot_test_start(void)
  *   帧长不再覆盖（传 0 = 沿用 SERVO_FRAME_MS），保持与业务一致。
  */
 #define SERVO_AB_STEP_MS SERVO_SPEED_VERY_SLOW ///< 慢速档(50ms/度)，抖动最明显的速度
-#define SERVO_AB_ANGLE_LO 40.0f                ///< 行程下限（避开端点，防堵转干扰判断）
-#define SERVO_AB_ANGLE_HI 140.0f               ///< 行程上限（100°行程，慢档约5秒走完，够看清）
+// ★2026-09-03 行程放大到近全程（原 40~140），让曲线的快慢差异更容易用肉眼分辨。
+//   仍各留 15° 余量不碰 0/180 端点：外壳若有机械限位，顶死会堵转，
+//   堵转的抖动会混进来干扰判断（规格书堵转电流塑胶齿1100mA/金属齿600mA）。
+#define SERVO_AB_ANGLE_LO 15.0f  ///< 行程下限
+#define SERVO_AB_ANGLE_HI 165.0f ///< 行程上限（150°行程，MID档约2.2秒走完）
 #define SERVO_AB_CH CH_HEAD                    ///< 单轴测试用哪一路（三轴同动会互相干扰观察）
 
 static void servo_test_task(void *arg)
@@ -409,49 +412,81 @@ static void servo_test_task(void *arg)
     (void)arg;
     bsp_servo_debug_set_frame_ms(0); // 沿用 SERVO_FRAME_MS，不覆盖
 
-    ESP_LOGW("SERVO_AB", "════ 三阶段抖动定位（不用信号发生器，只用本主控）════");
-    ESP_LOGW("SERVO_AB", "★阶段1【静止】写一次角度后【完全不再写】，保持5秒。");
-    ESP_LOGW("SERVO_AB", "★  LEDC硬件自己在输出恒定脉宽，全程零软件参与。");
-    ESP_LOGW("SERVO_AB", "★  这5秒里抖 ⇒ 舵机在恒定信号下自己抖，与代码彻底无关。");
-    ESP_LOGW("SERVO_AB", "★阶段2【粗步进】每500ms直接跳2°，一步到位不插值。");
-    ESP_LOGW("SERVO_AB", "★  跳完那一下之后的静止期抖不抖？抖 ⇒ 是舵机的整定振荡。");
-    ESP_LOGW("SERVO_AB", "★阶段3【正常插值】走业务同款慢速运动，作为对照基准。");
+    ESP_LOGW("SERVO_AB", "════ 匀速 vs S曲线 对照（纯持续运动）════");
+    ESP_LOGW("SERVO_AB", "★静止不抖、粗步进后静止不抖 已于上一轮实测确认，故这两阶段已删除。");
+    ESP_LOGW("SERVO_AB", "★现在只测【持续运动】——那是唯一会抖的场景。");
+    ESP_LOGW("SERVO_AB", "★A组匀速：速度恒定，但起止瞬间加速度突变（力突变）。");
+    ESP_LOGW("SERVO_AB", "★B组S曲线：两端速度与加速度均为0，jerk有界，力平滑变化。");
+    ESP_LOGW("SERVO_AB", "★两组行程/速度/总耗时【完全相同】，唯一变量是速度分配方式。");
+    ESP_LOGW("SERVO_AB", "★2026-09-04 新增 FAST(5ms)/VERY_FAST(2ms) 两快档，重点看两件事：");
+    ESP_LOGW("SERVO_AB", "  ① 帧数少到什么程度时曲线形状消失（每档已打印 frames）");
+    ESP_LOGW("SERVO_AB", "  ② VERY_FAST 峰值约938°/秒 > MG90S极限600°/秒，是否出现过冲/末端追尾");
+    ESP_LOGW("SERVO_AB", "⚠️ 当前 SERVO_CURVE_DEMO_FULL=1（k恒为0.15，绕过死区钳位），");
+    ESP_LOGW("SERVO_AB", "   看到的两端顿挫可能来自演示模式而非速度本身，判断快档问题时请留意。");
+
+    // 五档速度依次跑，每档四种曲线，你直接对比
+    // ★2026-09-04 加入 FAST(5) / VERY_FAST(2) 两个快档，验证两件事：
+    //   ① 帧数够不够：frames = 行程×step_ms/frame_ms，快档 total_ms 小 → 帧数少，
+    //      帧数太少时曲线只被采样到几个点，形状根本表现不出来（见下方每档打印的 frames）。
+    //   ② 峰值速度会不会超舵机极限：MG90S 空载约 600°/秒，S曲线峰值可达平均的 1.875 倍，
+    //      VERY_FAST(2ms/度=500°/秒) 的峰值理论上已越界 → 舵机跟不上会过冲/末端追尾。
+    //   顺序由慢到快排列，便于逐档观察劣化的拐点出现在哪一档。
+    static const uint32_t speeds[] = {SERVO_SPEED_VERY_SLOW, SERVO_SPEED_SLOW, SERVO_SPEED_MID,
+                                      SERVO_SPEED_FAST, SERVO_SPEED_VERY_FAST};
+    static const char *names[] = {"VERY_SLOW", "SLOW", "MID", "FAST", "VERY_FAST"};
+    const int speed_cnt = (int)(sizeof(speeds) / sizeof(speeds[0]));
 
     while (1)
     {
-        // ══ 阶段 1：绝对静止——写一次就撒手，验证"恒定信号下抖不抖" ══════════
-        // ★这是本次测试的核心。等价于"用信号发生器送一路干净不变的PWM"：
-        //   写完这一笔后，软件再也不碰 LEDC，硬件持续输出同一个脉宽。
-        //   若此时仍抖，说明是舵机内部电位器反馈+模拟比较器的整定振荡，
-        //   属于廉价模拟舵机的固有特性，任何软件手段都消不掉。
-        // ⚠️ 先移到别处再回来：bsp_servo_move_smooth 有「差值<1° 直接返回」的死区过滤，
-        //    上一轮阶段3 结束时已停在 ANGLE_LO，这里若再写 ANGLE_LO 会被过滤掉、
-        //    根本不产生运动，第二轮起阶段1 就失去意义。故先去 90° 再回来。
-        bsp_servo_move_smooth(SERVO_AB_CH, 90.0f, SERVO_SPEED_MID);
-        vTaskDelay(pdMS_TO_TICKS(300));
-
-        ESP_LOGW("SERVO_AB", "【阶段1·静止】已写 %.0f°，接下来5秒【零写入】——现在抖吗？",
-                 SERVO_AB_ANGLE_LO);
-        bsp_servo_move_smooth(SERVO_AB_CH, SERVO_AB_ANGLE_LO, SERVO_SPEED_MID);
-        vTaskDelay(pdMS_TO_TICKS(5000)); // 全程不写 LEDC，纯硬件恒定输出
-
-        // ══ 阶段 2：粗步进——每步远大于死区，且步间完全静止 ══════════════════
-        // 若阶段1不抖、这里每跳一下之后的静止期也不抖，但连续插值时抖，
-        // 才说明问题真在"连续写入"上；否则就是舵机自身特性。
-        ESP_LOGW("SERVO_AB", "【阶段2·粗步进】每500ms跳2°，共10步——每跳之后静止时抖吗？");
-        for (int i = 1; i <= 10; i++)
+        for (int i = 0; i < speed_cnt; i++)
         {
-            // 直接用 INSTANT（瞬间模式）：内部只写一次 duty，不做任何插值
-            bsp_servo_move_smooth(SERVO_AB_CH, SERVO_AB_ANGLE_LO + (float)i * 2.0f, SERVO_SPEED_INSTANT);
-            vTaskDelay(pdMS_TO_TICKS(500));
-        }
-        vTaskDelay(pdMS_TO_TICKS(1500));
+            const uint32_t st = speeds[i];
+            // ★帧长必须与 bsp_servo.c 的 servo_auto_frame_ms() 同公式，否则打印出来的
+            //   帧长/每帧位移与实际运行值对不上，会误导判断。
+            //   实际公式：ceil(step_ms × SERVO_DEADBAND_DEG(0.8) × SERVO_DEADBAND_MARGIN(1.5)
+            //             / SERVO_FRAME_MS(20)) × 20，再钳到 [20, 60]。
+            //   （旧写法用 ×0.8 且按 10 取整，漏了 1.5 倍余量、基数也不对，故此处修正）
+            uint32_t fm = ((uint32_t)((float)st * 0.8f * 1.5f + 20.0f - 0.001f) / 20U) * 20U;
+            if (fm < 20U)
+                fm = 20U;
+            if (fm > 60U)
+                fm = 60U;
 
-        // ══ 阶段 3：正常插值运动——业务同款，作为对照 ════════════════════════
-        ESP_LOGW("SERVO_AB", "【阶段3·插值】业务同款慢速运动——和前两阶段比，抖得更明显吗？");
-        bsp_servo_move_smooth(SERVO_AB_CH, SERVO_AB_ANGLE_HI, SERVO_AB_STEP_MS);
-        bsp_servo_move_smooth(SERVO_AB_CH, SERVO_AB_ANGLE_LO, SERVO_AB_STEP_MS);
-        vTaskDelay(pdMS_TO_TICKS(2000));
+            // 本档在本测试行程下实际会被切成多少帧 —— 帧数太少（<10）时曲线形状会失真
+            const float total_deg = SERVO_AB_ANGLE_HI - SERVO_AB_ANGLE_LO;
+            const uint32_t total_ms = (uint32_t)(total_deg * (float)st);
+            int frames = (int)(total_ms / fm);
+            if (frames < 1)
+                frames = 1;
+
+            // 峰值速度估算：纯S曲线为平均的 1.875 倍（当前 DEMO 模式 k=0.15 时约 1.74 倍）
+            const float avg_dps = 1000.0f / (float)st;
+
+            ESP_LOGW("SERVO_AB", "════ %s (%ums/度, %.0f°/秒) 帧长%ums 每帧%.2f° 帧数%d 峰值约%.0f°/秒%s ════",
+                     names[i], (unsigned)st, avg_dps,
+                     (unsigned)fm, (float)fm / (float)st, frames, avg_dps * 1.875f,
+                     (avg_dps * 1.875f > 600.0f) ? " ⚠超舵机极限600" : "");
+
+            // 四种曲线依次跑，挑出你想要的那一种
+            static const char *cn[] = {"匀速(对照)", "S曲线(最柔)", "梯形(有匀速段)", "三角(最有冲劲)"};
+            for (int c = 0; c < 4; c++)
+            {
+                bsp_servo_debug_set_curve(c);
+                ESP_LOGW("SERVO_AB", "  【%s】去程", cn[c]);
+                bsp_servo_move_smooth(SERVO_AB_CH, SERVO_AB_ANGLE_HI, st);
+                // ★去程与回程之间必须停顿：否则"去程的收尾减速"与"回程的起步加速"
+                //   连成一片，看起来就成了"只有尾端慢"，曲线的前后对称性被掩盖。
+                //   （2026-09-03 实测反馈"三角只有尾端慢"即由此造成）
+                // ★快档必须【加长】停顿：VERY_SLOW 单程 7.5 秒，1200ms 停顿占比很小；
+                //   而 VERY_FAST 单程仅 0.3 秒，若沿用 1200ms，人眼刚看到动作就结束了，
+                //   来回连成一串反而更难分辨。故快档给足停顿，让每一趟都能单独看清。
+                vTaskDelay(pdMS_TO_TICKS(st >= SERVO_SPEED_MID ? 1200 : 2000));
+                ESP_LOGW("SERVO_AB", "  【%s】回程", cn[c]);
+                bsp_servo_move_smooth(SERVO_AB_CH, SERVO_AB_ANGLE_LO, st);
+                vTaskDelay(pdMS_TO_TICKS(st >= SERVO_SPEED_MID ? 2000 : 2500));
+            }
+            vTaskDelay(pdMS_TO_TICKS(2000)); // 档间多停一会，便于分辨
+        }
     }
 }
 
@@ -885,9 +920,9 @@ void application_init(void)
         tskNO_AFFINITY,
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
-    /* ── 步骤 10.5: 无活动待机模块（依赖 LCD/唤醒词/舵机管理器均已就绪）──── */
-    standby_init();
-    PRINT_INTERNAL_HEAP_STEP("standby_init");
+    // /* ── 步骤 10.5: 无活动待机模块（依赖 LCD/唤醒词/舵机管理器均已就绪）──── */
+    // standby_init();
+    // PRINT_INTERNAL_HEAP_STEP("standby_init");
 
     // /* ── 步骤 10.6: app 远程手动控制模块（舵机角度 / GIF 显示 + 30s 冻结窗口）──
     //  * 依赖：舵机（步骤 9）、LCD/UI（步骤 2.5）均已就绪 —— worker 任务一旦跑起来
