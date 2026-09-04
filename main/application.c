@@ -400,41 +400,105 @@ static void offline_audio_boot_test_start(void)
  *   帧长不再覆盖（传 0 = 沿用 SERVO_FRAME_MS），保持与业务一致。
  */
 #define SERVO_AB_STEP_MS SERVO_SPEED_VERY_SLOW ///< 慢速档(50ms/度)，抖动最明显的速度
-// ★2026-09-03 行程放大到近全程（原 40~140），让曲线的快慢差异更容易用肉眼分辨。
-//   仍各留 15° 余量不碰 0/180 端点：外壳若有机械限位，顶死会堵转，
-//   堵转的抖动会混进来干扰判断（规格书堵转电流塑胶齿1100mA/金属齿600mA）。
-#define SERVO_AB_ANGLE_LO 15.0f  ///< 行程下限
-#define SERVO_AB_ANGLE_HI 165.0f ///< 行程上限（150°行程，MID档约2.2秒走完）
+/* ★2026-09-04 用途改为【过渡 + 动作】观察，角度全部落在 0~180 内：
+ *   ┌ 第一段：0 →(过渡)→ 150，到位后以 150 为中心 ±20° 来回三次，最后回到 150
+ *   ├ 归  中：→ 0
+ *   └ 第二段：0 →(过渡)→ 130，到位后以 130 为中心 ±20° 来回三次（末段停在 110）
+ *   要看的是"长距离过渡"与"短距离往复"两种性质不同的运动，在同一条 S 曲线下
+ *   衔接起来是什么观感（过渡末端的收尾减速会不会与下一段起步加速黏在一起）。 */
+#define SERVO_AB_HOME     0.0f   ///< 归位角（本测试的"归中"即回到 0）
+#define SERVO_AB_MID1     150.0f ///< 第一段中心角
+#define SERVO_AB_MID2     130.0f ///< 第二段中心角
+#define SERVO_AB_SWING    20.0f  ///< 往复摆幅（中心角 ± 该值）
+#define SERVO_AB_SWING_N  3      ///< 往复次数
 #define SERVO_AB_CH CH_HEAD                    ///< 单轴测试用哪一路（三轴同动会互相干扰观察）
+
+/**
+ * @brief 一段"过渡 + 往复动作"：先 S 曲线过渡到 center，再以 center 为中心上下摆动
+ *
+ * @param center   过渡目标角，也是往复动作的中心角
+ * @param swing    摆幅（上下各 swing 度）
+ * @param n        往复次数
+ * @param st       速度档（ms/度）
+ * @param back_mid 摆动结束后是否再回到 center（第一段要回，第二段不回）
+ *
+ * ★过渡结束后必须停顿：否则过渡的收尾减速与首次摆动的起步加速连成一片，
+ *   "到位了再动作"的层次感会被抹掉，看起来就成了一整段连续运动。
+ */
+static void servo_transit_and_swing(float center, float swing, int n,
+                                    uint32_t st, bool back_mid)
+{
+    ESP_LOGW("SERVO_AB", "  【过渡】→ %.0f°", center);
+    bsp_servo_move_smooth(SERVO_AB_CH, center, st);
+    vTaskDelay(pdMS_TO_TICKS(800)); // 到位停顿，把"过渡"与"动作"在观感上分开
+
+    for (int k = 0; k < n; k++)
+    {
+        ESP_LOGW("SERVO_AB", "  【动作 %d/%d】%.0f° ↕ %.0f°", k + 1, n,
+                 center + swing, center - swing);
+        bsp_servo_move_smooth(SERVO_AB_CH, center + swing, st);
+        vTaskDelay(pdMS_TO_TICKS(300)); // 换向短停，让每一趟能单独看清
+        bsp_servo_move_smooth(SERVO_AB_CH, center - swing, st);
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+
+    if (back_mid)
+    {
+        ESP_LOGW("SERVO_AB", "  【收势】回中心 %.0f°", center);
+        bsp_servo_move_smooth(SERVO_AB_CH, center, st);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
 
 static void servo_test_task(void *arg)
 {
     (void)arg;
-    bsp_servo_debug_set_frame_ms(0); // 沿用 SERVO_FRAME_MS，不覆盖
+    // ★帧长不在这里定：每档进循环时按 frame_override[] 单独设置（见下方）。
 
-    ESP_LOGW("SERVO_AB", "════ 匀速 vs S曲线 对照（纯持续运动）════");
-    ESP_LOGW("SERVO_AB", "★静止不抖、粗步进后静止不抖 已于上一轮实测确认，故这两阶段已删除。");
-    ESP_LOGW("SERVO_AB", "★现在只测【持续运动】——那是唯一会抖的场景。");
-    ESP_LOGW("SERVO_AB", "★A组匀速：速度恒定，但起止瞬间加速度突变（力突变）。");
-    ESP_LOGW("SERVO_AB", "★B组S曲线：两端速度与加速度均为0，jerk有界，力平滑变化。");
-    ESP_LOGW("SERVO_AB", "★2026-09-04 梯形/三角已删除，S曲线定为产品唯一正式曲线。");
-    ESP_LOGW("SERVO_AB", "★两组行程/速度/总耗时【完全相同】，唯一变量是速度分配方式。");
-    ESP_LOGW("SERVO_AB", "★2026-09-04 新增 FAST(5ms)/VERY_FAST(2ms) 两快档，重点看两件事：");
-    ESP_LOGW("SERVO_AB", "  ① 帧数少到什么程度时曲线形状消失（每档已打印 frames）");
-    ESP_LOGW("SERVO_AB", "  ② VERY_FAST 峰值约938°/秒 > MG90S极限600°/秒，是否出现过冲/末端追尾");
-    ESP_LOGW("SERVO_AB", "⚠️ 当前 SERVO_CURVE_DEMO_FULL=1（k恒为0.15，绕过死区钳位），");
-    ESP_LOGW("SERVO_AB", "   看到的两端顿挫可能来自演示模式而非速度本身，判断快档问题时请留意。");
+    // ★2026-09-04 匀速对照已删除：S 曲线已定为产品唯一正式曲线，不再做 A/B 横向对比。
+    //   本任务改为验证【过渡 + 动作】的衔接观感。
+    bsp_servo_debug_set_curve(1); // 1 = SERVO_CURVE_SCURVE，全程只跑 S 曲线
 
-    // 五档速度依次跑，每档四种曲线，你直接对比
-    // ★2026-09-04 加入 FAST(5) / VERY_FAST(2) 两个快档，验证两件事：
-    //   ① 帧数够不够：frames = 行程×step_ms/frame_ms，快档 total_ms 小 → 帧数少，
-    //      帧数太少时曲线只被采样到几个点，形状根本表现不出来（见下方每档打印的 frames）。
-    //   ② 峰值速度会不会超舵机极限：MG90S 空载约 600°/秒，S曲线峰值可达平均的 1.875 倍，
-    //      VERY_FAST(2ms/度=500°/秒) 的峰值理论上已越界 → 舵机跟不上会过冲/末端追尾。
-    //   顺序由慢到快排列，便于逐档观察劣化的拐点出现在哪一档。
-    static const uint32_t speeds[] = {SERVO_SPEED_VERY_SLOW, SERVO_SPEED_SLOW, SERVO_SPEED_MID,
-                                      SERVO_SPEED_FAST, SERVO_SPEED_VERY_FAST};
-    static const char *names[] = {"VERY_SLOW", "SLOW", "MID", "FAST", "VERY_FAST"};
+    ESP_LOGW("SERVO_AB", "════ S曲线：过渡 + 往复动作 ════");
+    ESP_LOGW("SERVO_AB", "★第一段：0 →过渡→ 150，再以150为中心±20°来回3次，最后回150");
+    ESP_LOGW("SERVO_AB", "★归  中：→ 0");
+    ESP_LOGW("SERVO_AB", "★第二段：0 →过渡→ 130，再以130为中心±20°来回3次");
+    ESP_LOGW("SERVO_AB", "★看点：长距离过渡的收尾，与紧接着的短距离往复起步，衔接是否自然。");
+
+    /* ★2026-09-04 只保留 MID/FAST/VERY_FAST 三档（慢档已删）。
+     *
+     * 【为什么减速看不出来 —— 真因】
+     *   曲线末段每帧位移 = k × (frame_ms / step_ms)，当前 k=0.15（DEMO 模式）：
+     *       档          step_ms  默认帧长  匀速每帧   末段每帧   死区0.8°
+     *       MID           15      20ms     1.33°     0.20°     ← 远低于死区
+     *       FAST          10      20ms     2.00°     0.30°     ← 远低于死区
+     *       VERY_FAST      5      20ms     4.00°     0.60°     ← 低于死区
+     *   减速指令【确实发出去了】，但末段每帧只要求动 0.2~0.6°，全部落在舵机
+     *   死区(0.8°)以下 —— 舵机对这些帧【根本不响应】，于是它一路滑到目标角
+     *   然后戛然而止，看起来就是"没有减速"。
+     *
+     * 【解法：拉长帧长】总耗时 = 行程 × step_ms，与帧长无关（见 bsp_board.h:471），
+     *   所以拉长帧长【不会让动作变快变慢】，只是把同一段时间切成更少、更粗的帧，
+     *   每帧位移随之变大，末段就能重新越过死区被舵机真实执行。
+     *   要让末段 0.15 × (fm/st) ≥ 0.8  ⇒  fm ≥ 5.33 × st：
+     *       MID(15)       → 需 80ms
+     *       FAST(10)      → 需 54ms → 取 60ms
+     *       VERY_FAST(5)  → 需 27ms → 取 40ms（多给余量，帧数仍够）
+     *   ⚠️ 代价：帧数变少，曲线被采样得更粗糙，过渡可能有轻微台阶感。
+     *      这是"看得见减速"必须付的代价，观感如何以实测为准。
+     */
+    static const uint32_t speeds[] = {SERVO_SPEED_MID, SERVO_SPEED_FAST, SERVO_SPEED_VERY_FAST};
+    static const char *names[] = {"MID", "FAST", "VERY_FAST"};
+    /* 与 speeds[] 一一对应的帧长覆盖值（0 = 不覆盖，沿用自动帧长）
+     *
+     * ★2026-09-04 全部改回 0 —— 曾试过 {80,60,40} 想让末段越过死区，实测【全程抖动】，已撤销。
+     *   失败原因：帧长是【全程】生效的，不是只作用于末段。
+     *   拉长帧长确实让末段每帧越过了死区，但同时把中段每帧也放大到
+     *   1.875 × (80/15) ≈ 10°/帧 —— 舵机每 80ms 收到一个 10° 的跳变指令，
+     *   中段从连续运动变成大步长阶梯，整体观感反而比原来差得多。
+     *   ⇒ 教训：帧长是全局杠杆，不能用来解决只发生在末段的问题。
+     */
+    static const uint32_t frame_override[] = {0U, 0U, 0U};
     const int speed_cnt = (int)(sizeof(speeds) / sizeof(speeds[0]));
 
     while (1)
@@ -442,19 +506,27 @@ static void servo_test_task(void *arg)
         for (int i = 0; i < speed_cnt; i++)
         {
             const uint32_t st = speeds[i];
-            // ★帧长必须与 bsp_servo.c 的 servo_auto_frame_ms() 同公式，否则打印出来的
-            //   帧长/每帧位移与实际运行值对不上，会误导判断。
-            //   实际公式：ceil(step_ms × SERVO_DEADBAND_DEG(0.8) × SERVO_DEADBAND_MARGIN(1.5)
-            //             / SERVO_FRAME_MS(20)) × 20，再钳到 [20, 60]。
-            //   （旧写法用 ×0.8 且按 10 取整，漏了 1.5 倍余量、基数也不对，故此处修正）
-            uint32_t fm = ((uint32_t)((float)st * 0.8f * 1.5f + 20.0f - 0.001f) / 20U) * 20U;
-            if (fm < 20U)
-                fm = 20U;
-            if (fm > 60U)
-                fm = 60U;
+
+            // ★本档使用的帧长：优先用 frame_override（为了让末段减速越过死区，见上方注释）。
+            //   置 0 时才回落到 bsp_servo.c 的 servo_auto_frame_ms() 自动值。
+            uint32_t fm = frame_override[i];
+            if (fm == 0U)
+            {
+                // 与 servo_auto_frame_ms() 同公式：
+                //   ceil(step_ms × DEADBAND_DEG(0.8) × DEADBAND_MARGIN(1.5) / FRAME_MS(20)) × 20，
+                //   再钳到 [20, 60]。
+                fm = ((uint32_t)((float)st * 0.8f * 1.5f + 20.0f - 0.001f) / 20U) * 20U;
+                if (fm < 20U)
+                    fm = 20U;
+                if (fm > 60U)
+                    fm = 60U;
+            }
+            // ★必须在本档所有运动之前设置：该接口对正在进行的运动不生效，下一次运动才采用。
+            bsp_servo_debug_set_frame_ms(fm);
 
             // 本档在本测试行程下实际会被切成多少帧 —— 帧数太少（<10）时曲线形状会失真
-            const float total_deg = SERVO_AB_ANGLE_HI - SERVO_AB_ANGLE_LO;
+            // ★按最长的一段（0→150 的过渡）估算，摆动段行程只有 40° 帧数会更少
+            const float total_deg = SERVO_AB_MID1 - SERVO_AB_HOME;
             const uint32_t total_ms = (uint32_t)(total_deg * (float)st);
             int frames = (int)(total_ms / fm);
             if (frames < 1)
@@ -463,30 +535,37 @@ static void servo_test_task(void *arg)
             // 峰值速度估算：纯S曲线为平均的 1.875 倍（当前 DEMO 模式 k=0.15 时约 1.74 倍）
             const float avg_dps = 1000.0f / (float)st;
 
-            ESP_LOGW("SERVO_AB", "════ %s (%ums/度, %.0f°/秒) 帧长%ums 每帧%.2f° 帧数%d 峰值约%.0f°/秒%s ════",
+            // ★末段每帧位移 = k × 匀速每帧（k=SERVO_CURVE_DEMO_K=0.15）。
+            //   这是"减速看不看得见"的判据：低于死区 0.8° 舵机就不响应，减速被吃掉。
+            //   ⚠️ 当前三档都会掉死区（0.20/0.30/0.60°），即减速确实看不见 ——
+            //      这是【已知未解】的问题，不能靠拉长帧长解决（见上方 frame_override 注释）。
+            const float per_frame = (float)fm / (float)st;
+            const float tail_deg = 0.15f * per_frame;
+
+            ESP_LOGW("SERVO_AB", "════ %s (%ums/度, %.0f°/秒) 帧长%ums 每帧%.2f° 末段每帧%.2f°%s 帧数%d 峰值约%.0f°/秒%s ════",
                      names[i], (unsigned)st, avg_dps,
-                     (unsigned)fm, (float)fm / (float)st, frames, avg_dps * 1.875f,
+                     (unsigned)fm, per_frame, tail_deg,
+                     (tail_deg < 0.8f) ? "⚠掉死区(减速会被吃掉)" : "✓越过死区",
+                     frames, avg_dps * 1.875f,
                      (avg_dps * 1.875f > 600.0f) ? " ⚠超舵机极限600" : "");
 
-            // ★2026-09-04：梯形/三角已删除，只剩匀速(对照) 与 S曲线(产品正式曲线)
-            static const char *cn[] = {"匀速(对照)", "S曲线(产品)"};
-            const int curve_cnt = (int)(sizeof(cn) / sizeof(cn[0]));
-            for (int c = 0; c < curve_cnt; c++)
-            {
-                bsp_servo_debug_set_curve(c);
-                ESP_LOGW("SERVO_AB", "  【%s】去程", cn[c]);
-                bsp_servo_move_smooth(SERVO_AB_CH, SERVO_AB_ANGLE_HI, st);
-                // ★去程与回程之间必须停顿：否则"去程的收尾减速"与"回程的起步加速"
-                //   连成一片，看起来就成了"只有尾端慢"，曲线的前后对称性被掩盖。
-                //   （2026-09-03 实测反馈"三角只有尾端慢"即由此造成）
-                // ★快档必须【加长】停顿：VERY_SLOW 单程 7.5 秒，1200ms 停顿占比很小；
-                //   而 VERY_FAST 单程仅 0.3 秒，若沿用 1200ms，人眼刚看到动作就结束了，
-                //   来回连成一串反而更难分辨。故快档给足停顿，让每一趟都能单独看清。
-                vTaskDelay(pdMS_TO_TICKS(st >= SERVO_SPEED_MID ? 1200 : 2000));
-                ESP_LOGW("SERVO_AB", "  【%s】回程", cn[c]);
-                bsp_servo_move_smooth(SERVO_AB_CH, SERVO_AB_ANGLE_LO, st);
-                vTaskDelay(pdMS_TO_TICKS(st >= SERVO_SPEED_MID ? 2000 : 2500));
-            }
+            // ── 起始：确保从 0 出发（首轮以及上一档结束后的位置都可能不是 0）──
+            bsp_servo_move_smooth(SERVO_AB_CH, SERVO_AB_HOME, st);
+            vTaskDelay(pdMS_TO_TICKS(800));
+
+            // ── 第一段：0 → 150 过渡，150±20 来回三次，最后收回 150 ──
+            ESP_LOGW("SERVO_AB", "──── 第一段 ────");
+            servo_transit_and_swing(SERVO_AB_MID1, SERVO_AB_SWING, SERVO_AB_SWING_N, st, true);
+
+            // ── 归中：回到 0 ──
+            ESP_LOGW("SERVO_AB", "──── 归中 → %.0f° ────", SERVO_AB_HOME);
+            bsp_servo_move_smooth(SERVO_AB_CH, SERVO_AB_HOME, st);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+
+            // ── 第二段：0 → 130 过渡，130±20 来回三次（不再收回中心，停在 110）──
+            ESP_LOGW("SERVO_AB", "──── 第二段 ────");
+            servo_transit_and_swing(SERVO_AB_MID2, SERVO_AB_SWING, SERVO_AB_SWING_N, st, false);
+
             vTaskDelay(pdMS_TO_TICKS(2000)); // 档间多停一会，便于分辨
         }
     }

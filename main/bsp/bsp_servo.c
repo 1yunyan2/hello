@@ -994,8 +994,8 @@ void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms)
     //   「方案三」），实测【无效】：慢速抖动依旧，且因收尾段每帧位移衰减到远小于舵机死区
     //   （MG90S 约 ±1°），出现「中段快、末段原地磨蹭不动」的新问题，比线性更差，故回退。
     float total_deg = fabsf(safe_target - current);
-    uint32_t total_ms = (uint32_t)(total_deg * (float)step_ms); // 维持原速度语义
-    const uint32_t frame_ms = servo_auto_frame_ms(step_ms);     // ★按速度自动选帧长，保证每帧位移≥死区
+    uint32_t total_ms = (uint32_t)(total_deg * (float)step_ms);     // 维持原速度语义
+    const uint32_t frame_ms = servo_auto_frame_ms(step_ms);         // ★按速度自动选帧长，保证每帧位移≥死区
     const float curve_k = servo_curve_min_ratio(step_ms, frame_ms); // ★按死区反算S曲线两端速度，见该函数
     int frames = (int)(total_ms / frame_ms);
     if (frames < 1)
@@ -1123,7 +1123,7 @@ void bsp_servo_move_smooth_preempt(uint8_t channel, float target, uint32_t step_
     // 定帧线性插值（与 bsp_servo_move_smooth 同一套算法，详见该函数步骤 5 注释）
     float total_deg = fabsf(safe_target - current);
     uint32_t total_ms = (uint32_t)(total_deg * (float)step_ms);
-    const uint32_t frame_ms = servo_auto_frame_ms(step_ms); // ★按速度自动选帧长，保证每帧位移≥死区
+    const uint32_t frame_ms = servo_auto_frame_ms(step_ms);         // ★按速度自动选帧长，保证每帧位移≥死区
     const float curve_k = servo_curve_min_ratio(step_ms, frame_ms); // ★按死区反算S曲线两端速度，见该函数
     int frames = (int)(total_ms / frame_ms);
     if (frames < 1)
@@ -1340,7 +1340,7 @@ void bsp_servo_move_all_parallel(float head_target, float larm_target, float rar
     //   总耗时不变，更新率提升到 50Hz，消除慢速档肉眼可见的逐步跳变。
     float max_deg = fmaxf(fmaxf(fabsf(h_safe - h_cur), fabsf(l_safe - l_cur)), fabsf(r_safe - r_cur));
     uint32_t total_ms = (uint32_t)(max_deg * (float)step_ms);
-    const uint32_t frame_ms = servo_auto_frame_ms(step_ms); // ★按速度自动选帧长，保证每帧位移≥死区
+    const uint32_t frame_ms = servo_auto_frame_ms(step_ms);         // ★按速度自动选帧长，保证每帧位移≥死区
     const float curve_k = servo_curve_min_ratio(step_ms, frame_ms); // ★按死区反算S曲线两端速度，见该函数
     int max_steps = (int)(total_ms / frame_ms);
 
