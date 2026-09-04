@@ -489,6 +489,7 @@ void bsp_servo_debug_set_frame_ms(uint32_t frame_ms);
  *   切换曲线只改变这段时间内的速度分配。
  *
  * @param curve_type 0 = 匀速（对照基准）；1 = S 曲线（jerk 受限，两端力不突变）
+ *                   ★梯形(2)/三角(3) 已于 2026-09-04 删除，传入将告警并回落为 S 曲线。
  * @note 线程安全（atomic）。对正在进行的运动不生效，下一次运动才采用新值。
  */
 void bsp_servo_debug_set_curve(int curve_type);

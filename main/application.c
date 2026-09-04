@@ -417,6 +417,7 @@ static void servo_test_task(void *arg)
     ESP_LOGW("SERVO_AB", "★现在只测【持续运动】——那是唯一会抖的场景。");
     ESP_LOGW("SERVO_AB", "★A组匀速：速度恒定，但起止瞬间加速度突变（力突变）。");
     ESP_LOGW("SERVO_AB", "★B组S曲线：两端速度与加速度均为0，jerk有界，力平滑变化。");
+    ESP_LOGW("SERVO_AB", "★2026-09-04 梯形/三角已删除，S曲线定为产品唯一正式曲线。");
     ESP_LOGW("SERVO_AB", "★两组行程/速度/总耗时【完全相同】，唯一变量是速度分配方式。");
     ESP_LOGW("SERVO_AB", "★2026-09-04 新增 FAST(5ms)/VERY_FAST(2ms) 两快档，重点看两件事：");
     ESP_LOGW("SERVO_AB", "  ① 帧数少到什么程度时曲线形状消失（每档已打印 frames）");
@@ -467,9 +468,10 @@ static void servo_test_task(void *arg)
                      (unsigned)fm, (float)fm / (float)st, frames, avg_dps * 1.875f,
                      (avg_dps * 1.875f > 600.0f) ? " ⚠超舵机极限600" : "");
 
-            // 四种曲线依次跑，挑出你想要的那一种
-            static const char *cn[] = {"匀速(对照)", "S曲线(最柔)", "梯形(有匀速段)", "三角(最有冲劲)"};
-            for (int c = 0; c < 4; c++)
+            // ★2026-09-04：梯形/三角已删除，只剩匀速(对照) 与 S曲线(产品正式曲线)
+            static const char *cn[] = {"匀速(对照)", "S曲线(产品)"};
+            const int curve_cnt = (int)(sizeof(cn) / sizeof(cn[0]));
+            for (int c = 0; c < curve_cnt; c++)
             {
                 bsp_servo_debug_set_curve(c);
                 ESP_LOGW("SERVO_AB", "  【%s】去程", cn[c]);
