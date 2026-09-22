@@ -29,7 +29,7 @@
 //   若需临时收广播，可由调用方给 udp_logger_start() 传具体地址覆盖本默认值。
 // ★2026-07-29 更新为当前开发电脑 WLAN 实际 IP（原 .243 已失效）。换网/换机必须同步改这里重烧，
 //   否则包全发到不存在的地址且 UDP 是 fire-and-forget，电脑侧完全静默、设备侧也不报错。
-#define UDP_LOGGER_DEFAULT_DEST_IP "192.168.1.245"
+#define UDP_LOGGER_DEFAULT_DEST_IP "192.168.1.255"
 #define UDP_LOGGER_BUF_SIZE 512 // 单条日志最大长度，超出截断（够用；ESP_LOG 单行一般 <200B）
 #define UDP_LOGGER_QUEUE_LEN 32 // 发送队列深度：突发日志（如启动阶段）允许暂存这么多条，超出直接丢弃最旧的
 

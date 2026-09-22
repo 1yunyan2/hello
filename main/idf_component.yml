@@ -7,4 +7,4 @@ dependencies:
   lvgl/lvgl: ^9.5.0
   espressif/esp_lvgl_port: ^2.7.0
   ningzixi/weather: ^1.1.0  # weather.c 有本地改动（6/15），hash 校验会拦编译；回滚=取消本行注释+删 components/ningzixi__weather
-  xianjielianmeng/remote_udp_logger: ^0.1.1
+  xianjielianmeng/remote_udp_logger: ^0.1.1 
