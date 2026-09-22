@@ -17,6 +17,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h" // SemaphoreHandle_t（带完成通知的提交接口）
 #include "bsp_config.h"      // SERVO_SPEED_* 宏的唯一定义来源（避免与 bsp_servo.c 重复）
+#include "bsp_board.h"       // bsp_servo_seq_axis_t / BSP_SERVO_SEQ_MAX_POINTS（动作序列底层类型）
 
 // 幅度等级（对应具体角度偏差）
 typedef enum
@@ -92,6 +93,85 @@ typedef struct
     servo_abs_axis_t l_arm;
     servo_abs_axis_t r_arm;
 } servo_abs_parallel_request_t;
+
+/** 动作序列每轴最大步数（须与 interaction.h 的 ACTION_SEQ_MAX_STEPS 一致）
+ *  ★2026-09-11 由 8 提到 32：情绪 19「怕痒扭动」已用满 8 步，上限先于表达力
+ *    成为瓶颈。代价仅约 1KB flash（表是 const 放 flash，不占内部 SRAM）。 */
+#define SERVO_SEQ_MAX_STEPS 32
+
+/**
+ * @brief 动作序列中的一步：目标角度 + 该步专属速度 + 到达后停留（2026-09-11 新增）
+ *
+ * 与 interaction.h 的 ActionSeqStep_t 字段一一对应（那边配置侧、这边执行侧）。
+ * speed 留 0 表示"沿用本轴的 seq_speed"，由 servo_exec_seq 负责解析成实际值。
+ *
+ * ★2026-09-18 新增 hold_ms：走到本步角度后原地停 hold_ms 毫秒再走下一步。
+ *   0 = 不停留，故所有旧配置写法不变、语义不变。
+ *   【为什么需要它】执行层时间的唯一来源是位移（帧数 = 角度差 × speed ÷ 帧长），
+ *   "原地不动"耗时恒为 0，会被钳成 1 帧。所以连写多个相同角度（或 ±1° 交替）
+ *   都换不来停顿——想停，只能显式填这个字段。
+ */
+typedef struct
+{
+    float angle;     ///< 该步目标角度（度，0~180，bsp 内部软限位裁剪）
+    uint32_t speed;  ///< 该步速度（step_ms）；★0 = 沿用本轴 seq_speed
+    uint32_t hold_ms; ///< ★走到本步角度后【原地停留】的毫秒数（0 = 不停留）
+} servo_seq_step_t;
+
+/**
+ * @brief 单轴动作序列（2026-09-04 新增）
+ *
+ * 一个轴的完整生命周期：90°(起始) → target(终点) → seq[](动作序列) → 归中90°
+ * 与 interaction.h 的 ActionSeq_t 字段一一对应（那边是配置侧，这边是执行侧）。
+ *
+ * 【与 servo_abs_axis_t 的区别】旧结构只能表达"A↔B 往返 N 次"，且执行时三轴
+ * 被强行同步（速度取三轴最慢者）。本结构支持多步任意角度，且三轴各走各的。
+ *
+ * ★2026-09-11：seq 由「纯角度数组 + 一个统一速度」改为「每步自带速度」，
+ *   以支持一个动作内的节奏变化（如猛地甩出去 + 慢慢晃回来）。seq_speed 保留，
+ *   降级为【默认值】——每步 speed 填 0 即沿用它，故不想变速的动作写法不变。
+ */
+typedef struct
+{
+    float target;                              ///< 终点角度：从当前位置走到这里
+    uint32_t speed;                            ///< 走向终点的速度（step_ms）
+    servo_seq_step_t seq[SERVO_SEQ_MAX_STEPS]; ///< 动作序列（角度 + 每步速度）
+    uint8_t seq_len;                           ///< 序列步数（0 = 到终点即止）
+    uint32_t seq_speed;                        ///< 序列【默认】速度（每步 speed=0 时用它）
+} servo_seq_axis_t;
+
+/**
+ * @brief 三轴动作序列请求：三轴【各走各的】，各自归中。
+ *
+ * 与 servo_abs_parallel_request_t 的关键差异：三轴不再共用同一时间窗口，
+ * 各轴按自己的 speed/seq_speed 独立推进。
+ *
+ * ★2026-09-17：归中不再等三轴到齐。每个轴走完自己的终点+序列后【立即】
+ *   回到自己的归位角（头 90° / 臂 ARM_CENTER_DEG），由 servo_exec_seq 把
+ *   归中作为该轴序列的最后一段实现。此前是"全部走完后 worker 统一归中一次"，
+ *   实测表现为双臂做完后干等头部摇完 8 步才一起回中。
+ *   worker 那处统一归中保留，仅作 flush 打断时的兜底。
+ */
+typedef struct
+{
+    servo_seq_axis_t head;
+    servo_seq_axis_t l_arm;
+    servo_seq_axis_t r_arm;
+} servo_seq_request_t;
+
+/**
+ * @brief 非阻塞提交【三轴动作序列】请求，可选完成通知。
+ *
+ * 每轴按 归位角→target→seq[]→归位角 执行，三轴独立推进互不等待（含各自的归中，
+ * 见 servo_seq_request_t 的说明）。
+ * 供 interaction 情绪动作使用（2026-09-04 起取代 abs_parallel 路径）。
+ *
+ * @param req      三轴序列请求（caller 保持其内存直到本函数返回）
+ * @param done_sem 完成信号量：非 NULL 时执行完（含被 flush 打断）后 give；NULL=不通知
+ * @return ESP_OK 成功入队
+ */
+esp_err_t servo_manager_submit_seq_notify(const servo_seq_request_t *req,
+                                          SemaphoreHandle_t done_sem);
 
 /**
  * @brief 初始化 servo_manager（创建队列 + worker task）

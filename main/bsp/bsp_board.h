@@ -462,6 +462,75 @@ bool bsp_servo_read_angle(uint8_t channel, float *out_angle);
  */
 void bsp_servo_move_all_parallel(float head_target, float larm_target, float rarm_target, uint32_t step_ms);
 
+/** 三轴动作序列每轴最大角度点数
+ *
+ * ★须与另外两处同步（2026-09-11 由 8 提到 12）：
+ *   - interaction.h  ACTION_SEQ_MAX_STEPS  （配置侧：情绪表能填几步）
+ *   - servo_manager.h SERVO_SEQ_MAX_STEPS  （中间层：队列消息能装几步）
+ *   本宏是【底层容量】，须 ≥ 上面两者 +2：多出的 2 个位置留给 servo_exec_seq
+ *   里被拼进同一串点的另外两段（见该函数注释）：
+ *     · ①「走向终点」那一步（target，2026-09-04 起）；
+ *     · ③「归中」那一步（2026-09-17 起，归中由 worker 下沉为每轴最后一段）。 */
+#define BSP_SERVO_SEQ_MAX_POINTS 34
+
+/**
+ * @brief 单轴的一串角度点（供 bsp_servo_move_seq_parallel 使用）
+ *
+ * 该轴从【当前角度】出发，依次运动到 points[0]、points[1] ... points[n_points-1]，
+ * 每一段都走完整的 S 曲线插值。
+ *
+ * ★2026-09-11：速度由「整轴一个标量」改为「每点一个」——step_ms[i] 是走向
+ *   points[i] 这一段所用的速度（毫秒/度）。
+ *
+ * 【为什么要这么改】同一个动作里前后段常常需要不同节奏，例如"惊吓"应当是
+ *   猛地甩过去（快）+ 余悸未消地慢慢晃回来（慢）。旧结构整轴共用一个 step_ms，
+ *   做不出这种对比，一整套动作只能匀速走完，观感偏机械。
+ *
+ * 【为什么改动很小】本函数的 SEQ_LOAD_NEXT 宏本来就是【每段单独】重算帧数与
+ *   S 曲线系数的（每段行程不同，总耗时 = 行程 × step_ms），架构天然逐段，
+ *   只是此前每段都去读同一个标量。换成数组后按下标取即可。
+ *
+ * @note 本层不接受 0 作为"沿用默认"——调用方（servo_exec_seq）必须把上层
+ *       「0 = 用 seq_speed」的语义解析成实际值再填进来。step_ms[0]==0 仅在
+ *       "该轴不动"时出现（此时 n_points 也为 0）。
+ *
+ * ★2026-09-18：新增 hold_ms[]——给这套结构补上【时间】这个维度。
+ *
+ * 【为什么必须新增（不能靠堆重复点凑）】本层时间的唯一来源是位移：
+ *   帧数 = |角度差| × step_ms ÷ 帧长。所以"原地不动"的耗时恒为 0，会被
+ *   frames<1 的钳位压成【1 帧】（零位移段 = 走完 1 帧就换下一点）。后果是
+ *   上层连写 6 个 {60.0f} 想表达"停在 60° 一会儿"，实际只买到约 6×20ms，
+ *   肉眼完全看不出停顿；而改用 {89},{90} 交替同样无效——1° 的位移折算出
+ *   0 帧，照样被钳成 1 帧，与纯重复角度【耗时完全相同】。
+ *   ⇒ 想停住，只能显式给出"到达该点后原地等多少毫秒"。
+ *
+ * 【语义】hold_ms[i] 附着在 points[i] 上：走到 points[i] 之后、前往 points[i+1]
+ *   之前，原地保持该角度 hold_ms 毫秒。0 = 不停留（所有旧配置语义不变）。
+ * @note 停留以【毫秒】计，与轴速无关：本层按循环基准帧长折算成帧数，
+ *       故快轴慢轴的"600ms 停留"都是同样的 600ms 墙上时间。
+ */
+typedef struct
+{
+    float points[BSP_SERVO_SEQ_MAX_POINTS];     ///< 依次要走到的角度点
+    uint32_t step_ms[BSP_SERVO_SEQ_MAX_POINTS]; ///< 走向对应点的速度（毫秒/度），逐点独立
+    uint32_t hold_ms[BSP_SERVO_SEQ_MAX_POINTS]; ///< ★到达对应点后【原地停留】的毫秒数（0=不停留）
+    uint8_t n_points;                           ///< 实际点数（0 = 该轴不动）
+} bsp_servo_seq_axis_t;
+
+/**
+ * @brief 三轴各自按一串角度点运动，三轴【独立推进、互不等待】
+ *
+ * 与 bsp_servo_move_all_parallel 的区别：后者强制三轴同时到达、共用一个
+ * step_ms（行程短的轴被迫走慢）；本函数每轴带自己的角度点串和自己的速度，
+ * 各走各的，先走完的轴停在最后一个点等其余轴。全部走完才返回。
+ *
+ * 逐帧检查打断标志，被 bsp_servo_request_abort() 打断时立即停在当前角度。
+ *
+ * @param axes 三轴序列描述，下标 0/1/2 分别对应 CH_HEAD / CH_L_ARM / CH_R_ARM
+ * @return true = 中途被打断，false = 正常走完
+ */
+bool bsp_servo_move_seq_parallel(const bsp_servo_seq_axis_t axes[3]);
+
 /**
  * @brief 【★抖动排查临时接口，定位完即删】运行时覆盖插值帧长
  *

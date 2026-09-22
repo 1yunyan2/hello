@@ -73,12 +73,12 @@ bool bsp_servo_abort_requested(void)
 // ⚠️ 组装好外壳后，请务必根据实际情况修改这几个极限值！
 // 超出范围时 clamp_safe_angle 会自动修正并打印警告日志。
 //! 需要修改,以90为0度,左右各80为极限
-#define HEAD_MIN_ANGLE 0.0f    ///< 头部向左最大极限角度（度），防止颈部过度旋转损坏舵机
-#define HEAD_MAX_ANGLE 180.0f  ///< 头部向右最大极限角度（度）
-#define L_ARM_MIN_ANGLE 0.0f   ///< 左臂向后最大极限角度（度），防止手臂撞到机身
-#define L_ARM_MAX_ANGLE 180.0f ///< 左臂向前最大极限角度（度），防止撞头
-#define R_ARM_MIN_ANGLE 0.0f   ///< 右臂向后最大极限角度（度）
-#define R_ARM_MAX_ANGLE 180.0f ///< 右臂向前最大极限角度（度），防止撞头
+#define HEAD_MIN_ANGLE 10.0f   ///< 头部向左最大极限角度（度），防止颈部过度旋转损坏舵机
+#define HEAD_MAX_ANGLE 170.0f  ///< 头部向右最大极限角度（度）
+#define L_ARM_MIN_ANGLE 10.0f  ///< 左臂向后最大极限角度（度），防止手臂撞到机身
+#define L_ARM_MAX_ANGLE 170.0f ///< 左臂向前最大极限角度（度），防止撞头
+#define R_ARM_MIN_ANGLE 10.0f  ///< 右臂向后最大极限角度（度）
+#define R_ARM_MAX_ANGLE 170.0f ///< 右臂向前最大极限角度（度），防止撞头
 
 /**
  * 插值运动的固定帧间隔（毫秒）—— 所有平滑运动统一按此节拍写入 PWM。
@@ -283,7 +283,7 @@ typedef enum
  * ⚠️ 2026-09-04 仍为 1：当前手感是在 k=0.15 下调出来的，改回 0 后 k 会
  *    跳到 0.50~0.67，曲线明显变平、手感会变，改前需重新确认观感。
  */
-#define SERVO_CURVE_DEMO_FULL 1
+#define SERVO_CURVE_DEMO_FULL 0
 
 /**
  * 演示模式下的固定 k（0~1）。越小曲线越夸张：
@@ -291,21 +291,29 @@ typedef enum
  *   0.15 → 快慢比约 7:1，形状清晰且起止不至于完全停死 ★推荐
  *   0.40 → 快慢比约 4:1，较温和
  */
-#define SERVO_CURVE_DEMO_K 0.15f
+#define SERVO_CURVE_DEMO_K 0.3f
 
 /**
- * 全局默认曲线 —— ★这是产品的正式形态，不是调试开关。
+ * 每通道默认曲线 —— ★这是产品的正式形态，不是调试开关。
  *
- * 所有舵机动作默认走曲线（而非匀速），让运动有加减速、更像活物。
- * 匀速（LINEAR）仅保留作对照基准与极端情况的退路。
+ * 【2026-09-17 起头臂分离】头部走匀速、手臂走 S 曲线：
+ *   - 头部（CH_HEAD）：匀速 LINEAR。用户要求头部不用 S 曲线——头部动作轻快、
+ *     不追求加减速柔化，匀速更干脆（也省掉 S 曲线两端速度钳位的开销）。
+ *   - 手臂（CH_L_ARM / CH_R_ARM）：S 曲线 SCURVE。手臂带加减速，更像活物的
+ *     生物感运动，是产品定型曲线。
  *
- * 【安全性】曲线两端速度会被 servo_curve_min_ratio() 按死区逐档钳位，
+ * 【安全性】S 曲线两端速度会被 servo_curve_min_ratio() 按死区逐档钳位，
  *   保证任何速度档下每帧位移都不低于死区，不会出现 2026-09-03 早期版本
- *   "纯 S 曲线两端掉进死区反而更抖"的问题。
+ *   "纯 S 曲线两端掉进死区反而更抖"的问题。头部走匀速，本就不受此约束。
  *
- * 运行时可用 bsp_servo_debug_set_curve() 切换，便于同一次烧录里横向对比。
+ * 运行时可用 bsp_servo_debug_set_curve() 整体覆盖三轴，便于同一次烧录里横向对比。
+ * 日常业务不改这里，改本数组初值即可（数组下标即通道号，CH_HEAD=0/1/2，见 bsp_config.h）。
  */
-static _Atomic int s_curve_type = (int)SERVO_CURVE_SCURVE;
+static _Atomic int s_curve_type[3] = {
+    [CH_HEAD] = (int)SERVO_CURVE_LINEAR,  ///< 头部匀速（2026-09-17 不用 S）
+    [CH_L_ARM] = (int)SERVO_CURVE_SCURVE, ///< 左臂 S 曲线
+    [CH_R_ARM] = (int)SERVO_CURVE_SCURVE, ///< 右臂 S 曲线
+};
 
 void bsp_servo_debug_set_curve(int curve_type)
 {
@@ -317,22 +325,26 @@ void bsp_servo_debug_set_curve(int curve_type)
         ESP_LOGW(TAG, "curve_type=%d 已废弃(梯形/三角已删)，回落为 S 曲线", curve_type);
         curve_type = (int)SERVO_CURVE_SCURVE;
     }
-    atomic_store(&s_curve_type, curve_type);
+    // ★三轴统一设置（调试接口）：产品默认已是头 LINEAR/臂 SCURVE，此接口做整体覆盖，
+    //   便于 A/B 对比。日常业务不改这里，改上面 s_curve_type 数组的初值即可。
+    for (int i = 0; i < 3; i++)
+        atomic_store(&s_curve_type[i], curve_type);
 }
 
 /**
  * @brief 把归一化时间 τ 映射为归一化位移 ŝ
+ * @param channel 舵机通道（CH_HEAD/CH_L_ARM/CH_R_ARM）：决定用哪条曲线（2026-09-17 起按通道选）
  * @param t 归一化时间 0~1
  * @return  归一化位移 0~1，保证 ŝ(0)=0、ŝ(1)=1（故总行程与总耗时不变）
  */
-static inline float servo_curve_map(float t, float k)
+static inline float servo_curve_map(uint8_t channel, float t, float k)
 {
     if (t <= 0.0f)
         return 0.0f;
     if (t >= 1.0f)
         return 1.0f;
 
-    const int type = atomic_load(&s_curve_type);
+    const int type = atomic_load(&s_curve_type[channel]); // ★按通道取曲线类型（头臂分离）
     if (type == (int)SERVO_CURVE_LINEAR)
         return t; // 匀速：速度恒定，但起止瞬间加速度无穷大（力突变）
 
@@ -578,6 +590,35 @@ static float clamp_safe_angle(uint8_t channel, float target_angle)
         ESP_LOGW(TAG, "通道 %d 触发软限位保护! 修正 %.1f -> %.1f", channel, target_angle, safe_angle);
     }
     return safe_angle;
+}
+
+/* ── 左臂镜像封装（2026-09-17）──────────────────────────────────────────────
+ * 左臂舵机硬件反装，与头/右臂运动方向相反：同样的 PWM 脉宽，左臂物理摆角是
+ * 镜像的（物理角 = 180° - 逻辑角）。
+ *
+ * 全项目左臂镜像收口在这两个封装里：上层（interaction / servo_manager / 归中）
+ * 继续用统一的逻辑角度（0~180，中位 90，前+后−），写/读时由这里对 CH_L_ARM
+ * 做 180-angle 转换。这样情绪表里左右臂对称填角度，物理上也就对称了。
+ *
+ * ⚠️ 标定/测试代码（死区标定、单脉冲测试）直接写裸角度，不走本封装——
+ *   它们测的是舵机硬件本身，镜像会干扰标定结论。
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* 写角度：逻辑角 → 物理角（左臂 180-angle），再写 PWM */
+static void servo_write_angle(uint8_t channel, float angle)
+{
+    if (channel == CH_L_ARM)
+        angle = 180.0f - angle;
+    iot_servo_write_angle(LEDC_LOW_SPEED_MODE, channel, angle);
+}
+
+/* 读角度：读 PWM → 物理角，左臂再 180-angle 还原成逻辑角，与写对称 */
+static esp_err_t servo_read_angle(uint8_t channel, float *angle)
+{
+    esp_err_t err = iot_servo_read_angle(LEDC_LOW_SPEED_MODE, channel, angle);
+    if (err == ESP_OK && channel == CH_L_ARM)
+        *angle = 180.0f - *angle;
+    return err;
 }
 
 #if SERVO_DEADBAND_CALIB_TEST && (SERVO_CALIB_MODE == 1)
@@ -880,15 +921,19 @@ void bsp_board_servo_init(bsp_board_t *bsp_board)
         ESP_LOGW(TAG, "★标定期间舵机不再响应任何业务指令，请看后续标定日志");
         // 注意：不置 servo_initialized、不置 SERVO_READY —— 标定模式全程独占舵机
 #else
-        // ── 步骤 3：上电归中——三路直接持续输出 90° ─────────────────────────────
-        //   - 正常开机：固件保证深度待机/关机前三轴已归中 90°（standby.c），物理就在 90°，
+        // ── 步骤 3：上电归中——头部 90°、手臂 15°（2026-09-16 头臂分离）────────
+        //   - 正常开机：固件保证深度待机/关机前头/臂已归位（standby.c），物理就在归位角，
         //     脉冲一来纹丝不动，零甩动；
         //   - 断电期间被外力掰歪：上电回正一次（速度取决于单脉冲测试结论：失力型可换回
         //     脉冲串软启动限速；记忆型则为舵机全速，硬件属性不可调）。
         //   - iot_servo_init 已收编改为 duty=0 静默启动（components/servo），首个脉冲的
         //     时机由这里完全掌控。
         for (int i = 0; i < 3; i++)
-            iot_servo_write_angle(LEDC_LOW_SPEED_MODE, (uint8_t)i, 90.0f);
+        {
+            // 头回 90°（SERVO_CENTER_DEG），手臂回 15°（ARM_CENTER_DEG）；左臂镜像由 servo_write_angle 统一处理
+            float center = (i == CH_HEAD) ? SERVO_CENTER_DEG : ARM_CENTER_DEG;
+            servo_write_angle((uint8_t)i, center);
+        }
 
         // ── 步骤 4：标记初始化成功 + 置位就绪事件 ────────────────────────────────
         bsp_board->servo_initialized = true;
@@ -960,7 +1005,7 @@ void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms)
 
     // ── 步骤 2：读取当前实际角度（iot_servo_read_angle 返回 LEDC 寄存器推算值）──
     float current = 0.0f;
-    esp_err_t err = iot_servo_read_angle(LEDC_LOW_SPEED_MODE, channel, &current);
+    esp_err_t err = servo_read_angle(channel, &current);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "读取通道 %d 角度失败!", channel);
@@ -978,7 +1023,7 @@ void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms)
     // ── 步骤 4：瞬间模式（step_ms == 0，直接写入目标，无平滑过渡）──────────
     if (step_ms == 0)
     {
-        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, channel, safe_target);
+        servo_write_angle(channel, safe_target);
         xSemaphoreGive(s_ch_mutex[channel]);
         return;
     }
@@ -1019,9 +1064,9 @@ void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms)
             aborted = true;
             break;
         }
-        // ★经运动曲线映射（匀速时原样返回 t，详见 servo_curve_map）
-        float t = servo_curve_map((float)f / (float)frames, curve_k);
-        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, channel, current + t * (safe_target - current));
+        // ★经运动曲线映射（按通道选曲线：头匀速/臂S，详见 servo_curve_map）
+        float t = servo_curve_map(channel, (float)f / (float)frames, curve_k);
+        servo_write_angle(channel, current + t * (safe_target - current));
         vTaskDelayUntil(&last_wake, frame_ticks); // 恒定帧间隔（绝对定时，不累积抢占误差）
     }
 
@@ -1030,7 +1075,7 @@ void bsp_servo_move_smooth(uint8_t channel, float target, uint32_t step_ms)
     // 一路转到目标位，打断等于白做。被打断则停在当前插值角度，由后续动作从此处接管。
     if (!aborted)
     {
-        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, channel, safe_target);
+        servo_write_angle(channel, safe_target);
     }
 
     // ── 解锁：本次运动完成，释放通道 ─────────────────────────────────────────
@@ -1092,7 +1137,7 @@ void bsp_servo_move_smooth_preempt(uint8_t channel, float target, uint32_t step_
     float safe_target = clamp_safe_angle(channel, target);
 
     float current = 0.0f;
-    esp_err_t err = iot_servo_read_angle(LEDC_LOW_SPEED_MODE, channel, &current);
+    esp_err_t err = servo_read_angle(channel, &current);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "读取通道 %d 角度失败!", channel);
@@ -1115,7 +1160,7 @@ void bsp_servo_move_smooth_preempt(uint8_t channel, float target, uint32_t step_
 
     if (step_ms == 0)
     {
-        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, channel, safe_target);
+        servo_write_angle(channel, safe_target);
         xSemaphoreGive(s_ch_mutex[channel]);
         return;
     }
@@ -1144,9 +1189,9 @@ void bsp_servo_move_smooth_preempt(uint8_t channel, float target, uint32_t step_
             aborted = true;
             break;
         }
-        float t = servo_curve_map((float)f / (float)frames, curve_k); // ★经运动曲线映射
+        float t = servo_curve_map(channel, (float)f / (float)frames, curve_k); // ★经运动曲线映射
         float a = current + t * (safe_target - current);
-        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, channel, a);
+        servo_write_angle(channel, a);
         steps++;
         last_a = a;
         vTaskDelayUntil(&last_wake, frame_ticks); // 绝对定时，同 bsp_servo_move_smooth
@@ -1154,7 +1199,7 @@ void bsp_servo_move_smooth_preempt(uint8_t channel, float target, uint32_t step_
 
     if (!aborted)
     {
-        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, channel, safe_target);
+        servo_write_angle(channel, safe_target);
     }
 
     // 【诊断】循环结果：走了几步、是否被打断、停在哪
@@ -1182,7 +1227,7 @@ bool bsp_servo_read_angle(uint8_t channel, float *out_angle)
 
     xSemaphoreTake(s_ch_mutex[channel], portMAX_DELAY);
     float current = 0.0f;
-    esp_err_t err = iot_servo_read_angle(LEDC_LOW_SPEED_MODE, channel, &current);
+    esp_err_t err = servo_read_angle(channel, &current);
     xSemaphoreGive(s_ch_mutex[channel]);
 
     if (err != ESP_OK)
@@ -1273,7 +1318,8 @@ void bsp_servo_resume(void)
         return;
 
     // ★直接写 90°，不再走 move_smooth 扫描式归中（修"退低功耗舵机先抽到0°再慢慢转回90°"）：
-    //   进深度待机前 enter_deep_standby 已保证三轴【先归中 90° 再停 PWM】，物理位置就在 90°。
+    //   进深度待机前 enter_deep_standby 已保证三轴【先归位再停 PWM】，物理就在归位角
+    //   （头 90°/臂 15°，2026-09-16 起头臂分离；下文"90°"泛指"各自归位角"）。
     //   旧实现 move_smooth 第一步 iot_servo_read_angle 读"当前角"做插值起点——但该函数是拿
     //   LEDC duty 寄存器反算角度，而 bsp_servo_idle 停止前已把 duty 清 0（防截断抽搐），
     //   反算结果恒为 0°→ 插值从假起点 0° 逐度扫到 90°→ 发给舵机的第一个脉冲就是 0°，
@@ -1288,13 +1334,13 @@ void bsp_servo_resume(void)
         if (s_ch_mutex[ch] != NULL)
         {
             xSemaphoreTake(s_ch_mutex[ch], portMAX_DELAY);
-            iot_servo_write_angle(LEDC_LOW_SPEED_MODE, ch, 90.0f); // 恢复 PWM 输出 90°（write 内部 set_duty+update）
+            servo_write_angle(ch, (ch == CH_HEAD) ? SERVO_CENTER_DEG : ARM_CENTER_DEG); // 头90°/臂15°，左臂镜像由封装处理
             xSemaphoreGive(s_ch_mutex[ch]);
         }
         if (i < 2)
             vTaskDelay(pdMS_TO_TICKS(200)); // 路间错峰 200ms，摊平可能的瞬时电流尖峰
     }
-    ESP_LOGI(TAG, "舵机已从低功耗休眠恢复（直接写90°，无扫描归中）");
+    ESP_LOGI(TAG, "舵机已从低功耗休眠恢复（直接写归位角：头90°/臂15°，无扫描归中）");
 }
 
 // ==========================================
@@ -1330,9 +1376,9 @@ void bsp_servo_move_all_parallel(float head_target, float larm_target, float rar
     float r_safe = clamp_safe_angle(CH_R_ARM, rarm_target);
 
     float h_cur = 0.0f, l_cur = 0.0f, r_cur = 0.0f;
-    iot_servo_read_angle(LEDC_LOW_SPEED_MODE, CH_HEAD, &h_cur);
-    iot_servo_read_angle(LEDC_LOW_SPEED_MODE, CH_L_ARM, &l_cur);
-    iot_servo_read_angle(LEDC_LOW_SPEED_MODE, CH_R_ARM, &r_cur);
+    servo_read_angle(CH_HEAD, &h_cur);
+    servo_read_angle(CH_L_ARM, &l_cur);
+    servo_read_angle(CH_R_ARM, &r_cur);
 
     // 以三轴中行程最大的为基准算总耗时，再按 SERVO_FRAME_MS 拆帧，保证三轴同时到达。
     // 【与旧版差异】旧版 max_steps = 最大行程度数（1°/步），延时 step_ms；
@@ -1346,9 +1392,9 @@ void bsp_servo_move_all_parallel(float head_target, float larm_target, float rar
 
     if (max_deg < 1.0f || max_steps < 1 || step_ms == 0)
     {
-        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_HEAD, h_safe);
-        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_L_ARM, l_safe);
-        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_R_ARM, r_safe);
+        servo_write_angle(CH_HEAD, h_safe);
+        servo_write_angle(CH_L_ARM, l_safe);
+        servo_write_angle(CH_R_ARM, r_safe);
         for (int i = 0; i < 3; i++)
             xSemaphoreGive(s_ch_mutex[i]);
         return;
@@ -1385,11 +1431,14 @@ void bsp_servo_move_all_parallel(float head_target, float larm_target, float rar
             aborted = true;
             break;
         }
-        // ★经运动曲线映射：匀速时原样返回，S 曲线时两端柔化（详见 servo_curve_map）
-        float t = servo_curve_map((float)step / (float)max_steps, curve_k);
-        float ha = h_cur + t * (h_safe - h_cur);
-        float la = l_cur + t * (l_safe - l_cur);
-        float ra = r_cur + t * (r_safe - r_cur);
+        // ★经运动曲线映射：按通道选曲线（头匀速/臂S）。因头臂曲线不同，
+        //   三轴需各自映射 t，不能再共用一个 t（2026-09-17 头臂分离）。
+        float th = servo_curve_map(CH_HEAD, (float)step / (float)max_steps, curve_k);
+        float tl = servo_curve_map(CH_L_ARM, (float)step / (float)max_steps, curve_k);
+        float tr = servo_curve_map(CH_R_ARM, (float)step / (float)max_steps, curve_k);
+        float ha = h_cur + th * (h_safe - h_cur);
+        float la = l_cur + tl * (l_safe - l_cur);
+        float ra = r_cur + tr * (r_safe - r_cur);
 
         // ★三轴写入尽量不被打断：保证三路 duty 落在同一个 PWM 周期，一起生效。
         //   用 vTaskSuspendAll（禁止任务调度）而【不用 taskENTER_CRITICAL】：
@@ -1398,9 +1447,9 @@ void bsp_servo_move_all_parallel(float head_target, float larm_target, float rar
         //   vTaskSuspendAll 只挡住同核的任务切换，不关中断，日志路径依然安全，
         //   而"三轴写入不被别的任务插队"这个目的同样达到。
         vTaskSuspendAll();
-        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_HEAD, ha);
-        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_L_ARM, la);
-        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_R_ARM, ra);
+        servo_write_angle(CH_HEAD, ha);
+        servo_write_angle(CH_L_ARM, la);
+        servo_write_angle(CH_R_ARM, ra);
         xTaskResumeAll();
 
         // ★绝对时刻递推，抢占不累积误差（替代原 vTaskDelay 的相对延时）
@@ -1410,11 +1459,262 @@ void bsp_servo_move_all_parallel(float head_target, float larm_target, float rar
     // 兜底：未被打断时精准落在目标位置（被打断则停在当前插值角度，不强制到位）
     if (!aborted)
     {
-        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_HEAD, h_safe);
-        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_L_ARM, l_safe);
-        iot_servo_write_angle(LEDC_LOW_SPEED_MODE, CH_R_ARM, r_safe);
+        servo_write_angle(CH_HEAD, h_safe);
+        servo_write_angle(CH_L_ARM, l_safe);
+        servo_write_angle(CH_R_ARM, r_safe);
     }
 
     for (int i = 0; i < 3; i++)
         xSemaphoreGive(s_ch_mutex[i]);
+}
+
+// ==========================================
+// API: 三轴动作序列（三轴各走各的，2026-09-04 新增）
+// ==========================================
+
+/**
+ * @brief 三轴各自按一串角度点依次运动，三轴独立推进、互不等待
+ *
+ * 【与 bsp_servo_move_all_parallel 的本质区别】
+ *   move_all_parallel 是"三轴同时出发、同时到达"：以行程最长的轴定总时长，
+ *   三轴共用一个 step_ms，行程短的轴被迫走慢。头和手臂的幅度、快慢本来就
+ *   该不一样，被这样统一后动作全走样（旧情绪表正是受此限制）。
+ *
+ *   本函数让每轴带自己的一串角度点和自己的速度，各走各的：
+ *     · 每轴独立记录"走到第几个点、该点走了几帧"，按自己的 step_ms 推进；
+ *     · 某轴的点走完了就停在最后一个点，不影响其余轴继续走；
+ *     · 全部轴都走完，函数才返回。
+ *
+ * 【实现要点：为什么不能简单地对三轴串行调 move_smooth】
+ *   move_smooth 是阻塞的（走完才返回），串行调用就退化成"头走完臂才动"，
+ *   正是要避免的割裂感。故此处在同一个循环里同时推进三轴。
+ *
+ * 【复用的既有机制】逐帧插值 + S 曲线映射 + 每轴按速度自动选帧长 + 软限位，
+ *   与 move_all_parallel/move_smooth 完全一致；打断检查同样逐帧进行。
+ *   ★三轴写入仍用 vTaskSuspendAll 包住，保证三路 duty 落在同一 PWM 周期
+ *     （理由见 move_all_parallel 内缺陷②注释）。
+ *
+ * 【帧长的处理】三轴速度不同 ⇒ 各自需要的帧长不同。循环统一用三轴中【最小】
+ *   的帧长推进（最细的时间粒度），每轴按自己的 step_ms 折算该走多少帧，
+ *   从而各轴实际速度仍是各自的 step_ms 语义。
+ *
+ * 【原地停留 hold_ms（★2026-09-18 新增）】本函数的时间原先【只能】由位移换来
+ *   （帧数 = 角度差 × step_ms ÷ 帧长），"停住不动"因此无法表达：零位移段被
+ *   frames<1 钳成 1 帧就换下一点。现在每个点可自带 hold_ms——走到该点后原地
+ *   保持 hold_ms 毫秒再前往下一点。
+ *
+ *   【为什么用"帧数倒扣"而不是 vTaskDelay】三轴在同一循环里推进，某轴一旦
+ *   vTaskDelay 就把另外两轴一起冻住（本函数的立身之本就是"三轴各走各的"）。
+ *   故停留实现为：该轴进入 hold 状态后【只倒计时、不写角度】，每过一个基准帧
+ *   减 1，减到 0 才装载下一个点。其余轴照常推进，互不干扰。
+ *
+ *   【保持角度靠什么】不写即保持——iot_servo 持续输出上一次写入的 duty，
+ *   舵机停在原位；hold 期间该轴 write[] 恒为 false，不参与 SuspendAll 那一段。
+ *
+ * @param axes      三轴序列描述（下标 0/1/2 = CH_HEAD/CH_L_ARM/CH_R_ARM）
+ * @param n_points  每轴的角度点个数（0 = 该轴不动）
+ * @return true = 中途被打断（bsp_servo_request_abort），false = 正常走完
+ */
+bool bsp_servo_move_seq_parallel(const bsp_servo_seq_axis_t axes[3])
+{
+    bsp_board_t *board = bsp_board_get_instance();
+    if (board == NULL || !board->servo_initialized)
+        return false;
+
+    for (int i = 0; i < 3; i++)
+    {
+        if (s_ch_mutex[i] == NULL)
+            return false;
+        xSemaphoreTake(s_ch_mutex[i], portMAX_DELAY);
+    }
+
+    const uint8_t chs[3] = {CH_HEAD, CH_L_ARM, CH_R_ARM};
+
+    // 每轴的推进状态
+    float cur[3];     // 本段起点角度（上一个点的角度）
+    float dst[3];     // 本段终点角度（当前点的角度，已软限位）
+    int idx[3];       // 当前走到第几个点
+    int frame[3];     // 本段已走帧数
+    int frames[3];    // 本段总帧数
+    float k[3];       // 本段 S 曲线两端速度比
+    int per_frame[3]; // 本轴每推进一帧，相当于循环的几个最小帧（速度折算）
+    int tick[3];      // 本轴距离下次推进还差几个最小帧
+    bool done[3];     // 本轴是否已全部走完
+    // ★2026-09-18 原地停留：hold_frames = 当前点到达后【总共】要停几个基准帧
+    //   （装载该点时按 hold_ms 折算）；hold_left = 还剩几个基准帧。
+    //   hold_left 走完一个基准帧减 1，减到 0 才装载下一个点。
+    int hold_frames[3]; // 本点停留总帧数（0 = 不停留）
+    int hold_left[3];   // 本点停留剩余帧数（>0 = 正在停）
+
+    // 循环统一帧长 = 三轴【所有段】所需帧长的最小值（最细粒度）
+    // ★2026-09-11：速度改为逐点后，同一轴的不同段帧长可能不同，故须遍历每个点，
+    //   取全局最小值作为循环基准帧，否则最快的那一段会被粗粒度的基准帧拖慢。
+    uint32_t base_frame_ms = 0xFFFFFFFFU;
+    for (int i = 0; i < 3; i++)
+    {
+        for (uint8_t p = 0; p < axes[i].n_points; p++)
+        {
+            if (axes[i].step_ms[p] == 0)
+                continue; // 该段不动（正常不会出现，调用方已解析过默认值）
+            uint32_t f = servo_auto_frame_ms(axes[i].step_ms[p]);
+            if (f < base_frame_ms)
+                base_frame_ms = f;
+        }
+    }
+    if (base_frame_ms == 0xFFFFFFFFU)
+        base_frame_ms = SERVO_FRAME_MS; // 三轴都不动：给个安全值，随即全部 done 退出
+
+    for (int i = 0; i < 3; i++)
+    {
+        idx[i] = 0;
+        frame[i] = 0;
+        frames[i] = 0;
+        tick[i] = 0;
+        done[i] = (axes[i].n_points == 0 || axes[i].step_ms[0] == 0);
+        cur[i] = 0.0f;
+        servo_read_angle(chs[i], &cur[i]);
+        dst[i] = cur[i];
+        k[i] = 1.0f;
+        // ★per_frame 不再在此处定死：速度已逐点独立，每段的帧长可能不同，
+        //   故改由 SEQ_LOAD_NEXT 在装载每个点时重算（漏了这条会表现为
+        //   "速度没按填的走"——慢段用了快段的折算倍数）。此处仅给安全初值。
+        per_frame[i] = 1;
+        hold_frames[i] = 0; // ★2026-09-18：初值必须清零，否则首点会被误判为在停留
+        hold_left[i] = 0;
+    }
+
+// 为某轴装载下一个角度点
+// 【为什么每段单独算 frames/k】每段行程长度不同，总耗时 = 行程 × step_ms，
+//   S 曲线两端速度比也要按该段的帧长重算，与 move_smooth 的处理一致。
+//
+// ★【2026-09-04 修正】起点必须用上一段的终点 dst[i]，【不能】用
+//   iot_servo_read_angle 读回。原因：本宏在"本段最后一帧"里被调用，而那一帧
+//   的角度要到本轮循环末尾的 SuspendAll 段才真正写进舵机 —— 此刻读回的是
+//   【上一帧】的角度，比真实终点差了一帧的位移。后果是 deg 被算小（首段甚至
+//   接近 0），frames 被钳到 1，于是后续每个点都只走 1 帧瞬间跳完，
+//   肉眼看就是"舵机几乎不动"，且动作在几十毫秒内结束（s_ia_playing 立刻清掉，
+//   表现为"新的触摸情绪能立刻打断上一个"）。
+#define SEQ_LOAD_NEXT(i)                                                                               \
+    do                                                                                                 \
+    {                                                                                                  \
+        if (idx[i] >= axes[i].n_points)                                                                \
+        {                                                                                              \
+            done[i] = true;                                                                            \
+            break;                                                                                     \
+        }                                                                                              \
+        cur[i] = dst[i]; /* ★上一段终点即本段起点，不读回 */                                           \
+        dst[i] = clamp_safe_angle(chs[i], axes[i].points[idx[i]]);                                     \
+        /* ★2026-09-11 速度逐点独立：idx[i] 此刻仍指向【本段】，末尾才自增 */                          \
+        uint32_t own_st = axes[i].step_ms[idx[i]];                                                     \
+        if (own_st == 0U)                                                                              \
+            own_st = 20U; /* 防御：调用方未把"0=用默认"解析成实际值时兜底 */                           \
+        float deg = fabsf(dst[i] - cur[i]);                                                            \
+        uint32_t own_fm = servo_auto_frame_ms(own_st);                                                 \
+        frames[i] = (int)((uint32_t)(deg * (float)own_st) / own_fm);                                   \
+        if (frames[i] < 1)                                                                             \
+            frames[i] = 1;                                                                             \
+        k[i] = servo_curve_min_ratio(own_st, own_fm);                                                  \
+        /* ★本段速度折算倍数必须每段重算：漏了会表现为"速度没按填的走" */                              \
+        per_frame[i] = (int)(own_fm / base_frame_ms);                                                  \
+        if (per_frame[i] < 1)                                                                          \
+            per_frame[i] = 1;                                                                          \
+        /* ★2026-09-18 停留折算：毫秒 → 基准帧数，向上取整（宁可多停一帧， \
+         *   也不因取整把停留截短成 0）。刻意用 base_frame_ms 而非 own_fm：         \
+         *   停留是"墙上时间"，与轴速无关，快轴慢轴的 600ms 都应是 600ms。  */  \
+        uint32_t own_hold = axes[i].hold_ms[idx[i]];                                                   \
+        hold_frames[i] = (own_hold == 0U)                                                              \
+                             ? 0                                                                       \
+                             : (int)((own_hold + base_frame_ms - 1U) / base_frame_ms);                 \
+        hold_left[i] = 0; /* 到达该点后才置位（见主循环"到达"分支） */                                 \
+        tick[i] = 0;                                                                                   \
+        frame[i] = 0;                                                                                  \
+        idx[i]++;                                                                                      \
+    } while (0)
+
+    for (int i = 0; i < 3; i++)
+        if (!done[i])
+            SEQ_LOAD_NEXT(i);
+
+    TickType_t last_wake = xTaskGetTickCount();
+    const TickType_t base_ticks = pdMS_TO_TICKS(base_frame_ms);
+    bool aborted = false;
+
+    for (;;)
+    {
+        if (done[0] && done[1] && done[2])
+            break;
+
+        // 逐帧检查打断（延迟 = 一个最小帧，与 move_all_parallel 同量级）
+        if (bsp_servo_abort_requested())
+        {
+            aborted = true;
+            break;
+        }
+
+        float ang[3];
+        bool write[3] = {false, false, false};
+
+        for (int i = 0; i < 3; i++)
+        {
+            if (done[i])
+                continue;
+
+            /* ★2026-09-18 停留中：只倒计时，不写角度。
+             *   "不写"就是"保持"——iot_servo 持续输出上一次写入的 duty，舵机停在
+             *   当前点；本轴 write[i] 保持 false，不参与下面的 SuspendAll 写入段。
+             *   ★刻意放在速度折算出【之前】并直接 continue：停留是纯墙上时间，
+             *     若让它掺进 tick/per_frame 折算，慢轴的停留会被自己的速度倍数
+             *     拉长（600ms 停成 1.8s），停留时长就与轴速绑死了。 */
+            if (hold_left[i] > 0)
+            {
+                if (--hold_left[i] == 0)
+                    SEQ_LOAD_NEXT(i); // 停够，前往下一个点
+                continue;             // 本帧不写角度
+            }
+
+            // 速度折算：慢轴每 per_frame 个最小帧才推进一帧
+            if (++tick[i] < per_frame[i])
+                continue;
+            tick[i] = 0;
+
+            frame[i]++;
+            float t = servo_curve_map(chs[i], (float)frame[i] / (float)frames[i], k[i]);
+            ang[i] = cur[i] + t * (dst[i] - cur[i]);
+            write[i] = true;
+
+            if (frame[i] >= frames[i])
+            {
+                ang[i] = dst[i]; // 精准落在本段目标点
+                /* ★2026-09-18 到达即判断要不要停留（本帧照旧写 dst，所以停留期间
+                 *   舵机稳稳停在该点，不会因为不写回弹）。
+                 *   hold_frames 取走后立刻清零——同一个点只允许停一次，否则这个
+                 *   轴走完后续段再回到此处会莫名其妙又停一遍。 */
+                if (hold_frames[i] > 0)
+                {
+                    hold_left[i] = hold_frames[i];
+                    hold_frames[i] = 0;
+                }
+                else
+                {
+                    SEQ_LOAD_NEXT(i); // 装载下一个点（无点则 done）
+                }
+            }
+        }
+
+        // ★三轴写入包在 SuspendAll 内：三路 duty 落同一 PWM 周期（见 move_all_parallel 缺陷②）
+        vTaskSuspendAll();
+        for (int i = 0; i < 3; i++)
+            if (write[i])
+                servo_write_angle(chs[i], ang[i]);
+        xTaskResumeAll();
+
+        vTaskDelayUntil(&last_wake, base_ticks);
+    }
+
+#undef SEQ_LOAD_NEXT
+
+    for (int i = 0; i < 3; i++)
+        xSemaphoreGive(s_ch_mutex[i]);
+
+    return aborted;
 }

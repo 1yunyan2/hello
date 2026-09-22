@@ -25,9 +25,19 @@
 
 static const char *TAG = "SERVO_MGR";
 
-#define SERVO_MGR_QUEUE_LEN 64      // 舵机动作请求队列长度
-#define SERVO_MGR_TASK_PRIO 6       // 舵机管理器任务优先级
-#define SERVO_MGR_TASK_STACK 4096   // 舵机管理器任务栈大小（分配在PSRAM中）
+#define SERVO_MGR_QUEUE_LEN 64 // 舵机动作请求队列长度
+#define SERVO_MGR_TASK_PRIO 6  // 舵机管理器任务优先级
+/* 舵机管理器任务栈大小（分配在PSRAM中）
+ *
+ * ★2026-09-18 由 4096 提到 6144 —— 本次给动作序列加 hold_ms[] 的连带影响：
+ *   worker 栈上同时躺着两坨大对象，且【同时存活】：
+ *     · servo_worker_task 的局部 item（含 servo_seq_request_t，3 轴 × 34 点）
+ *     · servo_exec_seq  的局部 axes[3]（同规模）
+ *   hold_ms[] 给每轴 +136B，两处合计约 +790B——占 4096 栈的近 20%，
+ *   而这两处本就是本任务栈占用的绝对大头。栈分配在 PSRAM，加这 2KB 的
+ *   代价为零（不占内部 SRAM），用它换掉一个"可能只剩几百字节余量"的隐患。
+ *   若后续再把 SERVO_SEQ_MAX_STEPS 调大，这里必须跟着重新评估。 */
+#define SERVO_MGR_TASK_STACK 6144
 #define NVS_NAMESPACE "servo_calib" // NVS命名空间，用于存储舵机校准参数
 
 // 请求类型标签：区分「单轴串行请求」与「三轴并行请求」，worker 据此分派执行路径
@@ -36,6 +46,7 @@ typedef enum
     REQ_KIND_SINGLE = 0,   // 单轴动作（servo_request_t），串行执行
     REQ_KIND_PARALLEL,     // 三轴并行动作（servo_parallel_request_t），同步执行
     REQ_KIND_ABS_PARALLEL, // 三轴绝对角度并行动作（servo_abs_parallel_request_t）
+    REQ_KIND_SEQ,          // 三轴动作序列（servo_seq_request_t）：终点+序列+各自归中，三轴各走各的
 } req_kind_t;
 
 // 内部队列项结构体，包装舵机请求（用 kind 区分 union 的有效成员）
@@ -47,6 +58,7 @@ typedef struct
         servo_request_t single;               // kind==REQ_KIND_SINGLE 时有效
         servo_parallel_request_t parallel;    // kind==REQ_KIND_PARALLEL 时有效
         servo_abs_parallel_request_t abs_par; // kind==REQ_KIND_ABS_PARALLEL 时有效
+        servo_seq_request_t seq;              // kind==REQ_KIND_SEQ 时有效
     } u;
     SemaphoreHandle_t done; // 非 NULL：执行完毕后 give 通知调用方（完成等待用）
 } internal_req_t;
@@ -60,8 +72,8 @@ static bool s_inited = false;        // 初始化状态标志
 //   避免 xQueueCreate 默认从内部 SRAM 分配这一整块（回收 ~3.6KB 内部 SRAM）。
 //   队列只是数据搬运，worker 取出后才调 bsp_servo_*（不涉及 Flash/NVS），队列存储区放
 //   PSRAM 没有 cache 关闭期不可访问的风险（与 udp_logger.c 同款做法）。
-static StaticQueue_t s_queue_struct;         // 队列控制块（TCB 级，静态放 .bss）
-static uint8_t *s_queue_storage = NULL;      // heap_caps_malloc(..., MALLOC_CAP_SPIRAM) 的存储区
+static StaticQueue_t s_queue_struct;    // 队列控制块（TCB 级，静态放 .bss）
+static uint8_t *s_queue_storage = NULL; // heap_caps_malloc(..., MALLOC_CAP_SPIRAM) 的存储区
 
 // flush 中断标志：servo_manager_flush() 置 true，正在执行的并行动作循环检测到后
 // 在下一个循环边界 break 跳出；worker 归中后清回 false。atomic 保证跨核可见（plan R2）。
@@ -99,6 +111,13 @@ static inline servo_direction_t opposite_dir(servo_direction_t dir)
     return (dir == SERVO_DIR_LEFT) ? SERVO_DIR_RIGHT : SERVO_DIR_LEFT;
 }
 
+/* 内部：取某通道的「归位角」（2026-09-16 起头/臂分离）
+ * 头部回 SERVO_CENTER_DEG(90°)，手臂回 ARM_CENTER_DEG(15°)。归中速度仍由调用方传。 */
+static inline float servo_center_deg(uint8_t channel)
+{
+    return (channel == CH_HEAD) ? SERVO_CENTER_DEG : ARM_CENTER_DEG;
+}
+
 /* 内部：执行一个单轴串行请求（原逻辑，保持不变） */
 static void servo_exec_single(const servo_request_t *r)
 {
@@ -120,16 +139,141 @@ static void servo_exec_single(const servo_request_t *r)
             bsp_servo_move_smooth(r->channel, primary, r->speed_ms);  // 移动到主要位置
             bsp_servo_move_smooth(r->channel, opposite, r->speed_ms); // 移动到相反位置
         }
-        // 最后回中到90度位置
-        bsp_servo_move_smooth(r->channel, 90.0f, SERVO_SPEED_CENTER);
+        // 最后回中：头部回 90°，手臂回 ARM_CENTER_DEG（2026-09-16 头臂分离）
+        bsp_servo_move_smooth(r->channel, servo_center_deg(r->channel), SERVO_SPEED_CENTER);
     }
     else
     {
         // 单次到位模式：移动到目标位置后回中
         bsp_servo_move_smooth(r->channel, primary, r->speed_ms);
-        // 回中以保证一致性（UI 习惯），若不需要可改为不回中
-        bsp_servo_move_smooth(r->channel, 90.0f, SERVO_SPEED_CENTER);
+        // 回中以保证一致性（UI 习惯），若不需要可改为不回中；角度随通道头/臂分离
+        bsp_servo_move_smooth(r->channel, servo_center_deg(r->channel), SERVO_SPEED_CENTER);
     }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * 内部：执行一个【三轴动作序列】请求（2026-09-04 新增）
+ *
+ * 【一个轴的完整生命周期，四段】
+ *
+ *      归位角(起始) →  target(终点)  →  seq[](动作序列)  →  归位角(归中)
+ *                      ╰──────────────── 本函数负责 ──────────────────╯
+ *
+ *   起始角是上一次动作结束时的位置（本函数末尾也归中，故恒为归位角）。
+ *   本函数把"终点 + 序列 + 归中"三者拼成一串角度点交给
+ *   bsp_servo_move_seq_parallel，三轴各走各的速度与步数，互不等待。
+ *
+ *   ★2026-09-17：归中【已从 worker 下沉到本函数】（见下方 ③）。此前归中是
+ *   worker 在本函数返回后统一做的一次三轴同步动作，导致先走完的轴干等最慢的
+ *   轴（双臂等头部摇摆）。worker 那处调用保留，降级为 flush 打断时的兜底。
+ *
+ * 【为什么把三段拼成一串】对底层而言它们没有区别，都是"依次走到这些角度"。
+ *   拼成一串可以让三轴的时间线完全独立——若先统一走 target、再统一走序列、
+ *   最后统一归中，每段之间就多出一个"三轴都得到齐"的同步点，正是要消除的东西。
+ *   ★归中在 2026-09-17 也被并入这一串（此前它正是最后一个同步点）。
+ *
+ * 返回 true=被打断（提前退出），false=正常跑完。
+ * ════════════════════════════════════════════════════════════════════════════ */
+static bool servo_exec_seq(const servo_seq_request_t *p)
+{
+    const servo_seq_axis_t *src[3] = {&p->head, &p->l_arm, &p->r_arm};
+    // 下标 0/1/2 顺序 = 头/左臂/右臂（与 bsp_servo_move_seq_parallel 内部约定一致）。
+    // 仅用于取本轴的归位角（头 90° / 臂 ARM_CENTER_DEG），见下方 ③。
+    const uint8_t chs[3] = {CH_HEAD, CH_L_ARM, CH_R_ARM};
+    bsp_servo_seq_axis_t axes[3];
+
+    for (int i = 0; i < 3; i++)
+    {
+        uint8_t n = 0;
+
+        // 该轴不参与本动作：target 与 seq 都没配（speed=0 或 target=0 且无序列）
+        if (src[i]->speed == 0 && src[i]->seq_len == 0)
+        {
+            axes[i].n_points = 0;
+            axes[i].step_ms[0] = 0;
+            axes[i].hold_ms[0] = 0; // ★2026-09-18：一并清零，不留未初始化值
+            continue;
+        }
+
+        // ① 终点：作为序列的第一个点，用本轴自己的 speed
+        //
+        // ★2026-09-11 顺带修复：这一步终于用上 speed 了。旧版底层每轴只接受
+        //   一个 step_ms，整条（含"走向终点"这步）被迫统一取 seq_speed ——
+        //   也就是说配置里的 speed 在【配了序列时完全不生效】，是个静默失效的
+        //   字段。速度改为逐点后该限制消失，两个速度现在都真实生效。
+        if (src[i]->speed > 0)
+        {
+            axes[i].points[n] = src[i]->target;
+            axes[i].step_ms[n] = src[i]->speed;
+            axes[i].hold_ms[n] = 0; // ★2026-09-18：终点不设停留（停留属于 seq 步）
+            n++;
+        }
+
+        // ② 动作序列：依次追加，超出底层容量则截断（表里不该配这么多）
+        //    ★每步 speed 填 0 = "沿用本轴 seq_speed"，必须在此解析成实际值：
+        //      底层 bsp_servo_seq_axis_t 不认 0 语义（见该结构注释）。
+        for (uint8_t s = 0; s < src[i]->seq_len && n < BSP_SERVO_SEQ_MAX_POINTS; s++)
+        {
+            uint32_t st = src[i]->seq[s].speed;
+            if (st == 0)
+                st = src[i]->seq_speed; // 该步未单独指定 → 用本轴序列默认速度
+            if (st == 0)
+                st = src[i]->speed; // 默认也没配 → 退回终点速度（底层另有兜底）
+
+            axes[i].points[n] = src[i]->seq[s].angle;
+            axes[i].step_ms[n] = st;
+            // ★2026-09-18：停留时长原样透传给底层（0 = 不停留，无需解析默认值）
+            axes[i].hold_ms[n] = src[i]->seq[s].hold_ms;
+            n++;
+        }
+
+        /* ③ 归中：作为本轴序列的【最后一个点】（2026-09-17 新增）
+         *
+         * 【为什么挪到这里】此前归中是 worker 在本函数返回后做的【一次三轴同步
+         *   动作】（见 worker 内 bsp_servo_move_all_parallel）。而本函数"三轴全部
+         *   走完才返回"，于是先做完的轴只能停在末位干等最慢的轴：实测情绪 20
+         *   （头 8 步 MID 摇摆、双臂 5 步）表现为「双臂到了 170° 不动，一直等到
+         *   头摇完 8 步，三轴才一起归中」——用户明确反馈这是错的。
+         *
+         * 【改法】归中下沉成每轴自己的最后一段：某轴走完自己的点就立即回中位，
+         *   不再理会其余轴是否还在走。三轴因此各走各的完整生命周期：
+         *       当前角 → target → seq[] → 归位角
+         *   worker 的统一归中【保留】，降级为 flush 打断时的兜底（见 worker 处注释）：
+         *   正常跑完时三轴已在归位角，那次调用是幂等的 no-op，无副作用。
+         *
+         * 【容量】本点占用底层 points[] 的一个坑位，故 bsp_board.h 的
+         *   BSP_SERVO_SEQ_MAX_POINTS 需 ≥ 配置侧步数 +2（终点 1 + 归中 1），
+         *   已由 interaction.c 的 static_assert 在编译期卡住。此处仍加边界判断：
+         *   极端情况下（配置侧步数填满）就【不追加】，自动退回 worker 统一归中，
+         *   宁可归中晚一点，也不越界写数组。
+         *
+         * 【n > 0 的含义】该轴参与了本动作才归中；speed=0 且 seq_len=0 的轴
+         *   （"本情绪不参与"或低功耗模式下的手臂）n 恒为 0，不追加、保持钉住。 */
+        if (n > 0 && n < BSP_SERVO_SEQ_MAX_POINTS)
+        {
+            axes[i].points[n] = servo_center_deg(chs[i]); // 头 90° / 臂 ARM_CENTER_DEG
+                                                          // axes[i].step_ms[n] = SERVO_SPEED_CENTER;      // 与 worker 统一归中同速
+                                                          // 改成按轴分开
+            axes[i].step_ms[n] = (chs[i] == CH_HEAD) ? SERVO_SPEED_CENTER
+                                                     : SERVO_SPEED_CENTER_ARM; // 新增宏
+            axes[i].hold_ms[n] = 0;                                            // ★2026-09-18：归中段不停留
+            n++;
+        }
+
+        axes[i].n_points = n;
+    }
+
+    // flush 已被请求：直接返回，不启动本动作
+    if (atomic_load(&s_flush_req))
+        return true;
+
+    // 三轴独立推进，全部走完才返回；内部逐帧检查 abort
+    bool aborted = bsp_servo_move_seq_parallel(axes);
+
+    // ★补检：move_seq_parallel 被 abort 打断后返回 true，但 flush 也可能在
+    //   期间被置位。二者任一为真都算被打断——理由同 servo_exec_abs_parallel
+    //   里那条 2026-08-05 注释：worker 误判"正常跑完"会强行归中抢走通道锁。
+    return aborted || atomic_load(&s_flush_req) || bsp_servo_abort_requested();
 }
 
 /* 内部：执行一个三轴并行请求 —— 三轴【同时】运动，调 bsp_servo_move_all_parallel 实现真正同步。
@@ -260,7 +404,7 @@ static bool servo_exec_abs_parallel(const servo_abs_parallel_request_t *p)
             return true;
     }
 
-    return false;
+    return false; // 正常跑完（归中由 worker 统一负责）
 }
 
 /* 内部：worker 主循环，串行消费动作请求 */
@@ -288,6 +432,8 @@ static void servo_worker_task(void *arg)
                 aborted = servo_exec_parallel(&item.u.parallel);
             else if (item.kind == REQ_KIND_ABS_PARALLEL)
                 aborted = servo_exec_abs_parallel(&item.u.abs_par);
+            else if (item.kind == REQ_KIND_SEQ)
+                aborted = servo_exec_seq(&item.u.seq); // 终点+序列+各自归中，三轴各走各的
             else
                 servo_exec_single(&item.u.single); // 单轴自带归中，不参与 flush
 
@@ -295,8 +441,18 @@ static void servo_worker_task(void *arg)
              * - 并行动作（含绝对角度）统一在此归中，无论正常跑完还是被 flush 打断。
              * - 被打断时：必须【先清 flush 标志】，否则归中本身也会因标志为真而无法进行。
              *   清标志后再做一次独立的平滑归中，把舵机带回中位。
-             * - 正常跑完：标志本就为 false，直接归中。 */
-            if (item.kind == REQ_KIND_PARALLEL || item.kind == REQ_KIND_ABS_PARALLEL)
+             * - 正常跑完：标志本就为 false，直接归中。
+             *
+             * ★2026-09-17 REQ_KIND_SEQ 的性质已变：动作序列请求的归中【已在
+             *   servo_exec_seq 内部下沉为每轴的最后一段】（某轴走完立即回中，
+             *   不再等其余轴）。因此对 SEQ 而言，本处这次调用：
+             *     · 正常跑完（aborted=false）：三轴已各自归位，本调用是幂等的
+             *       no-op（move_all_parallel 走 0 行程），留着不影响观感；
+             *     · 被 flush 打断：三轴停在半路、没走到各自的归中段，正是靠本处
+             *       把它们拉回中位——这是打断后唯一还会归中的地方，【不能删】。
+             *   另两路（PARALLEL / ABS_PARALLEL）的行为完全未变，仍由本处统一归中。 */
+            if (item.kind == REQ_KIND_PARALLEL || item.kind == REQ_KIND_ABS_PARALLEL ||
+                item.kind == REQ_KIND_SEQ)
             {
                 // ★2026-08-05：被打断时是否归中，取决于「打断方有没有后续动作接管」。
                 //   center=false（远程控制）：直接停在当前角度，【不清打断标志、不归中】。
@@ -326,7 +482,8 @@ static void servo_worker_task(void *arg)
                      * 本行是【所有并行/绝对角度请求】归中的唯一出口：无论正常播完
                      * 还是被 servo_manager_flush() 打断（进功能盘、闹钟/番茄钟到期）
                      * 都走这里，故改这一行即覆盖用户能感知到的全部归中。 */
-                    bsp_servo_move_all_parallel(90.0f, 90.0f, 90.0f, SERVO_SPEED_CENTER);
+                    bsp_servo_move_all_parallel(SERVO_CENTER_DEG, ARM_CENTER_DEG, ARM_CENTER_DEG,
+                                                SERVO_SPEED_CENTER); // 头90°/臂15°（2026-09-16 头臂分离）
                 }
             }
 
@@ -459,6 +616,24 @@ esp_err_t servo_manager_submit_abs_parallel_notify(const servo_abs_parallel_requ
     if (xQueueSend(s_queue, &item, 0) != pdTRUE)
     {
         ESP_LOGW(TAG, "队列已满，拒绝绝对角度并行请求");
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+/* 非阻塞入队【三轴动作序列】请求，可选完成通知（情绪动作用，2026-09-04 起） */
+esp_err_t servo_manager_submit_seq_notify(const servo_seq_request_t *req,
+                                          SemaphoreHandle_t done_sem)
+{
+    if (!s_inited || req == NULL)
+        return ESP_ERR_INVALID_STATE;
+    internal_req_t item;
+    item.kind = REQ_KIND_SEQ;
+    item.done = done_sem; // 非 NULL 时执行完毕 give 通知
+    memcpy(&item.u.seq, req, sizeof(item.u.seq));
+    if (xQueueSend(s_queue, &item, 0) != pdTRUE)
+    {
+        ESP_LOGW(TAG, "队列已满，拒绝动作序列请求");
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
