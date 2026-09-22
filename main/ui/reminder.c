@@ -26,6 +26,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_sntp.h"
+#include "esp_netif.h" /* esp_netif_get_nr_of_ifs()：探测 TCP/IP 协议栈是否已初始化，见 net_stack_is_up() */
 #include "esp_http_client.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -431,6 +432,40 @@ static void sntp_sync_notification_cb(struct timeval *tv)
     nvs_save_last_time();        /* 有更准的来源，覆盖 NVS 旧值 */
 }
 
+/**
+ * @brief 探测 TCP/IP（lwip）协议栈是否已经起来
+ *
+ * 【为什么非加这个判据不可】
+ * esp_sntp_setoperatingmode() / esp_sntp_init() 内部走 tcpip_callback()，要往 lwip
+ * 的 TCP/IP 线程邮箱投消息。若 esp_netif_init() 从未执行过，那个线程和邮箱压根不存在，
+ * lwip 会直接断言 abort：
+ *     assert failed: tcpip_callback  tcpip.c:313 (Invalid mbox)
+ *     Backtrace: ... esp_sntp_setoperatingmode → sntp_time_sync_init → reminder_init
+ * 实测复现路径：application.c 的「步骤 5: bsp_board_wifi_main」被注释掉做裸板调试时，
+ * 只要打开 reminder_init 就必崩在这里（本函数上方那行日志「初始化 SNTP 时间同步...」
+ * 是崩溃前最后一条输出）。
+ *
+ * 【必须区分「断网」与「没有协议栈」——这是两种不同状态】
+ *   · 断网（产品真实场景）：WiFi 已 init、esp_netif_init() 跑过，只是连不上 AP 或
+ *     中途掉线。此时协议栈【存在】，SNTP 初始化完全正常，只是拉不到时间而静默重试
+ *     失败 → sntp_synced 保持 false → 自动落到下面的 NVS 兜底。**不崩，无需拦截。**
+ *   · 没有协议栈（裸板调试）：esp_netif_init() 从未执行。此时才必须跳过 SNTP。
+ * 故本判据【只拦裸板，不影响断网行为】——断网时它返回 true，SNTP 照常初始化，
+ * 与加本判据之前的行为完全一致，不会削弱任何离线能力。
+ *
+ * 【为什么不用现成的 bsp_wifi_is_offline_mode()】那个标志（bsp_wifi.c 的
+ * s_offline_mode）只由 WiFi 事件回调置位。裸板下 WiFi 从未初始化 ⇒ 没有任何事件
+ * ⇒ 它恒为 false，即「假装在线」，拦不住本崩溃。两者判的不是同一件事，不能互相替代。
+ *
+ * @return true = 协议栈已就绪（可安全调用 SNTP/HTTP）；false = 裸板，必须跳过网络调用
+ */
+static bool net_stack_is_up(void)
+{
+    /* esp_netif_init() 会注册默认接口；未初始化时接口数为 0。
+     * 这个查询本身不碰 lwip 邮箱，协议栈没起来时调用它也是安全的。 */
+    return esp_netif_get_nr_of_ifs() > 0;
+}
+
 static void sntp_time_sync_init(void)
 {
     setenv("TZ", REMINDER_TZ, 1);
@@ -474,7 +509,7 @@ static void sntp_time_sync_init(void)
                 {
                     struct timeval tv = {.tv_sec = (time_t)saved, .tv_usec = 0};
                     settimeofday(&tv, NULL);
-                    s_ctx.sntp_synced = true;  /* 有可用时间 → 放行闹钟等时间相关功能 */
+                    s_ctx.sntp_synced = true;   /* 有可用时间 → 放行闹钟等时间相关功能 */
                     s_ctx.time_from_nvs = true; /* 但标记为兜底 → 日历暂停触发 */
 
                     struct tm t;
@@ -487,6 +522,18 @@ static void sntp_time_sync_init(void)
                 nvs_close(handle);
             }
         }
+    }
+
+    /* ★ 裸板拦截（2026-09-14）：协议栈没起来时绝不能碰 SNTP，否则 lwip 断言 abort。
+     * 判据与理由详见上方 net_stack_is_up() 的注释。
+     * 注意【只跳过 SNTP 本身】——上面那段 NVS 兜底时间回填【必须照常执行】，
+     * 它是裸板/断网下时间、日历、闹钟能正常显示的唯一来源（回填后会把
+     * sntp_synced 置 true，放行所有时间相关 UI）。 */
+    if (!net_stack_is_up())
+    {
+        ESP_LOGW(TAG, "TCP/IP 协议栈未初始化（裸板调试：WiFi 步骤被注释），"
+                      "跳过 SNTP；时间走 NVS 兜底，闹钟/日历/天气均使用上次缓存");
+        return;
     }
 
     ESP_LOGI(TAG, "初始化 SNTP 时间同步... 时区=%s", REMINDER_TZ);
@@ -682,6 +729,33 @@ static void url_encode(const char *src, char *dst, size_t dst_size);
 
 static esp_err_t weather_fetch_and_notify(void)
 {
+    /* ★ 裸板拦截（2026-09-14 补充）：本函数是【所有天气拉取路径的唯一汇合点】，
+     * 拦在这里才拦得全。
+     *
+     * 【为什么 init 处拦了还会崩】上一版只拦了 reminder_weather_fetch_now()，
+     * 但那个函数只负责【往队列投事件】；事件被 reminder_task 消费后仍会走到本函数
+     * 发真正的 HTTP。而天气页触摸进入时 weather_page_show() 会投一次事件
+     * （ui_port.c:4929），定时播报也会投 —— 两条路都绕过了 init 处的拦截，
+     * 于是崩在 DNS 解析：
+     *     assert failed: tcpip_send_msg_wait_sem  tcpip.c:449 (Invalid mbox)
+     *     Backtrace: ... getaddrinfo → esp_tls → esp_http_client_perform
+     *                → weather_http_request → weather_get → weather_fetch_and_notify
+     *                → reminder_task
+     *
+     * 【为什么用 net_stack_is_up 而不是 bsp_wifi_is_offline_mode】理由同
+     * net_stack_is_up() 的注释：后者在裸板下恒为 false（无 WiFi 事件），拦不住。
+     * 两个判据并列使用，各拦一种场景。
+     *
+     * 【返回 ESP_FAIL 是否有副作用】没有。调用方（reminder_task 的
+     * REM_EVT_WEATHER_FETCH 分支）只打印失败日志，不做重试、不改状态；
+     * 天气页继续显示 NVS 里的上次缓存（nvs_load_weather_data 已在 init 载入）。 */
+    if (!net_stack_is_up())
+    {
+        ESP_LOGW(TAG, "TCP/IP 协议栈未初始化（裸板调试），跳过天气拉取，"
+                      "天气页显示 NVS 上次缓存");
+        return ESP_FAIL;
+    }
+
 #if WEATHER_PROVIDER == 0
 #define WEATHER_PROVIDER_NAME "和风"
 #else
@@ -1373,6 +1447,17 @@ esp_err_t reminder_init(reminder_trigger_cb_t cb)
     /* ★ 离线拦截：下面两步都是同步阻塞 HTTP（IP 定位 + 天气拉取），断网时每一步都要
      *   走完 DNS 解析失败 → connect 超时的完整链路（数秒），把开机流程白白拖慢。
      *   离线时直接跳过：城市用 NVS 里的配置，天气用 NVS 里的上次缓存，均已在上面载入。 */
+    /* ★ 裸板拦截（2026-09-14）：与 SNTP 同理，协议栈没起来时这两步的 HTTP 调用
+     * 同样会碰 lwip。原判据 bsp_wifi_is_offline_mode() 在裸板下恒为 false
+     * （那个标志只由 WiFi 事件置位，裸板无事件），拦不住，故并列补上本判据。
+     * 判据说明详见 net_stack_is_up() 注释。 */
+    if (!net_stack_is_up())
+    {
+        ESP_LOGW(TAG, "TCP/IP 协议栈未初始化（裸板调试），跳过 IP 定位与天气拉取"
+                      "（使用 NVS 缓存数据）");
+        return ESP_OK;
+    }
+
     if (bsp_wifi_is_offline_mode())
     {
         ESP_LOGW(TAG, "离线模式，跳过 IP 定位与天气拉取（使用 NVS 缓存数据）");
@@ -1397,8 +1482,12 @@ void reminder_on_offline_mode(void)
         return;
 
 #ifndef REMINDER_MOCK_TIME
-    /* 停掉 SNTP 轮询：射频已关，UDP 包发不出去，留着纯属周期性空转 */
-    esp_sntp_stop();
+    /* 停掉 SNTP 轮询：射频已关，UDP 包发不出去，留着纯属周期性空转。
+     * ★ 裸板守卫（2026-09-14）：esp_sntp_stop() 内部同样走 tcpip_callback，
+     *   协议栈没起来时调用它会复发同一条 (Invalid mbox) 断言。而裸板下 SNTP
+     *   本就没 init（见 sntp_time_sync_init 的拦截），没什么可停，直接跳过。 */
+    if (net_stack_is_up())
+        esp_sntp_stop();
 #endif
 
     /* 关闭定时天气拉取：避免 07:30/11:30/15:30/19:30 四个时间点各白跑一次超时链路。
@@ -1477,7 +1566,9 @@ void reminder_deinit(void)
     }
 
 #ifndef REMINDER_MOCK_TIME
-    esp_sntp_stop();
+    /* ★ 裸板守卫（2026-09-14）：同 reminder_on_offline_mode 处的理由 */
+    if (net_stack_is_up())
+        esp_sntp_stop();
 #endif
     s_ctx.initialized = false;
     ESP_LOGI(TAG, "提醒系统已销毁");
@@ -2024,7 +2115,9 @@ esp_err_t reminder_auto_locate_city(void)
     // 1. 调用新组件的 IP 定位接口
     location_info_t *loc = get_city_by_ip(NULL);
 
-    if (loc == NULL || loc->city == NULL)
+    // if (loc == NULL || loc->city == NULL)
+    if (loc == NULL || (loc->province == NULL && loc->city == NULL))
+
     {
         ESP_LOGE(TAG, "IP 定位失败，保留默认城市");
         if (loc)
@@ -2036,11 +2129,17 @@ esp_err_t reminder_auto_locate_city(void)
     xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
 
     // 心知天气直接通过中文城市名（如 "北京"）即可查询，无需繁琐的 GeoAPI 转换
-    strncpy(s_ctx.weather_cfg.city_name, loc->city, sizeof(s_ctx.weather_cfg.city_name) - 1);
+    // strncpy(s_ctx.weather_cfg.city_name, loc->city, sizeof(s_ctx.weather_cfg.city_name) - 1);
+    strncpy(s_ctx.weather_cfg.city_name, loc->province ? loc->province : loc->city,
+            sizeof(s_ctx.weather_cfg.city_name) - 1);
+
     s_ctx.weather_cfg.city_name[sizeof(s_ctx.weather_cfg.city_name) - 1] = '\0';
 
     // city_code 可以废弃或直接用中文名覆盖，保证向后兼容
-    strncpy(s_ctx.weather_cfg.city_code, loc->city, sizeof(s_ctx.weather_cfg.city_code) - 1);
+    // strncpy(s_ctx.weather_cfg.city_code, loc->city, sizeof(s_ctx.weather_cfg.city_code) - 1);
+    strncpy(s_ctx.weather_cfg.city_code, loc->province ? loc->province : loc->city,
+            sizeof(s_ctx.weather_cfg.city_code) - 1);
+
     s_ctx.weather_cfg.city_code[sizeof(s_ctx.weather_cfg.city_code) - 1] = '\0';
 
     nvs_save_weather_config();

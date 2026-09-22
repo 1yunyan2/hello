@@ -62,7 +62,7 @@ esp_err_t iot_servo_init(ledc_mode_t speed_mode, const servo_config_t *config)
     }
 
     ledc_timer_config_t ledc_timer = {
-        .clk_cfg = LEDC_AUTO_CLK,
+        .clk_cfg = LEDC_USE_XTAL_CLK,
         .duty_resolution = SERVO_LEDC_INIT_BITS, // resolution of PWM duty
         .freq_hz = config->freq,                 // frequency of PWM signal
         .speed_mode = speed_mode,                // timer mode

@@ -72,3 +72,14 @@ CONFIG_LV_USE_GIF=y
 
 #FreeRTOS 定时器服务任务的堆栈大小，默认2048字节
 CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096
+
+# --- 【2026-09-17 恢复】误点芯片按钮导致 sdkconfig 被按默认值整份重生成，
+#     以下三项本地调优被抹掉，导致开机 logo/每帧 GIF 都回外挂 flash 逐区域读，
+#     CPU0 被 taskLVGL 吃满、IDLE0 饿死 10 秒触发 task_wdt（日志见 2026-09-17）。
+#     写进本文件（随 git 跟踪）后，以后 set-target / 误点芯片按钮都不会再丢。
+# --- 图片解码缓存：0 = 关闭 → 每次重绘都重新解码并回文件读
+CONFIG_LV_CACHE_DEF_SIZE=1048576
+# --- bin 图整图载入 RAM：关掉后走 fs_read_file_at 逐区域 lseek+read 外挂 flash
+CONFIG_LV_BIN_DECODER_RAM_LOAD=y
+# --- main 任务栈：3584 只剩一半，峰值用过约 2472B，余量不足 1.2KB
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
