@@ -286,6 +286,17 @@ void ui_pause_main_gif(void);
 void ui_resume_main_gif(void);
 
 /**
+ * @brief 开启/关闭主界面「空闲态自动轮播」（空闲 GIF + 随附空闲舵机动作）
+ *
+ * 调试 GIF/舵机适配时置 false，彻底停掉空闲态自动轮播（ready_cb 不排下一张、
+ * resume_loop 不恢复、开机不补投首张空闲动作），让「循环播放当前情绪」或「MQTT
+ * 指令」独占。情绪/状态切图走 pending_path 分支，不受本开关影响。
+ * 正式产品置 true 恢复待机空闲表现。默认 true。
+ * @param enabled true=开启空闲轮播（默认） false=彻底禁用
+ */
+void ui_set_idle_carousel_enabled(bool enabled);
+
+/**
  * @brief 显示「低功耗常亮时钟」（进深度待机，背光渐暗前调用，跨线程安全）
  *
  * 二级低功耗的终点由「渐变全黑 + 关显示控制器」改为「渐变到 10% + 常驻显示时间」，

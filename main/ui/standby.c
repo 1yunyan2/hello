@@ -85,9 +85,9 @@ static const char *TAG = "STANDBY";
  *   duty = BSP_MOTOR_DUTY_MAX - BSP_MOTOR_DUTY_MAX*本值/100，与 bsp_motor_set() 同源。
  * 【与 BSP_MOTOR_DEFAULT_STRENGTH 的区别】那条是触摸反馈的默认强度（100%），
  *   属于短脉冲；本条是持续 3 秒的长震，独立成宏以便单独调弱不影响触摸手感。 */
-#define STANDBY_SHUTDOWN_WARN_STRENGTH 20 ///< 关机前震动提醒强度（%），0~100
+#define STANDBY_SHUTDOWN_WARN_STRENGTH 60 ///< 关机前震动提醒强度（%），0~100
 
-#define STANDBY_CLOCK_BK_PCT 2 ///< 低功耗常亮时钟的背光亮度（%），占位可自调
+#define STANDBY_CLOCK_BK_PCT 10 ///< 低功耗常亮时钟的背光亮度（%），占位可自调
 
 // ─── 进/退低功耗的「三段式转场」时长（2026-08-20）──────────────────────────
 //   【为什么要三段】渐变的是【背光】，画面是瞬间切换的。若在屏幕亮着时切画面，
@@ -360,8 +360,8 @@ static void enter_deep_standby(void)
     bsp_servo_clear_abort();
     //    5c. 兜底归中：worker 收尾已归中则三轴行程≈0 瞬间返回（无害）；worker 本来空闲的
     //        场景则这里真正把三轴带回 90°（阻塞插值，走到位才返回）。
-    bsp_servo_move_all_parallel(HEAD_CENTER_DEG, HEAD_CENTER_DEG, HEAD_CENTER_DEG,
-                                STANDBY_SERVO_CENTER_SPEED);
+    bsp_servo_move_all_parallel(HEAD_CENTER_DEG, ARM_CENTER_DEG, ARM_CENTER_DEG,
+                                STANDBY_SERVO_CENTER_SPEED); // 头90°/臂15°（2026-09-16 头臂分离）
     //    5d. 短等 50ms 让最后一个 PWM 周期（50Hz=20ms）完整输出，再停三路 PWM 失力省电。
     vTaskDelay(pdMS_TO_TICKS(50));
     bsp_servo_idle();

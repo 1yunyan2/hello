@@ -126,20 +126,20 @@ static void alarm_edit_zoom_cancel(void); // 取消「1秒后转场」定时器�
 __attribute__((unused)) static void alarm_edit_back(void);
 
 /* ── 单层横向功能盘：渲染与导航 前向声明 ── */
-static void menu_enter_fn_page(fn_page_t page);          // 从功能盘进入指定功能页（复用功能菜单）
-static void app_enter_time(void);                        // 功能盘项：时间 → FN_PAGE_TIME
-static void app_enter_calendar(void);                    // 功能盘项：日历 → FN_PAGE_CALENDAR
-static void app_enter_alarm(void);                       // 功能盘项：闹钟 → 直接进闹钟编辑
-static void app_enter_countdown(void);                   // 功能盘项：定时器 → FN_PAGE_COUNTDOWN
-static void app_enter_weather(void);                     // 功能盘项：天气 → FN_PAGE_WEATHER
-static void enter_whack(void);                           // 功能盘项：打地鼠 → UI_VIEW_GAME + games_start
-static void enter_race(void);                            // 功能盘项：赛车 → UI_VIEW_GAME + games_start
-static void enter_jump(void);                            // 功能盘项：跳一跳 → UI_VIEW_GAME + games_start
-static void home_render(void);                           // 渲染功能盘（居中大图标 + 名称）
-static void home_icon_cache_init(void);                  // 功能盘图标预读进 PSRAM（幂等）
-static void ui_home_fade_timer_cb(lv_timer_t *t);        // 进功能盘背光渐变 timer 回调
-static void home_jelly(int dir);                         // 果冻弹动切换（dir=+1 下一个 / -1 上一个）
-static void back_to_home(void);                          // 功能页/游戏 摸腹背 → 返回功能盘
+static void menu_enter_fn_page(fn_page_t page);   // 从功能盘进入指定功能页（复用功能菜单）
+static void app_enter_time(void);                 // 功能盘项：时间 → FN_PAGE_TIME
+static void app_enter_calendar(void);             // 功能盘项：日历 → FN_PAGE_CALENDAR
+static void app_enter_alarm(void);                // 功能盘项：闹钟 → 直接进闹钟编辑
+static void app_enter_countdown(void);            // 功能盘项：定时器 → FN_PAGE_COUNTDOWN
+static void app_enter_weather(void);              // 功能盘项：天气 → FN_PAGE_WEATHER
+static void enter_whack(void);                    // 功能盘项：打地鼠 → UI_VIEW_GAME + games_start
+static void enter_race(void);                     // 功能盘项：赛车 → UI_VIEW_GAME + games_start
+static void enter_jump(void);                     // 功能盘项：跳一跳 → UI_VIEW_GAME + games_start
+static void home_render(void);                    // 渲染功能盘（居中大图标 + 名称）
+static void home_icon_cache_init(void);           // 功能盘图标预读进 PSRAM（幂等）
+static void ui_home_fade_timer_cb(lv_timer_t *t); // 进功能盘背光渐变 timer 回调
+static void home_jelly(int dir);                  // 果冻弹动切换（dir=+1 下一个 / -1 上一个）
+static void back_to_home(void);                   // 功能页/游戏 摸腹背 → 返回功能盘
 /* 【2026-09-01】功能层渐变退出启动器（不震动）。实现在文件后段
  * （紧邻 ui_func_layer_exit_to_main）；这里声明是因为空闲超时回调
  * menu_idle_timeout_cb 位置更靠前，要调用它。 */
@@ -158,11 +158,11 @@ static void countdown_enter_start_timing(void);          // 渐变进入第二�
  * 启动器实现在 countdown_exit_fade_timer_cb 附近（与它共用状态机）；
  * 五个暗态动作各自就近实现在原硬切代码的位置上。 */
 static bool expire_fade_start(void (*dark_cb)(void), bool quiet_main_screen, const char *what);
-static void countdown_expired_dark_action(void);       // 主界面 → 番茄钟到期画面
-static void alarm_ringing_dark_action(void);           // 主界面 → 闹钟响铃画面
-static void countdown_tick_expired_dark_action(void);  // 番茄钟运行界面 → 到期画面（人在页上）
-static void countdown_reset_dark_action(void);         // 番茄钟到期画面 → 主界面空闲 GIF
-static void alarm_reset_dark_action(void);             // 闹钟响铃画面 → 主界面空闲 GIF
+static void countdown_expired_dark_action(void);      // 主界面 → 番茄钟到期画面
+static void alarm_ringing_dark_action(void);          // 主界面 → 闹钟响铃画面
+static void countdown_tick_expired_dark_action(void); // 番茄钟运行界面 → 到期画面（人在页上）
+static void countdown_reset_dark_action(void);        // 番茄钟到期画面 → 主界面空闲 GIF
+static void alarm_reset_dark_action(void);            // 闹钟响铃画面 → 主界面空闲 GIF
 /* 【2026-09-01】退出功能层回主界面的暗态动作本体（藏 menu_panel + 显 gif_obj +
  * s_view=MAIN + ui_resume_main_gif_loop 拉回空闲轮播与舵机动作）。实现在文件后段
  * （紧邻 ui_home_fade_timer_cb）；这里声明是因为上面两个到期暗态动作位置更靠前，
@@ -779,6 +779,10 @@ static volatile int64_t s_first_online_defer_until_us = 0;
  *                          对话中若收到情绪 pending（is_state=false）则丢弃，不抢状态 GIF。
  * 两个标志均由 LVGL 线程 / 状态接口写，跨线程仅做布尔赋值（原子），无需加锁。 */
 static volatile bool s_neutral_active = false;
+/* 空闲态自动轮播总开关（2026-09-17 调试用）：false = 彻底停掉主界面空闲 GIF 自动轮播
+ * + 随附空闲舵机动作（ready_cb 不排下一张、resume_loop 不恢复、开机不补投首张）。
+ * 正式产品需 true；调试 GIF/舵机适配时置 false（由 ui_set_idle_carousel_enabled 设置）。 */
+static volatile bool s_idle_carousel_enabled = true;
 static volatile bool s_gif_pending_is_state = false;
 
 /* 主时钟 UI */
@@ -3095,6 +3099,8 @@ static void main_gif_ready_cb(lv_event_t *e)
     // 状态回 IDLE 时 ui_set_neutral_gif_state(NEUTRAL_IDLE) 会清此标志并恢复循环。
     if (s_neutral_active)
         return;
+    if (!s_idle_carousel_enabled)
+        return; // 调试禁用空闲态自动轮播：不排下一张空闲图（情绪/状态切图走 pending_path 不受影响）
     if (s_gif_pending_idx >= 0)
         return; // 已有待切换,避免本轮重复排队
     s_gif_pending_idx = main_gif_pick_next_index(s_gif_cur_index);
@@ -3350,7 +3356,7 @@ static void main_gif_switch_timer_cb(lv_timer_t *t)
              *   "动作→切图"的回边；且只在开机揭图这一次执行，READY 主循环完全不动。
              * 【为什么判 interaction_is_playing】揭图瞬间若已有动作在跑（如唤醒/状态
              *   动作抢先），补投会排队叠加成"开机连做两个动作"，故让位跳过。 */
-            if (s_view == UI_VIEW_MAIN && !interaction_is_playing() &&
+            if (s_idle_carousel_enabled && s_view == UI_VIEW_MAIN && !interaction_is_playing() &&
                 s_gif_cur_index >= 0 && (size_t)s_gif_cur_index < IDLE_ACTION_COUNT)
             {
                 ESP_LOGI("GIFDBG", "timer_cb: 开机补投首张舵机动作 idx=%d", s_gif_cur_index);
@@ -3455,7 +3461,10 @@ static void main_gif_switch_timer_cb(lv_timer_t *t)
     // 动作播放中：不在这里自动切图（让位）。空闲动作 gif_path=NULL 不切图、keep_screen=true
     // 不 resume，故它播放期间被挡也不会停摆——下一张只由 GIF 的 READY 驱动（ready_cb），解耦。
     if (interaction_is_playing())
+    {
+        ESP_LOGI("GIFDBG", "切图被舵机挡住→丢弃 idx=%d", idx);
         return;
+    }
 
     /* ── 深度待机（唯一低功耗档）中：屏已关(bsp_board_lcd_disp_off)、舵机 PWM 已停
      * (bsp_servo_idle)，直接丢弃本次切图，绝不触发任何情绪动作 / 舵机 PWM。────────────
@@ -3705,6 +3714,8 @@ void ui_resume_main_gif_loop(void)
         ESP_LOGI("GIFDBG", "resume_loop: 对话态中，忽略恢复请求（防抢状态 GIF）");
         return;
     }
+    if (!s_idle_carousel_enabled)
+        return; // 调试禁用空闲态：动作播完不恢复空闲轮播
     if (s_gif_switch_tmr == NULL)
         return;
     s_gif_pending_path = NULL; // 确保走随机分支而非情绪指定分支
@@ -3775,6 +3786,14 @@ void ui_resume_main_gif(void)
     }
     if (s_gif_switch_tmr != NULL)
         lv_timer_resume(s_gif_switch_tmr); // 恢复「切下一张」自动轮播排队
+}
+
+/**
+ * @brief 开启/关闭主界面「空闲态自动轮播」（见 ui_port.h 声明）
+ */
+void ui_set_idle_carousel_enabled(bool enabled)
+{
+    s_idle_carousel_enabled = enabled;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -9551,16 +9570,25 @@ void ui_init(void)
  *
  * 注：背部位置后续可能去除，届时删 emo_group_back / 头+背组的对应分支即可。
  * ═══════════════════════════════════════════════════════════════ */
+/* ── 【调试开关】锁定触摸触发的情绪（2026-09-04 新增）────────────────────────
+ * 情绪是从组里随机抽的（下方 play_random_emotion 的 esp_random）。调某一个情绪
+ * 的动作序列时，摸半天碰不上、碰上了也不确定是不是它，没法验证。
+ *
+ * 打开下面这行 → 摸任意位置都播这一个情绪，专心调它；调完注释掉即恢复随机。
+ * 可填任意 robot_emotion_t 枚举值，如 EMO_HAPPY / EMO_ANGRY / EMO_EXCITED。
+ * ─────────────────────────────────────────────────────────────────────────── */
+// #define IA_DEBUG_FORCE_EMOTION EMO_HAPPY
+
 static const robot_emotion_t emo_group_head[] = {
-    EMO_HAPPY, EMO_CURIOUS, EMO_TSUNDERE, EMO_TICKLISH, EMO_SLEEPY, EMO_GRIEVED};
+    EMO_HAPPY, EMO_CURIOUS, EMO_TSUNDERE_BASE, EMO_TICKLISH, EMO_SLEEPY, EMO_GRIEVED};
 static const robot_emotion_t emo_group_abdomen[] = {
     EMO_COMFORTABLE, EMO_ACT_CUTE, EMO_ANGRY, EMO_SHY, EMO_SURPRISED, EMO_SLUGGISH};
 static const robot_emotion_t emo_group_back[] = {
-    EMO_HEALING, EMO_TSUNDERE, EMO_GRIEVED, EMO_EXCITED, EMO_CURIOUS, EMO_TICKLISH};
+    EMO_HEALING, EMO_TSUNDERE_BASE, EMO_GRIEVED, EMO_EXCITED, EMO_CURIOUS, EMO_TICKLISH};
 static const robot_emotion_t emo_group_head_abdomen[] = {
     EMO_EXCITED, EMO_SHY_RUB, EMO_COMFORTABLE_ROLL, EMO_TSUNDERE_PET, EMO_SLEEPY, EMO_SURPRISED};
 static const robot_emotion_t emo_group_head_back[] = {
-    EMO_HEALING, EMO_TSUNDERE, EMO_GRIEVED, EMO_EXCITED, EMO_CURIOUS, EMO_TICKLISH};
+    EMO_HEALING, EMO_TSUNDERE_BASE, EMO_GRIEVED, EMO_EXCITED, EMO_CURIOUS, EMO_TICKLISH};
 static const robot_emotion_t emo_group_abdomen_back[] = {
     EMO_SLUGGISH_SIT, EMO_SURPRISED_HUG, EMO_TICKLISH_WIGGLE, EMO_COMFORTABLE, EMO_ANGRY, EMO_EXCITED};
 
@@ -9590,8 +9618,19 @@ static void play_random_emotion(const robot_emotion_t *group, size_t count)
         ESP_LOGI("TOUCH", "对话进行中，屏蔽情绪触摸（保持状态中性 GIF）");
         return;
     }
+#ifdef IA_DEBUG_FORCE_EMOTION
+    /* ★调试用：锁定情绪（2026-09-04 新增）
+     * 情绪是从组里随机抽的，调某一个情绪的动作序列时根本碰不上、也不知道
+     * 这次抽中的是不是它，无法验证。定义本宏后摸哪个位置都播指定情绪。
+     * 调完把宏那行注释掉即恢复随机，见本文件上方 IA_DEBUG_FORCE_EMOTION 定义处。 */
+    robot_emotion_t emo = IA_DEBUG_FORCE_EMOTION;
+    ESP_LOGW("TOUCH", "【调试】情绪已锁定为 %d（IA_DEBUG_FORCE_EMOTION 生效，随机被跳过）", (int)emo);
+    (void)group;
+    (void)count;
+#else
     robot_emotion_t emo = group[esp_random() % count];
     ESP_LOGI("TOUCH", "触摸触发情绪: %d（组内随机 %u 选 1）", (int)emo, (unsigned)count);
+#endif
     ui_interaction_play(emo);
 }
 

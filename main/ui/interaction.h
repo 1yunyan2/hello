@@ -33,7 +33,7 @@ typedef enum
 {
     EMO_HAPPY = 0,        ///< 0: 开心（基础）
     EMO_CURIOUS,          ///< 1: 好奇（基础）
-    EMO_TSUNDERE,         ///< 2: 傲娇（基础）
+    EMO_TSUNDERE_BASE,    ///< 2: 傲娇1（傲娇基础态·别过脸哼，配 2_1.gif）
     EMO_TICKLISH,         ///< 3: 怕痒（基础）
     EMO_SLEEPY,           ///< 4: 犯困（基础）
     EMO_GRIEVED,          ///< 5: 委屈（基础）
@@ -47,14 +47,110 @@ typedef enum
     EMO_EXCITED,          ///< 13: 兴奋（基础）
     EMO_SHY_RUB,          ///< 14: 害羞蹭蹭（害羞进阶，头部左右轻蹭）
     EMO_COMFORTABLE_ROLL, ///< 15: 舒服到打滚（舒服进阶，头部大幅左右摇摆）
-    EMO_TSUNDERE_PET,     ///< 16: 傲娇求摸（傲娇进阶，头部微抬+手臂轻抬）
-    EMO_SLUGGISH_SIT,     ///< 17: 慵懒瘫坐（慵懒进阶，双臂完全下垂+头部低垂）
-    EMO_SURPRISED_HUG,    ///< 18: 惊喜抱抱（惊喜进阶，双臂快速上举张开）
-    EMO_TICKLISH_WIGGLE   ///< 19: 怕痒到扭动（怕痒进阶，头部+双臂极速抖动）
+    EMO_TSUNDERE_PET,     ///< 16: 傲娇求摸（配 2_4.gif，双臂抬到胸前绷住+头扭开让位）
+    EMO_TSUNDERE_PEEK,    ///< 17: 傲娇3（配 2_3.gif，偷瞄）
+    EMO_TSUNDERE_ROLL,    ///< 18: 傲娇2（配 2_2.gif，甩头→偷瞄→被发现，三要素最全）
+    EMO_SLUGGISH_SIT,     ///< 19: 慵懒瘫坐（慵懒进阶，双臂完全下垂+头部低垂）
+    EMO_SURPRISED_HUG,    ///< 20: 惊喜抱抱（惊喜进阶，双臂快速上举张开）
+    EMO_TICKLISH_WIGGLE,  ///< 21: 怕痒到扭动（怕痒进阶，头部+双臂极速抖动）
+    EMO_NEUTRAL1,         ///< 22: 中性1
+    EMO_NEUTRAL2,         ///< 23: 中性2
+    EMO_NEUTRAL3,         ///< 24: 中性3
+    EMO_NEUTRAL4,         ///< 25: 中性4
+    EMO_NEUTRAL5,         ///< 26: 中性5
+    EMO_NEUTRAL6,         ///< 27: 中性6
+    EMO_EXCITED1,         ///< 28: 兴奋3_1（星星眼·最亢奋，主角是双臂）
+    EMO_EXCITED2,         ///< 29: 兴奋3_2（圆眼笑·憨，起手慢半拍）
+    EMO_EXCITED3,         ///< 30: 兴奋3_3（眨眼笑·俏皮，左右臂刻意不对称）
+    EMO_EXCITED4,         ///< 31: 兴奋3_4（星星眼，头先动臂后动，相位相反）
+    EMO_CURIOUS1,         ///< 32: 好奇①  4_1.gif（好奇）
+    EMO_CURIOUS2,         ///< 33: 好奇②  4_2.gif（好奇2）
+    EMO_CURIOUS3,         ///< 34: 好奇③  4_3.gif（好奇 2）
+    EMO_GRIEVED1,         ///< 35: 委屈①  5_1.gif（委屈）
+    EMO_GRIEVED2,         ///< 36: 委屈②  5_2.gif（委屈2）
+    EMO_SHY1,             ///< 37: 害羞①  6_1.gif（害羞）
+    EMO_SHY2,             ///< 38: 害羞②  6_2.gif（害羞蹭蹭）
+    EMO_TICKLISH1,        ///< 39: 怕痒①  7_1.gif（怕痒）
+    EMO_TICKLISH2,        ///< 40: 怕痒②  7_2.gif（怕痒2）
+    EMO_TICKLISH3,        ///< 41: 怕痒③  7_3.gif（怕痒 2）
+    EMO_TICKLISH4,        ///< 42: 怕痒④  7_4.gif（怕痒到扭动）
+    EMO_SURPRISED1,       ///< 43: 惊喜①  8_1.gif（惊喜）
+    EMO_SURPRISED2,       ///< 44: 惊喜②  8_2.gif（惊喜2）
+    EMO_SURPRISED3,       ///< 45: 惊喜③  8_3.gif（惊喜抱抱）
+    EMO_SLUGGISH1,        ///< 46: 慵懒①  9_1.gif（慵懒2，全组仅此一张）
+    EMO_ACT_CUTE1,        ///< 47: 撒娇① 10_1.gif（撒娇，全组仅此一张）
+    EMO_HEALING1,         ///< 48: 治愈① 11_1.gif（治愈2，全组仅此一张）
+    EMO_SLEEPY1,          ///< 49: 犯困① 12_1.gif（犯困）
+    EMO_SLEEPY2,          ///< 50: 犯困② 12_2.gif（犯困 2）
+    EMO_ANGRY1,           ///< 51: 生气① 13_1.gif（生气）
+    EMO_ANGRY2,           ///< 52: 生气② 13_2.gif（生气 2）
+    EMO_COMFORTABLE1,     ///< 53: 舒服① 14_1.gif（舒服）
+    EMO_COMFORTABLE2,     ///< 54: 舒服② 14_2.gif（舒服到打滚）
+    EMO_COMFORTABLE3,     ///< 55: 舒服③ 14_3.gif（舒服(1)）
+
+    /* ── 2026-09-21 中性四张补齐 ───────────────────────────────────────────
+     * ★这里【不是】它们"应该"待的位置：EMO_NEUTRAL1~6 在 22~27（本枚举头部），
+     *   而 7/8/9 排在 56~58 的末尾。原因是硬规矩（见 [[emotion_4x_14x_sets]]）：
+     *   【新枚举一律末尾追加，绝不插队】——插在中间会让其后所有值整体 +1，
+     *   而 MQTT 下发 / NVS 持久化都是按【数值】认情绪的，一插队就整体错位。
+     *   （反例：EMO_TSUNDERE_ROLL 当年插在 18，使 18~30 全部 +1，已在记忆里留档。）
+     *   故编号"难看"是刻意的代价，功能上等价。 */
+    EMO_NEUTRAL7,         ///< 56: 中性7  1_7.gif（中性聆听1-1-1）
+    EMO_NEUTRAL8,         ///< 57: 中性8  1_8.gif（中性聆听2）
+    EMO_NEUTRAL9,         ///< 58: 中性9  1_9.gif（中性聆听3）
 } robot_emotion_t;
 
-/** 情绪矩阵总数（EMO_TICKLISH_WIGGLE 是最后一项，值为 count-1）；随机抽情绪用 */
-#define EMOTION_COUNT ((int)EMO_TICKLISH_WIGGLE + 1)
+// typedef enum
+// {
+//     EMO_NEUTRAL1,      ///< 1: 中性1
+//     EMO_NEUTRAL2,      ///< 2: 中性2
+//     EMO_NEUTRAL3,      ///< 3: 中性3
+//     EMO_NEUTRAL4,      ///< 4: 中性4
+//     EMO_NEUTRAL5,      ///< 5: 中性5
+//     EMO_NEUTRAL6,      ///< 6: 中性6
+//     EMO_NEUTRAL7,      ///< 7: 中性7聆听
+//     EMO_NEUTRAL8,      ///< 8: 中性8聆听
+//     EMO_NEUTRAL9,      ///< 9: 中性9聆听
+//     EMO_TSUNDERE_BASE, ///< 10: 傲娇1（傲娇基础态·别过脸哼，配 2_1.gif）
+//     EMO_TSUNDERE_ROLL, ///< 11: 傲娇2（配 2_2.gif，甩头→偷瞄→被发现，三要素最全）
+//     EMO_TSUNDERE_PEEK, ///< 12: 傲娇3（配 2_3.gif，偷瞄）
+//     EMO_TSUNDERE_PET,  ///< 13: 傲娇4求摸（配 2_4.gif，双臂抬到胸前绷住+头扭开让位）
+//     EMO_EXCITED1,      ///< 14: 兴奋3_1（星星眼·最亢奋，主角是双臂）
+//     EMO_EXCITED2,      ///< 15: 兴奋3_2（圆眼笑·憨，起手慢半拍）
+//     EMO_EXCITED3,      ///< 16: 兴奋3_3（眨眼笑·俏皮，左右臂刻意不对称）
+//     EMO_EXCITED4,      ///< 17: 兴奋3_4（星星眼，头先动臂后动，相位相反）
+//     EMO_CURIOUS1,      ///< 18: 好奇①  4_1.gif（好奇）
+//     EMO_CURIOUS2,     ///< 19: 好奇②  4_2.gif（好奇2）
+//     EMO_CURIOUS3,     ///< 20: 好奇③  4_3.gif（好奇 2）
+//     EMO_GRIEVED1,     ///< 21: 委屈①  5_1.gif（委屈）
+//     EMO_GRIEVED2,     ///< 22: 委屈②  5_2.gif（委屈2）
+//     EMO_SHY1,         ///< 23: 害羞①  6_1.gif（害羞）
+//     EMO_SHY2,         ///< 24: 害羞②  6_2.gif（害羞蹭蹭）
+//     EMO_TICKLISH1,    ///< 25: 怕痒①  7_1.gif（怕痒）
+//     EMO_TICKLISH2,    ///< 26: 怕痒②  7_2.gif（怕痒2）
+//     EMO_TICKLISH3,    ///< 27: 怕痒③  7_3.gif（怕痒 2）
+//     EMO_TICKLISH4,    ///< 28: 怕痒④  7_4.gif（怕痒到扭动）
+//     EMO_SURPRISED1,   ///< 29: 惊喜①  8_1.gif（惊喜）
+//     EMO_SURPRISED2,   ///< 30: 惊喜②  8_2.gif（惊喜2）
+//     EMO_SURPRISED3,   ///< 31: 惊喜③  8_3.gif（惊喜抱抱）
+//     EMO_SLUGGISH1,    ///< 32: 慵懒①  9_1.gif（慵懒2，全组仅此一张）
+//     EMO_ACT_CUTE1,    ///< 33: 撒娇① 10_1.gif（撒娇，全组仅此一张）
+//     EMO_HEALING1,     ///< 34: 治愈① 11_1.gif（治愈2，全组仅此一张）
+//     EMO_SLEEPY1,      ///< 35: 犯困① 12_1.gif（犯困）
+//     EMO_SLEEPY2,      ///< 36: 犯困② 12_2.gif（犯困 2）
+//     EMO_ANGRY1,       ///< 37: 生气① 13_1.gif（生气）
+//     EMO_ANGRY2,       ///< 38: 生气② 13_2.gif（生气 2）
+//     EMO_COMFORTABLE1, ///< 39: 舒服① 14_1.gif（舒服）
+//     EMO_COMFORTABLE2, ///< 40: 舒服② 14_2.gif（舒服到打滚）
+//     EMO_COMFORTABLE3, ///< 41: 舒服③ 14_3.gif（舒服(1)）
+// } robot_emotion_t;
+
+/** 情绪矩阵总数（最后一个枚举值 +1）；随机抽情绪用
+ *  ⚠️ 新增枚举后必须同步挪到这里 → 现在锚在 EMO_NEUTRAL9(58)，故 = 59。
+ *     旧值锚在 EMO_EXCITED4 上，4_x~14_x 加进来后若不改，随机抽情绪会抽不到新情绪；
+ *     2026-09-21 补 1_7/1_8/1_9 时序末尾追加了 EMO_NEUTRAL7~9，故再挪一次。
+ *  ⚠️ 锚点必须永远指向【枚举里最大的那个值】（即末尾那个），不能指向语义上"更该在这"的值。 */
+#define EMOTION_COUNT ((int)EMO_NEUTRAL9 + 1)
 
 /**
  * @brief 单轴舵机动作参数（绝对角度，中心 = 90°）
@@ -72,6 +168,118 @@ typedef struct
     uint8_t count;  ///< 循环次数（0 = 该轴不参与本动作）
 } ActionStep_t;
 
+/** 动作序列每轴最大步数（超过则表里放不下；不够用就改大这个数）
+ *
+ * ★2026-09-11 由 8 提到 32。原因：情绪 19「怕痒扭动」头部已用满 8 步，
+ *   上限先于表达力成为瓶颈。代价仅 flash（表是 static const 放 flash，
+ *   不占内部 SRAM），每加 1 步约 240 字节。
+ * ⚠️ 改这个数必须同步另外两处，否则长序列会被静默截断：
+ *   - servo_manager.h  SERVO_SEQ_MAX_STEPS   （须相等）
+ *   - bsp_board.h      BSP_SERVO_SEQ_MAX_POINTS（须 ≥ 本值 +2，多的 2 个
+ *     位置留给"走向终点"和"归中"那两步，它们被拼进同一串点） */
+#define ACTION_SEQ_MAX_STEPS 32
+
+/**
+ * @brief 动作序列中的一步：目标角度 + 该步专属速度（2026-09-11 新增）
+ *
+ * 【为什么每步要带速度】真实生物很少匀速做完一整套动作，一个动作里往往有
+ *   两种节奏。例如"惊吓"应当是【猛地甩过去】+【余悸未消地慢慢晃回来】，
+ *   "害羞"是【慢慢低头】+【突然快速缩回】。旧结构整条序列共用一个速度，
+ *   这类对比做不出来，动作观感偏机械。
+ *
+ * 【怎么填】speed 留空（或填 0）= 沿用本轴的 seq_speed，第三位 hold_ms 留空
+ *   （或填 0）= 到位后不停留。所以不想变速、不想停顿的动作写法和以前一样，
+ *   一个额外的数字都不用填：
+ *
+ *       .seq = {
+ *           { 65.0f, SERVO_SPEED_VERY_FAST },  // 这一步单独用极快 —— 猛地甩出去
+ *           { 65.0f, 0, 400 },                 // ★原地停 400ms（到位后不动）
+ *           {115.0f },                         // 速度位留空 = 用下面的 seq_speed
+ *           { 70.0f },                         // 同上
+ *       },
+ *       .seq_len   = 4,
+ *       .seq_speed = SERVO_SPEED_MID,          // 未单独指定的步都用它
+ *
+ * ★2026-09-18 新增 hold_ms —— 这一位补上了执行层缺失的【时间】维度。
+ *
+ * 【为什么必须要它，堆重复点为什么不行】执行层每段的耗时 = |角度差| × speed，
+ *   时间的唯一来源是【位移】。所以"原地不动"耗时恒为 0，会被 frames<1 的钳位
+ *   压成 1 帧（约 20ms）就换下一点：
+ *     · 连写 6 个 {60.0f} 想表示"停在 60° 一会儿" ⇒ 实际只停约 6×20=120ms，看不出；
+ *     · 改成 {89.0f},{90.0f} 交替 ⇒ 1° 折算出 0 帧，照样钳成 1 帧，
+ *       与纯重复角度【耗时完全相同】，只是多了一次 1° 的方波抖动。
+ *   ⇒ 停顿时长写不出来的问题，只能用显式字段解决，不能靠数组凑。
+ *
+ * 【hold_ms 语义】走到本步角度后，原地保持 hold_ms 毫秒，再前往下一步。
+ *   与轴速【无关】：按毫秒计，快轴慢轴的 400ms 都是同样的墙上时间。
+ *   ⚠️ 停留会占用本步的步数（不额外占位），故加了停顿后要注意 seq_len 与
+ *      容量 ACTION_SEQ_MAX_STEPS 的余量。
+ */
+typedef struct
+{
+    float angle;      ///< 该步目标角度（度，0~180；超出由 bsp 软限位裁剪）
+    uint32_t speed;   ///< 该步速度（SERVO_SPEED_xxx）；★留空/0 = 沿用 seq_speed
+    uint32_t hold_ms; ///< ★到位后原地停留的毫秒数；★留空/0 = 不停留
+} ActionSeqStep_t;
+
+/**
+ * @brief 单轴动作序列（2026-09-04 新结构，取代 ActionStep_t 的"A↔B 往返 N 次"）
+ *
+ * 【一个轴的完整生命周期，四段】
+ *
+ *      90°(起始)  →  终点(target)  →  动作序列(seq)  →  归中 90°
+ *      固定           每情绪每轴各配      真正的动作内容      收尾
+ *
+ *   ① 起始永远是 90°（上电归中位）。
+ *   ② 终点 target：从 90° 走到这里，每个情绪、每个轴都可以不一样。
+ *   ③ 动作序列 seq：到了终点之后，依次走过 seq[0]、seq[1]... 这一串角度点。
+ *      这才是"这个情绪长什么样"的主体，步数不固定（seq_len 指定）。
+ *   ④ 归中：序列走完才归中，由 servo_manager worker 统一负责。
+ *
+ * 【为什么推翻 ActionStep_t】旧结构只能表达"A↔B 来回 N 次"，两个角度打死，
+ *   做不出"到位后先向左 30°、再向右 20°、再回来一点"这类多步动作；且旧执行
+ *   路径把三轴强行同步（速度取三轴最慢的那个，见 servo_manager.c），头和手臂
+ *   的幅度、快慢本来就该不同，被统一后全走样。新结构下三轴各走各的。
+ *
+ * 【三轴的时间关系】三轴独立推进，各走各的步数与速度，互不等待；
+ *   全部走完后才一起归中（归中本身仍是三轴同步的一次动作）。
+ *
+ * 【怎么配】
+ *      .head = {
+ *          .target    = 60.0f,           // 先从 90° 走到 60°
+ *          .speed     = SERVO_SPEED_MID, // 走到终点用中速
+ *          .seq       = {                // 到位后依次走这 4 个角度
+ *              {120.0f, SERVO_SPEED_VERY_FAST}, // 这一步单独变速（猛地甩过去）
+ *              {120.0f, 0, 300},                // ★在 120° 原地停 300ms
+ *              { 60.0f },                       // 速度留空 = 用下面的 seq_speed
+ *              {100.0f },
+ *              { 80.0f },
+ *          },
+ *          .seq_len   = 5,
+ *          .seq_speed = SERVO_SPEED_FAST, // 未单独指定的步都用它
+ *      },
+ *
+ *   某轴不参与本情绪：整个填 0（seq_len=0 且 target=0 视为不动，见执行函数）。
+ *   只走终点不做序列：填 target/speed，seq_len 留 0。
+ *
+ * ⚠️【幅度硬约束】相邻两个角度点的差值建议 ≥ 3~5°。舵机死区约 1°，
+ *   加上齿隙，±1~2° 的微动在本硬件上肉眼看不出来（BUG-033 的成因）。
+ *
+ * ⚠️【想要停顿，必须用第三步 hold_ms，不能靠重复角度凑】（2026-09-18）
+ *   重复同一个角度 = 零位移段，执行层只花 1 帧（约 20ms）就过，完全看不出停；
+ *   ±1° 交替同理（同样钳成 1 帧）。正确写法是在要停的那个角度上填 hold_ms。
+ *
+ * @note 角度方向：head 左+(大) 右-(小) | L/R_arm 前+(大) 后-(小)
+ */
+typedef struct
+{
+    float target;                              ///< 终点角度（度）：从 90° 先走到这里
+    uint32_t speed;                            ///< 走向终点的速度（SERVO_SPEED_xxx，值越大越慢）
+    ActionSeqStep_t seq[ACTION_SEQ_MAX_STEPS]; ///< 动作序列：每步 = {角度, 该步速度, 到位后停留ms}
+    uint8_t seq_len;                           ///< 序列实际步数（0 = 到终点就停，不做序列）
+    uint32_t seq_speed;                        ///< 序列【默认】速度（每步 speed 留空时用它）
+} ActionSeq_t;
+
 /**
  * @brief 单段震动步骤
  *
@@ -82,9 +290,9 @@ typedef struct
  */
 typedef struct
 {
-    uint8_t strength;  ///< 该段震动强度 0~100
-    uint16_t on_ms;    ///< 该段震动时长（ms）
-    uint16_t off_ms;   ///< 该段结束后的静默间隔（ms），最后一段可填 0
+    uint8_t strength; ///< 该段震动强度 0~100
+    uint16_t on_ms;   ///< 该段震动时长（ms）
+    uint16_t off_ms;  ///< 该段结束后的静默间隔（ms），最后一段可填 0
 } VibStep_t;
 
 /* ═══════════════════════════════════════════════════════════════
@@ -225,3 +433,14 @@ void interaction_flush_queue(void);
  * @note 线程安全，可从任意任务（如 OTA 下载任务）调用。
  */
 void interaction_stop_for_ota(void);
+
+/**
+ * @brief 调试用：启动「GIF + 舵机适配」循环播放任务
+ *
+ * 新建一个独立任务，遍历 g_emotion_matrix 循环播放数组里现有的每一条情绪
+ * （切 GIF + 震动 + 三轴舵机序列 + 归中）。调试时只需在 interaction.c 的
+ * g_emotion_matrix 里注释/增删条目，数组里留几条就轮着播几条，无需改枚举。
+ *
+ * @note 调用者：application.c（舵机测试模式），须在 interaction_manager_init 之后调用。
+ */
+void interaction_demo_start(void);

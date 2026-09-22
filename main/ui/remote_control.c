@@ -33,17 +33,17 @@
 #include "esp_timer.h"
 #include "esp_log.h"
 
-#include "bsp/bsp_board.h"   // bsp_servo_move_smooth / CH_* / SERVO_SPEED_*
+#include "bsp/bsp_board.h"     // bsp_servo_move_smooth / CH_* / SERVO_SPEED_*
 #include "bsp/servo_manager.h" // servo_manager_flush：清 servo_manager 层队列 + 打断正在执行的那条
-#include "ui/ui_port.h"      // ui_request_state_gif / ui_resume_main_gif_loop / ui_get_current_view
-#include "ui/standby.h"      // standby_notify_activity（内部会 standby_wake 亮屏）
-#include "ui/interaction.h"  // interaction_flush_queue：远程指令抢占正在播的空闲/情绪动作
-#include "session/session.h" // session_get_state：对话中屏蔽
+#include "ui/ui_port.h"        // ui_request_state_gif / ui_resume_main_gif_loop / ui_get_current_view
+#include "ui/standby.h"        // standby_notify_activity（内部会 standby_wake 亮屏）
+#include "ui/interaction.h"    // interaction_flush_queue：远程指令抢占正在播的空闲/情绪动作
+#include "session/session.h"   // session_get_state：对话中屏蔽
 
 static const char *TAG = "RC"; ///< 日志 TAG（Remote Control）
 
 // ─── 可调参数 ────────────────────────────────────────────────────────────────
-#define RC_FREEZE_MS 30000   ///< 冻结窗口时长（ms）：收到指令后空闲序列被冻结多久
+#define RC_FREEZE_MS 300000  ///< 冻结窗口时长（ms）：收到指令后空闲序列被冻结多久
 #define RC_QUEUE_LEN 1       ///< 指令队列深度=1：只保留【最新】目标，见 rc_submit 的 xQueueOverwrite
 #define RC_TASK_STACK 4096   ///< worker 栈（内部 SRAM）：只调舵机+切图接口，4K 充裕
 #define RC_TASK_PRIO 6       ///< worker 优先级：高于 taskLVGL(5)，保证滑动指令即刻响应不被 GIF 解码压住
@@ -256,11 +256,11 @@ static void rc_worker_task(void *arg)
         }
 
         case RC_CMD_CENTER:
-            ESP_LOGI(TAG, "执行归中: 三轴 → 90°");
+            ESP_LOGI(TAG, "执行归中: 头90° / 臂15°");
             // 三轴并行归中：一次调用同时插值三路，比串行三次快且不割裂。
             // 用 RC_CENTER_SPEED 而非 RC_SERVO_SPEED：归中是「休息复位」，要柔和过程，
             // 不能像跟手指令那样快速到位（瞬间弹回中位很难看）。
-            bsp_servo_move_all_parallel(90.0f, 90.0f, 90.0f, RC_CENTER_SPEED);
+            bsp_servo_move_all_parallel(SERVO_CENTER_DEG, ARM_CENTER_DEG, ARM_CENTER_DEG, RC_CENTER_SPEED);
             break;
 
         default:
@@ -359,8 +359,8 @@ static bool rc_submit(const rc_cmd_t *cmd, const char *tag)
     //      以及 interaction_stop_for_ota 的三步齐全写法）。
     //   ② clear_abort 紧跟 abort 之后几微秒执行，而被打断方要走到插值循环的下一个
     //      检查点才读得到标志（最坏一个 step_ms）。标志在被看到之前就被清掉 = 没打断。
-    bsp_servo_request_abort();  // 1) 中止【正在执行】那条的逐度插值（bsp_servo.c 循环每步检查）
-    interaction_flush_queue();  // 2) 清 interaction 队列里【尚未执行】的存量动作
+    bsp_servo_request_abort(); // 1) 中止【正在执行】那条的逐度插值（bsp_servo.c 循环每步检查）
+    interaction_flush_queue(); // 2) 清 interaction 队列里【尚未执行】的存量动作
     // 3) 清 servo_manager 队列 + 打断其 worker 正在执行的那条。
     //    ★传 center=false：本次打断【有后续接管】——紧接着 rc_worker 就要把手臂送到用户
     //    指定角度。若让 worker 归中，它会与 rc_worker 抢同一把通道锁，实测产生三种随机
@@ -393,6 +393,9 @@ bool remote_control_submit_servo(uint8_t channel, float angle)
         ESP_LOGE(TAG, "非法舵机通道 %u，丢弃", (unsigned)channel);
         return false;
     }
+
+    // ★左臂镜像已收口到 bsp_servo.c 底层 servo_write_angle()（写/读时对 CH_L_ARM 做 180-angle），
+    // 这里不再对 offset 取反，否则会双重取反（2026-09-17 移除原取反逻辑）。
 
     rc_cmd_t cmd = {
         .type = RC_CMD_SERVO,

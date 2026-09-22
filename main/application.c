@@ -55,9 +55,11 @@
 #include "esp_lvgl_port.h"
 #define TAG "Application"
 
+#define APP_DEBUG_MODE 1 // 1 舵机测试模式与0 mqtt调试模式
+
 /* 开机诊断段总开关（内存快照 + 区域①验证 + 逐任务栈清单）。
  *
- * 【为何默认关闭】这段诊断跑在 main（prio 1、CPU0）上，而 CPU0 同时住着
+ * 【为何默】这段诊断跑在 main（prio 1、CPU0）上，而 CPU0 同时住着
  *   taskLVGL（prio 5，见 ui_port.c 的 lvgl_port_cfg.task_affinity=0）。
  *   GIF 轮播解码期间 main 几乎抢不到 CPU，实测 26 行任务清单要打 13 秒，
  *   把开机时间从 ~14s 拖到 ~30s；而且 main 全程不让权还会饿死 IDLE0，
@@ -400,175 +402,173 @@ static void offline_audio_boot_test_start(void)
  *   帧长不再覆盖（传 0 = 沿用 SERVO_FRAME_MS），保持与业务一致。
  */
 #define SERVO_AB_STEP_MS SERVO_SPEED_VERY_SLOW ///< 慢速档(50ms/度)，抖动最明显的速度
-/* ★2026-09-04 用途改为【过渡 + 动作】观察，角度全部落在 0~180 内：
- *   ┌ 第一段：0 →(过渡)→ 150，到位后以 150 为中心 ±20° 来回三次，最后回到 150
- *   ├ 归  中：→ 0
- *   └ 第二段：0 →(过渡)→ 130，到位后以 130 为中心 ±20° 来回三次（末段停在 110）
- *   要看的是"长距离过渡"与"短距离往复"两种性质不同的运动，在同一条 S 曲线下
- *   衔接起来是什么观感（过渡末端的收尾减速会不会与下一段起步加速黏在一起）。 */
-#define SERVO_AB_HOME     0.0f   ///< 归位角（本测试的"归中"即回到 0）
-#define SERVO_AB_MID1     150.0f ///< 第一段中心角
-#define SERVO_AB_MID2     130.0f ///< 第二段中心角
-#define SERVO_AB_SWING    20.0f  ///< 往复摆幅（中心角 ± 该值）
-#define SERVO_AB_SWING_N  3      ///< 往复次数
-#define SERVO_AB_CH CH_HEAD                    ///< 单轴测试用哪一路（三轴同动会互相干扰观察）
+/* ★2026-09-11 简化为【极限位来回】：只做 10° ↔ 170° 的整程往返，不再有小幅摆动。
+ *   ┌ 去程：10 → 170（整程 160°）
+ *   └ 回程：170 → 10
+ *   两端停顿分隔，如此循环 SERVO_AB_SWEEP_N 次，专门用来肉眼观察 S 曲线本身：
+ *   起步是否有加速段、中段是否匀速、收尾是否看得见减速。
+ *   ★为什么取 10/170 而不是 0/180：头部软限位就是 [10,170]（bsp_servo.c:76-77），
+ *     写 0/180 会被 clamp_safe_angle 钳回来并每轮刷一条软限位警告，等价但吵。 */
+#define SERVO_AB_END_LO 10.0f  ///< 低端极限位（= HEAD_MIN_ANGLE，头部物理下限）
+#define SERVO_AB_END_HI 170.0f ///< 高端极限位（= HEAD_MAX_ANGLE，头部物理上限）
+#define SERVO_AB_SWEEP_N 3     ///< 每档来回次数（一次 = 去 + 回）
+#define SERVO_AB_CH CH_HEAD    ///< 单轴测试用哪一路（三轴同动会互相干扰观察）
 
 /**
- * @brief 一段"过渡 + 往复动作"：先 S 曲线过渡到 center，再以 center 为中心上下摆动
+ * @brief 极限位整程来回：lo → hi → lo，重复 n 次
  *
- * @param center   过渡目标角，也是往复动作的中心角
- * @param swing    摆幅（上下各 swing 度）
- * @param n        往复次数
- * @param st       速度档（ms/度）
- * @param back_mid 摆动结束后是否再回到 center（第一段要回，第二段不回）
+ * @param lo  低端极限位（度）
+ * @param hi  高端极限位（度）
+ * @param n   来回次数（一次 = 去程 + 回程）
+ * @param st  速度档（ms/度）
  *
- * ★过渡结束后必须停顿：否则过渡的收尾减速与首次摆动的起步加速连成一片，
- *   "到位了再动作"的层次感会被抹掉，看起来就成了一整段连续运动。
+ * ★每趟之间必须停顿：否则去程的收尾减速与回程的起步加速连成一片，
+ *   S 曲线两端的"慢—快—慢"就被糊成一段连续运动，什么也看不出来。
+ *   停顿取 600ms：足够把两趟在视觉上切开，又不至于等得太久。
  */
-static void servo_transit_and_swing(float center, float swing, int n,
-                                    uint32_t st, bool back_mid)
+static void servo_sweep_end_to_end(float lo, float hi, int n, uint32_t st)
 {
-    ESP_LOGW("SERVO_AB", "  【过渡】→ %.0f°", center);
-    bsp_servo_move_smooth(SERVO_AB_CH, center, st);
-    vTaskDelay(pdMS_TO_TICKS(800)); // 到位停顿，把"过渡"与"动作"在观感上分开
-
     for (int k = 0; k < n; k++)
     {
-        ESP_LOGW("SERVO_AB", "  【动作 %d/%d】%.0f° ↕ %.0f°", k + 1, n,
-                 center + swing, center - swing);
-        bsp_servo_move_smooth(SERVO_AB_CH, center + swing, st);
-        vTaskDelay(pdMS_TO_TICKS(300)); // 换向短停，让每一趟能单独看清
-        bsp_servo_move_smooth(SERVO_AB_CH, center - swing, st);
-        vTaskDelay(pdMS_TO_TICKS(300));
-    }
+        ESP_LOGW("SERVO_AB", "  【去程 %d/%d】%.0f° → %.0f°", k + 1, n, lo, hi);
+        bsp_servo_move_smooth(SERVO_AB_CH, hi, st);
+        vTaskDelay(pdMS_TO_TICKS(600)); // 端点停顿，把去程与回程在观感上切开
 
-    if (back_mid)
-    {
-        ESP_LOGW("SERVO_AB", "  【收势】回中心 %.0f°", center);
-        bsp_servo_move_smooth(SERVO_AB_CH, center, st);
-        vTaskDelay(pdMS_TO_TICKS(500));
+        ESP_LOGW("SERVO_AB", "  【回程 %d/%d】%.0f° → %.0f°", k + 1, n, hi, lo);
+        bsp_servo_move_smooth(SERVO_AB_CH, lo, st);
+        vTaskDelay(pdMS_TO_TICKS(600));
     }
 }
+#define SERVO_DEMO_EMOTION EMO_HAPPY // ★改这里换情绪（robot_emotion_t 枚举，见 interaction.h）
+#define SERVO_DEMO_GAP_MS 1000       // 每轮之间停顿 2 秒，方便你观察
 
 static void servo_test_task(void *arg)
 {
-    (void)arg;
-    // ★帧长不在这里定：每档进循环时按 frame_override[] 单独设置（见下方）。
 
-    // ★2026-09-04 匀速对照已删除：S 曲线已定为产品唯一正式曲线，不再做 A/B 横向对比。
-    //   本任务改为验证【过渡 + 动作】的衔接观感。
-    bsp_servo_debug_set_curve(1); // 1 = SERVO_CURVE_SCURVE，全程只跑 S 曲线
+    // (void)arg;
+    // // ★帧长不在这里定：每档进循环时按 frame_override[] 单独设置（见下方）。
 
-    ESP_LOGW("SERVO_AB", "════ S曲线：过渡 + 往复动作 ════");
-    ESP_LOGW("SERVO_AB", "★第一段：0 →过渡→ 150，再以150为中心±20°来回3次，最后回150");
-    ESP_LOGW("SERVO_AB", "★归  中：→ 0");
-    ESP_LOGW("SERVO_AB", "★第二段：0 →过渡→ 130，再以130为中心±20°来回3次");
-    ESP_LOGW("SERVO_AB", "★看点：长距离过渡的收尾，与紧接着的短距离往复起步，衔接是否自然。");
+    // // ★2026-09-04 匀速对照已删除：S 曲线已定为产品唯一正式曲线，不再做 A/B 横向对比。
+    // //   本任务改为验证【过渡 + 动作】的衔接观感。
+    // bsp_servo_debug_set_curve(1); // 1 = SERVO_CURVE_SCURVE，全程只跑 S 曲线
+    // bsp_servo_clear_abort();      // 测试任务绕过 servo_manager worker,须自行清打断标志
 
-    /* ★2026-09-04 只保留 MID/FAST/VERY_FAST 三档（慢档已删）。
-     *
-     * 【为什么减速看不出来 —— 真因】
-     *   曲线末段每帧位移 = k × (frame_ms / step_ms)，当前 k=0.15（DEMO 模式）：
-     *       档          step_ms  默认帧长  匀速每帧   末段每帧   死区0.8°
-     *       MID           15      20ms     1.33°     0.20°     ← 远低于死区
-     *       FAST          10      20ms     2.00°     0.30°     ← 远低于死区
-     *       VERY_FAST      5      20ms     4.00°     0.60°     ← 低于死区
-     *   减速指令【确实发出去了】，但末段每帧只要求动 0.2~0.6°，全部落在舵机
-     *   死区(0.8°)以下 —— 舵机对这些帧【根本不响应】，于是它一路滑到目标角
-     *   然后戛然而止，看起来就是"没有减速"。
-     *
-     * 【解法：拉长帧长】总耗时 = 行程 × step_ms，与帧长无关（见 bsp_board.h:471），
-     *   所以拉长帧长【不会让动作变快变慢】，只是把同一段时间切成更少、更粗的帧，
-     *   每帧位移随之变大，末段就能重新越过死区被舵机真实执行。
-     *   要让末段 0.15 × (fm/st) ≥ 0.8  ⇒  fm ≥ 5.33 × st：
-     *       MID(15)       → 需 80ms
-     *       FAST(10)      → 需 54ms → 取 60ms
-     *       VERY_FAST(5)  → 需 27ms → 取 40ms（多给余量，帧数仍够）
-     *   ⚠️ 代价：帧数变少，曲线被采样得更粗糙，过渡可能有轻微台阶感。
-     *      这是"看得见减速"必须付的代价，观感如何以实测为准。
-     */
-    static const uint32_t speeds[] = {SERVO_SPEED_MID, SERVO_SPEED_FAST, SERVO_SPEED_VERY_FAST};
-    static const char *names[] = {"MID", "FAST", "VERY_FAST"};
-    /* 与 speeds[] 一一对应的帧长覆盖值（0 = 不覆盖，沿用自动帧长）
-     *
-     * ★2026-09-04 全部改回 0 —— 曾试过 {80,60,40} 想让末段越过死区，实测【全程抖动】，已撤销。
-     *   失败原因：帧长是【全程】生效的，不是只作用于末段。
-     *   拉长帧长确实让末段每帧越过了死区，但同时把中段每帧也放大到
-     *   1.875 × (80/15) ≈ 10°/帧 —— 舵机每 80ms 收到一个 10° 的跳变指令，
-     *   中段从连续运动变成大步长阶梯，整体观感反而比原来差得多。
-     *   ⇒ 教训：帧长是全局杠杆，不能用来解决只发生在末段的问题。
-     */
-    static const uint32_t frame_override[] = {0U, 0U, 0U};
-    const int speed_cnt = (int)(sizeof(speeds) / sizeof(speeds[0]));
+    // ESP_LOGW("SERVO_AB", "════ S曲线：极限位整程来回 ════");
+    // ESP_LOGW("SERVO_AB", "★动作：%.0f° ↔ %.0f°（整程%.0f°）来回 %d 次，端点各停 600ms",
+    //          SERVO_AB_END_LO, SERVO_AB_END_HI,
+    //          SERVO_AB_END_HI - SERVO_AB_END_LO, SERVO_AB_SWEEP_N);
+    // ESP_LOGW("SERVO_AB", "★看点：起步有没有加速段、中段是否匀速、收尾看不看得见减速。");
 
-    while (1)
-    {
-        for (int i = 0; i < speed_cnt; i++)
-        {
-            const uint32_t st = speeds[i];
+    // /* ★2026-09-04 只保留 MID/FAST/VERY_FAST 三档（慢档已删）。
+    //  *
+    //  * 【为什么减速看不出来 —— 真因】
+    //  *   曲线末段每帧位移 = k × (frame_ms / step_ms)，当前 k=0.15（DEMO 模式）：
+    //  *       档          step_ms  默认帧长  匀速每帧   末段每帧   死区0.8°
+    //  *       MID           15      20ms     1.33°     0.20°     ← 远低于死区
+    //  *       FAST          10      20ms     2.00°     0.30°     ← 远低于死区
+    //  *       VERY_FAST      5      20ms     4.00°     0.60°     ← 低于死区
+    //  *   减速指令【确实发出去了】，但末段每帧只要求动 0.2~0.6°，全部落在舵机
+    //  *   死区(0.8°)以下 —— 舵机对这些帧【根本不响应】，于是它一路滑到目标角
+    //  *   然后戛然而止，看起来就是"没有减速"。
+    //  *
+    //  * 【解法：拉长帧长】总耗时 = 行程 × step_ms，与帧长无关（见 bsp_board.h:471），
+    //  *   所以拉长帧长【不会让动作变快变慢】，只是把同一段时间切成更少、更粗的帧，
+    //  *   每帧位移随之变大，末段就能重新越过死区被舵机真实执行。
+    //  *   要让末段 0.15 × (fm/st) ≥ 0.8  ⇒  fm ≥ 5.33 × st：
+    //  *       MID(15)       → 需 80ms
+    //  *       FAST(10)      → 需 54ms → 取 60ms
+    //  *       VERY_FAST(5)  → 需 27ms → 取 40ms（多给余量，帧数仍够）
+    //  *   ⚠️ 代价：帧数变少，曲线被采样得更粗糙，过渡可能有轻微台阶感。
+    //  *      这是"看得见减速"必须付的代价，观感如何以实测为准。
+    //  */
+    // /* ★2026-09-11 暂时只留 MID(15ms/度, 67°/秒) 一档观察 S 曲线形状。
+    //  *   FAST/VERY_FAST 整程只要 1.6s/0.8s，慢快慢被压缩到看不清，先注释掉。
+    //  *   要恢复三档对比时，把下面两行的注释部分放回即可（frame_override 需同步补齐元素）。 */
+    // static const uint32_t speeds[] = {SERVO_SPEED_MID /*, SERVO_SPEED_FAST, SERVO_SPEED_VERY_FAST*/};
+    // static const char *names[] = {"MID" /*, "FAST", "VERY_FAST"*/};
+    // /* 与 speeds[] 一一对应的帧长覆盖值（0 = 不覆盖，沿用自动帧长）
+    //  *
+    //  * ★2026-09-04 全部改回 0 —— 曾试过 {80,60,40} 想让末段越过死区，实测【全程抖动】，已撤销。
+    //  *   失败原因：帧长是【全程】生效的，不是只作用于末段。
+    //  *   拉长帧长确实让末段每帧越过了死区，但同时把中段每帧也放大到
+    //  *   1.875 × (80/15) ≈ 10°/帧 —— 舵机每 80ms 收到一个 10° 的跳变指令，
+    //  *   中段从连续运动变成大步长阶梯，整体观感反而比原来差得多。
+    //  *   ⇒ 教训：帧长是全局杠杆，不能用来解决只发生在末段的问题。
+    //  */
+    // /* ⚠️★【拉长帧长已第二次被证伪，不要再走这条路】★⚠️
+    //  *   2026-09-04 试 {80,60,40} → 实测全程抖动，撤销。
+    //  *   2026-09-11 试 {120}      → 实测【一顿一顿】，撤销。（本次）
+    //  *
+    //  * 【为什么必然失败】帧长是【全程】生效的杠杆，不是只作用于两端。
+    //  *   帧长拉大后两端每帧确实越过了死区，但中段每帧被同比放大到 15°，
+    //  *   舵机每 120ms 收到一个 15° 的跳变指令 —— 整程只剩 20 帧，
+    //  *   连续运动退化成大步长阶梯，这就是"一顿一顿"的由来。
+    //  *   ⇒ 用全局杠杆去解决只发生在两端的问题，必然以牺牲中段为代价。
+    //  *
+    //  * 【结论】在本硬件（死区 0.8°）上，「两端慢速被执行」与「中段平滑」互斥，
+    //  *   靠调帧长/调 k 都无解，二者是同一个跷跷板的两头。
+    //  */
+    // static const uint32_t frame_override[] = {0U /*, 0U, 0U*/}; // ★须与 speeds[] 等长同序
+    // const int speed_cnt = (int)(sizeof(speeds) / sizeof(speeds[0]));
 
-            // ★本档使用的帧长：优先用 frame_override（为了让末段减速越过死区，见上方注释）。
-            //   置 0 时才回落到 bsp_servo.c 的 servo_auto_frame_ms() 自动值。
-            uint32_t fm = frame_override[i];
-            if (fm == 0U)
-            {
-                // 与 servo_auto_frame_ms() 同公式：
-                //   ceil(step_ms × DEADBAND_DEG(0.8) × DEADBAND_MARGIN(1.5) / FRAME_MS(20)) × 20，
-                //   再钳到 [20, 60]。
-                fm = ((uint32_t)((float)st * 0.8f * 1.5f + 20.0f - 0.001f) / 20U) * 20U;
-                if (fm < 20U)
-                    fm = 20U;
-                if (fm > 60U)
-                    fm = 60U;
-            }
-            // ★必须在本档所有运动之前设置：该接口对正在进行的运动不生效，下一次运动才采用。
-            bsp_servo_debug_set_frame_ms(fm);
+    // while (1)
+    // {
+    //     for (int i = 0; i < speed_cnt; i++)
+    //     {
+    //         const uint32_t st = speeds[i];
 
-            // 本档在本测试行程下实际会被切成多少帧 —— 帧数太少（<10）时曲线形状会失真
-            // ★按最长的一段（0→150 的过渡）估算，摆动段行程只有 40° 帧数会更少
-            const float total_deg = SERVO_AB_MID1 - SERVO_AB_HOME;
-            const uint32_t total_ms = (uint32_t)(total_deg * (float)st);
-            int frames = (int)(total_ms / fm);
-            if (frames < 1)
-                frames = 1;
+    //         // ★本档使用的帧长：优先用 frame_override（为了让末段减速越过死区，见上方注释）。
+    //         //   置 0 时才回落到 bsp_servo.c 的 servo_auto_frame_ms() 自动值。
+    //         uint32_t fm = frame_override[i];
+    //         if (fm == 0U)
+    //         {
+    //             // 与 servo_auto_frame_ms() 同公式：
+    //             //   ceil(step_ms × DEADBAND_DEG(0.8) × DEADBAND_MARGIN(1.5) / FRAME_MS(20)) × 20，
+    //             //   再钳到 [20, 60]。
+    //             fm = ((uint32_t)((float)st * 0.8f * 1.5f + 20.0f - 0.001f) / 20U) * 20U;
+    //             if (fm < 20U)
+    //                 fm = 20U;
+    //             if (fm > 60U)
+    //                 fm = 60U;
+    //         }
+    //         // ★必须在本档所有运动之前设置：该接口对正在进行的运动不生效，下一次运动才采用。
+    //         bsp_servo_debug_set_frame_ms(fm);
 
-            // 峰值速度估算：纯S曲线为平均的 1.875 倍（当前 DEMO 模式 k=0.15 时约 1.74 倍）
-            const float avg_dps = 1000.0f / (float)st;
+    //         // 本档在本测试行程下实际会被切成多少帧 —— 帧数太少（<10）时曲线形状会失真
+    //         // ★现在每一趟都是整程 160°，帧数就是实际值，不再是估算
+    //         const float total_deg = SERVO_AB_END_HI - SERVO_AB_END_LO;
+    //         const uint32_t total_ms = (uint32_t)(total_deg * (float)st);
+    //         int frames = (int)(total_ms / fm);
+    //         if (frames < 1)
+    //             frames = 1;
 
-            // ★末段每帧位移 = k × 匀速每帧（k=SERVO_CURVE_DEMO_K=0.15）。
-            //   这是"减速看不看得见"的判据：低于死区 0.8° 舵机就不响应，减速被吃掉。
-            //   ⚠️ 当前三档都会掉死区（0.20/0.30/0.60°），即减速确实看不见 ——
-            //      这是【已知未解】的问题，不能靠拉长帧长解决（见上方 frame_override 注释）。
-            const float per_frame = (float)fm / (float)st;
-            const float tail_deg = 0.15f * per_frame;
+    //         // 峰值速度估算：纯S曲线为平均的 1.875 倍（当前 DEMO 模式 k=0.15 时约 1.74 倍）
+    //         const float avg_dps = 1000.0f / (float)st;
 
-            ESP_LOGW("SERVO_AB", "════ %s (%ums/度, %.0f°/秒) 帧长%ums 每帧%.2f° 末段每帧%.2f°%s 帧数%d 峰值约%.0f°/秒%s ════",
-                     names[i], (unsigned)st, avg_dps,
-                     (unsigned)fm, per_frame, tail_deg,
-                     (tail_deg < 0.8f) ? "⚠掉死区(减速会被吃掉)" : "✓越过死区",
-                     frames, avg_dps * 1.875f,
-                     (avg_dps * 1.875f > 600.0f) ? " ⚠超舵机极限600" : "");
+    //         // ★末段每帧位移 = k × 匀速每帧（k=SERVO_CURVE_DEMO_K=0.15）。
+    //         //   这是"减速看不看得见"的判据：低于死区 0.8° 舵机就不响应，减速被吃掉。
+    //         //   ⚠️ 当前三档都会掉死区（0.20/0.30/0.60°），即减速确实看不见 ——
+    //         //      这是【已知未解】的问题，不能靠拉长帧长解决（见上方 frame_override 注释）。
+    //         const float per_frame = (float)fm / (float)st;
+    //         const float tail_deg = 0.15f * per_frame;
 
-            // ── 起始：确保从 0 出发（首轮以及上一档结束后的位置都可能不是 0）──
-            bsp_servo_move_smooth(SERVO_AB_CH, SERVO_AB_HOME, st);
-            vTaskDelay(pdMS_TO_TICKS(800));
+    //         ESP_LOGW("SERVO_AB", "════ %s (%ums/度, %.0f°/秒) 帧长%ums 每帧%.2f° 末段每帧%.2f°%s 帧数%d 峰值约%.0f°/秒%s ════",
+    //                  names[i], (unsigned)st, avg_dps,
+    //                  (unsigned)fm, per_frame, tail_deg,
+    //                  (tail_deg < 0.8f) ? "⚠掉死区(减速会被吃掉)" : "✓越过死区",
+    //                  frames, avg_dps * 1.875f,
+    //                  (avg_dps * 1.875f > 600.0f) ? " ⚠超舵机极限600" : "");
 
-            // ── 第一段：0 → 150 过渡，150±20 来回三次，最后收回 150 ──
-            ESP_LOGW("SERVO_AB", "──── 第一段 ────");
-            servo_transit_and_swing(SERVO_AB_MID1, SERVO_AB_SWING, SERVO_AB_SWING_N, st, true);
+    //         // ── 起始：先回到低端极限位（上一档结束后停在哪不确定，须对齐起点）──
+    //         bsp_servo_move_smooth(SERVO_AB_CH, SERVO_AB_END_LO, st);
+    //         vTaskDelay(pdMS_TO_TICKS(800));
 
-            // ── 归中：回到 0 ──
-            ESP_LOGW("SERVO_AB", "──── 归中 → %.0f° ────", SERVO_AB_HOME);
-            bsp_servo_move_smooth(SERVO_AB_CH, SERVO_AB_HOME, st);
-            vTaskDelay(pdMS_TO_TICKS(1000));
+    //         // ── 本档主体：10° ↔ 170° 整程来回 N 次 ──
+    //         servo_sweep_end_to_end(SERVO_AB_END_LO, SERVO_AB_END_HI, SERVO_AB_SWEEP_N, st);
 
-            // ── 第二段：0 → 130 过渡，130±20 来回三次（不再收回中心，停在 110）──
-            ESP_LOGW("SERVO_AB", "──── 第二段 ────");
-            servo_transit_and_swing(SERVO_AB_MID2, SERVO_AB_SWING, SERVO_AB_SWING_N, st, false);
-
-            vTaskDelay(pdMS_TO_TICKS(2000)); // 档间多停一会，便于分辨
-        }
-    }
+    //         vTaskDelay(pdMS_TO_TICKS(1000)); // 档间多停一会，便于分辨
+    //     }
+    // }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -805,65 +805,76 @@ static void ww_init_task(void *arg)
 void application_init(void)
 {
 
-    //     /* GPIO14 上电默认弱上拉，左臂舵机线焊死在此脚会被误触发抖动进而拉低电源轨，
-    //      * 引发 ES8311/触摸 NACK 及其他舵机连锁失灵。必须在最开头先拉低占住该脚。
-    //      */
-    //     gpio_config_t io_conf_g14 = {
-    //         .pin_bit_mask = (1ULL << GPIO_NUM_14),
-    //         .mode = GPIO_MODE_OUTPUT,
-    //         .pull_up_en = GPIO_PULLUP_DISABLE,
-    //         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-    //         .intr_type = GPIO_INTR_DISABLE,
-    //     };
-    //     ESP_ERROR_CHECK(gpio_config(&io_conf_g14));
-    //     gpio_set_level(GPIO_NUM_14, 0); // 打开震动
-    //     bsp_motor_ledc_init();          /* 幂等：bsp_touch_init() 里还会再调一次，同参数重复配置安全 */
-    //     bsp_motor_pulse_level(BOOT_VIBRATE_LEVEL, BOOT_VIBRATE_MS);
+    /* GPIO14 上电默认弱上拉，左臂舵机线焊死在此脚会被误触发抖动进而拉低电源轨，
+     * 引发 ES8311/触摸 NACK 及其他舵机连锁失灵。必须在最开头先拉低占住该脚。
+     */
+    gpio_config_t io_conf_g14 = {
+        .pin_bit_mask = (1ULL << GPIO_NUM_14),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf_g14));
+    gpio_set_level(GPIO_NUM_14, 0); // 打开震动
+    bsp_motor_ledc_init();          /* 幂等：bsp_touch_init() 里还会再调一次，同参数重复配置安全 */
+    bsp_motor_pulse_level(BOOT_VIBRATE_LEVEL, BOOT_VIBRATE_MS);
 
-    //     bsp_flash_init();
-    //     PRINT_INTERNAL_HEAP_STEP("bsp_flash_init");
-    //     HEAP_CHECK_STEP("bsp_flash_init");
-    //     debug_root_files();
-    //     scan_production_assets("/S"); // 扫描 /S 目录下的所有资源
-    //     if (access("/S/assets/gif/one.gif", F_OK) == 0)
-    //         printf("路径 A 物理存在！\n");
-    //     if (access("/S/gif/one.gif", F_OK) == 0)
-    //         printf("路径 B 物理存在！\n");
+    bsp_flash_init();
+    PRINT_INTERNAL_HEAP_STEP("bsp_flash_init");
+    HEAP_CHECK_STEP("bsp_flash_init");
+    debug_root_files();
+    scan_production_assets("/S"); // 扫描 /S 目录下的所有资源
+    if (access("/S/assets/gif/one.gif", F_OK) == 0)
+        printf("路径 A 物理存在！\n");
+    if (access("/S/gif/one.gif", F_OK) == 0)
+        printf("路径 B 物理存在！\n");
     //     /* ── 步骤 1: BSP 单例 ──────────────────────────────────────────────────── */
     bsp_board_t *bsp_board = bsp_board_get_instance();
 
-    //     /* ── 步骤 2: NVS Flash ─────────────────────────────────────────────────── */
-    //     bsp_board_nvs_init(bsp_board);
-    //     PRINT_INTERNAL_HEAP_STEP("bsp_board_nvs_init");
+    /* ── 步骤 2: NVS Flash ─────────────────────────────────────────────────── */
+    bsp_board_nvs_init(bsp_board);
+    PRINT_INTERNAL_HEAP_STEP("bsp_board_nvs_init");
 
-    //     /* ── 步骤 5: WiFi / BluFi 配网（阻塞直至获取 IP 或彻底失败后重启）───────
-    //      * ★LCD/UI 初始化必须放在此步【之后】：BLE controller 使能窗口内若 LVGL 正在
-    //      *   并发解码 GIF / SPI DMA 刷屏 / 投递舵机，会与 BT 抢内部资源，导致 BLE 初始化
-    //      *   随机崩溃（LoadProhibited 野 handle 或 ble_svc_gap_init 断言，见 BUG-026）。
-    //      *   配网不再显示二维码（已删除该逻辑），因此 UI 无需早于 WiFi，放回配网之后即可。*/
-    //     bsp_board_wifi_main(bsp_board);
-    //     PRINT_INTERNAL_HEAP_STEP("bsp_board_wifi_main");
-    //     /* ── 步骤 2.5: LCD + UI 初始化（WiFi/配网完成后再起，避开 BLE 初始化窗口）── */
-    //     bsp_board_lcd_init(bsp_board);
-    //     PRINT_INTERNAL_HEAP_STEP("bsp_board_lcd_init");
-    //     ui_init();
-    //     vTaskDelay(pdMS_TO_TICKS(100));
-    //     PRINT_INTERNAL_HEAP_STEP("ui_init");
-    //     if (lvgl_port_lock(1000))
-    //     {
-    //         /* ★背光渐变避让：ui_init() 内部可能已启动开机 logo 渐亮（UI_BOOT_FADE_IN）。
-    //          * 此时若走 bsp_board_lcd_on()，它会把背光直接拍到 100%，而渐变 timer 下一拍
-    //          * （4ms 后）按自身时间进度算出较低亮度又写回去 —— 表现为渐亮途中"突然亮一下
-    //          * 再暗回来"的回弹（仅首次配网路径可见，已配网设备时序不同不触发）。
-    //          * 故渐变进行中只开显示控制器、把背光完全交给渐变状态机推进。 */
-    //         if (ui_is_boot_fading())
-    //             bsp_board_lcd_disp_on(bsp_board); // 只开显示，不碰背光
-    //         else
-    //             bsp_board_lcd_on(bsp_board); // 无渐变：照旧开显示 + 点背光
-    //         lvgl_port_unlock();
-    //     }
+    /* 【舵机测试模式·临时注释】舵机通路不读写任何 NVS 键值：
+     *   bsp_board_servo_init 只配 LEDC + 建互斥锁，servo_test_task 只调
+     *   bsp_servo_move_smooth（纯    bsp_board_nvs_init(bsp_board);
+    PRINT_INTERNAL_HEAP_STEP("bsp_board_nvs_init"); PWM 写寄存器）。故 NVS 在本模式下无用。 */
 
-    //     /* ── 步骤 3: 音频硬件 + 采集任务（裸板无 ES8311，注释）──────────────── */
+    /* ── 步骤 5: WiFi / BluFi 配网（阻塞直至获取 IP 或彻底失败后重启）───────
+     * ★LCD/UI 初始化必须放在此步【之后】：BLE controller 使能窗口内若 LVGL 正在
+     *   并发解码 GIF / SPI DMA 刷屏 / 投递舵机，会与 BT 抢内部资源，导致 BLE 初始化
+     *   随机崩溃（LoadProhibited 野 handle 或 ble_svc_gap_init 断言，见 BUG-026）。
+     *   配网不再显示二维码（已删除该逻辑），因此 UI 无需早于 WiFi，放回配网之后即可。*/
+#if !APP_DEBUG_MODE
+    bsp_board_wifi_main(bsp_board);
+    PRINT_INTERNAL_HEAP_STEP("bsp_board_wifi_main");
+#endif /* !APP_DEBUG_MODE：本地调试关 WiFi（LCD 反而更快出图）；远程调试需联网 */
+    /* ── 步骤 2.5: LCD + UI 初始化（WiFi/配网完成后再起，避开 BLE 初始化窗口）── */
+    bsp_board_lcd_init(bsp_board);
+    PRINT_INTERNAL_HEAP_STEP("bsp_board_lcd_init");
+    ui_init();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    PRINT_INTERNAL_HEAP_STEP("ui_init");
+    /* 【调试·2026-09-17】彻底禁用主界面空闲态自动轮播（空闲 GIF + 空闲舵机动作）：
+     *   调试 GIF/舵机适配时不需要产品固有的待机空闲表现，只保留「循环播放当前情绪」或
+     *   「MQTT 指令」两条主动驱动路径。恢复正式产品时删掉本行或改 true。 */
+    ui_set_idle_carousel_enabled(false);
+    if (lvgl_port_lock(1000))
+    {
+        /* ★背光渐变避让：ui_init() 内部可能已启动开机 logo 渐亮（UI_BOOT_FADE_IN）。
+         * 此时若走 bsp_board_lcd_on()，它会把背光直接拍到 100%，而渐变 timer 下一拍
+         * （4ms 后）按自身时间进度算出较低亮度又写回去 —— 表现为渐亮途中"突然亮一下
+         * 再暗回来"的回弹（仅首次配网路径可见，已配网设备时序不同不触发）。
+         * 故渐变进行中只开显示控制器、把背光完全交给渐变状态机推进。 */
+        if (ui_is_boot_fading())
+            bsp_board_lcd_disp_on(bsp_board); // 只开显示，不碰背光
+        else
+            bsp_board_lcd_on(bsp_board); // 无渐变：照旧开显示 + 点背光
+        lvgl_port_unlock();
+    }
+
+    //     // /* ── 步骤 3: 音频硬件 + 采集任务（裸板无 ES8311，注释）──────────────── */
     //     audio_init(bsp_board);
     //     PRINT_INTERNAL_HEAP_STEP("audio_init");
 
@@ -904,47 +915,55 @@ void application_init(void)
     //     }
     //     PRINT_INTERNAL_HEAP_STEP("wake_word_init+start");
 
-    //     /* ── 步骤 6: MQTT 客户端 ───────────────────────────────────────────────── */
-    //     protocol_mqtt_start();
-    //     PRINT_INTERNAL_HEAP_STEP("protocol_mqtt_start");
+    /* ── 步骤 6: MQTT 客户端 ───────────────────────────────────────────────── */
+#if !APP_DEBUG_MODE
+    protocol_mqtt_start();
+    PRINT_INTERNAL_HEAP_STEP("protocol_mqtt_start");
+#endif /* !APP_DEBUG_MODE：本地调试关 MQTT；远程调试靠 MQTT 下行触发 remote_control */
 
-    //     /* ── 步骤 7: 会话模块（WebSocket 预连接）─────────────────────────────── */
-    //     //// session_init("ws://122.224.191.2:4888/ws/omni");
-    //     session_init("wss://ai.strailine-space.com/ws/omni");
-    //     PRINT_INTERNAL_HEAP_STEP("session_init");
+    // //     /* ── 步骤 7: 会话模块（WebSocket 预连接）─────────────────────────────── */
+    // //// session_init("ws://122.224.191.2:4888/ws/omni");
+    // session_init("wss://ai.strailine-space.com/ws/omni");
+    // PRINT_INTERNAL_HEAP_STEP("session_init");
 
-    //     // 6. 创建触摸扫描任务
-    //     // ⚠ 栈必须在内部 SRAM，不能放 SPIRAM！
-    //     //    本任务承载整个 UI 跳转链（含游戏初始化），其中 game_whack 读写 NVS 高分会
-    //     //    触发 spi_flash_disable_interrupts_caches_and_other_cpu()，期间 cache 被禁用，
-    //     //    SPIRAM 栈不可访问 → esp_task_stack_is_sane_cache_disabled() 断言 panic（BUG-010 家族）。
-    //     //    实测进游戏路径栈高水位剩 5888B，即峰值用量仅 2304B，故 4096 足够（留 ~1.7× 余量）。
-    //     //    内部 SRAM 净增 4KB，换来彻底消除「触摸任务里碰 flash 必崩」隐患。
-    //     esp_err_t ret = xTaskCreatePinnedToCoreWithCaps(
-    //         touch_scan_task,
-    //         "touch_scan",
-    //         4096,
-    //         NULL,
-    //         4, // 优先级略低于舵机和音频
-    //         NULL,
-    //         tskNO_AFFINITY,
-    //         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    // 6. 创建触摸扫描任务
+    // ⚠ 栈必须在内部 SRAM，不能放 SPIRAM！
+    //    本任务承载整个 UI 跳转链（含游戏初始化），其中 game_whack 读写 NVS 高分会
+    //    触发 spi_flash_disable_interrupts_caches_and_other_cpu()，期间 cache 被禁用，
+    //    SPIRAM 栈不可访问 → esp_task_stack_is_sane_cache_disabled() 断言 panic（BUG-010 家族）。
+    //    实测进游戏路径栈高水位剩 5888B，即峰值用量仅 2304B，故 4096 足够（留 ~1.7× 余量）。
+    //    内部 SRAM 净增 4KB，换来彻底消除「触摸任务里碰 flash 必崩」隐患。
+    esp_err_t ret = xTaskCreatePinnedToCoreWithCaps(
+        touch_scan_task,
+        "touch_scan",
+        4096,
+        NULL,
+        4, // 优先级略低于舵机和音频
+        NULL,
+        tskNO_AFFINITY,
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 
-    //     if (ret != pdPASS)
-    //     {
-    //         ESP_LOGE(TAG, "创建触摸扫描任务失败！");
-    //     }
-    //     else
-    //     {
-    //         ESP_LOGI(TAG, "触摸扫描任务创建完成");
-    //         PRINT_TASK_CREATED(TAG, "touch_scan", 4096, 1); // 栈在内部SRAM
-    //     }
+    if (ret != pdPASS)
+    {
+        ESP_LOGE(TAG, "创建触摸扫描任务失败！");
+    }
+    else
+    {
+        ESP_LOGI(TAG, "触摸扫描任务创建完成");
+        PRINT_TASK_CREATED(TAG, "touch_scan", 4096, 1); // 栈在内部SRAM
+    }
     // /* ── 步骤 8: 舵机硬件初始化（LEDC/PWM）──────────────────────────────── */
     bsp_board_servo_init(bsp_board);
     PRINT_INTERNAL_HEAP_STEP("bsp_board_servo_init");
 
-    // /* ── 步骤 9: 舵机管理器（队列 + worker task，栈在 SPIRAM）─────────────── */
-    esp_err_t ret = servo_manager_init();
+    /* ── 步骤 9/10: 舵机管理器 + 情绪交互管理器 ────────────────────────────────
+     * 【舵机测试模式·临时注释】这两个 worker 只负责【消费队列】，自己不主动动舵机。
+     * 本模式下已无任何投递方（空闲轮播/触摸情绪/对话状态/待机/远程控制全部停用），
+     * 留着纯属空转还多占两份 SPIRAM 栈。
+     *
+     * ★servo_test_task 不受影响：它【绕过队列】直接调 bsp_servo_move_smooth()，
+     *   只依赖上面的 bsp_board_servo_init()（LEDC + 互斥锁），与这两个管理器无关。 */
+    ret = servo_manager_init();
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "servo_manager_init 失败: %s", esp_err_to_name(ret));
@@ -955,7 +974,6 @@ void application_init(void)
     }
     PRINT_INTERNAL_HEAP_STEP("servo_manager_init");
 
-    /* ── 步骤 10: 情绪交互管理器（情绪矩阵 + worker task，栈在 SPIRAM）────── */
     ret = interaction_manager_init();
     if (ret != ESP_OK)
     {
@@ -987,40 +1005,50 @@ void application_init(void)
      * 【安全性】ui_notify_boot_ready() 只写标志 + 启 esp_timer，不依赖下方任何模块；
      * 反过来下方模块也不读 boot 渐变状态，两者无耦合，提前调用无副作用。
      * ══════════════════════════════════════════════════════════════════════ */
-    // ui_notify_boot_ready();
-    // printf("log结束标志\n");
+    /* 【舵机测试模式·临时注释】LCD/UI 未初始化，本调用进去后在
+     *   `if (s_boot_logo_img == NULL) return;` 处即退出，是个空操作。 */
+    ui_notify_boot_ready();
+    printf("log结束标志\n");
 
     // 舵机测试任务（独立跑，不影响 LVGL 刷新）
-    xTaskCreatePinnedToCoreWithCaps(
-        servo_test_task,
-        "servo_test",
-        4096,
-        NULL,
-        5,
-        NULL,
-        tskNO_AFFINITY,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    // xTaskCreatePinnedToCoreWithCaps(
+    //     servo_test_task,
+    //     "servo_test",
+    //     4096,
+    //     NULL,
+    //     5,
+    //     NULL,
+    //     tskNO_AFFINITY,
+    //     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
-    // /* ── 步骤 10.5: 无活动待机模块（依赖 LCD/唤醒词/舵机管理器均已就绪）──── */
+#if APP_DEBUG_MODE
+    /* ★本地调试：GIF + 舵机适配循环。遍历 g_emotion_matrix，数组里留几条就轮着播几条；
+     *   在 interaction.c 里注释/增删情绪条目即可控制测哪些，无需改枚举。 */
+    interaction_demo_start();
+#endif /* APP_DEBUG_MODE：远程调试关本地循环，避免与 remote_control 抢舵机/GIF */
+
+    // // /* ── 步骤 10.5: 无活动待机模块（依赖 LCD/唤醒词/舵机管理器均已就绪）──── */
     // standby_init();
     // PRINT_INTERNAL_HEAP_STEP("standby_init");
 
-    // /* ── 步骤 10.6: app 远程手动控制模块（舵机角度 / GIF 显示 + 30s 冻结窗口）──
-    //  * 依赖：舵机（步骤 9）、LCD/UI（步骤 2.5）均已就绪 —— worker 任务一旦跑起来
-    //  * 就可能立刻调用 bsp_servo_move_smooth / ui_request_state_gif。
-    //  * 与 standby 模块无强依赖（当前 standby_init 停用也不影响本模块工作）。
-    //  * 初始化失败只是远程控制不可用（后续 submit 静默丢弃），不影响其他功能，故不 abort。 */
-    // if (!remote_control_init())
-    // {
-    //     ESP_LOGE(TAG, "remote_control_init 失败，app 远程舵机/GIF 控制将不可用");
-    // }
-    // PRINT_INTERNAL_HEAP_STEP("remote_control_init");
+    /* ── 步骤 10.6: app 远程手动控制模块（舵机角度 / GIF 显示 + 30s 冻结窗口）──
+     * 依赖：舵机（步骤 9）、LCD/UI（步骤 2.5）均已就绪 —— worker 任务一旦跑起来
+     * 就可能立刻调用 bsp_servo_move_smooth / ui_request_state_gif。
+     * 与 standby 模块无强依赖（当前 standby_init 停用也不影响本模块工作）。
+     * 初始化失败只是远程控制不可用（后续 submit 静默丢弃），不影响其他功能，故不 abort。 */
+#if !APP_DEBUG_MODE
+    if (!remote_control_init())
+    {
+        ESP_LOGE(TAG, "remote_control_init 失败，app 远程舵机/GIF 控制将不可用");
+    }
+    PRINT_INTERNAL_HEAP_STEP("remote_control_init");
+#endif /* !APP_DEBUG_MODE：本地调试关远程控制；远程调试靠它处理 MQTT 下发的舵机/GIF */
 
-    // /* ── 步骤 11: 电池 + 提醒系统（无感/次要功能，后置以让核心链路尽早就绪）──
-    //  * 挪动理由：电池监控纯 ADC 无依赖；reminder_init 内部会同步做一次 IP 定位
-    //  * （阻塞 HTTPS，实测 ~850ms）+ 天气拉取。这两块对用户「看到 GIF、能对话、能
-    //  * 触摸互动」毫无感知贡献，故整体后移到所有可见模块之后，不再拖慢舵机/触摸/
-    //  * 待机的就绪。二者都依赖 WiFi 已连（此处 WiFi 早已就绪，无依赖风险）。 */
+    /* ── 步骤 11: 电池 + 提醒系统（无感/次要功能，后置以让核心链路尽早就绪）──
+     * 挪动理由：电池监控纯 ADC 无依赖；reminder_init 内部会同步做一次 IP 定位
+     * （阻塞 HTTPS，实测 ~850ms）+ 天气拉取。这两块对用户「看到 GIF、能对话、能
+     * 触摸互动」毫无感知贡献，故整体后移到所有可见模块之后，不再拖慢舵机/触摸/
+     * 待机的就绪。二者都依赖 WiFi 已连（此处 WiFi 早已就绪，无依赖风险）。 */
     // esp_err_t bat_ret = bsp_battery_init();
     // if (bat_ret == ESP_OK)
     // {
@@ -1034,23 +1062,24 @@ void application_init(void)
     //     ESP_LOGW(TAG, "电池监控未启用 (%s)，UI 电量将显示 --%%", esp_err_to_name(bat_ret));
     // }
     // PRINT_INTERNAL_HEAP_STEP("bsp_battery_init");
+    /*功能盘*/
     // reminder_init(on_reminder_trigger);
-    // PRINT_INTERNAL_HEAP_STEP("reminder_init");
-    // /* 注：ui_notify_boot_ready() 原本在这里，已提前到 touch_scan 任务创建之后
-    //  * （见上方"【2026-08-31 提前】"注释块）——GIF 不再等电池/天气这些无感知模块。 */
+    // PRINT_INTERNAL_HEAP_STEP("reminder_init"); /* 【舵机测试模式】reminder 已注释 */
+    /* 注：ui_notify_boot_ready() 原本在这里，已提前到 touch_scan 任务创建之后
+     * （见上方"【2026-08-31 提前】"注释块）——GIF 不再等电池/天气这些无感知模块。 */
 
-    // /* ── 步骤 8: OTA 验证（必须在所有初始化完成后调用）──────────────────── */
-    // // 若当前是刚 OTA 升级完首次启动，会进入 PENDING_VERIFY 状态：
-    // //   - 调用 esp_ota_mark_app_valid_cancel_rollback() 防止 Bootloader 回滚
-    // //   - 把 NVS 中的 pending_ver 提升为 committed_ver
-    // // 若启动前期崩溃（未到这里），Bootloader 下次启动会自动回滚到旧固件
-    // //
-    // // ★ 位置说明：本段必须排在下面的诊断段【之前】。诊断段开启时要打十几秒日志，
-    // //   放在它后面会让"防回滚标记"被无谓推迟同样长的时间（升级后这段时间内断电
-    // //   就会被误判为启动失败而回滚），与诊断无因果关系，不该受它拖累。
-    // ESP_LOGI(TAG, "当前固件版本: %s", bsp_ota_get_current_version());
-    // bsp_ota_mark_valid();
-    // ESP_LOGI(TAG, "后续版本使用变量");
+    /* ── 步骤 8: OTA 验证（必须在所有初始化完成后调用）──────────────────── */
+    // 若当前是刚 OTA 升级完首次启动，会进入 PENDING_VERIFY 状态：
+    //   - 调用 esp_ota_mark_app_valid_cancel_rollback() 防止 Bootloader 回滚
+    //   - 把 NVS 中的 pending_ver 提升为 committed_ver
+    // 若启动前期崩溃（未到这里），Bootloader 下次启动会自动回滚到旧固件
+    //
+    // ★ 位置说明：本段必须排在下面的诊断段【之前】。诊断段开启时要打十几秒日志，
+    //   放在它后面会让"防回滚标记"被无谓推迟同样长的时间（升级后这段时间内断电
+    //   就会被误判为启动失败而回滚），与诊断无因果关系，不该受它拖累。
+    ESP_LOGI(TAG, "当前固件版本: %s", bsp_ota_get_current_version());
+    bsp_ota_mark_valid();
+    ESP_LOGI(TAG, "后续版本使用变量");
 
 #if APP_BOOT_DIAG_ENABLE
     /* ── 诊断：全部初始化跑完后的内存全量快照 + 逐任务栈占用清单 ──────────────

@@ -38,10 +38,25 @@ static const char *MQTT_TAG = "MQTT"; ///< 日志 TAG
 // 当前设为 100 表示不缩放（与历史行为一致），按需下调。
 #define APP_VOLUME_HW_MAX 65 ///< app 满音量(100)对应的硬件音量上限
 
+// ─── 本地调试 Broker 开关 ────────────────────────────────────────────────────
+// 云端 Broker (122.224.191.2) 宕机期间，改用 PC 上跑的 Mosquitto 做中转，
+// 使 MQTTX 仍能下发 servo/gif 等调试指令。调试结束后改回 0 即恢复云端地址。
+//   PC 端启动命令：cd D:\new\baidu\Mosquitto && .\mosquitto.exe -c local.conf -v
+//   local.conf 内容：listener 1883 0.0.0.0 / allow_anonymous true
+// ⚠️ 设备与 PC 必须在同一局域网；PC 换网络后 IP 会变，需同步修改下方地址。
+#define MQTT_USE_LOCAL_BROKER 1 ///< 1=连本地 PC Broker（调试）, 0=连云端（生产）
+
 // ─── MQTT 凭证（运行时从 NVS 加载，回退到编译期默认值）────────────────────
+#if MQTT_USE_LOCAL_BROKER
+// #define MQTT_DEFAULT_URI "mqtt://192.168.1.30:1883" ///< 本地 PC Mosquitto（WLAN 网卡 IP）
+#define MQTT_DEFAULT_URI "mqtt://broker.emqx.io:1883" ///< 公网免费 broker（调试用，绕开局域网）
+#define MQTT_DEFAULT_USER ""                          ///< 本地 Broker 开了匿名，无需用户名
+#define MQTT_DEFAULT_PASS ""                          ///< 本地 Broker 开了匿名，无需密码
+#else
 #define MQTT_DEFAULT_URI "mqtt://122.224.191.2:1883" ///< 默认 Broker 地址（测试环境）
 #define MQTT_DEFAULT_USER "xtc"                      ///< 默认 MQTT 用户名
 #define MQTT_DEFAULT_PASS "Xtc@12345"                ///< 默认 MQTT 密码
+#endif
 
 // 运行时凭证缓冲区（由 mqtt_credentials_load 从 NVS 填充，否则保持默认值）
 static char s_mqtt_uri[128] = MQTT_DEFAULT_URI;
