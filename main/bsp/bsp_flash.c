@@ -75,9 +75,25 @@ void start_production_burning(void)
     uint8_t *buffer = (uint8_t *)heap_caps_malloc(BURNER_CHUNK, MALLOC_CAP_SPIRAM);
     if (!buffer)
     {
-        ESP_LOGE(TAG, "PSRAM 内存不足！");
+        ESP_LOGE(TAG, "PSRAM 内存不足！（接收缓冲）");
         return;
     }
+    // ★ 回读校验缓冲：每写完 128KB 就把它读回来和源数据逐字节比对。
+    //   旧代码把 esp_flash_write 的返回值直接丢掉、无条件 printf("ACK")，
+    //   于是「写入静默失败」会被 PC 端原样当成「烧录成功」。
+    uint8_t *rbuf = (uint8_t *)heap_caps_malloc(BURNER_CHUNK, MALLOC_CAP_SPIRAM);
+    if (!rbuf)
+    {
+        ESP_LOGE(TAG, "PSRAM 内存不足！（校验缓冲）");
+        heap_caps_free(buffer);
+        return;
+    }
+    // 失败信息载体：任何一步出错都填这三个值，最后统一走 burn_fail 标签上报
+    const char *fail_stage = NULL; // ERASE / RECV_TIMEOUT / WRITE / READ / VERIFY
+    uint32_t fail_offset = 0;      // 出错的 flash 字节偏移
+    uint32_t fail_detail = 0;      // 错误码，或 VERIFY 时首个不一致字节的下标
+    uint8_t fail_exp = 0, fail_act = 0; // VERIFY 时的期望值 / 实际读回值
+    uint32_t offset = 0;
     // 🚀 核心改动：先告诉电脑"我开始擦除了"，让 Python 脚本别慌
     printf("STARTING_ERASE\n");
     fflush(stdout);
@@ -89,9 +105,17 @@ void start_production_burning(void)
     xTaskCreate(erase_progress_task, "erase_prog", 3072, NULL, 1, NULL);
     PRINT_TASK_CREATED(TAG, "erase_prog", 3072, 1); // xTaskCreate → 栈在内部SRAM
 
-    esp_flash_erase_region(ext_flash, 0, s_real_flash_size);
+    // ⚠️ 必须查返回值：旧代码把它丢掉，擦除失败也一样往下走并打印「擦除完成 100%」
+    esp_err_t erase_err = esp_flash_erase_region(ext_flash, 0, s_real_flash_size);
 
     s_erase_in_progress = false;
+    if (erase_err != ESP_OK)
+    {
+        fail_stage = "ERASE";
+        fail_offset = 0;
+        fail_detail = (uint32_t)erase_err;
+        goto burn_fail;
+    }
     int64_t erase_total_ms = (esp_timer_get_time() - s_erase_start_us) / 1000;
     ESP_LOGW(TAG, "✅ 擦除完成 100%% — 实际耗时 %lld.%03lld 秒",
              erase_total_ms / 1000, erase_total_ms % 1000);
@@ -100,7 +124,6 @@ void start_production_burning(void)
     printf("READY_FOR_DATA\n");
     fflush(stdout);
 
-    uint32_t offset = 0;
     while (offset < s_real_flash_size)
     {
         int received = 0;
@@ -113,22 +136,84 @@ void start_production_burning(void)
                                                  pdMS_TO_TICKS(5000));
             if (len > 0)
                 received += len;
+            else
+            {
+                // 5 秒一个字节都没来：PC 端多半已断开或异常退出。
+                // 旧代码在这里会无限死等，现在明确报错，免得 PC 端白等。
+                fail_stage = "RECV_TIMEOUT";
+                fail_offset = offset;
+                fail_detail = (uint32_t)received; // 这一块只收到了这么多字节
+                goto burn_fail;
+            }
         }
 
-        // 直接进行物理扇区写入，不经过文件系统
-        esp_flash_write(ext_flash, buffer, offset, BURNER_CHUNK);
+        // ★ 直接进行物理扇区写入，不经过文件系统，并检查返回值
+        esp_err_t werr = esp_flash_write(ext_flash, buffer, offset, BURNER_CHUNK);
+        if (werr != ESP_OK)
+        {
+            fail_stage = "WRITE";
+            fail_offset = offset;
+            fail_detail = (uint32_t)werr;
+            goto burn_fail;
+        }
+
+        // ★ 回读校验：把刚写进去的 128KB 读回来逐字节比对。
+        //   这一步专治「写入返回成功、数据却没真正落盘」——那是唯一能让
+        //   PC 端报烧录成功、设备端却 f_mount failed(13) 的路径。
+        esp_err_t rerr = esp_flash_read(ext_flash, rbuf, offset, BURNER_CHUNK);
+        if (rerr != ESP_OK)
+        {
+            fail_stage = "READ";
+            fail_offset = offset;
+            fail_detail = (uint32_t)rerr;
+            goto burn_fail;
+        }
+        if (memcmp(buffer, rbuf, BURNER_CHUNK) != 0)
+        {
+            uint32_t bad = 0;
+            while (bad < BURNER_CHUNK && buffer[bad] == rbuf[bad])
+                bad++; // 定位第一个不一致的字节，便于判断是整块空还是零星坏
+            fail_stage = "VERIFY";
+            fail_offset = offset;
+            fail_detail = bad;
+            fail_exp = buffer[bad];
+            fail_act = rbuf[bad];
+            goto burn_fail;
+        }
+
         offset += BURNER_CHUNK;
 
-        // 给 Python 脚本反馈进度
+        // 给 Python 脚本反馈进度（只有上面全部通过才会走到这里）
         printf("ACK:%lu\n", offset);
         fflush(stdout);
     }
 
-    ESP_LOGI(TAG, "✅ %luMB 资源同步成功！设备即将重启...",
+    // ★ 128 块全部写完且逐块回读一致，PC 端收到这行才允许报「烧录成功」
+    printf("BURN_VERIFY_PASS:%lu\n", (unsigned long)offset);
+    fflush(stdout);
+    ESP_LOGI(TAG, "✅ %luMB 资源同步成功（已逐块回读校验）！设备即将重启...",
              (unsigned long)(s_real_flash_size / 1024 / 1024));
+    heap_caps_free(rbuf);
     heap_caps_free(buffer);
     vTaskDelay(pdMS_TO_TICKS(1000));
     esp_restart(); // 重启后进入正常挂载逻辑
+    return;
+
+burn_fail:
+    // 任何一步失败：把「阶段:偏移:详情」打给 PC，细节打给串口日志，然后重启回产线模式。
+    // 必须 fflush + 延时，esp_restart() 会立刻掐掉还没发完的串口数据。
+    printf("BURN_FAIL:%s:%lu:%lu\n", fail_stage, (unsigned long)fail_offset,
+           (unsigned long)fail_detail);
+    fflush(stdout);
+    ESP_LOGE(TAG, "❌ 烧录中止！阶段=%s 偏移=%lu(第%lu块) 详情=%lu 期望=0x%02X 实际=0x%02X",
+             fail_stage, (unsigned long)fail_offset,
+             (unsigned long)(fail_offset / BURNER_CHUNK),
+             (unsigned long)fail_detail, fail_exp, fail_act);
+    ESP_LOGE(TAG, "   本次烧录无效，外挂 Flash 未形成可挂载镜像，设备将重启回产线模式");
+    heap_caps_free(rbuf);
+    heap_caps_free(buffer);
+    vTaskDelay(pdMS_TO_TICKS(3000)); // 留足时间让 PC 端读到 BURN_FAIL
+    esp_restart();
 }
 
 // 1. 把这个提取函数加在 start_production_burning() 的下面

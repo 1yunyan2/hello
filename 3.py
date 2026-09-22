@@ -313,6 +313,11 @@ def run_burn():
                 line = ser.readline().decode(errors='ignore').strip()
                 if "READY_FOR_DATA" in line:
                     break
+                elif "BURN_FAIL" in line:
+                    # 设备端擦除失败：以前这里被无声吞掉，现在明确中止
+                    print(f"\n❌ 设备端擦除失败: {line}")
+                    print("   格式 = BURN_FAIL:阶段:偏移:详情（详情=esp_err_t 错误码）")
+                    return
                 elif line:
                     print(f"[设备日志]: {line}")
 
@@ -332,13 +337,44 @@ def run_burn():
                     ser.flush()
                     while True:
                         resp = ser.readline().decode(errors='ignore').strip()
+                        # ⚠️ 必须先判 BURN_FAIL：设备端的 ACK 只有在「写入成功
+                        #    + 回读校验一致」之后才发，但一旦中途放弃会发这行。
+                        if "BURN_FAIL" in resp:
+                            print(f"\n❌ 设备端烧录失败: {resp}")
+                            print("   格式 = BURN_FAIL:阶段:偏移:详情")
+                            print("   WRITE/READ=FLASH 驱动报错码；VERIFY=回读不一致(详情为坏字节下标)；")
+                            print("   RECV_TIMEOUT=设备 5 秒没收到数据(PC 侧串口断了)")
+                            print("   本次烧录无效，设备已回到产线模式，可直接重跑 3.py。")
+                            return
                         if "ACK" in resp:
                             sent += len(data)
                             print(f"\r进度: [{(sent/file_size)*100:6.2f}%] 已同步: {sent/1024/1024:6.2f}MB", end="")
                             break
 
+            # 6. ★ 等设备回「逐块回读校验通过」才算真成功。
+            #    旧版本一收满 ACK 就报成功，而设备端的 ACK 旧代码是无条件发的，
+            #    于是出现「PC 说烧录成功 / 设备说无有效镜像」两边打架。
+            print()
+            verify_ok = False
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                resp = ser.readline().decode(errors='ignore').strip()
+                if "BURN_VERIFY_PASS" in resp:
+                    verify_ok = True
+                    break
+                if "BURN_FAIL" in resp:
+                    print(f"❌ 设备端烧录失败: {resp}")
+                    print("   本次烧录无效，设备已回到产线模式，可直接重跑 3.py。")
+                    return
+                if resp:
+                    print(f"[设备日志]: {resp}")
+
             duration = time.time() - start_time
-            print(f"\n🎉 烧录成功！耗时: {duration:.1f} 秒")
+            if not verify_ok:
+                print(f"❌ 未收到设备「回读校验通过」信号（耗时 {duration:.1f} 秒）")
+                print("   16MB 已全部发出，但设备没有确认数据落盘，本次烧录作废，请重跑 3.py。")
+                return
+            print(f"🎉 烧录成功（设备已逐块回读校验）！耗时: {duration:.1f} 秒")
             print("🔔 [请拔线]：检测到当前设备尚未拔除，等待拔出...")
 
             # 等待设备拔出
