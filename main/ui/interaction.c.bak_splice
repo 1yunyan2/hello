@@ -1,0 +1,2670 @@
+/**
+ * @file interaction.c
+ * @brief 情绪矩阵与动作解析引擎（非阻塞 worker 架构）
+ *
+ * 架构说明：
+ *   - ui_interaction_play() 仅入队，立即返回，不阻塞调用方（session/UI 任务）。
+ *   - 内部 interaction_worker_task 串行消费队列，依次执行：
+ *       屏幕动画 → 音效 → 震动马达 → 三轴舵机动作序列 → 舵机归中
+ *   - 所有舵机调用经 bsp_servo_move_smooth()，内部持 per-channel mutex，线程安全。
+ *
+ * 角度约定：中心点 = 90°
+ *   头部：左+ 右−  (左转30° → angle=120, 右转30° → angle=60)
+ *   手臂：前+ 后−  (前摆20° → angle=110, 后摆20° → angle=70)
+ */
+
+#include "interaction.h"
+#include "bsp/servo_manager.h" // SERVO_SPEED_* 常量
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h" // 完成通知信号量
+#include "driver/gpio.h"
+#include "driver/i2s_std.h"
+#include "esp_heap_caps.h"
+#include <stdatomic.h> // atomic_bool 播放中标志（跨核安全）
+#include "bsp/bsp_board.h"
+#include "ui/ui_port.h"
+#include "ui/remote_control.h"   // remote_control_is_active：收尾 flush 不得打断远程接管运动
+#include "object.h"              // PRINT_TASK_CREATED / PRINT_TASK_STACK_HWM
+#include "audio/offline_audio.h" // 离线音频播放（情绪音效 → 外挂 flash /S/voice/）
+#include <stdio.h>               // snprintf 拼音频绝对路径
+
+static const char *TAG = "INTERACTION";
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 【2026-08-31 问题3】情绪音效（离线提示音）总开关
+ *
+ * 需求：暂时去除情绪的声音。置 0 后，触摸触发情绪时【不再播放】/S/voice/ 下的
+ * 离线音效，GIF、震动、舵机三项全部不受影响，照常执行。
+ *
+ * 【为什么用宏而不是删代码】用户明确说是"暂时"。情绪矩阵里 20 条 .audio_file
+ * 字段全部保留原样（见下方 g_emotion_matrix），要恢复只需把本宏置回 1，
+ * 一行开关即可，不必再去逐条补回文件名。
+ *
+ * 【影响范围】只管情绪音效这一条链路。以下不受本开关影响：
+ *   · 唤醒提示音、闹钟/倒计时的震动提醒 —— 走的是别的模块，与此无关；
+ *   · application.c 的 OFFLINE_AUDIO_BOOT_TEST 开机自测 —— 已是 0，本就不播。
+ * 即：全项目 offline_audio_play() 的调用点只有两处，另一处已关，故本宏置 0 后
+ * 离线提示音链路整体静默。
+ * ═══════════════════════════════════════════════════════════════════════════ */
+#define IA_EMOTION_AUDIO_ENABLE 0
+
+// ─── 情绪播放状态（供 ui_port 自动循环/触摸路由读取，跨核 atomic）──────────────
+// true = 正在执行某动作（情绪/对话状态/空闲）。置位早于 GIF/震动，清位在动作完成后。
+static atomic_bool s_ia_playing = ATOMIC_VAR_INIT(false);
+// true = 当前正在播放的是“空闲动作”（低优先级，可被触摸情绪打断）。
+// 区分：情绪动作 / 对话状态动作（keep_screen=true）置 false；空闲动作（keep_screen=false）置 true。
+static atomic_bool s_ia_is_idle = ATOMIC_VAR_INIT(false);
+// true = 低功耗（一级待机）头部专属模式：情绪播放时手臂钉 90°（count 清零）+ 跳过震动，
+// 头部动作/GIF 切图不受影响。由 standby.c 在 enter_standby/standby_wake 时置位/清位。
+static atomic_bool s_ia_lowpower = ATOMIC_VAR_INIT(false);
+// 情绪舵机动作完成信号量：worker 入队舵机请求带此 sem，servo_manager 执行完 give。
+static SemaphoreHandle_t s_ia_d1_2_sem = NULL;
+
+bool interaction_is_playing(void)
+{
+    return atomic_load(&s_ia_playing);
+}
+
+bool interaction_is_idle_action(void)
+{
+    return atomic_load(&s_ia_is_idle);
+}
+
+void interaction_set_lowpower(bool enable)
+{
+    atomic_store(&s_ia_lowpower, enable);
+}
+
+// interaction_flush_queue 定义在文件末尾（需在 s_ia_queue/s_ia_inited 定义之后）。
+
+// ─── Worker task 配置 ────────────────────────────────────────────────────────
+#define INTERACTION_QUEUE_LEN 8     ///< 最多缓存 4 个待执行情绪（超出时丢弃新请求）
+#define INTERACTION_TASK_STACK 8192 ///< worker 栈大小（含音频/舵机调用链）
+#define INTERACTION_TASK_PRIO 5     ///< 优先级与 session 相当，略低于音频（7）
+
+static QueueHandle_t s_ia_queue = NULL; ///< 动作请求队列（情绪 ID / 自定义动作）
+static TaskHandle_t s_ia_worker = NULL; ///< worker 任务句柄
+
+/// OTA 停止标志：置 true 后 worker 丢弃一切请求、不再切 GIF/驱动舵机/震动。
+/// 用于 OTA 升级期间彻底静默 interaction（GIF+舵机+震动）。置位后不清除（OTA 必重启）。
+static volatile bool s_ia_stopped_for_ota = false;
+static bool s_ia_inited = false; // 初始化完成
+
+// ==========================================
+// 1. 数据结构：严格对齐情绪矩阵表头
+// ==========================================
+
+/* ActionStep_t / VibStep_t 已移到 interaction.h 暴露（供 ui_port 构造状态动作表）。 */
+
+/* ── 命名震动序列（对应情绪队列表 D 列的 10 种震动类型）────────────────────
+ * 强度用中间占空比（真 PWM 方波，0/100 为直流端点）。这里是初版手感值，
+ * 烧录后用示波器/体感逐项微调 strength/on_ms/off_ms 即可，不必改结构。
+ * 多个情绪可复用同一序列（同震动类型）。 */
+// static const VibStep_t vib_short2[] = {{70, 50, 50}, {70, 50, 0}}; // 短促震动 2 次
+static const VibStep_t vib_light1[] = {{50, 60, 0}}; // 轻微震动 1 次
+// static const VibStep_t vib_light2[] = {{50, 60, 60}, {50, 60, 0}};                  // 轻微震动 2 次
+// static const VibStep_t vib_short_strong2[] = {{85, 50, 50}, {85, 50, 0}};           // 短促强震动 2 次
+// static const VibStep_t vib_strong2[] = {{100, 90, 70}, {100, 90, 0}};               // 强震动 2 次
+// static const VibStep_t vib_fast_cont[] = {{80, 30, 25}, {80, 30, 25}, {80, 30, 25}, // 连续/快速连续震动
+//                                           {80, 30, 25},
+//                                           {80, 30, 0}};
+// static const VibStep_t vib_slow_long1[] = {{45, 400, 0}};                  // 缓慢长震动 1 次
+// static const VibStep_t vib_soft_cont[] = {{35, 500, 0}};                   // 持续轻柔震动
+// static const VibStep_t vib_intermittent[] = {{45, 40, 120}, {45, 40, 120}, // 轻微间断震动
+//                                              {45, 40, 120},
+//                                              {45, 40, 0}};
+/* 「无震动」用 vib_seq = NULL 表示，无需定义序列。 */
+
+/**
+ * @brief 情绪矩阵行：情绪 ID → 全套硬件动作映射
+ */
+typedef struct
+{
+    robot_emotion_t emotion_id; ///< 情绪枚举 ID（查表键）
+    const char *screen_anim;    ///< 屏幕动画标识（人类可读描述，仅日志用）
+    const char *gif_path;       ///< 该情绪的 GIF 路径（占位符，后续接外挂flash）；NULL=不切图
+    const VibStep_t *vib_seq;   ///< 震动序列（NULL=无震动）；按段顺序播放，与 GIF 大致同期
+    uint8_t vib_seq_len;        ///< 震动序列长度（段数）
+    const char *audio_file;     ///< 音效文件名（传给音频层，预留）
+    /* ★2026-09-04：三轴由 ActionStep_t（A↔B 往返 N 次）改为 ActionSeq_t（终点+动作序列）。
+     * 新流程：90°(起始) → target(终点) → seq[](动作序列) → 归中90°。
+     * 三轴各走各的步数与速度，互不同步；详见 interaction.h 的 ActionSeq_t 注释。
+     * 空闲/状态动作走的 ia_custom_action_t 仍用旧 ActionStep_t，本次不动。 */
+    ActionSeq_t head;      ///< 头部舵机（CH_HEAD）
+    ActionSeq_t left_arm;  ///< 左臂舵机（CH_L_ARM）
+    ActionSeq_t right_arm; ///< 右臂舵机（CH_R_ARM）
+} InteractionMatrix_t;
+
+// ══════════════════════════════════════════════════════════════════════════════
+//   ⚠️【幅度硬约束】相邻两个角度点的差值须 ≥ 3~5°：舵机死区约 1°，再加齿隙，
+//      ±1~2° 的微动在本硬件上肉眼看不出来（这正是 BUG-033 的成因）。
+//
+// ══════════════════════════════════════════════════════════════════════════════
+/* ★序列上限三处一致性护栏（2026-09-11 新增）
+ *
+ * 序列上限分散在三个头文件里，改一处忘了另两处的后果是【静默截断】——
+ * 动作少走几步，不报错也不打日志，只能靠肉眼发现"这个情绪好像没做完"。
+ * 用编译期断言把它变成编译错误，改漏了当场就知道。
+ *
+ *   ACTION_SEQ_MAX_STEPS     (interaction.h)   配置侧：表里能填几步
+ *   SERVO_SEQ_MAX_STEPS      (servo_manager.h) 中间层：队列消息能装几步
+ *   BSP_SERVO_SEQ_MAX_POINTS (bsp_board.h)     底层：一串角度点的容量
+ *
+ * 底层要 ≥ 配置侧 +2，因为 servo_exec_seq 把"走向终点"和"归中"这两步也拼进
+ * 同一串点（归中自 2026-09-17 起由 worker 下沉为每轴最后一段）。 */
+_Static_assert(ACTION_SEQ_MAX_STEPS == SERVO_SEQ_MAX_STEPS,
+               "配置侧与执行侧的序列上限必须相等，否则长序列会被静默截断");
+_Static_assert(BSP_SERVO_SEQ_MAX_POINTS >= ACTION_SEQ_MAX_STEPS + 2,
+               "底层点数容量须 ≥ 序列上限+2（多的 2 个给'走向终点'和'归中'两步）");
+
+static const InteractionMatrix_t g_emotion_matrix[] = {
+    // ── 1 ：1_1:中性1 ──────────────────────────────────────────────────────────────
+    /* ★2026-09-24 改版（需求2：速度慢 / 幅度大 / 降噪）
+     *
+     * 【幅度】这是本条的第二次放大：头 70↔110(40°) → 55↔125(70°)，臂 140↔170(30°)
+     *   → 30↔80(50°)。幅度大的真实收益不是"动作夸张"，而是【磨损摊开】——
+     *   舵机齿轮的磨损集中在"反复经过的那一小段齿弧"上，摆 30° 就只有那 30° 的
+     *   齿在受力，摆 70° 则整段齿弧轮流受力，同样次数的动作总磨损量差不多，
+     *   但【局部集中磨损】没了，寿命由"最先磨秃的那几个齿"决定，故这才是寿命项。
+     *
+     * 【速度】头/臂序列全用 MID(15ms/°) —— bsp_config.h:297 实测的"最慢不抖档"。
+     *   想更慢要先看 1_2（那条专门用 SLOWER/SLOW 做 A/B 实测），别在这里先降。
+     *
+     * 【停顿】每一步都显式写了 hold_ms。1_1 的"中性"感就靠"摆过去 → 停住 → 摆回来"
+     *   的呼吸节奏，纯位移链（hold=0）会读成机械往复，见 [[feedback_pause_plus_variation]]。
+     *
+     * 【⭐ 本次最大的一处改动其实是行程】旧版手臂 target=170，意味着每播一次 1_1，
+     *   手臂要 15→170→15 空跑 310°——这 310° 跟"演什么"无关，是纯粹多出来的磨损
+     *   和噪音，且归中那程走的是 SERVO_SPEED_CENTER_ARM=FAST(10ms/°) 相当快。
+     *   改成 target=75 后单程降到 60°+15°，同样的情绪表达，行程砍掉七成。
+     *   ⚠️ 代价：手臂不再一直举到最高位，观感会变（若你要保留 170 的高举姿势，
+     *      把 target 与 seq 整体上移即可，时长按 |位移|×15 重算）。
+     *
+     * 【时长】重放校验 5080ms / GIF 周期 5000ms = 1.016 倍。 */
+    {
+        .emotion_id = EMO_NEUTRAL1,
+        .screen_anim = "中性1.gif",
+        .gif_path = "S:/gif/1_1.gif", // 中性1
+        .vib_seq = vib_light1,
+        .vib_seq_len = 2,
+        // 由于没有设计师，audio_file音频暂时放弃。全部删除改动太大，暂时占位
+        .audio_file = "laugh_short.mp3", // 暂弃
+        .head = {
+            .target = 55.0f, // 90→55，先摆到偏右 35°
+            .speed = SERVO_SPEED_MID,
+            .seq = {
+                {125.0f, 0, 300}, // 70° 大摆到偏左（旧值 40°）
+                {55.0f, 0, 300},  // 摆回
+                {125.0f, 0, 300}, // 再摆过去
+                {90.0f},          // 收回中位，归中因此是零位移
+            },
+            .seq_len = 4,
+            .seq_speed = SERVO_SPEED_MID,
+        },
+        .left_arm = {
+            .target = 80.0f, // 15→80，抬 65°（旧值 target=170，要多跑 90°）
+            .speed = SERVO_SPEED_MID,
+            .seq = {
+                {30.0f, 0, 500}, // 50° 下摆（旧值只 30°）
+                {80.0f, 0, 500}, // 摆上去
+                {30.0f, 0, 500}, // 再摆下来，收在低处
+            },
+            .seq_len = 3,
+            .seq_speed = SERVO_SPEED_MID,
+        },
+        .right_arm = {
+            // 与左臂逐字相同：中性是"两侧一起呼吸"，同相才对
+            .target = 80.0f,
+            .speed = SERVO_SPEED_MID,
+            .seq = {
+                {30.0f, 0, 500},
+                {80.0f, 0, 500},
+                {30.0f, 0, 500},
+            },
+            .seq_len = 3,
+            .seq_speed = SERVO_SPEED_MID,
+        },
+    },
+
+    // ── 1: 中性1_2 ──────────────────────────────────────────────────────────────
+    /* ★2026-09-28 改版（按 1_1 已验收的模板重做）
+     *
+     * 【为什么推翻 2026-09-24 那版】那版把本条做成"慢档 A/B 实验组"——头 @SLOWER、
+     *   臂 @SLOW，用来实测 bsp_config.h:298-300 那句"SLOWER/SLOW 实测有抖动"还成不
+     *   成立。★2026-09-28 你拍板：【降速这条路不好做，放弃】，力度改放到"增加头部
+     *   角度"上。故本条回归 1_1 同款【全 MID + 大幅 + 显式停顿】。
+     *   ⚠️ 那条 A/B 至此【未验先废】—— bsp_config.h 的抖动警告仍按"有效"对待，
+     *      全库默认不上 SLOWER/SLOW。想哪天再验，把本条头/臂降一档即可。
+     *
+     * 【幅度】头 70°(55↔125)、臂 50°(25↔75)，与 1_1 同量级。
+     *   幅度大的真实收益是【磨损摊开】，不是"动作夸张"：舵机齿轮只吃"反复经过的
+     *   那一小段齿弧"，摆 70° 就是整段齿弧轮流受力，局部集中磨损消失，寿命才上去。
+     *
+     * 【与 1_1 的差异】只差节奏：1_1 是 hold 300/500 的慢呼吸，本条压到 250/400。
+     *   同样的大幅、更密的拍子，两条不雷同（见 [[feedback_pause_plus_variation]]：
+     *   一组内禁止复用动作体，差异化维度可以是"停顿长短"）。
+     *
+     * 【时长】头 4960ms / 臂 4420ms，最长 4960ms / GIF 5000ms = 0.992 倍。 */
+    {
+        .emotion_id = EMO_NEUTRAL2,
+        .screen_anim = "中性2.gif",
+        .gif_path = "S:/gif/1_2.gif",
+        .vib_seq = vib_light1,
+        .vib_seq_len = 1,
+        .audio_file = "doubt.mp3",
+        .head = {
+            .target = 55.0f, // 90→55，先摆到偏右 35°
+            .speed = SERVO_SPEED_MID,
+            .seq = {
+                {125.0f, 0, 250}, // 70° 大摆到偏左（旧值 50°@SLOWER）
+                {55.0f, 0, 250},
+                {125.0f, 0, 250},
+                {90.0f}, // 收回中位，归中因此是零位移
+            },
+            .seq_len = 4,
+            .seq_speed = SERVO_SPEED_MID,
+        },
+        .left_arm = {
+            .target = 75.0f, // 15→75，抬 60°
+            .speed = SERVO_SPEED_MID,
+            .seq = {
+                {25.0f, 0, 400}, // 50° 大摆（旧值 40°@SLOW）
+                {75.0f, 0, 400},
+                {25.0f, 0, 400},
+            },
+            .seq_len = 3,
+            .seq_speed = SERVO_SPEED_MID,
+        },
+        .right_arm = {
+            // 与左臂逐字相同：中性是"两侧一起呼吸"，同相才对
+            .target = 75.0f,
+            .speed = SERVO_SPEED_MID,
+            .seq = {
+                {25.0f, 0, 400},
+                {75.0f, 0, 400},
+                {25.0f, 0, 400},
+            },
+            .seq_len = 3,
+            .seq_speed = SERVO_SPEED_MID,
+        },
+    },
+
+    // ── 1: 中性1_3 ──────────────────────────────────────────────────────────────
+    /* ★2026-09-28 改版
+     *
+     * 【头部本来就没问题】旧版已经是 60°@MID 大摆，本轮【只动三处】：
+     *   ① target 90 → 60：旧版 target=90 就是中位本身，那一步位移恒为 0，
+     *      白占一个点还让 seq[0] 只能从 90 走到 60（30°）。
+     *   ② 每步补显式 hold（旧版靠 750ms 的大停顿撑节奏，拍子太稀）。
+     *   ③ 摆动次数 5 次、hold 320ms —— 时长从 7140 收到 7000，正好等于 GIF 周期。
+     *
+     * 【手臂改动较大】旧版两臂是 target=20@VERY_FAST + 序列 @SLOWER：
+     *   · 那个 target 只走 15→20 = 5° —— 很小又很快，正是需求1 要避开的形态；
+     *   · 序列本身 65° 不小，但速度档混用（点用 VERY_FAST、段用 SLOWER），
+     *     读起来"前半段抽一下、后半段慢慢晃"。
+     *   现改为【全 MID + 60° 单步 + 显式 hold】。总时长 7740 → 6920ms，
+     *   与 GIF 周期 7000ms 的比值从 1.106 收到 1.000（最长轴其实是头 7000ms）。
+     *
+     * 【时长】头 7000ms / 臂 6920ms，最长 7000ms / GIF 7000ms = 1.000 倍（整拍）。 */
+    {
+        .emotion_id = EMO_NEUTRAL3,
+        .screen_anim = "中性3.gif",
+        .gif_path = "S:/gif/1_3.gif",
+        .vib_seq = vib_light1,
+        .vib_seq_len = 1,
+        .audio_file = "doubt.mp3",
+        .head = {
+            .target = 60.0f, // 90→60，先摆到偏右 30°
+            .speed = SERVO_SPEED_MID,
+            .seq = {
+                {120.0f, 0, 320}, // 60° 大摆到偏左（保持旧版量级）
+                {60.0f, 0, 320},
+                {120.0f, 0, 320},
+                {60.0f, 0, 320},
+                {120.0f, 0, 320},
+                {90.0f}, // 收回中位，归中因此是零位移
+            },
+            .seq_len = 6,
+            .seq_speed = SERVO_SPEED_MID,
+        },
+        .left_arm = {
+            .target = 75.0f, // 15→75，抬 60°（旧版 target 只到 20°，等于没抬）
+            .speed = SERVO_SPEED_MID,
+            .seq = {
+                {15.0f, 0, 300}, // 60° 下摆到基线（旧版 10°，已贴下限）
+                {75.0f, 0, 300},
+                {15.0f, 0, 300},
+                {75.0f, 0, 300},
+                {15.0f, 0, 300},
+            },
+            .seq_len = 5,
+            .seq_speed = SERVO_SPEED_MID,
+        },
+        .right_arm = {
+            // 与左臂逐字相同（旧版两臂也是逐字相同，保留）
+            .target = 75.0f,
+            .speed = SERVO_SPEED_MID,
+            .seq = {
+                {15.0f, 0, 300},
+                {75.0f, 0, 300},
+                {15.0f, 0, 300},
+                {75.0f, 0, 300},
+                {15.0f, 0, 300},
+            },
+            .seq_len = 5,
+            .seq_speed = SERVO_SPEED_MID,
+        },
+    },
+
+    // ── 1: 中性1_4 ──────────────────────────────────────────────────────────────
+    /* ★2026-09-28 改版（本条是中性组问题最重的一条）
+     *
+     * 【旧版头部的病】整条 11 步里没有一个超过 20°：10°/20° 来回倒，全 @MID。
+     *   舵机从 80° 到 100° 那 20° 齿弧里来回磨了 8 遍 —— 这就是需求1 点名的
+     *   "过度使用某几个齿轮"。而且 1000ms 的两次长停（旧 seq[0]/seq[5]）把
+     *   整条切得七零八落，读起来是"呆住 → 抖两下 → 呆住 → 抖两下"。
+     *   ★一般化（14_x 起照用）：判断"像不像"先看每个轴有没有长于约 1s 的
+     *   零运动段；静止与节奏是两个独立毛病，得分别治。
+     *   现改为 60° 单步 @MID + 200ms hold。
+     *
+     * 【旧版手臂的病】左臂 target=130@VERY_FAST 之后是 20°@MID 的小步，
+     *   最后一步还写了 {0.0f}（会被软限位钳到 10°，等于一次 130° 的暴走复位）；
+     *   右臂 seq_len=0，整条【完全不参与】—— 单臂动、另一臂僵着，本身就是坏的观感。
+     *   现改为两臂同相 75° 单步 @MID。
+     *
+     * 【时长卡点】1_4.gif 周期实测 5330ms（不是 5000），这个数不是 20ms 的整数倍，
+     *   所以只能求贴近、做不到精确整拍。头 hold 200ms（10 基准帧整）、
+     *   臂 hold 300ms（15 基准帧整），都取 20 的整数倍以免被折算抹掉零头：
+     *   头 5300ms / 臂 5400ms，最长 5400ms / GIF 5330ms = 1.013 倍。
+     *   （初版填 250/400 得 5540/5700 = 1.069，超过 6% 的观感阈值，已收。）*/
+    {
+        .emotion_id = EMO_NEUTRAL4,
+        .screen_anim = "中性4.gif",
+        .gif_path = "S:/gif/1_4.gif",
+        .vib_seq = vib_light1,
+        .vib_seq_len = 1,
+        .audio_file = "doubt.mp3",
+        .head = {
+            .target = 60.0f, // 90→60，先摆到偏右 30°
+            .speed = SERVO_SPEED_MID,
+            .seq = {
+                {120.0f, 0, 200}, // 60° 大摆到偏左（旧值全程 10~20°）
+                {60.0f, 0, 200},
+                {120.0f, 0, 200},
+                {60.0f, 0, 200},
+                {90.0f}, // 收回中位，归中因此是零位移
+            },
+            .seq_len = 5,
+            .seq_speed = SERVO_SPEED_MID,
+        },
+        .left_arm = {
+            .target = 90.0f, // 15→90，抬 75°（旧版 130°，行程空跑太多）
+            .speed = SERVO_SPEED_MID,
+            .seq = {
+                {15.0f, 0, 300}, // 75° 下摆（旧值只 20°）
+                {90.0f, 0, 300},
+                {15.0f, 0, 300},
+            },
+            .seq_len = 3,
+            .seq_speed = SERVO_SPEED_MID,
+        },
+        .right_arm = {
+            // ★旧版这条 seq_len=0，整条不动；现补成与左臂同相
+            .target = 90.0f,
+            .speed = SERVO_SPEED_MID,
+            .seq = {
+                {15.0f, 0, 300},
+                {90.0f, 0, 300},
+                {15.0f, 0, 300},
+            },
+            .seq_len = 3,
+            .seq_speed = SERVO_SPEED_MID,
+        },
+    },
+
+    // ── 1: 中性1_5 ──────────────────────────────────────────────────────────────
+    /* ★2026-09-28 改版（本条的主要毛病其实是【时长】，幅度是次要的）
+     *
+     * 【旧版时长只有 GIF 的一半】旧版最长轴 3880ms，而 1_5.gif 实测周期 7330ms
+     *   —— 比值 0.529。一次情绪的时长 == 舵机序列时长（interaction.c 阻塞等舵机、
+     *   一完就 ui_resume_main_gif_loop() 硬切 GIF），所以旧版每次播到 GIF 一半
+     *   就被砍断重来。这条比"幅度小"更显眼，只是没人量过。
+     *
+     * 【旧版头部的病】前 4 步是 30/60° 的正常大摆，后 5 步突然退化成
+     *   …→90→85→95→85→95→90，全是 5°/10° 的微动 @MID。等于"摆完大动作之后
+     *   在原地抖嘴唇"。那 5 步单步最小只有 5°，是需求1 的典型形态。
+     *   现整条统一成 60° 单步 @MID + 400ms hold，摆动 5 次把时长顶到 7400ms。
+     *
+     * 【旧版手臂的病】左臂先空停 1500ms（零位移），再 75° 来回一次；右臂
+     *   只做一次 75° 单程。两臂各做各的，且都只有一趟，撑不满节奏。
+     *   现改为两臂同相、70° 单步、来回各两趟。
+     *
+     * 【时长】头 7400ms / 臂 7420ms，最长 7420ms / GIF 7330ms = 1.012 倍。
+     *   （旧版 3880/7330 = 0.529。）*/
+    {
+        .emotion_id = EMO_NEUTRAL5,
+        .screen_anim = "中性5.gif",
+        .gif_path = "S:/gif/1_5.gif",
+        .vib_seq = vib_light1,
+        .vib_seq_len = 1,
+        .audio_file = "doubt.mp3",
+        .head = {
+            .target = 60.0f, // 90→60，先摆到偏右 30°
+            .speed = SERVO_SPEED_MID,
+            .seq = {
+                {120.0f, 0, 400}, // 60° 大摆（旧版尾巴那 5 步只有 5~10°）
+                {60.0f, 0, 400},
+                {120.0f, 0, 400},
+                {60.0f, 0, 400},
+                {120.0f, 0, 400},
+                {90.0f}, // 收回中位，归中因此是零位移
+            },
+            .seq_len = 6,
+            .seq_speed = SERVO_SPEED_MID,
+        },
+        .left_arm = {
+            .target = 85.0f, // 15→85，抬 70°
+            .speed = SERVO_SPEED_MID,
+            .seq = {
+                {15.0f, 0, 380}, // 70° 下摆（旧版先空停 1500ms 才动）
+                {85.0f, 0, 380},
+                {15.0f, 0, 380},
+                {85.0f, 0, 380},
+            },
+            .seq_len = 4,
+            .seq_speed = SERVO_SPEED_MID,
+        },
+        .right_arm = {
+            // ★旧版只做一次单程，现补成与左臂同相、同样两趟
+            .target = 85.0f,
+            .speed = SERVO_SPEED_MID,
+            .seq = {
+                {15.0f, 0, 380},
+                {85.0f, 0, 380},
+                {15.0f, 0, 380},
+                {85.0f, 0, 380},
+            },
+            .seq_len = 4,
+            .seq_speed = SERVO_SPEED_MID,
+        },
+    },
+
+    // {
+    //     // ── 1_6: 中性①「中性表情3」── 主语：头（两次偏右的打量）
+    //     .emotion_id = EMO_NEUTRAL6,
+    //     .screen_anim = "中性表情3.gif",
+    //     .gif_path = "S:/gif/1_6.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 68.0f, .speed = SERVO_SPEED_SLOW, .seq = {
+    //                                                              {68.0f, 0, 320},                // ★停 320ms（素材静止段①）
+    //                                                              {80.0f, SERVO_SPEED_SLOW, 0},   // 收回 12°
+    //                                                              {66.0f, SERVO_SPEED_SLOW, 0},   // 再下去 14°
+    //                                                              {88.0f, SERVO_SPEED_SLOW, 320}, // ★22° 最大行程（对素材 +1580 的高潮）
+    //                                                              {74.0f, SERVO_SPEED_SLOW, 0},   // 收回 14°
+    //                                                              {90.0f, SERVO_SPEED_SLOW, 0},   // 16° 收在中位，归中零位移
+    //                                                          },
+    //              .seq_len = 6,
+    //              .seq_speed = SERVO_SPEED_SLOW},
+    //     .left_arm = {.target = 34.0f, .speed = SERVO_SPEED_SLOWER, .seq = {
+    //                                                                    {34.0f, 0, 680},
+    //                                                                    {30.0f, SERVO_SPEED_SLOWER, 400},
+    //                                                                    {22.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                    {36.0f, SERVO_SPEED_SLOWER, 600},
+    //                                                                    {15.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                },
+    //                  .seq_len = 5,
+    //                  .seq_speed = SERVO_SPEED_SLOWER},
+    //     .right_arm = {.target = 0.0f, .speed = 0, .seq_len = 0, .seq_speed = 0},
+    // },
+    // {
+    //     // ── 1_7: 中性②「中性聆听1-1-1」── 主语：两臂（全程不停的匀速往复）
+    //     .emotion_id = EMO_NEUTRAL7,
+    //     .screen_anim = "中性聆听1.gif",
+    //     .gif_path = "S:/gif/1_7.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 74.0f, .speed = SERVO_SPEED_SLOW, .seq = {
+    //                                                              {74.0f, 0, 160},              // 唯一的停顿（160ms）
+    //                                                              {88.0f, SERVO_SPEED_SLOW, 0}, // 回 14°
+    //                                                              {72.0f, SERVO_SPEED_SLOW, 0}, // 出 16°
+    //                                                              {86.0f, SERVO_SPEED_SLOW, 0}, // 回 14°
+    //                                                              {70.0f, SERVO_SPEED_SLOW, 0}, // 出 16°
+    //                                                              {86.0f, SERVO_SPEED_SLOW, 0}, // 回 16°
+    //                                                              {78.0f, SERVO_SPEED_SLOW, 0}, // 出 8°
+    //                                                              {90.0f, SERVO_SPEED_SLOW, 0}, // 回 12°，收在中位
+    //                                                          },
+    //              .seq_len = 8,
+    //              .seq_speed = SERVO_SPEED_SLOW},
+    //     .left_arm = {.target = 38.0f, .speed = SERVO_SPEED_SLOWER, .seq = {
+    //                                                                    {38.0f, 0, 320},
+    //                                                                    {15.0f, SERVO_SPEED_SLOWER, 360},
+    //                                                                    {38.0f, SERVO_SPEED_SLOWER, 360},
+    //                                                                    {15.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                },
+    //                  .seq_len = 4,
+    //                  .seq_speed = SERVO_SPEED_SLOWER},
+    //     .right_arm = {.target = 32.0f, .speed = SERVO_SPEED_SLOWER, .seq = {
+    //                                                                     {32.0f, 0, 680}, // 起手先停 680ms ⇒ 与左臂错开相位
+    //                                                                     {15.0f, SERVO_SPEED_SLOWER, 360},
+    //                                                                     {32.0f, SERVO_SPEED_SLOWER, 480},
+    //                                                                     {15.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                 },
+    //                   .seq_len = 4,
+    //                   .seq_speed = SERVO_SPEED_SLOWER},
+    // },
+    // {
+    //     // ── 1_8: 中性③「中性聆听2」── 主语：头（4 次眨眼同步的小"嗯"）
+    //     .emotion_id = EMO_NEUTRAL8,
+    //     .screen_anim = "中性聆听2.gif",
+    //     .gif_path = "S:/gif/1_8.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 84.0f, .speed = SERVO_SPEED_SLOW, .seq = {
+    //                                                              {84.0f, 0, 180},                // 眨眼1(浅)：落 6°，微停
+    //                                                              {88.0f, SERVO_SPEED_SLOW, 500}, // 眨眼2(浅)：回 4°，停 500ms
+    //                                                              {79.0f, SERVO_SPEED_SLOW, 200}, // 眨眼3(深)：出去 9°，只停 200ms
+    //                                                              {86.0f, SERVO_SPEED_SLOW, 840}, // 眨眼4(深)：回 7°，长停收尾
+    //                                                          },
+    //              .seq_len = 4,
+    //              .seq_speed = SERVO_SPEED_SLOW},
+    //     .left_arm = {.target = 28.0f, .speed = SERVO_SPEED_SLOWER, .seq = {
+    //                                                                    {28.0f, 0, 1400},
+    //                                                                },
+    //                  .seq_len = 1,
+    //                  .seq_speed = SERVO_SPEED_SLOWER},
+    //     .right_arm = {.target = 15.0f, .speed = SERVO_SPEED_SLOWER, .seq = {
+    //                                                                     {15.0f, 0, 500}, // 等左臂先动
+    //                                                                     {28.0f, SERVO_SPEED_SLOWER, 900},
+    //                                                                 },
+    //                   .seq_len = 2,
+    //                   .seq_speed = SERVO_SPEED_SLOWER},
+    // },
+    // {
+    //     // ── 1_9: 中性④「中性聆听3」── 主语：头（每 750ms 一拍，共 4 拍）
+    //     .emotion_id = EMO_NEUTRAL9,
+    //     .screen_anim = "中性聆听3.gif",
+    //     .gif_path = "S:/gif/1_9.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 70.0f, .speed = SERVO_SPEED_SLOW, .seq = {
+    //                                                              {70.0f, 0, 200},                // 拍1：20° 到位，停 200ms
+    //                                                              {88.0f, SERVO_SPEED_SLOW, 240}, // 拍2：18° 回摆，停 240ms
+    //                                                              {70.0f, SERVO_SPEED_SLOW, 240}, // 拍3：18° 出去，停 240ms
+    //                                                              {88.0f, SERVO_SPEED_SLOW, 240}, // 拍4：18° 回摆，停 240ms
+    //                                                              {90.0f, SERVO_SPEED_SLOW, 0},   // 收在中位
+    //                                                          },
+    //              .seq_len = 5,
+    //              .seq_speed = SERVO_SPEED_SLOW},
+    //     .left_arm = {.target = 38.0f, .speed = SERVO_SPEED_SLOWER, .seq = {
+    //                                                                    {38.0f, 0, 200},
+    //                                                                    {20.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                    {40.0f, SERVO_SPEED_SLOWER, 240},
+    //                                                                    {26.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                    {38.0f, SERVO_SPEED_SLOWER, 200},
+    //                                                                    {15.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                },
+    //                  .seq_len = 6,
+    //                  .seq_speed = SERVO_SPEED_SLOWER},
+    //     .right_arm = {.target = 34.0f, .speed = SERVO_SPEED_SLOWER, .seq = {
+    //                                                                     {34.0f, 0, 320},
+    //                                                                     {18.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                     {36.0f, SERVO_SPEED_SLOWER, 240},
+    //                                                                     {20.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                     {34.0f, SERVO_SPEED_SLOWER, 240},
+    //                                                                     {15.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                 },
+    //                   .seq_len = 6,
+    //                   .seq_speed = SERVO_SPEED_SLOWER},
+    // },
+    // // ══════════════════════════════════════════════════════════════════════════
+    // // ── 10- 2_1傲娇① 别过脸·哼（配 assets/gif/2_1.gif = 傲娇1.gif：斜眼+波浪嘴）──────
+    // {
+    //     .emotion_id = EMO_TSUNDERE_BASE,
+    //     .screen_anim = "傲娇1.gif",
+    //     .gif_path = "S:/gif/2_1.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = "doubt.mp3",
+    //     .head = {
+    //         .target = 142.0f,
+    //         .speed = SERVO_SPEED_FAST,
+    //         .seq = {
+    //             {142.0f, 0, 800},
+    //             {130.0f, SERVO_SPEED_MID, 1200},
+    //             {145.0f, SERVO_SPEED_FAST, 800},
+
+    //         },
+    //         .seq_len = 3,
+    //         .seq_speed = SERVO_SPEED_MID,
+    //     },
+    //     .left_arm = {
+    //         .target = 104.0f,
+    //         .speed = SERVO_SPEED_VERY_FAST,
+    //         .seq = {
+    //             {104.0f, 0, 3105},
+    //             {15.0f, SERVO_SPEED_MID},
+    //         },
+    //         .seq_len = 2,
+    //         .seq_speed = SERVO_SPEED_MID,
+    //     },
+    //     .right_arm = {
+    //         .target = 100.0f,
+    //         .speed = SERVO_SPEED_VERY_FAST,
+    //         .seq = {
+    //             {100.0f, 0, 3105},
+    //             {15.0f, SERVO_SPEED_MID},
+    //         },
+    //         .seq_len = 2,
+    //         .seq_speed = SERVO_SPEED_MID,
+    //     },
+    // },
+
+    // // ── 11- 2_2傲娇────────
+    // {
+    //     .emotion_id = EMO_TSUNDERE_ROLL,
+    //     .screen_anim = "傲娇2.gif",
+    //     .gif_path = "S:/gif/2_2.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = "doubt.mp3",
+    //     .head = {
+    //         .target = 70.0f,
+    //         .speed = SERVO_SPEED_FAST,
+    //         .seq = {
+    //             {70.0f, 0, 250},
+    //             {140.0f, SERVO_SPEED_MID, 1500},
+    //             {110.0f, 0, 350},
+    //             {96.0f, SERVO_SPEED_MID, 500},
+    //             {130.0f, SERVO_SPEED_MID},
+    //             {130.0f, 0, 500},
+    //         },
+    //         .seq_len = 6,
+    //         .seq_speed = SERVO_SPEED_MID,
+    //     },
+    //     .left_arm = {
+    //         .target = 62.0f,
+    //         .speed = SERVO_SPEED_MID,
+    //         .seq = {
+    //             {62.0f, 0, 3105},
+    //             {15.0f, SERVO_SPEED_FAST},
+    //         },
+    //         .seq_len = 2,
+    //         .seq_speed = SERVO_SPEED_MID,
+    //     },
+    //     .right_arm = {
+    //         .target = 58.0f,
+    //         .speed = SERVO_SPEED_MID,
+    //         .seq = {
+    //             {58.0f, 0, 3105},
+    //             {15.0f, SERVO_SPEED_FAST},
+    //         },
+    //         .seq_len = 2,
+    //         .seq_speed = SERVO_SPEED_MID,
+    //     },
+    // },
+    // // ── 12 -2_3傲娇③ 绷住·抬臂挡（配 assets/gif/2_3.gif = 傲娇3.gif）★主角是手 ────────
+    // {
+    //     .emotion_id = EMO_TSUNDERE_PEEK,
+    //     .screen_anim = "傲娇3.gif",
+    //     .gif_path = "S:/gif/2_3.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = "doubt.mp3",
+    //     .head = {
+    //         .target = 110.0f,
+    //         .speed = SERVO_SPEED_FAST,
+    //         .seq = {
+    //             {110.0f, 0, 300},
+    //             {144.0f, SERVO_SPEED_FAST},
+    //             {144.0f, 0, 900},
+    //             {98.0f, SERVO_SPEED_MID, 400},
+    //         },
+    //         .seq_len = 4,
+    //         .seq_speed = SERVO_SPEED_MID,
+    //     },
+    //     .left_arm = {
+    //         .target = 100.0f,
+    //         .speed = SERVO_SPEED_FAST,
+    //         .seq = {
+    //             {100.0f, 0, 300},
+    //             {124.0f, SERVO_SPEED_VERY_FAST},
+    //             {124.0f, 0, 700},
+    //             {117.0f, SERVO_SPEED_MID, 600},
+    //             {15.0f, SERVO_SPEED_MID},
+    //         },
+    //         .seq_len = 5,
+    //         .seq_speed = SERVO_SPEED_MID,
+    //     },
+    //     .right_arm = {
+    //         .target = 94.0f,
+    //         .speed = SERVO_SPEED_FAST,
+    //         .seq = {
+    //             {94.0f, 0, 300},
+    //             {118.0f, SERVO_SPEED_VERY_FAST},
+    //             {118.0f, 0, 700},
+    //             {111.0f, SERVO_SPEED_MID, 600},
+    //             {15.0f, SERVO_SPEED_MID},
+    //         },
+    //         .seq_len = 5,
+    //         .seq_speed = SERVO_SPEED_MID,
+    //     },
+    // },
+
+    // // ── 傲娇④ 求摸（配 assets/gif/2_4.gif = 傲娇求摸.gif）──────────────────────
+    // {
+    //     .emotion_id = EMO_TSUNDERE_PET,
+    //     .screen_anim = "傲娇4.gif",
+    //     .gif_path = "S:/gif/2_4.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = "doubt.mp3",
+    //     .head = {
+    //         .seq = {
+    //             {60.0f},
+    //             {110.0f},
+    //             {60.0f},
+    //             {110.0f},
+    //             {60.0f},
+    //             {110.0f},
+    //         },
+    //         .seq_len = 6,
+    //         .seq_speed = SERVO_SPEED_MID,
+    //     },
+    //     .left_arm = {
+    //         .target = 45.0f,
+    //         .speed = SERVO_SPEED_FAST,
+    //         .seq = {
+    //             {45.0f, 0, 300},
+    //             {55.0f},
+    //             {35.0f},
+    //             {55.0f},
+    //             {35.0f},
+    //             {55.0f},
+
+    //         },
+    //         .seq_len = 6,
+    //         .seq_speed = SERVO_SPEED_MID,
+    //     },
+    //     .right_arm = {
+    //         .target = 45.0f, // 与左臂刻意差 6°（124/118 同源的差量）
+    //         .speed = SERVO_SPEED_FAST,
+    //         .seq = {
+    //             {45.0f, 0, 300},
+    //             {35.0f},
+    //             {55.0f},
+    //             {35.0f},
+    //             {55.0f},
+    //             {35.0f},
+
+    //         },
+    //         .seq_len = 6,
+    //         .seq_speed = SERVO_SPEED_MID,
+    //     },
+    // },
+
+    // // ── 3: 兴奋3_1 ──────────────────────────────────────────────────────────────
+    // {
+    //     .emotion_id = EMO_EXCITED1,
+    //     .screen_anim = "兴奋3_1.gif",
+    //     .gif_path = "S:/gif/3_1.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = "laugh_short.mp3",
+    //     .head = {
+    //         .target = 96.0f,
+    //         .speed = SERVO_SPEED_MID,
+    //         .seq = {
+    //             {96.0f, 0, 500},
+    //             {84.0f},
+    //             {96.0f},
+    //             {84.0f},
+    //             {96.0f},
+    //             {84.0f},
+    //             {96.0f},
+    //             {90.0f, SERVO_SPEED_FAST},
+    //         },
+    //         .seq_len = 8,
+    //         .seq_speed = SERVO_SPEED_MID,
+    //     },
+    //     .left_arm = {
+    //         .target = 120.0f,
+    //         .speed = SERVO_SPEED_VERY_FAST,
+    //         .seq = {
+    //             {105.0f, SERVO_SPEED_FAST},
+    //             {125.0f},
+    //             {105.0f},
+    //             {125.0f},
+    //             {105.0f},
+    //             {125.0f},
+    //             {105.0f},
+    //             {125.0f},
+    //             {105.0f},
+    //             {33.0f, SERVO_SPEED_FAST},
+    //         },
+    //         .seq_len = 10,
+    //         .seq_speed = SERVO_SPEED_FAST,
+    //     },
+    //     .right_arm = {
+    //         .target = 116.0f,
+    //         .speed = SERVO_SPEED_VERY_FAST,
+    //         .seq = {
+    //             {101.0f, SERVO_SPEED_FAST},
+    //             {121.0f},
+    //             {101.0f},
+    //             {121.0f},
+    //             {101.0f},
+    //             {121.0f},
+    //             {101.0f},
+    //             {121.0f},
+    //             {101.0f},
+    //             {33.0f, SERVO_SPEED_FAST},
+    //         },
+    //         .seq_len = 10,
+    //         .seq_speed = SERVO_SPEED_FAST,
+    //     },
+    // },
+
+    // // ── 3_2: 兴奋② 圆眼笑·憨 ─────────────────────────────────────────────────
+    // {
+    //     .emotion_id = EMO_EXCITED2,
+    //     .screen_anim = "兴奋3_2.gif",
+    //     .gif_path = "S:/gif/3_2.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = "laugh_short.mp3",
+    //     .head = {
+    //         .target = 98.0f,
+    //         .speed = SERVO_SPEED_MID,
+    //         .seq = {
+    //             {82.0f},
+    //             {98.0f},
+    //             {82.0f},
+    //             {98.0f},
+    //             {90.0f, SERVO_SPEED_FAST},
+    //         },
+    //         .seq_len = 5,
+    //         .seq_speed = SERVO_SPEED_MID,
+    //     },
+    //     .left_arm = {
+    //         .target = 124.0f,
+    //         .speed = SERVO_SPEED_FAST,
+    //         .seq = {
+    //             {104.0f, SERVO_SPEED_FAST},
+    //             {130.0f},
+    //             {104.0f},
+    //             {130.0f},
+    //             {104.0f},
+    //             {130.0f},
+    //             {33.0f, SERVO_SPEED_MID},
+    //         },
+    //         .seq_len = 7,
+    //         .seq_speed = SERVO_SPEED_FAST,
+    //     },
+    //     .right_arm = {
+    //         .target = 120.0f,
+    //         .speed = SERVO_SPEED_FAST,
+    //         .seq = {
+    //             {100.0f, SERVO_SPEED_FAST},
+    //             {126.0f},
+    //             {100.0f},
+    //             {126.0f},
+    //             {100.0f},
+    //             {126.0f},
+    //             {33.0f, SERVO_SPEED_MID},
+    //         },
+    //         .seq_len = 7,
+    //         .seq_speed = SERVO_SPEED_FAST,
+    //     },
+    // },
+
+    // // ── 3_3: 兴奋③ 眨眼笑·俏皮 ────────────────────────
+    // {
+    //     .emotion_id = EMO_EXCITED3,
+    //     .screen_anim = "兴奋3_3.gif",
+    //     .gif_path = "S:/gif/3_3.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = "laugh_short.mp3",
+    //     .head = {
+    //         .target = 90.0f,
+    //         .speed = SERVO_SPEED_FAST,
+    //         .seq = {
+    //             {84.0f, 0, 600},
+    //             {96.0f},
+    //             {86.0f},
+    //             {96.0f},
+    //             {86.0f},
+    //             {92.0f, SERVO_SPEED_MID},
+    //         },
+    //         .seq_len = 6,
+    //         .seq_speed = SERVO_SPEED_FAST,
+    //     },
+    //     .left_arm = {
+    //         .target = 103.0f,
+    //         .speed = SERVO_SPEED_VERY_FAST,
+    //         .seq = {
+    //             {123.0f, SERVO_SPEED_FAST},
+    //             {103.0f},
+    //             {123.0f},
+    //             {103.0f},
+    //             {123.0f},
+    //             {103.0f},
+    //             {123.0f},
+    //             {103.0f},
+    //             {123.0f},
+    //             {33.0f, SERVO_SPEED_FAST},
+    //         },
+    //         .seq_len = 10,
+    //         .seq_speed = SERVO_SPEED_FAST,
+    //     },
+    //     .right_arm = {
+    //         .target = 123.0f,
+    //         .speed = SERVO_SPEED_VERY_FAST,
+    //         .seq = {
+    //             {103.0f, SERVO_SPEED_FAST},
+    //             {123.0f},
+    //             {103.0f},
+    //             {123.0f},
+    //             {103.0f},
+    //             {123.0f},
+    //             {103.0f},
+    //             {33.0f, SERVO_SPEED_FAST},
+    //         },
+    //         .seq_len = 8,
+    //         .seq_speed = SERVO_SPEED_FAST,
+    //     },
+    // },
+
+    // // ── 3_4: 兴奋④ 星星眼────────────────────────────────────────
+    // {
+    //     .emotion_id = EMO_EXCITED4,
+    //     .screen_anim = "兴奋3_4.gif",
+    //     .gif_path = "S:/gif/3_4.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = "laugh_short.mp3",
+    //     .head = {
+    //         .target = 90.0f,
+    //         .speed = SERVO_SPEED_FAST,
+    //         .seq = {
+    //             {90.0f, 0, 500},
+    //             {84.0f},
+    //             {96.0f},
+    //             {84.0f},
+    //             {96.0f},
+    //             {84.0f},
+    //             {96.0f},
+    //             {84.0f},
+    //             {96.0f},
+    //             {90.0f, SERVO_SPEED_MID},
+    //         },
+    //         .seq_len = 10,
+    //         .seq_speed = SERVO_SPEED_FAST,
+    //     },
+    //     .left_arm = {
+    //         .target = 116.0f,
+    //         .speed = SERVO_SPEED_VERY_FAST,
+    //         .seq = {
+    //             {101.0f, SERVO_SPEED_FAST},
+    //             {121.0f},
+    //             {101.0f},
+    //             {121.0f},
+    //             {101.0f},
+    //             {33.0f, SERVO_SPEED_FAST},
+    //         },
+    //         .seq_len = 6,
+    //         .seq_speed = SERVO_SPEED_FAST,
+    //     },
+    //     .right_arm = {
+    //         .target = 112.0f,
+    //         .speed = SERVO_SPEED_VERY_FAST,
+    //         .seq = {
+    //             {117.0f, SERVO_SPEED_SLOW},
+    //             {97.0f},
+    //             {117.0f},
+    //             {97.0f},
+    //             {117.0f},
+    //             {33.0f, SERVO_SPEED_FAST},
+    //         },
+    //         .seq_len = 6,
+    //         .seq_speed = SERVO_SPEED_FAST,
+    //     },
+    // },
+
+    // // ── 4_1: 好奇①「好奇」── 主语：头（长停打量）
+    // {
+    //     .emotion_id = EMO_CURIOUS1,
+    //     .screen_anim = "好奇.gif",
+    //     .gif_path = "S:/gif/4_1.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 114.0f,
+    //              .speed = SERVO_SPEED_MID,
+    //              .seq = {
+    //                  {114.0f, 0, 700},
+    //                  {104.0f, 0, 900},
+    //                  {122.0f, 0, 1300},
+    //                  {112.0f, 0, 1300},
+    //              },
+    //              .seq_len = 4,
+    //              .seq_speed = SERVO_SPEED_MID},
+    //     .left_arm = {.target = 96.0f, .speed = SERVO_SPEED_FAST, .seq = {
+    //                                                                  {96.0f, 0, 2800},
+    //                                                                  {78.0f, 0, 800},
+    //                                                              },
+    //                  .seq_len = 2,
+    //                  .seq_speed = SERVO_SPEED_FAST},
+    //     .right_arm = {.target = 44.0f, .speed = SERVO_SPEED_MID, .seq = {
+    //                                                                  {44.0f, 0, 4600},
+    //                                                              },
+    //                   .seq_len = 1,
+    //                   .seq_speed = SERVO_SPEED_MID},
+    // },
+    // {
+    //     // ── 4_2: 好奇②「好奇2」──
+    //     .emotion_id = EMO_CURIOUS2,
+    //     .screen_anim = "好奇2.gif",
+    //     .gif_path = "S:/gif/4_2.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 110.0f, .speed = SERVO_SPEED_FAST, .seq = {
+    //                                                               {110.0f, 0, 4600},
+    //                                                           },
+    //              .seq_len = 1,
+    //              .seq_speed = SERVO_SPEED_FAST},
+    //     .left_arm = {.target = 88.0f, .speed = SERVO_SPEED_MID, .seq = {
+    //                                                                 {88.0f, 0, 1200},
+    //                                                                 {56.0f, SERVO_SPEED_MID, 1500},
+    //                                                             },
+    //                  .seq_len = 2,
+    //                  .seq_speed = SERVO_SPEED_MID},
+    //     .right_arm = {.target = 40.0f, .speed = SERVO_SPEED_MID, .seq = {
+    //                                                                  {40.0f, 0, 1925},
+    //                                                                  {80.0f, SERVO_SPEED_MID, 1500},
+    //                                                              },
+    //                   .seq_len = 2,
+    //                   .seq_speed = SERVO_SPEED_MID},
+    // },
+    // {
+    //     // ── 4_3: 好奇③「好奇 2」── 主语：头（凑近端详）+ 两臂同步前倾
+    //     .emotion_id = EMO_CURIOUS3,
+    //     .screen_anim = "好奇 2.gif",
+    //     .gif_path = "S:/gif/4_3.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 60.0f, .speed = SERVO_SPEED_MID, .seq = {
+    //                                                             {60.0f, 0, 1000},
+    //                                                             {48.0f, 0, 1200},
+    //                                                             {56.0f, 0, 1500},
+    //                                                         },
+    //              .seq_len = 3,
+    //              .seq_speed = SERVO_SPEED_MID},
+    //     .left_arm = {.target = 64.0f, .speed = SERVO_SPEED_FAST, .seq = {
+    //                                                                  {64.0f, 0, 3900},
+    //                                                                  {48.0f},
+    //                                                              },
+    //                  .seq_len = 2,
+    //                  .seq_speed = SERVO_SPEED_FAST},
+    //     .right_arm = {.target = 64.0f, .speed = SERVO_SPEED_FAST, .seq = {
+    //                                                                   {64.0f, 0, 3900},
+    //                                                                   {48.0f},
+    //                                                               },
+    //                   .seq_len = 2,
+    //                   .seq_speed = SERVO_SPEED_FAST},
+    // },
+
+    // /* ── 5_x：委屈（2 张）── */
+    // {
+    //     .emotion_id = EMO_GRIEVED1,
+    //     .screen_anim = "委屈.gif",
+    //     .gif_path = "S:/gif/5_1.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 68.0f, // 偏右 22°（大角=左，故偏右取小角）
+    //              .speed = SERVO_SPEED_MID,
+    //              .seq = {
+    //                  {68.0f, 0, 2200}, // ★停住：这 4.2s 的"偏着头不动"就是"躲"
+    //                  {58.0f, 0, 400},  // ★瑟缩：再躲开 10°，顿住
+    //              },
+    //              .seq_len = 2,
+    //              .seq_speed = SERVO_SPEED_MID},
+    //     .left_arm = {.target = 88.0f, // 抬 73°
+    //                  .speed = SERVO_SPEED_MID,
+    //                  .seq = {
+    //                      {88.0f, 0, 2430}, // ★停住（到位 1.10s + 停 3.43s = t 4.53s）
+    //                      {72.0f, 0, 500},  // ★随瑟缩收 16°
+    //                  },
+    //                  .seq_len = 2,
+    //                  .seq_speed = SERVO_SPEED_MID},
+    //     .right_arm = {.target = 66.0f, // 抬 51°，比左臂低 22°
+    //                   .speed = SERVO_SPEED_MID,
+    //                   .seq = {
+    //                       {66.0f, 0, 2765}, // ★停住（到位 0.77s + 停 3.77s = t 4.53s）
+    //                       {54.0f, 0, 500},  // ★随瑟缩收 12°
+    //                   },
+    //                   .seq_len = 2,
+    //                   .seq_speed = SERVO_SPEED_MID},
+    // },
+    // {
+    //     // ── 5_2: 委屈②「委屈2」── 主语：两臂（双手抬到脸前 + 抽泣）
+
+    //     .emotion_id = EMO_GRIEVED2,
+    //     .screen_anim = "委屈2.gif",
+    //     .gif_path = "S:/gif/5_2.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 90.0f, .speed = SERVO_SPEED_MID, .seq = {{90.0f, 0, 3800}, {104.0f, 0, 900}}, .seq_len = 2, .seq_speed = SERVO_SPEED_MID},
+    //     .left_arm = {.target = 140.0f, .speed = SERVO_SPEED_VERY_FAST, .seq = {
+    //                                                                        {140.0f, 0, 250},
+    //                                                                        {120.0f, 0, 150},
+    //                                                                        {140.0f, 0, 250},
+    //                                                                        {120.0f, 0, 150},
+    //                                                                        {120.0f, 0, 150},
+    //                                                                        {140.0f, 0, 250},
+    //                                                                        {120.0f, 0, 150},
+    //                                                                        {140.0f, 0, 600},
+    //                                                                        {120.0f},
+    //                                                                    },
+    //                  .seq_len = 9,
+    //                  .seq_speed = SERVO_SPEED_FAST},
+    //     .right_arm = {.target = 138.0f, .speed = SERVO_SPEED_VERY_FAST, .seq = {
+    //                                                                         {138.0f, 0, 800},
+    //                                                                         {118.0f, 0, 250},
+    //                                                                         {138.0f, 0, 150},
+    //                                                                         {138.0f, 0, 150},
+    //                                                                         {118.0f, 0, 250},
+    //                                                                         {138.0f, 0, 150},
+    //                                                                         {118.0f, 0, 250},
+    //                                                                         {138.0f, 0, 300},
+    //                                                                         {118.0f},
+    //                                                                     },
+    //                   .seq_len = 9,
+    //                   .seq_speed = SERVO_SPEED_FAST},
+    // },
+
+    // /* ── 6_x：害羞（2 张）─────────────────────────────────────────────────────── */
+
+    // {
+    //     // ── 6_1: 害羞①「害羞」── 主语：两臂（对称，两次"举起捂脸—停住—放下"）
+
+    //     .emotion_id = EMO_SHY1,
+    //     .screen_anim = "害羞.gif",
+    //     .gif_path = "S:/gif/6_1.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 90.0f,
+    //              .speed = SERVO_SPEED_MID,
+    //              .seq = {
+    //                  {90.0f, 0, 150},                 // ★滞后：先让两臂动起来
+    //                  {112.0f, SERVO_SPEED_MID, 1175}, // 偏开330 + 停到 t1675（对齐"捂着"那一段）
+    //                  {90.0f, SERVO_SPEED_MID, 755},   // 回正330 + 停到 t2760（对齐"歇"那一段）
+    //                  {112.0f, SERVO_SPEED_MID, 1175}, // 第二次偏开
+    //                  {90.0f, SERVO_SPEED_MID, 85},    // 回正，与两臂同刻收尾（t4680）
+    //              },
+    //              .seq_len = 5,
+    //              .seq_speed = SERVO_SPEED_MID},
+    //     .left_arm = {.target = 132.0f, .speed = SERVO_SPEED_VERY_FAST, .seq = {
+    //                                                                        {132.0f, 0, 920},                     // ① 捂住脸，停住（素材那 0.92s 静止）
+    //                                                                        {15.0f, SERVO_SPEED_VERY_FAST, 500},  // ② 放下585 + 歇500
+    //                                                                        {132.0f, SERVO_SPEED_VERY_FAST, 920}, // ③ 再捂一次，停住
+    //                                                                        {15.0f, SERVO_SPEED_VERY_FAST, 0},    // ④ 放下
+    //                                                                    },
+    //                  .seq_len = 4,
+    //                  .seq_speed = SERVO_SPEED_VERY_FAST},
+    //     .right_arm = {.target = 132.0f, .speed = SERVO_SPEED_VERY_FAST, .seq = {
+    //                                                                         {132.0f, 0, 920}, // ★与左臂逐字相同 = 刻意同步
+    //                                                                         {15.0f, SERVO_SPEED_VERY_FAST, 500},
+    //                                                                         {132.0f, SERVO_SPEED_VERY_FAST, 920},
+    //                                                                         {15.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                     },
+    //                   .seq_len = 4,
+    //                   .seq_speed = SERVO_SPEED_VERY_FAST},
+    // },
+
+    // {
+    //     // ── 6_2: 害羞②「害羞蹭蹭」── 主语：头（偏置的快速「蹭」）+ 两臂三级慢缩肩
+    //     .emotion_id = EMO_SHY2,
+    //     .screen_anim = "害羞蹭蹭.gif",
+    //     .gif_path = "S:/gif/6_2.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 108.0f, .speed = SERVO_SPEED_MID, .seq = {
+    //                                                              {96.0f, SERVO_SPEED_MID, 130},
+    //                                                              {108.0f, SERVO_SPEED_MID, 130},
+    //                                                              {96.0f, SERVO_SPEED_MID, 130},
+    //                                                              {108.0f, SERVO_SPEED_MID, 130},
+    //                                                              {96.0f, SERVO_SPEED_MID, 130},
+    //                                                              {108.0f, SERVO_SPEED_MID, 130},
+    //                                                              {96.0f, SERVO_SPEED_MID, 130},
+    //                                                              {108.0f, SERVO_SPEED_MID, 130},
+    //                                                          },
+    //              .seq_len = 8,
+    //              .seq_speed = SERVO_SPEED_FAST},
+    //     // 左臂：每级 16° 位移 @MID=240ms，级间长停 ⇒ 读作"一点点越缩越紧"。
+    //     .left_arm = {.target = 52.0f, .speed = SERVO_SPEED_MID, .seq = {
+    //                                                                 {52.0f, 0, 900},               // 第 1 级到位，停
+    //                                                                 {68.0f, SERVO_SPEED_MID, 900}, // 第 2 级
+    //                                                                 {84.0f, SERVO_SPEED_MID, 435}, // 第 3 级，一直停到与头同刻收尾
+    //                                                             },
+    //                  .seq_len = 3,
+    //                  .seq_speed = SERVO_SPEED_MID},
+    //     // 右臂：与左臂同刻换级，但每级高度都低 12~16° ⇒ 不对称（"蹭"本就该歪）。
+    //     .right_arm = {.target = 40.0f, .speed = SERVO_SPEED_MID, .seq = {
+    //                                                                  {40.0f, 0, 1080},
+    //                                                                  {54.0f, SERVO_SPEED_MID, 930},
+    //                                                                  {68.0f, SERVO_SPEED_MID, 465},
+    //                                                              },
+    //                   .seq_len = 3,
+    //                   .seq_speed = SERVO_SPEED_MID},
+    // },
+
+    // /* ── 7_x：怕痒（4 张）── 源文档《9 憨笑晃动》─────────────────────────────     */
+    // {
+    //     // ── 7_1: 怕痒①「怕痒」—— 主语=两臂，头钉死；锯齿 435ms × 11 拍
+    //     .emotion_id = EMO_TICKLISH1,
+    //     .screen_anim = "怕痒.gif",
+    //     .gif_path = "S:/gif/7_1.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 100.0f, .speed = SERVO_SPEED_MID, .seq = {{100.0f, 0, 2575}}, .seq_len = 1, .seq_speed = SERVO_SPEED_MID},
+    //     .left_arm = {.target = 44.0f, .speed = SERVO_SPEED_FAST, .seq = {
+    //                                                                  {15.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                  {44.0f, SERVO_SPEED_FAST, 0},
+    //                                                                  {15.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                  {44.0f, SERVO_SPEED_FAST, 0},
+    //                                                                  {15.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                  {44.0f, SERVO_SPEED_FAST, 0},
+    //                                                                  {15.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                  {44.0f, SERVO_SPEED_FAST, 0},
+    //                                                                  {15.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                  {44.0f, SERVO_SPEED_FAST, 0},
+    //                                                                  {15.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                  {44.0f, SERVO_SPEED_FAST, 0},
+    //                                                              },
+    //                  .seq_len = 12,
+    //                  .seq_speed = SERVO_SPEED_FAST},
+    //     .right_arm = {.target = 44.0f, .speed = SERVO_SPEED_FAST, .seq = {
+    //                                                                   {15.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                   {44.0f, SERVO_SPEED_FAST, 0},
+    //                                                                   {15.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                   {44.0f, SERVO_SPEED_FAST, 0},
+    //                                                                   {15.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                   {44.0f, SERVO_SPEED_FAST, 0},
+    //                                                                   {15.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                   {44.0f, SERVO_SPEED_FAST, 0},
+    //                                                                   {15.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                   {44.0f, SERVO_SPEED_FAST, 0},
+    //                                                                   {15.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                   {44.0f, SERVO_SPEED_FAST, 0},
+    //                                                               },
+    //                   .seq_len = 12,
+    //                   .seq_speed = SERVO_SPEED_FAST},
+    // },
+    // {
+    //     // ── 7_2: 怕痒②「怕痒2」—— 两层节奏：两臂 500ms 快摆 + 头 1000ms 慢缩
+    //     .emotion_id = EMO_TICKLISH2,
+    //     .screen_anim = "怕痒2.gif",
+    //     .gif_path = "S:/gif/7_2.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 110.0f, .speed = SERVO_SPEED_MID, .seq = {
+    //                                                              {110.0f, SERVO_SPEED_MID, 200},
+    //                                                              {90.0f, SERVO_SPEED_MID, 200},
+    //                                                              {110.0f, SERVO_SPEED_MID, 200},
+    //                                                              {90.0f, SERVO_SPEED_MID, 200},
+    //                                                              {110.0f, SERVO_SPEED_MID, 200},
+    //                                                              {90.0f, SERVO_SPEED_MID, 200},
+    //                                                          },
+    //              .seq_len = 6,
+    //              .seq_speed = SERVO_SPEED_MID},
+    //     .left_arm = {.target = 38.0f, .speed = SERVO_SPEED_FAST, .seq = {
+    //                                                                  {15.0f, SERVO_SPEED_FAST, 20},
+    //                                                                  {38.0f, SERVO_SPEED_FAST, 20},
+    //                                                                  {15.0f, SERVO_SPEED_FAST, 20},
+    //                                                                  {38.0f, SERVO_SPEED_FAST, 20},
+    //                                                                  {15.0f, SERVO_SPEED_FAST, 20},
+    //                                                                  {38.0f, SERVO_SPEED_FAST, 20},
+    //                                                                  {15.0f, SERVO_SPEED_FAST, 20},
+    //                                                                  {38.0f, SERVO_SPEED_FAST, 20},
+    //                                                                  {15.0f, SERVO_SPEED_FAST, 20},
+    //                                                                  {38.0f, SERVO_SPEED_FAST, 20},
+    //                                                              },
+    //                  .seq_len = 10,
+    //                  .seq_speed = SERVO_SPEED_FAST},
+    //     .right_arm = {.target = 38.0f, .speed = SERVO_SPEED_FAST, .seq = {
+    //                                                                   {15.0f, SERVO_SPEED_FAST, 20},
+    //                                                                   {38.0f, SERVO_SPEED_FAST, 20},
+    //                                                                   {15.0f, SERVO_SPEED_FAST, 20},
+    //                                                                   {38.0f, SERVO_SPEED_FAST, 20},
+    //                                                                   {15.0f, SERVO_SPEED_FAST, 20},
+    //                                                                   {38.0f, SERVO_SPEED_FAST, 20},
+    //                                                                   {15.0f, SERVO_SPEED_FAST, 20},
+    //                                                                   {38.0f, SERVO_SPEED_FAST, 20},
+    //                                                                   {15.0f, SERVO_SPEED_FAST, 20},
+    //                                                                   {38.0f, SERVO_SPEED_FAST, 20},
+    //                                                               },
+    //                   .seq_len = 10,
+    //                   .seq_speed = SERVO_SPEED_FAST},
+    // },
+    // {
+    //     // ── 7_3: 怕痒③「怕痒 2」—— 主语=两臂【反相】；290ms × 18 拍，最快最碎
+    //     .emotion_id = EMO_TICKLISH3,
+    //     .screen_anim = "怕痒 2.gif",
+    //     .gif_path = "S:/gif/7_3.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     // 头：钉在中位（与两臂的反相快抽形成对比）
+    //     .head = {.target = 90.0f, .speed = SERVO_SPEED_MID, .seq = {{90.0f, 0, 3530}}, .seq_len = 1, .seq_speed = SERVO_SPEED_MID},
+    //     // 左臂：25°@FAST=250ms + 停 40ms = 290ms/步，两步 580ms 一个往复 × 9 = 18 步
+    //     .left_arm = {.target = 40.0f, .speed = SERVO_SPEED_FAST, .seq = {
+    //                                                                  {40.0f, SERVO_SPEED_FAST, 40},
+    //                                                                  {15.0f, SERVO_SPEED_FAST, 40},
+    //                                                                  {40.0f, SERVO_SPEED_FAST, 40},
+    //                                                                  {15.0f, SERVO_SPEED_FAST, 40},
+    //                                                                  {40.0f, SERVO_SPEED_FAST, 40},
+    //                                                                  {15.0f, SERVO_SPEED_FAST, 40},
+    //                                                                  {40.0f, SERVO_SPEED_FAST, 40},
+    //                                                                  {15.0f, SERVO_SPEED_FAST, 40},
+    //                                                                  {40.0f, SERVO_SPEED_FAST, 40},
+    //                                                                  {15.0f, SERVO_SPEED_FAST, 40},
+    //                                                              },
+    //                  .seq_len = 10,
+    //                  .seq_speed = SERVO_SPEED_FAST},
+    //     .right_arm = {.target = 15.0f, .speed = SERVO_SPEED_FAST, .seq = {
+    //                                                                   {15.0f, 0, 290}, // ← 相位延迟：左臂先动
+    //                                                                                    //   {40.0f, SERVO_SPEED_FAST, 40}, {15.0f, SERVO_SPEED_FAST, 40},
+    //                                                                                    //   {40.0f, SERVO_SPEED_FAST, 40}, {15.0f, SERVO_SPEED_FAST, 40},
+    //                                                                                    //   {40.0f, SERVO_SPEED_FAST, 40}, {15.0f, SERVO_SPEED_FAST, 40},
+    //                                                                                    //   {40.0f, SERVO_SPEED_FAST, 40}, {15.0f, SERVO_SPEED_FAST, 40},
+    //                                                                   {40.0f, SERVO_SPEED_FAST, 40},
+    //                                                                   {15.0f, SERVO_SPEED_FAST, 40},
+    //                                                                   {40.0f, SERVO_SPEED_FAST, 40},
+    //                                                                   {15.0f, SERVO_SPEED_FAST, 40},
+    //                                                                   {40.0f, SERVO_SPEED_FAST, 40},
+    //                                                                   {15.0f, SERVO_SPEED_FAST, 40},
+    //                                                                   {40.0f, SERVO_SPEED_FAST, 40},
+    //                                                                   {15.0f, SERVO_SPEED_FAST, 40},
+    //                                                                   {40.0f, SERVO_SPEED_FAST, 40},
+    //                                                                   {15.0f, SERVO_SPEED_FAST, 40},
+    //                                                               },
+    //                   .seq_len = 11,
+    //                   .seq_speed = SERVO_SPEED_FAST},
+    // },
+    // {
+    //     // ── 7_4: 怕痒④「怕痒到扭动」—— 主语=全身扭；头 640ms / 臂 700ms × 8 拍，幅度最大
+    //     .emotion_id = EMO_TICKLISH4,
+    //     .screen_anim = "怕痒到扭动.gif",
+    //     .gif_path = "S:/gif/7_4.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 106.0f, .speed = SERVO_SPEED_FAST, .seq = {
+    //                                                               {74.0f, SERVO_SPEED_FAST, 0},
+    //                                                               {106.0f, SERVO_SPEED_FAST, 0},
+    //                                                               {74.0f, SERVO_SPEED_FAST, 0},
+    //                                                               {106.0f, SERVO_SPEED_FAST, 0},
+    //                                                               {74.0f, SERVO_SPEED_FAST, 0},
+    //                                                               {106.0f, SERVO_SPEED_FAST, 0},
+    //                                                               {74.0f, SERVO_SPEED_FAST, 0},
+    //                                                               {106.0f, SERVO_SPEED_FAST, 0},
+    //                                                           },
+    //              .seq_len = 8,
+    //              .seq_speed = SERVO_SPEED_FAST},
+    //     .left_arm = {.target = 50.0f, .speed = SERVO_SPEED_FAST, .seq = {
+    //                                                                  {15.0f, SERVO_SPEED_FAST, 0},
+    //                                                                  {50.0f, SERVO_SPEED_FAST, 0},
+    //                                                                  {15.0f, SERVO_SPEED_FAST, 0},
+    //                                                                  {50.0f, SERVO_SPEED_FAST, 0},
+    //                                                                  {15.0f, SERVO_SPEED_FAST, 0},
+    //                                                                  {50.0f, SERVO_SPEED_FAST, 0},
+    //                                                                  {15.0f, SERVO_SPEED_FAST, 0},
+    //                                                                  {50.0f, SERVO_SPEED_FAST, 0},
+    //                                                              },
+    //                  .seq_len = 8,
+    //                  .seq_speed = SERVO_SPEED_FAST},
+    //     .right_arm = {.target = 15.0f, .speed = SERVO_SPEED_FAST, .seq = {
+    //                                                                   {15.0f, 0, 350}, // ← 相位延迟：反相
+    //                                                                   {50.0f, SERVO_SPEED_FAST, 0},
+    //                                                                   {15.0f, SERVO_SPEED_FAST, 0},
+    //                                                                   {50.0f, SERVO_SPEED_FAST, 0},
+    //                                                                   {15.0f, SERVO_SPEED_FAST, 0},
+    //                                                                   {50.0f, SERVO_SPEED_FAST, 0},
+    //                                                                   {15.0f, SERVO_SPEED_FAST, 0},
+    //                                                                   {50.0f, SERVO_SPEED_FAST, 0},
+    //                                                                   {15.0f, SERVO_SPEED_FAST, 0},
+    //                                                               },
+    //                   .seq_len = 9,
+    //                   .seq_speed = SERVO_SPEED_FAST},
+    // },
+
+    // /* ── 8_x：惊喜（3 张）────────────────────────────────────────────────── */
+    // {
+    //     // ── 8_1: 惊喜①「惊喜」—— 惊(头定格) + 喜(两臂连续锯齿)，500ms 无停顿
+    //     .emotion_id = EMO_SURPRISED1,
+    //     .screen_anim = "惊喜.gif",
+    //     .gif_path = "S:/gif/8_1.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 126.0f,
+    //              .speed = SERVO_SPEED_MID,
+    //              .seq = {
+    //                  {126.0f, 0, 300},
+    //                  {102.0f, SERVO_SPEED_FAST, 0},
+    //                  {126.0f, SERVO_SPEED_FAST, 0},
+    //                  {102.0f, SERVO_SPEED_FAST, 0},
+    //                  {126.0f, SERVO_SPEED_FAST, 0},
+    //                  {102.0f, SERVO_SPEED_FAST, 0},
+    //                  {126.0f, SERVO_SPEED_FAST, 0},
+    //                  {102.0f, SERVO_SPEED_FAST, 0},
+    //                  {126.0f, SERVO_SPEED_FAST, 0},
+    //                  {102.0f, SERVO_SPEED_FAST, 0},
+    //                  {126.0f, SERVO_SPEED_FAST, 0},
+    //                  {102.0f, SERVO_SPEED_FAST, 0},
+    //                  {126.0f, SERVO_SPEED_FAST, 0},
+    //                  {102.0f, SERVO_SPEED_FAST, 0},
+    //                  {126.0f, SERVO_SPEED_FAST, 0},
+    //              },
+    //              .seq_len = 15,
+    //              .seq_speed = SERVO_SPEED_FAST},
+    //     .left_arm = {.target = 140.0f, .speed = SERVO_SPEED_VERY_FAST, .seq = {
+    //                                                                        {140.0f, 0, 100}, // 弹到高位，停 100ms 再做第一个"惊"的定格
+    //                                                                                          // ── 以下 6 拍锯齿，无停顿 ──────────────────────────
+    //                                                                        {105.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                        {140.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {105.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                        {140.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {105.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                        {140.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {105.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                        {140.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {105.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                        {140.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {105.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                        {140.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {30.0f, SERVO_SPEED_VERY_FAST, 0}, // 110°×5=550ms 快速收手
+    //                                                                    },
+    //                  .seq_len = 14,
+    //                  .seq_speed = SERVO_SPEED_FAST},
+    //     .right_arm = {.target = 136.0f, .speed = SERVO_SPEED_VERY_FAST, .seq = {
+    //                                                                         {136.0f, 0, 100},
+    //                                                                         // ── 6 拍锯齿，与左臂同拍 ────────────────────────────
+    //                                                                         {101.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                         {136.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {101.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                         {136.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {101.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                         {136.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {101.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                         {136.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {101.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                         {136.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {101.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                         {136.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {30.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                     },
+    //                   .seq_len = 14,
+    //                   .seq_speed = SERVO_SPEED_FAST},
+    // },
+    // {
+    //     // ── 8_2: 惊喜②「惊喜2」—— 「憋-放」一抽一停，头同拍屏息（全程偏右侧不跨中位）
+    //     .emotion_id = EMO_SURPRISED2,
+    //     .screen_anim = "惊喜2.gif",
+    //     .gif_path = "S:/gif/8_2.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 105.0f, .speed = SERVO_SPEED_MID, .seq = {
+    //                                                              {105.0f, 0, 320},              // ★等两臂起手到位（15°×15=225ms + 20ms + 320 = 565ms）
+    //                                                                                             // ── 8 拍"屏息"，与两臂同拍但慢 3 倍 ────────────────
+    //                                                              {93.0f, SERVO_SPEED_MID, 130}, // 收 180ms + ★柔停 130ms
+    //                                                              {105.0f, SERVO_SPEED_MID, 0},  // 放 180ms
+    //                                                              {93.0f, SERVO_SPEED_MID, 130},
+    //                                                              {105.0f, SERVO_SPEED_MID, 0},
+    //                                                              {93.0f, SERVO_SPEED_MID, 130},
+    //                                                              {105.0f, SERVO_SPEED_MID, 0},
+    //                                                              {93.0f, SERVO_SPEED_MID, 130},
+    //                                                              {105.0f, SERVO_SPEED_MID, 0},
+    //                                                              {93.0f, SERVO_SPEED_MID, 130},
+    //                                                              {105.0f, SERVO_SPEED_MID, 0},
+    //                                                              {93.0f, SERVO_SPEED_MID, 130},
+    //                                                              {105.0f, SERVO_SPEED_MID, 0},
+    //                                                              {93.0f, SERVO_SPEED_MID, 130},
+    //                                                              {105.0f, SERVO_SPEED_MID, 0},
+    //                                                              {93.0f, SERVO_SPEED_MID, 130},
+    //                                                              {105.0f, SERVO_SPEED_MID, 0},
+    //                                                          },
+    //              .seq_len = 17,
+    //              .seq_speed = SERVO_SPEED_MID},
+    //     .left_arm = {.target = 128.0f, .speed = SERVO_SPEED_VERY_FAST, .seq = {
+    //                                                                        // ── 8 拍"憋-放" ────────────────────────────────────
+    //                                                                        {104.0f, SERVO_SPEED_VERY_FAST, 130}, // 收 120ms + ★憋住 130ms
+    //                                                                        {128.0f, SERVO_SPEED_FAST, 0},        // 放 240ms
+    //                                                                        {104.0f, SERVO_SPEED_VERY_FAST, 130},
+    //                                                                        {128.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {104.0f, SERVO_SPEED_VERY_FAST, 130},
+    //                                                                        {128.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {104.0f, SERVO_SPEED_VERY_FAST, 130},
+    //                                                                        {128.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {104.0f, SERVO_SPEED_VERY_FAST, 130},
+    //                                                                        {128.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {104.0f, SERVO_SPEED_VERY_FAST, 130},
+    //                                                                        {128.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {104.0f, SERVO_SPEED_VERY_FAST, 130},
+    //                                                                        {128.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {104.0f, SERVO_SPEED_VERY_FAST, 130},
+    //                                                                        {128.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {30.0f, SERVO_SPEED_VERY_FAST, 0}, // 98°×5=490ms 快速收手
+    //                                                                    },
+    //                  .seq_len = 17,
+    //                  .seq_speed = SERVO_SPEED_FAST},
+    //     .right_arm = {.target = 124.0f, .speed = SERVO_SPEED_VERY_FAST, .seq = {
+    //                                                                         // ── 8 拍"憋-放"，与左臂同拍 ────────────────────────
+    //                                                                         {100.0f, SERVO_SPEED_VERY_FAST, 130},
+    //                                                                         {124.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {100.0f, SERVO_SPEED_VERY_FAST, 130},
+    //                                                                         {124.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {100.0f, SERVO_SPEED_VERY_FAST, 130},
+    //                                                                         {124.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {100.0f, SERVO_SPEED_VERY_FAST, 130},
+    //                                                                         {124.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {100.0f, SERVO_SPEED_VERY_FAST, 130},
+    //                                                                         {124.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {100.0f, SERVO_SPEED_VERY_FAST, 130},
+    //                                                                         {124.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {100.0f, SERVO_SPEED_VERY_FAST, 130},
+    //                                                                         {124.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {100.0f, SERVO_SPEED_VERY_FAST, 130},
+    //                                                                         {124.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {30.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                     },
+    //                   .seq_len = 17,
+    //                   .seq_speed = SERVO_SPEED_FAST},
+    // },
+    // {
+    //     // ── 8_3: 惊喜③「惊喜抱抱」—— 头【靠过去 + 呼吸】+ 两臂柔和合抱收放，660ms 周期
+    //     .emotion_id = EMO_SURPRISED3,
+    //     .screen_anim = "惊喜抱抱.gif",
+    //     .gif_path = "S:/gif/8_3.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 106.0f, .speed = SERVO_SPEED_MID, .seq = {
+    //                                                              {106.0f, 0, 200},               // ★"靠上了"，停 200ms
+    //                                                                                              // ── 3 拍慢呼吸，一拍 1320ms（两臂的 2 倍）──────────
+    //                                                              {102.0f, SERVO_SPEED_MID, 960}, // 收 180ms + ★歇 960ms
+    //                                                              {114.0f, SERVO_SPEED_MID, 0},   // 放 180ms
+    //                                                              {102.0f, SERVO_SPEED_MID, 960},
+    //                                                              {114.0f, SERVO_SPEED_MID, 0},
+    //                                                              {102.0f, SERVO_SPEED_MID, 960},
+    //                                                              {114.0f, SERVO_SPEED_MID, 0},
+    //                                                          },
+    //              .seq_len = 7,
+    //              .seq_speed = SERVO_SPEED_MID},
+    //     .left_arm = {.target = 163.0f, .speed = SERVO_SPEED_VERY_FAST, .seq = {
+    //                                                                        // ── 6 个柔和来回，全程无停顿 ────────────────────────
+    //                                                                        {130.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {163.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {130.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {163.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {130.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {163.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {130.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {163.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {130.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {163.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {130.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {163.0f, SERVO_SPEED_FAST, 0},
+    //                                                                        {40.0f, SERVO_SPEED_VERY_FAST, 0}, // 123°×5=615ms 松手放下
+    //                                                                    },
+    //                  .seq_len = 13,
+    //                  .seq_speed = SERVO_SPEED_FAST},
+    //     .right_arm = {.target = 159.0f, .speed = SERVO_SPEED_VERY_FAST, .seq = {
+    //                                                                         // ── 6 个柔和来回，与左臂同拍 ────────────────────────
+    //                                                                         {126.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {159.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {126.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {159.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {126.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {159.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {126.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {159.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {126.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {159.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {126.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {159.0f, SERVO_SPEED_FAST, 0},
+    //                                                                         {40.0f, SERVO_SPEED_VERY_FAST, 0},
+    //                                                                     },
+    //                   .seq_len = 13,
+    //                   .seq_speed = SERVO_SPEED_FAST},
+    // },
+
+    // /* ── 9_x：慵懒（1 张）─────────────────────────────── */
+    // {
+    //     // ── 9_1: 慵懒①「慵懒2」
+    //     .emotion_id = EMO_SLUGGISH1,
+    //     .screen_anim = "慵懒2.gif",
+    //     .gif_path = "S:/gif/9_1.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1, // 慵懒气质，不配震动
+    //     .audio_file = NULL,
+    //     .head = {.target = 90.0f, .speed = SERVO_SPEED_FAST, .seq = {{90.0f, 0, 500}, {100.0f}}, .seq_len = 2, .seq_speed = SERVO_SPEED_MID},
+    //     .left_arm = {.target = 75.0f, .speed = SERVO_SPEED_FAST, .seq = {{75.0f, 0, 500}, {20.0f}}, .seq_len = 2, .seq_speed = SERVO_SPEED_MID},
+    //     .right_arm = {.target = 75.0f, .speed = SERVO_SPEED_FAST, .seq = {{75.0f, 0, 500}, {20.0f}}, .seq_len = 2, .seq_speed = SERVO_SPEED_MID},
+    // },
+
+    // /* ── 10_x：撒娇（1 张）── 素材 撒娇.gif（全组仅此一张）─────────────────── */
+    // {
+    //     // ── 10_1: 撒娇①「撒娇」── 主语：两臂（同幅不同速的"各自晃"）
+    //     .emotion_id = EMO_ACT_CUTE1,
+    //     .screen_anim = "撒娇.gif",
+    //     .gif_path = "S:/gif/10_1.gif",
+    //     .vib_seq = vib_light1, // 轻微 1 次（强度 50/60ms）—— 撒娇只给"轻轻一下"
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     // 头：偏左 24° 靠过去 → 定住 400ms"贴上了" → 在 102~114 之间断续蹭 9 下
+    //     //     ★全程 ≥102° > 90° 中位，一次都不跨越 ⇒ 是"偏置往复"不是摇头
+    //     .head = {.target = 114.0f, // 偏左 24°（大角=左）
+    //              .speed = SERVO_SPEED_MID,
+    //              .seq = {
+    //                  {114.0f, 0, 400},               // ★定住：长保持 = "靠住了"
+    //                  {102.0f, SERVO_SPEED_MID, 300}, // 回撤 12°(180ms) + 停 300ms = 480ms/段
+    //                  {114.0f, SERVO_SPEED_MID, 300}, // 靠回去 12°(180ms) + 停 300ms
+    //                  {102.0f, SERVO_SPEED_MID, 300},
+    //                  {114.0f, SERVO_SPEED_MID, 300},
+    //                  {102.0f, SERVO_SPEED_MID, 300},
+    //                  {114.0f, SERVO_SPEED_MID, 300},
+    //                  {102.0f, SERVO_SPEED_MID, 300},
+    //                  {114.0f, SERVO_SPEED_MID, 300},
+    //                  {102.0f, SERVO_SPEED_MID, 300}, // 末位 102°
+    //              },
+    //              .seq_len = 10,
+    //              .seq_speed = SERVO_SPEED_MID},
+    //     // 左臂（配角）：33° 全幅 @MID 慢档 ⇒ 半拍 495ms、整拍 990ms，共 5 拍
+    //     //               与右臂同幅但慢 1.5 倍、少 2 拍 ⇒ 相位差一路在变，读作"另一只手慢慢跟着晃"
+    //     .left_arm = {.target = 48.0f,
+    //                  .speed = SERVO_SPEED_FAST, // 起步 42°×10 = 420ms
+    //                  .seq = {
+    //                      {15.0f, SERVO_SPEED_MID},
+    //                      {48.0f, SERVO_SPEED_MID},
+    //                      {15.0f, SERVO_SPEED_MID},
+    //                      {48.0f, SERVO_SPEED_MID},
+    //                      {15.0f, SERVO_SPEED_MID},
+    //                      {48.0f, SERVO_SPEED_MID},
+    //                      {15.0f, SERVO_SPEED_MID},
+    //                      {48.0f, SERVO_SPEED_MID},
+    //                      {15.0f, SERVO_SPEED_MID},
+    //                      {48.0f, SERVO_SPEED_MID}, // 末位 48°
+    //                  },
+    //                  .seq_len = 10,
+    //                  .seq_speed = SERVO_SPEED_MID},
+    //     // 右臂（主角）：同 33° 全幅但 @FAST 快档 ⇒ 半拍 330ms、整拍 660ms，共 7 拍
+    //     //               ★整拍 660ms 与素材 500ms 同量级；7 拍与左臂 5 拍不整除 = 刻意错位
+    //     .right_arm = {.target = 48.0f,
+    //                   .speed = SERVO_SPEED_FAST, // 起步 42°×10 = 420ms
+    //                   .seq = {
+    //                       {15.0f, SERVO_SPEED_FAST},
+    //                       {48.0f, SERVO_SPEED_FAST},
+    //                       {15.0f, SERVO_SPEED_FAST},
+    //                       {48.0f, SERVO_SPEED_FAST},
+    //                       {15.0f, SERVO_SPEED_FAST},
+    //                       {48.0f, SERVO_SPEED_FAST},
+    //                       {15.0f, SERVO_SPEED_FAST},
+    //                       {48.0f, SERVO_SPEED_FAST},
+    //                       {15.0f, SERVO_SPEED_FAST},
+    //                       {48.0f, SERVO_SPEED_FAST},
+    //                       {15.0f, SERVO_SPEED_FAST},
+    //                       {48.0f, SERVO_SPEED_FAST},
+    //                       {15.0f, SERVO_SPEED_FAST},
+    //                       {48.0f, SERVO_SPEED_FAST}, // 末位 48°
+    //                   },
+    //                   .seq_len = 14,
+    //                   .seq_speed = SERVO_SPEED_FAST},
+    // },
+
+    // /* ── 11_x：治愈（1 张）───────────────────── */
+    // {
+    //     // ── 11_1: 治愈①「治愈2」── 主语：两臂（三次缓慢张合 = 呼吸，与眼睛的 `<` 逐拍锁相）
+    //     .emotion_id = EMO_HEALING1,
+    //     .screen_anim = "治愈2.gif",
+    //     .gif_path = "S:/gif/11_1.gif",
+    //     .vib_seq = vib_light1, // 轻微 1 次（强度 50/60ms）—— 治愈只给"轻轻一下"
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 112.0f, // 偏左 22°（大角=左）
+    //              .speed = SERVO_SPEED_MID,
+    //              .seq = {
+    //                  {112.0f, 0, 1600}, // 定住 —— 温柔靠过去
+    //                  {100.0f, 0, 1500}, // 回撤 12°，但【仍在 90 以左】
+    //                  {116.0f, 0, 1000}, // 再靠过去 16°；末拍拉长到 1500 使头在 5.74s 收尾
+    //              },
+    //              .seq_len = 3,
+    //              .seq_speed = SERVO_SPEED_MID},
+    //     .left_arm = {.target = 66.0f, .speed = SERVO_SPEED_VERY_FAST, .seq = {
+    //                                                                       {66.0f, 0, 750},                     // 峰停 750ms（素材 290→1040）
+    //                                                                       {15.0f, SERVO_SPEED_VERY_FAST, 740}, // 收回 255ms 落到基线 15°
+    //                                                                       {66.0f, SERVO_SPEED_VERY_FAST, 750}, // 第 2 个呼吸
+    //                                                                       {15.0f, SERVO_SPEED_VERY_FAST, 1000},
+    //                                                                       {66.0f, SERVO_SPEED_VERY_FAST, 700}, // 第 3 个呼吸
+    //                                                                       {15.0f, SERVO_SPEED_VERY_FAST, 0},   // ★只压缩【末尾静止】，不碰前面任何一拍
+    //                                                                   },
+    //                  .seq_len = 6,
+    //                  .seq_speed = SERVO_SPEED_VERY_FAST},
+    //     .right_arm = {.target = 66.0f, .speed = SERVO_SPEED_VERY_FAST, .seq = {
+    //                                                                        {66.0f, 0, 750}, // ★与左臂逐字相同 = 刻意同步
+    //                                                                        {15.0f, SERVO_SPEED_VERY_FAST, 740},
+    //                                                                        {66.0f, SERVO_SPEED_VERY_FAST, 750},
+    //                                                                        {15.0f, SERVO_SPEED_VERY_FAST, 1000},
+    //                                                                        {66.0f, SERVO_SPEED_VERY_FAST, 700},
+    //                                                                        {15.0f, SERVO_SPEED_VERY_FAST, 0}, // ★与左臂逐字相同
+    //                                                                    },
+    //                   .seq_len = 6,
+    //                   .seq_speed = SERVO_SPEED_VERY_FAST},
+    // },
+
+    // /* ── 12_x：犯困（2 张）──────────────────────────────────────────────────     */
+    // {
+    //     .emotion_id = EMO_SLEEPY1,
+    //     .screen_anim = "犯困.gif",
+    //     .gif_path = "S:/gif/12_1.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 0, // 犯困气质，不配震动（见 interaction.c:118 约定）
+    //     .audio_file = NULL,
+    //     .head = {.target = 112.0f, // 偏左 22°（大角=左）
+    //              .speed = SERVO_SPEED_SLOWER,
+    //              .seq = {
+    //                  {112.0f, 0, 1180},               // 停住（= 想停 1200ms，已扣 1 帧）
+    //                  {98.0f, SERVO_SPEED_SLOWER, 0},  // 缓沉 14°（280ms）
+    //                  {98.0f, 0, 1300},                // 停住（= 想停 1320ms）
+    //                  {112.0f, SERVO_SPEED_SLOWER, 0}, // 缓抬 14°（280ms）
+    //                  {112.0f, 0, 1300},
+    //                  {98.0f, SERVO_SPEED_SLOWER, 0},
+    //                  {98.0f, 0, 680},                // 停（= 想停 700ms）
+    //                  {90.0f, SERVO_SPEED_SLOWER, 0}, // ★慢慢"醒"回中位（8°→160ms）
+    //              },
+    //              .seq_len = 8,
+    //              .seq_speed = SERVO_SPEED_SLOWER},
+    //     .left_arm = {.target = 33.0f, .speed = SERVO_SPEED_SLOWER, .seq = {
+    //                                                                    {33.0f, 0, 560},                // 停（= 想停 580ms）
+    //                                                                    {15.0f, SERVO_SPEED_SLOWER, 0}, // 慢慢落下 18°（360ms）
+    //                                                                    {15.0f, 0, 680},                // 停（= 想停 700ms）
+    //                                                                    {33.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                    {33.0f, 0, 560},
+    //                                                                    {15.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                    {15.0f, 0, 680},
+    //                                                                    {33.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                    {33.0f, 0, 560},
+    //                                                                    {15.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                    {15.0f, 0, 680},
+    //                                                                },
+    //                  .seq_len = 11,
+    //                  .seq_speed = SERVO_SPEED_SLOWER},
+    //     .right_arm = {.target = 33.0f, .speed = SERVO_SPEED_SLOWER, .seq = {
+    //                                                                     {33.0f, 0, 560},
+    //                                                                     {15.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                     {15.0f, 0, 680},
+    //                                                                     {33.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                     {33.0f, 0, 560},
+    //                                                                     {15.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                     {15.0f, 0, 680},
+    //                                                                     {33.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                     {33.0f, 0, 560},
+    //                                                                     {15.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                     {15.0f, 0, 680},
+    //                                                                 },
+    //                   .seq_len = 11,
+    //                   .seq_speed = SERVO_SPEED_SLOWER},
+    // },
+    // {
+    //     // ── 12_2: 犯困②「犯困 2」── 主语：头（沉下去 → 惊醒，3 拍）
+    //     .emotion_id = EMO_SLEEPY2,
+    //     .screen_anim = "犯困 2.gif",
+    //     .gif_path = "S:/gif/12_2.gif",
+    //     .vib_seq = NULL,
+    //     .vib_seq_len = 0,
+    //     .audio_file = NULL,
+    //     .head = {.target = 106.0f, // 偏左 16°（大角=左），"沉下去"
+    //              .speed = SERVO_SPEED_SLOWER,
+    //              .seq = {
+    //                  {106.0f, 0, 740},               // 停在"睡得最沉"（= 想停 760ms）
+    //                  {92.0f, SERVO_SPEED_SLOWER, 0}, // ★惊醒！280ms 弹回
+    //                  {92.0f, 0, 620},                // t=2000ms，拍 1 收
+    //                  {106.0f, SERVO_SPEED_SLOWER, 0},
+    //                  {106.0f, 0, 760}, // t=3060ms
+    //                  {92.0f, SERVO_SPEED_SLOWER, 0},
+    //                  {92.0f, 0, 640}, // t=4000ms，拍 2 收
+    //                  {106.0f, SERVO_SPEED_SLOWER, 0},
+    //                  {106.0f, 0, 720},               // t=5020ms
+    //                  {90.0f, SERVO_SPEED_SLOWER, 0}, // ★末拍直接回到中位（320ms）
+    //                  {90.0f, 0, 640},                // t=6000ms
+    //              },
+    //              .seq_len = 11,
+    //              .seq_speed = SERVO_SPEED_SLOWER},
+    //     .left_arm = {.target = 33.0f, .speed = SERVO_SPEED_SLOWER, .seq = {
+    //                                                                    {33.0f, 0, 1100},               // 停（= 想停 1120ms）
+    //                                                                    {15.0f, SERVO_SPEED_SLOWER, 0}, // 慢慢垂下 18°（360ms）
+    //                                                                    {15.0f, 0, 1140},               // 停（= 想停 1160ms）⇒ 一拍 3000ms
+    //                                                                    {33.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                    {33.0f, 0, 1100},
+    //                                                                    {15.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                    {15.0f, 0, 1140},
+    //                                                                },
+    //                  .seq_len = 7,
+    //                  .seq_speed = SERVO_SPEED_SLOWER},
+    //     .right_arm = {.target = 33.0f, .speed = SERVO_SPEED_SLOWER, .seq = {
+    //                                                                     {33.0f, 0, 1100},
+    //                                                                     {15.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                     {15.0f, 0, 1140},
+    //                                                                     {33.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                     {33.0f, 0, 1100},
+    //                                                                     {15.0f, SERVO_SPEED_SLOWER, 0},
+    //                                                                     {15.0f, 0, 1140},
+    //                                                                 },
+    //                   .seq_len = 7,
+    //                   .seq_speed = SERVO_SPEED_SLOWER},
+    // },
+    // /* ── 13_x：生气（2 张）─────────────────────────────────────────────────────
+    //  * ★2026-09-24 幅度改版（用户："生气幅度还是很小"）。
+    //  *
+    //  * 【旧值有多小】13_1 两臂只摆 24°(72↔48)、头 6~8°；13_2 头 16°、臂 25°。
+    //  *   舵机全程只在一小片齿面上来回磨 —— 这正是需求1 点名的寿命杀手：
+    //  *   局部齿弧磨秃 ⇒ 整机寿命由那几个齿决定（幅度大的真实收益见 1_1 的注释）。
+    //  *
+    //  * 【本次值】13_1 臂 120°(15↔135) / 头 60°(75↔135)；
+    //  *           13_2 臂 105°(15↔120) / 头 60°(40↔100)。
+    //  *   臂 15° 就是 ARM_CENTER_DEG（自然下垂），所以两个低点都是"垂到底"，
+    //  *   高位 135/120 是抬到胸前偏上 —— 整段可用齿弧基本全用上了。
+    //  *
+    //  * 【速度一律不动】生气要的就是瞬间爆发，两臂留 VERY_FAST。
+    //  *   ★"大幅 + 快"和"小幅 + 快"不是一回事：前者每帧都在新的齿面上，只有后者
+    //  *   才是反复磨同一小段。所以"幅度大"是降磨损的手段，"快"可以不牺牲。
+    //  *
+    //  * 【头不跨 90°】两张都是"别过脸"：13_1 偏左（75~135，中心 105）、
+    //  *   13_2 偏右（40~100，中心 70）。偏置往复读作"别着脸使劲"，
+    //  *   对称往复（中心正好 90）才是"摇头"，语义相反，见 [[curious_4x_redesign]]。
+    //  *
+    //  * 【头必须比臂慢、且不同幅】8_x 三条硬原则：头不许整条钉死、头要比四肢慢
+    //  *   一档、头绝不能与四肢同速同幅。此处 13_1 头 MID(15) vs 臂 VERY_FAST(5)、
+    //  *   60° vs 120°；13_2 头 FAST(10) vs 臂 VERY_FAST(5)、60° vs 105°，三条都满足。
+    //  *
+    //  * 【时长】按素材周期卡整拍：13_1 素材 6000ms、13_2 素材 5000ms（逐帧 duration
+    //  *   累加实测）。实配 13_1 = 6140ms(1.023×)、13_2 = 5100ms(1.020×)，
+    //  *   见 _tools/replay_emotion.py 重放校验。 */
+    // {
+    //     // ── 13_1: 生气①「生气」── 爆发式怒气（主语：两臂同相大幅挥）
+    //     .emotion_id = EMO_ANGRY1,
+    //     .screen_anim = "生气.gif",
+    //     .gif_path = "S:/gif/13_1.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {
+    //         .target = 135.0f, // 偏左 45°（大角=左），"别过脸生气"
+    //         .speed = SERVO_SPEED_MID,
+    //         .seq = {
+    //             {135.0f, 0, 700}, // ★先别住 ~0.7s（旧值 2400ms，>1s 的零运动段太长，见 8_x 原则①）
+    //             {75.0f, 0, 700},  // 甩到另一侧 60°（旧值只 8°）
+    //             {135.0f, 0, 700}, // 甩回
+    //             {80.0f, 0, 600},  // 再落一点收尾，离中位 10°，好接归中
+    //         },
+    //         .seq_len = 4,
+    //         .seq_speed = SERVO_SPEED_MID, // 头 MID 比臂 VERY_FAST 慢三倍（8_x 原则②）
+    //     },
+    //     .left_arm = {
+    //         .target = 135.0f, // 15→135，抬 120°
+    //         .speed = SERVO_SPEED_VERY_FAST,
+    //         .seq = {
+    //             {135.0f, 0, 150}, // 起手蓄力：到顶先顿一下再砸
+    //             {15.0f},          // ★120° 单程（旧值 24°）——本轮"幅度调大"的主体
+    //             {135.0f},
+    //             {15.0f},
+    //             {135.0f},
+    //             {15.0f},
+    //             {135.0f},
+    //             {15.0f}, // 7 次位移落 4 下 3 上，收在低位 ="被压住"而非"弹回来"
+    //         },
+    //         .seq_len = 8,
+    //         .seq_speed = SERVO_SPEED_VERY_FAST,
+    //     },
+    //     .right_arm = {
+    //         // 与左臂逐字相同 = 同相（"气得发抖"是双侧一起使劲）
+    //         .target = 135.0f,
+    //         .speed = SERVO_SPEED_VERY_FAST,
+    //         .seq = {
+    //             {135.0f, 0, 150},
+    //             {15.0f},
+    //             {135.0f},
+    //             {15.0f},
+    //             {135.0f},
+    //             {15.0f},
+    //             {135.0f},
+    //             {15.0f},
+    //         },
+    //         .seq_len = 8,
+    //         .seq_speed = SERVO_SPEED_VERY_FAST,
+    //     },
+    // },
+    // {
+    //     // ── 13_2: 生气②「生气 2」── 全身一起使劲（主语：头也抖，两臂反相砸）
+    //     .emotion_id = EMO_ANGRY2,
+    //     .screen_anim = "生气 2.gif",
+    //     .gif_path = "S:/gif/13_2.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {
+    //         .target = 100.0f, // 先摆到偏左 10° 起势
+    //         .speed = SERVO_SPEED_MID,
+    //         .seq = {
+    //             // ★停顿 240ms（不是 300）：本轴总时长因此从 5400 收到 5100ms，
+    //             //   正好贴住 GIF 周期 5000ms（1.02×）。240 是 20ms 的整数倍，
+    //             //   折算成 12 个基准帧无余数浪费；取 300 会多出 400ms 空转。
+    //             {100.0f, 0, 240},
+    //             {40.0f, 0, 240}, // 60° 单步（旧值 16°）；区间 40~100 中心 70
+    //             {100.0f, 0, 240},
+    //             {40.0f, 0, 240},
+    //             {100.0f, 0, 240},
+    //             {40.0f}, // 收在偏右 50° 处
+    //         },
+    //         .seq_len = 6,
+    //         .seq_speed = SERVO_SPEED_FAST, // 头 FAST 比臂 VERY_FAST 慢一档（8_x 原则②）
+    //     },
+    //     .left_arm = {
+    //         .target = 120.0f, // 15→120，抬 105°
+    //         .speed = SERVO_SPEED_VERY_FAST,
+    //         .seq = {
+    //             {120.0f, 0, 300},
+    //             {15.0f}, // ★105° 单程（旧值 25°）
+    //             {120.0f},
+    //             {15.0f},
+    //             {120.0f},
+    //             {15.0f}, // 收在基线，归中零位移
+    //         },
+    //         .seq_len = 6,
+    //         .seq_speed = SERVO_SPEED_VERY_FAST,
+    //     },
+    //     .right_arm = {
+    //         // ★与左臂反相：整条晚半拍（首步 hold 300 + 410 = 710ms）
+    //         .target = 120.0f,
+    //         .speed = SERVO_SPEED_VERY_FAST,
+    //         .seq = {
+    //             {120.0f, 0, 710}, // ★半拍错开：本组拍长 820ms，故 +410ms
+    //             {15.0f},
+    //             {120.0f},
+    //             {15.0f},
+    //             {120.0f},
+    //             {15.0f},
+    //         },
+    //         .seq_len = 6,
+    //         .seq_speed = SERVO_SPEED_VERY_FAST,
+    //     },
+    // },
+
+    // /* ── 14_x：舒服（3 张）── 2026-09-21 重做，取代源文档《7 满足舒展》───────*/
+    // {
+    //     // ── 14_1: 舒服①「舒服」── 同相轻快呼吸（主语：两臂同相，头单向偏左）
+    //     .emotion_id = EMO_COMFORTABLE1,
+    //     .screen_anim = "舒服.gif",
+    //     .gif_path = "S:/gif/14_1.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 116.0f, .speed = SERVO_SPEED_MID, .seq = {
+    //                                                              {116.0f, 0, 1500},                  // ★定住：靠过去以后"舒服地待着"
+    //                                                              {130.0f, SERVO_SPEED_SLOWER, 1500}, // 再慢慢偏深 14°（小位移才敢用慢档）
+    //                                                              {118.0f, SERVO_SPEED_SLOWER, 1580}, // 略收回 12° 长静默收尾
+    //                                                          },
+    //              .seq_len = 3,
+    //              .seq_speed = SERVO_SPEED_MID},
+    //     .left_arm = {.target = 15.0f, .speed = SERVO_SPEED_FAST, .seq = {
+    //                                                                  {45.0f, 0, 177},
+    //                                                                  {15.0f, 0, 177}, // 第 1 次起伏
+    //                                                                  {45.0f, 0, 177},
+    //                                                                  {15.0f, 0, 177}, // 第 2 次
+    //                                                                  {45.0f, 0, 177},
+    //                                                                  {15.0f, 0, 177}, // 第 3 次
+    //                                                                  {45.0f, 0, 177},
+    //                                                                  {15.0f, 0, 177}, // 第 4 次
+    //                                                                  {45.0f, 0, 176},
+    //                                                                  {15.0f, 0, 176}, // 第 5 次
+    //                                                                  {45.0f, 0, 176},
+    //                                                                  {15.0f, 0, 176}, // 第 6 次（收在基线）
+    //                                                              },
+    //                  .seq_len = 12,
+    //                  .seq_speed = SERVO_SPEED_FAST},
+    //     .right_arm = {.target = 15.0f, .speed = SERVO_SPEED_FAST, .seq = {
+    //                                                                   {45.0f, 0, 177},
+    //                                                                   {15.0f, 0, 177},
+    //                                                                   {45.0f, 0, 177},
+    //                                                                   {15.0f, 0, 177},
+    //                                                                   {45.0f, 0, 177},
+    //                                                                   {15.0f, 0, 177},
+    //                                                                   {45.0f, 0, 177},
+    //                                                                   {15.0f, 0, 177},
+    //                                                                   {45.0f, 0, 176},
+    //                                                                   {15.0f, 0, 176},
+    //                                                                   {45.0f, 0, 176},
+    //                                                                   {15.0f, 0, 176},
+    //                                                               },
+    //                   .seq_len = 12,
+    //                   .seq_speed = SERVO_SPEED_FAST},
+    // },
+    // {
+    //     // ── 14_2: 舒服②「舒服到打滚」── 同相深缩舒（主语：两臂同相，幅度更大次数更少）
+    //     .emotion_id = EMO_COMFORTABLE2,
+    //     .screen_anim = "舒服到打滚.gif",
+    //     .gif_path = "S:/gif/14_2.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 110.0f, .speed = SERVO_SPEED_MID, .seq = {
+    //                                                              {110.0f, 0, 1400},                  // ★定住：眯起眼舒服地待着
+    //                                                              {124.0f, SERVO_SPEED_SLOWER, 1400}, // 微微陷进去 14°
+    //                                                              {112.0f, SERVO_SPEED_SLOWER, 1296}, // 松回来 12°，收尾
+    //                                                          },
+    //              .seq_len = 3,
+    //              .seq_speed = SERVO_SPEED_MID},
+    //     .left_arm = {.target = 15.0f, .speed = SERVO_SPEED_FAST, .seq = {
+    //                                                                  {55.0f, 0, 242},
+    //                                                                  {15.0f, 0, 242}, // 第 1 次缩舒
+    //                                                                  {55.0f, 0, 242},
+    //                                                                  {15.0f, 0, 242}, // 第 2 次
+    //                                                                  {55.0f, 0, 242},
+    //                                                                  {15.0f, 0, 242}, // 第 3 次
+    //                                                                  {55.0f, 0, 242},
+    //                                                                  {15.0f, 0, 242}, // 第 4 次（收在基线）
+    //                                                              },
+    //                  .seq_len = 8,
+    //                  .seq_speed = SERVO_SPEED_FAST},
+    //     .right_arm = {.target = 15.0f, .speed = SERVO_SPEED_FAST, .seq = {
+    //                                                                   {55.0f, 0, 242},
+    //                                                                   {15.0f, 0, 242},
+    //                                                                   {55.0f, 0, 242},
+    //                                                                   {15.0f, 0, 242},
+    //                                                                   {55.0f, 0, 242},
+    //                                                                   {15.0f, 0, 242},
+    //                                                                   {55.0f, 0, 242},
+    //                                                                   {15.0f, 0, 242},
+    //                                                               },
+    //                   .seq_len = 8,
+    //                   .seq_speed = SERVO_SPEED_FAST},
+    // },
+    // {
+    //     // ── 14_3: 舒服③「舒服(1)」── 错开起手的涟漪顶（主语：两臂 + 头偏置往复）
+    //     .emotion_id = EMO_COMFORTABLE3,
+    //     .screen_anim = "舒服(1).gif",
+    //     .gif_path = "S:/gif/14_3.gif",
+    //     .vib_seq = vib_light1,
+    //     .vib_seq_len = 1,
+    //     .audio_file = NULL,
+    //     .head = {.target = 100.0f, .speed = SERVO_SPEED_SLOWER, .seq = {
+    //                                                                 {100.0f, 0, 848},               // ★先定住，再开始"蹭"
+    //                                                                 {122.0f, SERVO_SPEED_MID, 848}, // 往里蹭 22°
+    //                                                                 {100.0f, SERVO_SPEED_MID, 848}, // 出来
+    //                                                                 {122.0f, SERVO_SPEED_MID, 848}, // 再蹭
+    //                                                                 {100.0f, SERVO_SPEED_MID, 848}, // 再出来（收在这一侧）
+    //                                                             },
+    //              .seq_len = 5,
+    //              .seq_speed = SERVO_SPEED_MID},
+    //     .left_arm = {.target = 15.0f, .speed = SERVO_SPEED_MID, .seq = {
+    //                                                                 {45.0f, 0, 533},
+    //                                                                 {15.0f, 0, 533}, // 第 1 次上顶
+    //                                                                 {45.0f, 0, 533},
+    //                                                                 {15.0f, 0, 533}, // 第 2 次
+    //                                                                 {45.0f, 0, 534},
+    //                                                                 {15.0f, 0, 534}, // 第 3 次（收在基线）
+    //                                                             },
+    //                  .seq_len = 6,
+    //                  .seq_speed = SERVO_SPEED_MID},
+    //     .right_arm = {.target = 15.0f, .speed = SERVO_SPEED_MID, .seq = {
+    //                                                                  {15.0f, 0, 675}, // ★原地等，让左臂先顶
+    //                                                                  {45.0f, 0, 533},
+    //                                                                  {15.0f, 0, 533}, // 第 1 次上顶
+    //                                                                  {45.0f, 0, 533},
+    //                                                                  {15.0f, 0, 533}, // 第 2 次
+    //                                                                  {45.0f, 0, 533}, // 第 3 次只顶上来，不落（归中代劳）
+    //                                                              },
+    //                   .seq_len = 6,
+    //                   .seq_speed = SERVO_SPEED_MID},
+    // },
+};
+
+/**
+ * @brief 播放一段震动序列（按段顺序：震 on_ms → 停 off_ms）
+ *
+ * 实现「一个情绪/GIF 可挂多个强度、时长各不相同的震动」。逐段执行，
+ * 不与 GIF 帧精确对齐，触发时一口气播完即可（与 GIF 大致同期）。
+ * 马达已升级 LEDC PWM（见 bsp_touch.c），强度即占空比；中间值才是真方波，
+ * 0/100 为直流端点。强度统一走 bsp_motor_pulse_level()，不直接操作 GPIO。
+ *
+ * @param seq  震动序列数组（NULL 表示无震动，直接返回）
+ * @param len  序列段数
+ */
+static void trigger_vibration_motor(const VibStep_t *seq, uint8_t len)
+{
+    if (seq == NULL || len == 0)
+        return;
+
+    for (uint8_t i = 0; i < len; i++)
+    {
+        // 本段震动：strength 强度持续 on_ms（on_ms=0 则跳过震动，只保留停顿）
+        if (seq[i].on_ms > 0)
+            bsp_motor_pulse_level(seq[i].strength, seq[i].on_ms);
+
+        // 段间静默间隔（最后一段若 off_ms=0 则不停顿，立即结束）
+        if (seq[i].off_ms > 0)
+            vTaskDelay(pdMS_TO_TICKS(seq[i].off_ms));
+    }
+}
+
+// ==========================================
+// 4. 私有：同步执行单个情绪动作（在 worker 任务中调用）
+//    调用方必须在 FreeRTOS 任务上下文，不可在中断中使用
+// ==========================================
+
+/**
+ * @brief 阻塞执行指定情绪的完整动作序列（worker 内部调用）
+ *
+ * 执行顺序：
+ *   1. 查表
+ *   2. 触发屏幕动画（预留日志占位）
+ *   3. 触发音频播放（预留日志占位）
+ *   4. 触发震动马达
+ *   5. 三轴舵机同步动作（angle_1 → angle_2，循环 count 次）
+ *   6. 全轴归中至待机姿态（90°）
+ */
+static void interaction_play_blocking(robot_emotion_t target_emotion)
+{
+    const InteractionMatrix_t *cmd = NULL;
+    int table_size = (int)(sizeof(g_emotion_matrix) / sizeof(g_emotion_matrix[0])); // 获取矩阵大小
+
+    // ── 1. 查表 ───────────────────────────────────────────────────────────────
+    for (int i = 0; i < table_size; i++)
+    {
+        if (g_emotion_matrix[i].emotion_id == target_emotion)
+        {
+            cmd = &g_emotion_matrix[i];
+            break;
+        }
+    }
+
+    if (cmd == NULL)
+    {
+        ESP_LOGE(TAG, "未在矩阵中找到情绪 ID: %d，请在 g_emotion_matrix 中补充！", (int)target_emotion);
+        return;
+    }
+
+    ESP_LOGI(TAG, ">>> 开始执行情绪动画: %d (%s) <<<", (int)target_emotion, cmd->screen_anim);
+
+    // ── 0. 置「情绪播放中」标志 + 清队（必须早于 GIF/震动/舵机）──────────────────
+    // 置位后：主界面自动 GIF 循环立刻让位（不切图、不入舵机请求），触摸路由屏蔽新情绪。
+    // ★ 必须 flush：从「触摸」到「worker 置此标志」有 50~150ms 延迟，期间自动循环已往
+    //   servo_manager 队列塞了 2~3 条旧舵机请求。标志只能拦「之后」的新入队，拦不掉
+    //   已堆积的旧请求。不清的话情绪舵机要排在旧请求后，表现为「GIF 已切、舵机还在做
+    //   上一个动作」（现象1）。flush 清队 + 打断当前 + 归中，让情绪舵机从干净状态起步。
+    atomic_store(&s_ia_playing, true);
+    servo_manager_flush();
+
+    // ── 2. 屏幕 GIF 切换（跨线程安全）─────────────────────────────────────────
+    // 本任务（ia_worker）栈在 SPIRAM，禁 cache 时不能直接调 lv_gif_set_src（BUG-010）。
+    // ui_request_emotion_gif 只设 pending 标记 + 唤醒 LVGL 线程的延迟 timer，由其
+    // 在 LVGL 线程真正切图，安全。gif_path 为 NULL 的情绪（如无 GIF）会被内部忽略。
+    ui_request_emotion_gif(cmd->gif_path);
+
+    // ── 3. 音频播放（情绪音效 → 外挂 flash /S/voice/）──────────────────────────
+    // audio_file 是情绪矩阵里的文件名（如 "doubt.mp3"），拼成绝对路径后交给
+    // offline_audio_play 异步播放：它内部另起独立解码任务（栈/缓冲全在 SPIRAM），
+    // 不阻塞本 ia_worker，也不碰云端对话解码实例。
+    // 仲裁由 offline_audio 内部处理：对话中（非 IDLE）会被拒绝、播放中会被顶掉，
+    // 与情绪触摸在 play_random_emotion 处的屏蔽策略一致，双重保险。
+#if IA_EMOTION_AUDIO_ENABLE
+    if (cmd->audio_file && cmd->audio_file[0] != '\0')
+    {
+        char audio_path[64];
+        snprintf(audio_path, sizeof(audio_path), "/S/voice/%s", cmd->audio_file);
+        esp_err_t aret = offline_audio_play(audio_path);
+        if (aret != ESP_OK)
+            ESP_LOGW(TAG, "🔊 情绪音效播放未启动: %s (ret=%d)", audio_path, aret);
+        else
+            ESP_LOGI(TAG, "🔊 情绪音效: %s", audio_path);
+    }
+#else
+    /* 【2026-08-31 问题3】情绪音效已由 IA_EMOTION_AUDIO_ENABLE 关闭（暂时去除）。
+     * 矩阵里的 .audio_file 字段保留不动，置回 1 即恢复。 */
+    (void)cmd->audio_file;
+#endif
+
+    // ── 4. 震动马达 ──────────────────────────────────────────────────────────
+    // 按情绪表配置的震动序列逐段播放（强度/时长/间隔每段独立；NULL=无震动）。
+    // 低功耗（一级待机）头部专属模式下跳过震动，避免打扰。
+    bool lowpower = atomic_load(&s_ia_lowpower);
+    if (!lowpower)
+        trigger_vibration_motor(cmd->vib_seq, cmd->vib_seq_len);
+
+    // ── 5. 舵机三轴动作序列（入队 servo_manager，统一执行体）───────────────────
+    // 把整个情绪压成【一条】序列请求，交给 servo_manager worker 执行：
+    //   - 每轴走 归位角→target→seq[]→归位角，三轴【各走各的】互不等待，
+    //     各轴走完自己的序列就【立即】回自己的归位角（头 90°/臂 ARM_CENTER_DEG），
+    //     不再等其余两轴（★2026-09-17：此前由 worker 在三轴全走完后统一归中，
+    //     导致双臂做完后干等头部摇完 8 步才一起回中，用户反馈这是错的）；
+    //     （★2026-09-11 更正：此处原注释写的"angle_1↔angle_2 往返
+    //     count 次"是 2026-09-04 之前旧结构的语义，改序列结构时没跟着改）；
+    //   - 带 s_ia_d1_2_sem，执行完（正常 或 被 servo_manager_flush 打断）后 give；
+    //   - 统一执行体保证情绪/自动循环/待机互斥，且进功能盘 flush 能打断本动作。
+    // 情绪表 ActionSeq_t 是绝对角度，1:1 填入请求，无换算误差（plan R5）。
+    //
+    // 低功耗模式下手臂【seq_len 与 speed 一起清零】：seq_len=0 只是不走序列，
+    // 若 speed 还留着，手臂仍会走"到终点"那一步（★2026-09-17 起还会再走一步
+    // 归中，见 servo_exec_seq 的 ③）；两者都清才真正钉住不动
+    // （见下方 if (lowpower) 块）。头部不受影响，情绪头部动作照常播放。
+    // ★seq 位填 {{0}}（不是 {0}）：seq 现在是结构体数组，多一层花括号才与类型
+    //   形状匹配，否则 -Wmissing-braces 会报警告。实际内容由下面的循环填入。
+    servo_seq_request_t preq = {
+        .head = {cmd->head.target, cmd->head.speed, {{0}}, cmd->head.seq_len, cmd->head.seq_speed},
+        .l_arm = {cmd->left_arm.target, cmd->left_arm.speed, {{0}}, (uint8_t)(lowpower ? 0 : cmd->left_arm.seq_len), cmd->left_arm.seq_speed},
+        .r_arm = {cmd->right_arm.target, cmd->right_arm.speed, {{0}}, (uint8_t)(lowpower ? 0 : cmd->right_arm.seq_len), cmd->right_arm.seq_speed},
+    };
+    // 序列逐步拷贝：配置侧 ActionSeqStep_t → 执行侧 servo_seq_step_t。
+    //
+    // ★2026-09-11 由 memcpy 改为逐字段拷贝：两者是【不同类型】的结构体，
+    //   memcpy 依赖"两边内存布局恰好一致"这个隐含前提，哪天有人只给其中一边
+    //   加了字段就会静默错位（角度读成速度），且编译器不会报错。逐字段赋值
+    //   让编译器替我们保证正确性，代价只是几行代码。
+    // ★2026-09-18 hold_ms 也在此逐字段透传（新增字段时正是靠这条约定避免了
+    //   "只给一边加字段导致静默错位"，见上方注释）。
+    for (int s = 0; s < ACTION_SEQ_MAX_STEPS; s++)
+    {
+        preq.head.seq[s].angle = cmd->head.seq[s].angle;
+        preq.head.seq[s].speed = cmd->head.seq[s].speed;
+        preq.head.seq[s].hold_ms = cmd->head.seq[s].hold_ms;
+        preq.l_arm.seq[s].angle = cmd->left_arm.seq[s].angle;
+        preq.l_arm.seq[s].speed = cmd->left_arm.seq[s].speed;
+        preq.l_arm.seq[s].hold_ms = cmd->left_arm.seq[s].hold_ms;
+        preq.r_arm.seq[s].angle = cmd->right_arm.seq[s].angle;
+        preq.r_arm.seq[s].speed = cmd->right_arm.seq[s].speed;
+        preq.r_arm.seq[s].hold_ms = cmd->right_arm.seq[s].hold_ms;
+    }
+    // 低功耗：手臂不参与（speed 也清零，否则仍会走"到终点"那一步）
+    if (lowpower)
+    {
+        preq.l_arm.speed = 0;
+        preq.r_arm.speed = 0;
+    }
+
+    // 清掉可能残留的旧 d1_2 信号（防上一轮超时遗留导致本轮 take 立即返回）
+    xSemaphoreTake(s_ia_d1_2_sem, 0);
+
+    if (servo_manager_submit_seq_notify(&preq, s_ia_d1_2_sem) == ESP_OK)
+    {
+        // 阻塞等待舵机动作执行完毕（含归中）。10s 超时兜底：万一被 flush 清队
+        // 丢弃了请求导致 give 不发生，也不会永久卡死（plan R4）。
+        if (xSemaphoreTake(s_ia_d1_2_sem, pdMS_TO_TICKS(10000)) != pdTRUE)
+            ESP_LOGW(TAG, "情绪舵机完成等待超时（可能被 flush 打断），继续");
+    }
+    else
+    {
+        ESP_LOGW(TAG, "情绪舵机请求入队失败（队列满？），跳过本次动作");
+    }
+
+    ESP_LOGI(TAG, ">>> 情绪动作执行完毕: %d <<<", (int)target_emotion);
+
+    // ── 6. 清「情绪播放中」标志 + 恢复主界面自动 GIF 循环 ──────────────────────
+    // 先 flush 再清标志再恢复：清掉情绪期间可能残留的旧舵机请求（理论上已空，
+    // 但兜底防现象2「恢复后 GIF 切好几遍舵机才动」）。flush 必须在 ui_resume 之前——
+    // 否则会把 resume 刚入队的新舵机请求一起清掉。
+    //
+    // ★远程控制活跃时【必须跳过】(2026-08-05)：本情绪动作往往正是被远程指令打断的那条，
+    //   打断后 rc_worker 已经拿到通道锁开始把舵机送往用户指定角度。此处 flush 内部会调
+    //   bsp_servo_request_abort()，把 rc 刚清干净的打断标志重新置上 → rc 的插值走两步就
+    //   break，手臂停在半路（实测 steps=2 aborted=1 停在 35.0°，目标 0°）。
+    //   而正常收尾时 resume_loop 早于 rc 运动完成，两者不重叠，故表现为「时灵时不灵」。
+    //   远程控制期间也不需要这个归中兜底：rc 马上要把舵机放到用户要的位置，归中纯属多余。
+    if (!remote_control_is_active())
+        servo_manager_flush();
+    atomic_store(&s_ia_playing, false);
+    ui_resume_main_gif_loop();
+}
+
+/**
+ * @brief 阻塞执行一个自定义动作（GIF + 三轴舵机 + 震动），不查情绪矩阵（worker 内部调用）
+ *
+ * 与 interaction_play_blocking 同样的执行骨架（置标志+flush → 切图 → 震动 → 舵机 → 等
+ * 完成 → flush 归中 → 清标志），但：
+ *   - 切图按 act->is_state_gif 选高优先级状态切图 / 普通情绪切图（见 D.1）；
+ *   - act->keep_screen=true 时【跳过】结尾的 ui_resume_main_gif_loop，屏幕停在该 GIF
+ *     （对话中状态动作播完不应跳回待机循环）。
+ */
+static void interaction_play_custom_blocking(const ia_custom_action_t *act)
+{
+    if (act == NULL)
+        return;
+
+    // 置「播放中」+ 清舵机队列（与情绪同样的起步姿态，防旧请求残留）
+    // is_idle=true 即「空闲动作」（低优先级，可被触摸情绪 flush 打断）；
+    // 对话状态动作 is_idle=false（不可被打断，与情绪同级）。is_idle 与 keep_screen 解耦。
+    atomic_store(&s_ia_is_idle, act->is_idle);
+    atomic_store(&s_ia_playing, true);
+    // ESP_LOGI("GIFDBG", "custom动作 开始 idle=%d gif=%s keep=%d",
+    //          act->is_idle, act->gif_path ? act->gif_path : "(NULL)", act->keep_screen);
+    /* 【堆探针·2026-07-29 已验证无问题，暂停用】
+     * 实测这四个探针（进入前/flush后/切图后/震动后）在事故日志里【全部同时报同一地址】，
+     * 且「进入前」就已经报 → 说明本函数只是撞上别处留下的损坏，自身不是凶手。
+     * 整条 GIF+舵机+震动链路据此排除嫌疑。需再查时取消注释即可。 */
+    // if (!heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true))
+    //     ESP_LOGE("HEAPCHK", "★堆损坏@custom进入前(上一动作遗留)");
+    servo_manager_flush();
+    // if (!heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true))
+    //     ESP_LOGE("HEAPCHK", "★堆损坏@servo_manager_flush()之后");
+
+    // 切图（跨线程安全）：状态动作走高优先级 ui_request_state_gif（is_state=true），
+    // 否则会被对话中 main_gif_switch_timer_cb 的「丢弃情绪切图」兜底误伤（D.1）。
+    if (act->gif_path != NULL && act->gif_path[0] != '\0')
+    {
+        if (act->is_state_gif)
+            ui_request_state_gif(act->gif_path);
+        else
+            ui_request_emotion_gif(act->gif_path);
+    }
+    // if (!heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true))
+    //     ESP_LOGE("HEAPCHK", "★堆损坏@切图之后");   // 【已验证无问题，暂停用】
+
+    // 震动（逐段阻塞播放；NULL/0 直接返回）
+    trigger_vibration_motor(act->vib_seq, act->vib_seq_len);
+    // if (!heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true))
+    //     ESP_LOGE("HEAPCHK", "★堆损坏@震动之后");   // 【已验证无问题，暂停用】
+
+    // 三轴舵机绝对角度并行动作（与情绪同一执行体，执行完 worker 统一归中 90°）
+    servo_abs_parallel_request_t preq = {
+        .head = {act->head.angle_1, act->head.angle_2, act->head.speed, act->head.count},
+        .l_arm = {act->left_arm.angle_1, act->left_arm.angle_2, act->left_arm.speed, act->left_arm.count},
+        .r_arm = {act->right_arm.angle_1, act->right_arm.angle_2, act->right_arm.speed, act->right_arm.count},
+    };
+    xSemaphoreTake(s_ia_d1_2_sem, 0); // 清残留 d1_2 信号
+    if (servo_manager_submit_abs_parallel_notify(&preq, s_ia_d1_2_sem) == ESP_OK)
+    {
+        if (xSemaphoreTake(s_ia_d1_2_sem, pdMS_TO_TICKS(10000)) != pdTRUE)
+            ESP_LOGW(TAG, "状态动作舵机完成等待超时（可能被 flush 打断），继续");
+    }
+    else
+    {
+        ESP_LOGW(TAG, "状态动作舵机请求入队失败（队列满？），跳过本次动作");
+    }
+
+    // if (!heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true))
+    //     ESP_LOGE("HEAPCHK", "★堆损坏@舵机动作之后");  // 【已验证无问题，暂停用】
+    /* ia_worker 栈在 PSRAM（见 interaction_manager_init 的 MALLOC_CAP_SPIRAM），
+     * 溢出踩不到内部 SRAM 堆；实测水位剩 7676B/8192B，极宽裕 → 排除。 */
+    // WARN_TASK_STACK_LOW("HEAPCHK", NULL, 1024);
+    // ★远程控制活跃时跳过：理由同 interaction_play_blocking 收尾处的详细注释——
+    //   本 flush 会重新置上打断标志，打断 rc_worker 正在进行的接管运动。
+    //   空闲动作走的正是本函数，故「空闲时下发指令也会停住」同源于此。
+    if (!remote_control_is_active())
+        servo_manager_flush(); // 归中（含打断兜底）
+    atomic_store(&s_ia_is_idle, false);
+    atomic_store(&s_ia_playing, false);
+    // ESP_LOGI("GIFDBG", "custom动作 结束 keep=%d → %s", act->keep_screen,
+    //          act->keep_screen ? "停在GIF" : "恢复循环");
+    if (!act->keep_screen)
+        ui_resume_main_gif_loop(); // 仅非 keep_screen 才恢复待机循环；对话中 keep_screen=true 停在状态 GIF（D.3）
+}
+
+// ==========================================
+// 5. Worker 任务：串行消费动作队列（情绪 / 自定义动作）
+// ==========================================
+
+/**
+ * @brief interaction worker 主循环
+ *
+ * 永久阻塞等待队列，每次取出一个 robot_emotion_t 并执行完整动作序列。
+ * 串行执行保证动作不重叠，无需外部加锁。
+ */
+static void interaction_worker_task(void *arg)
+{
+    PRINT_TASK_STACK_HWM(TAG); // 打印本任务栈历史最小剩余
+    ia_request_t req;
+    for (;;)
+    {
+        // 无限等待，收到请求后按类型分发执行（阻塞期间不占 CPU）
+        if (xQueueReceive(s_ia_queue, &req, portMAX_DELAY) == pdTRUE)
+        {
+            // OTA 升级期间：丢弃一切请求，不切 GIF / 不驱动舵机 / 不震动
+            if (s_ia_stopped_for_ota)
+                continue;
+            if (req.type == IA_REQ_EMOTION)
+                interaction_play_blocking(req.u.emo);
+            else /* IA_REQ_CUSTOM */
+                interaction_play_custom_blocking(&req.u.custom);
+        }
+    }
+}
+
+// ==========================================
+// 6. 公开 API
+// ==========================================
+
+/**
+ * @brief 初始化 interaction_manager（创建队列 + worker 任务）
+ *
+ * 必须在 bsp_board_servo_init() 之后、首次调用 ui_interaction_play() 之前调用。
+ */
+esp_err_t interaction_manager_init(void)
+{
+    if (s_ia_inited)
+        return ESP_OK;
+
+    // ── 创建情绪请求队列 ──────────────────────────────────────────────────────
+    s_ia_queue = xQueueCreate(INTERACTION_QUEUE_LEN, sizeof(ia_request_t));
+    if (s_ia_queue == NULL)
+    {
+        ESP_LOGE(TAG, "创建 interaction 队列失败，内存不足!");
+        return ESP_ERR_NO_MEM;
+    }
+
+    // ── 创建舵机动作完成信号量（worker 等待 servo_manager 执行完毕用）──────────
+    s_ia_d1_2_sem = xSemaphoreCreateBinary();
+    if (s_ia_d1_2_sem == NULL)
+    {
+        ESP_LOGE(TAG, "创建 interaction 完成信号量失败，内存不足!");
+        vQueueDelete(s_ia_queue);
+        s_ia_queue = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    // ── 创建 worker 任务（栈分配到 SPIRAM，节省内部 SRAM）────────────────────
+    BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(
+        interaction_worker_task,
+        "ia_worker",
+        INTERACTION_TASK_STACK,
+        NULL,
+        INTERACTION_TASK_PRIO,
+        &s_ia_worker,
+        tskNO_AFFINITY,                       // 不绑定 CPU 核心，调度器自由分配
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); // 栈分配在 SPIRAM
+
+    if (ret != pdPASS)
+    {
+        vQueueDelete(s_ia_queue);
+        s_ia_queue = NULL;
+        ESP_LOGE(TAG, "创建 interaction worker 任务失败，内存不足!");
+        return ESP_ERR_NO_MEM;
+    }
+    PRINT_TASK_CREATED(TAG, "ia_worker", INTERACTION_TASK_STACK, 0); // 栈在PSRAM
+
+    s_ia_inited = true;
+    ESP_LOGI(TAG, "interaction_manager 初始化完成（队列深度=%d）", INTERACTION_QUEUE_LEN);
+    return ESP_OK;
+}
+
+/**
+ * @brief 非阻塞触发情绪动作（将 emotion_id 入队后立即返回）
+ *
+ * 线程安全，可从任意任务调用。
+ * 若队列已满（INTERACTION_QUEUE_LEN），新请求被丢弃并打印警告。
+ */
+void ui_interaction_play(robot_emotion_t target_emotion)
+{
+    if (!s_ia_inited || s_ia_queue == NULL)
+    {
+        ESP_LOGE(TAG, "interaction_manager 未初始化，调用 interaction_manager_init() 后再使用!");
+        return;
+    }
+
+    // 触摸情绪优先级高于空闲动作：若当前正在播空闲动作，先 flush 打断它的舵机，
+    // 让 worker 的舵机等待（s_ia_d1_2_sem）立即返回、空闲动作迅速收尾，紧接着出队本情绪。
+    // （空闲动作震动很短，flush 主要打断耗时的舵机摆动；对话状态动作不置 idle，不受影响。）
+    if (interaction_is_idle_action())
+    {
+        ESP_LOGI(TAG, "触摸情绪打断当前空闲动作");
+        servo_manager_flush();
+    }
+
+    // 非阻塞入队（timeout=0），队满则丢弃
+    ia_request_t req = {.type = IA_REQ_EMOTION, .u.emo = target_emotion};
+    if (xQueueSend(s_ia_queue, &req, 0) != pdTRUE)
+    {
+        ESP_LOGW(TAG, "interaction 队列已满，丢弃情绪 %d", (int)target_emotion);
+    }
+}
+
+/**
+ * @brief 非阻塞触发一个自定义动作（GIF + 三轴舵机 + 震动），不查情绪矩阵
+ *
+ * 将动作整体值拷贝入队后立即返回，由 worker 串行执行（见 interaction_play_custom_blocking）。
+ * 线程安全，可从任意任务调用；队列满时丢弃并打印警告。
+ */
+void ui_interaction_play_custom(const ia_custom_action_t *act)
+{
+    if (act == NULL)
+    {
+        ESP_LOGE(TAG, "custom 动作为空，忽略请求!");
+        return;
+    }
+    if (!s_ia_inited || s_ia_queue == NULL)
+    {
+        // 开机早期 GIF 自动轮播已启动，但 interaction_manager_init() 要等舵机硬件/
+        // servo_manager 就绪后才执行（见 application_init 步骤 8~10），中间这段时间
+        // 的 custom 请求属预期内丢弃，不应按 ERROR 刷屏。
+        ESP_LOGD(TAG, "interaction_manager 尚未初始化，忽略 custom 请求");
+        return;
+    }
+
+    // 整体值拷贝入队（custom 内 gif_path/vib_seq 是指针，须指向 static const，由调用方保证）
+    ia_request_t req = {.type = IA_REQ_CUSTOM, .u.custom = *act};
+    if (xQueueSend(s_ia_queue, &req, 0) != pdTRUE)
+    {
+        ESP_LOGW(TAG, "interaction 队列已满，丢弃 custom 动作");
+    }
+}
+
+void interaction_flush_queue(void)
+{
+    // 只清「未执行」的存量请求；正在执行的那条由 servo_manager_flush 打断（二者配合）。
+    if (s_ia_inited && s_ia_queue != NULL)
+        xQueueReset(s_ia_queue);
+}
+
+void interaction_stop_for_ota(void)
+{
+    // ① 置停止标志：worker 此后取到任何请求都直接丢弃，不再切 GIF/舵机/震动
+    s_ia_stopped_for_ota = true;
+    // ② 清空队列里未执行的存量请求
+    if (s_ia_inited && s_ia_queue != NULL)
+        xQueueReset(s_ia_queue);
+    // ③ 打断【正在执行】的那条舵机动作（含归中兜底），让当前动作立即收尾
+    servo_manager_flush();
+    ESP_LOGW(TAG, "interaction 已为 OTA 停止（GIF/舵机/震动全部静默）");
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 调试用：GIF + 舵机适配循环播放任务（2026-09-16 新增）
+ *
+ * 【用途】逐个情绪调试「GIF + 三轴舵机」的适配性。调试时只需在 g_emotion_matrix
+ *   里注释/增删条目，数组里留几条就轮着播几条（留一条就循环播那一条），
+ *   无需改任何枚举/宏，也无需碰 MQTT / session 等上层链路。
+ *
+ * 【为什么直接调 interaction_play_blocking 而非走队列】本任务与 ia_worker 同角色，
+ *   串行阻塞执行每一条情绪（切 GIF → 震动 → 舵机序列 → 归中），节奏由本任务控制；
+ *   栈在 SPIRAM，与 ia_worker 一致，blocking 内不直接擦写 flash，无 BUG-039 风险。
+ * ═══════════════════════════════════════════════════════════════════════════ */
+#define INTERACTION_DEMO_GAP_MS 000         ///< 每轮情绪之间停顿（ms），方便肉眼观察适配效果
+#define INTERACTION_DEMO_INIT_DELAY_MS 3000 ///< 启动后先等 UI/主循环就绪再开播
+
+/**
+ * @brief demo 任务主体：遍历 g_emotion_matrix，循环播放数组里现有的每一条情绪
+ */
+static void interaction_demo_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(INTERACTION_DEMO_INIT_DELAY_MS)); // 等开机 logo/UI 就绪
+
+    /* ★demo 独占（2026-09-17 根治空闲态抢占）：置 OTA 停止标志，让 worker 丢弃一切
+     * 队列请求（尤其主界面空闲轮播投递的空闲动作）。否则 worker 与 demo 并发执行，
+     * 且在空闲动作收尾 atomic_store(s_ia_playing,false) 清掉 demo 的锁 → "偶尔空闲态抢占"。
+     * demo task 直接调 interaction_play_blocking（不走队列），不受此标志影响。 */
+    s_ia_stopped_for_ota = true;
+
+    for (;;)
+    {
+        int n = (int)(sizeof(g_emotion_matrix) / sizeof(g_emotion_matrix[0]));
+        for (int i = 0; i < n; i++)
+        {
+            /* ★锁住主界面「空闲 GIF 自动轮播」（2026-09-17 修复抢占）：
+             * 不锁的话，主循环 main_gif_switch_timer_cb 会在轮间停顿(GAP_MS)期间
+             * 切它自己的空闲 GIF + 投递空闲舵机动作，与 demo 情绪抢占屏幕和舵机
+             * （实测"好几个抢占"）。
+             *   - interaction_flush_queue()：清掉 worker 队列里已积压的空闲动作；
+             *   - atomic_store(&s_ia_playing, true)：主循环 timer_cb 的「自动随机循环」
+             *     分支判 interaction_is_playing()==true 即 return，不再切空闲图/投空闲动作。
+             *   ★不拦 demo 自己的情绪 GIF：情绪切图走 timer_cb 的 pending_path 分支
+             *     （在 playing 判断之前），照常切。 */
+            interaction_flush_queue();
+            atomic_store(&s_ia_playing, true);
+
+            ESP_LOGI(TAG, "[DEMO] 播放情绪 %d: %s (GIF=%s)",
+                     (int)g_emotion_matrix[i].emotion_id,
+                     g_emotion_matrix[i].screen_anim,
+                     g_emotion_matrix[i].gif_path ? g_emotion_matrix[i].gif_path : "(无)");
+            interaction_play_blocking(g_emotion_matrix[i].emotion_id);
+
+            /* interaction_play_blocking 收尾会清 s_ia_playing=false 并 ui_resume_main_gif_loop，
+             * 这里立即重新锁 true，堵住轮间停顿期间主循环空闲轮播的插队。 */
+            atomic_store(&s_ia_playing, true);
+            vTaskDelay(pdMS_TO_TICKS(INTERACTION_DEMO_GAP_MS));
+        }
+    }
+}
+
+void interaction_demo_start(void)
+{
+    BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(
+        interaction_demo_task,
+        "ia_demo",
+        INTERACTION_TASK_STACK,
+        NULL,
+        INTERACTION_TASK_PRIO,
+        NULL,
+        tskNO_AFFINITY,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    if (ret != pdPASS)
+        ESP_LOGE(TAG, "创建 interaction demo 任务失败，内存不足!");
+    else
+        PRINT_TASK_CREATED(TAG, "ia_demo", INTERACTION_TASK_STACK, 0);
+}
