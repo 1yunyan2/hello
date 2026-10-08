@@ -136,6 +136,99 @@ BLACK = (0, 0, 0)  # LVGL draw_buf 分配后未初始化,矩形外区域实际�
                     # 显示效果一致(而不是让 Pillow 自己选一个不确定的颜色)
 
 
+def put_black_at_index0(pal):
+    """把该帧调色板里"最接近纯黑"的那一格换到索引 0(索引 0 ↔ k 互换,像素同步重映射)。
+
+    ── 为什么必须做这件事(B3)─────────────────────────────────────────────
+    GIF 的逻辑屏幕描述符(LSD)里有一个"背景色索引"字节,位置固定在文件偏移 11。
+    Pillow 保存时固定把它写成 0(且不认我们传的 info['background'])。而本脚本对
+    每一帧各自做 MEDIANCUT 量化,量化后的索引 0 恰好不是黑,而是纯白:
+      · 实测 assets/gif/ 下 41/41 个文件的 LSD 背景索引 = 0
+      · 按索引 0 去查全局调色板,41/41 都是 (255, 255, 255) 纯白
+      · 真正的黑落在别的索引上,且每帧不同(实测 1_2.gif 第 0 帧是索引 154)
+      · 而且 1_2 有 88/89 帧、1_6 有 119/120 帧各自带【本地调色板(LCT)】,
+        LVGL 是按"当前帧自己的调色板"去查 pal[背景索引] 的
+    LVGL 9.5 的 GIF 解码器(lv_gif.c 的 gif_blend_to_rgb565 / gif_disposal_last_frame)
+    在【含透明像素】或【disposal==2】这两条分支里,会用 pal[背景索引] 去填那些本该
+    "保留上一帧、不重画"的透明像素 —— 背景索引是白,就会出现整片"白横",肉眼看
+    像颜色反转(见 gif_backup_orig/check_gif.py 里的同款描述)。
+
+    本脚本产出的图【不含透明像素、disposal 全为 1】,当前走不到那两条分支,
+    所以这是一颗【尚未引爆】的雷。但一旦将来素材格式变化、或某次 Pillow 版本
+    行为改变让它写进透明帧,背景索引指向白色就会立刻变成肉眼可见的白块。
+    把索引 0 恒定为黑,LSD 里那个 0 就等于黑,与画布未初始化区、帧矩形以外
+    区域(都是黑)保持一致,最坏情况也不突兀。
+
+    纯调色板索引置换:颜色集合不变、画质零变化、文件长度不变。"""
+    raw = pal.getpalette()
+    if not raw:
+        return pal
+    n = len(raw) // 3
+    # 找调色板里最接近纯黑的一格(距离用平方和,免开方)
+    k = min(range(n), key=lambda i: sum(v * v for v in raw[i * 3:i * 3 + 3]))
+    if k == 0:
+        return pal  # 已经是黑,无需置换
+    lut = list(range(256))          # P 模式:256 项查找表,作用在"调色板索引"上
+    lut[0], lut[k] = k, 0
+    new_pal = list(raw)
+    new_pal[0:3], new_pal[k * 3:k * 3 + 3] = raw[k * 3:k * 3 + 3], raw[0:3]
+    out = pal.point(lut)            # 像素索引重映射
+    out.putpalette(new_pal)         # 调色板同步对调
+    return out
+
+
+def verify_black_at_index0(path):
+    """落盘后复检:每一帧的调色板索引 0 是不是黑。
+
+    【为什么不直接用 Pillow 读】实测某个 Pillow 版本在 seek() 之后 getpalette()
+    对"带本地调色板(LCT)的帧"返回 None,会把本来正确的文件全部误报成坏文件
+    (当时报 88/89 帧不通过,而按字节解析是 0 个不通过)。字节解析是确定的:
+      LSD: 0-5 签名/版本, 6-7 宽, 8-9 高, 10 packed, 11 背景色索引, 12 像素比
+      packed 的 0x80 位 => 有全局调色板(GCT),长度 3*(2<<(packed&0x07))
+      帧: 0x2C 图像描述符(10 字节),第 9 字节是 packed,其 0x80 位 => 有 LCT
+          带 LCT 的帧查 LCT 的索引 0,不带的沿用 GCT —— 两者都要是黑
+    返回 (是否全部通过, 有问题的帧号列表;0 代表全局调色板,帧号从 1 开始)"""
+    try:
+        d = open(path, 'rb').read()
+    except Exception:
+        return False, [-1]
+    if len(d) < 13 or d[:3] != b'GIF':
+        return False, [-1]
+    bad = []
+    packed = d[10]
+    if not (packed & 0x80):
+        return False, [0]                       # 无 GCT:背景索引无意义,按异常报
+    n_gct = 2 << (packed & 0x07)
+    if tuple(d[13:16]) != (0, 0, 0):
+        bad.append(0)
+    q = 13 + n_gct * 3
+    nf = 0
+    while q < len(d) and d[q] != 0x3B:
+        if d[q] == 0x21:                        # 扩展块
+            label = d[q + 1]
+            q += 2
+            if label == 0xF9:                   # GCE:块长字节 + 块数据
+                q += 1 + d[q]
+            while q < len(d) and d[q] != 0:
+                q += d[q] + 1
+            q += 1
+        elif d[q] == 0x2C:                      # 图像描述符
+            nf += 1
+            ip = d[q + 9]
+            q += 10
+            if ip & 0x80:                       # 有本地调色板:查它的索引 0
+                if tuple(d[q:q + 3]) != (0, 0, 0):
+                    bad.append(nf)
+                q += (2 << (ip & 0x07)) * 3
+            q += 1                              # LZW 最小码长
+            while q < len(d) and d[q] != 0:
+                q += d[q] + 1
+            q += 1
+        else:
+            break
+    return (len(bad) == 0), bad
+
+
 def fix_gif(src_path, dst_path, target_size=None):
     """用 Pillow 逐帧合成出【真实可见画面】,再重新量化成 256 色、不含透明索引,
     保存 —— 这样每帧都是完整画面,LVGL 只会走它唯一实现正确的"无透明直查表"
@@ -162,6 +255,7 @@ def fix_gif(src_path, dst_path, target_size=None):
         pal = black_bg.quantize(colors=256, method=Image.MEDIANCUT,
                                  dither=Image.FLOYDSTEINBERG)
         pal.info.pop('transparency', None)
+        pal = put_black_at_index0(pal)  # B3:索引 0 恒为黑 —— 拆"背景索引指向白"的雷
         frames.append(pal)
         durations.append(fr.info.get('duration', 40))
 
@@ -198,6 +292,7 @@ def main():
     n_fixed = 0
     n_safe = 0
     n_resized = 0
+    n_bg_bad = 0  # B3 复检失败计数(调色板索引 0 不是黑)
 
     for fn in files:
         sp = os.path.join(src_abs, fn)
@@ -230,19 +325,35 @@ def main():
 
         if info['risky'] or target_size:
             fix_gif(sp, dp, target_size)
+            ok, bad = verify_black_at_index0(dp)  # B3 复检:索引 0 是否全帧为黑
+            if not ok:
+                n_bg_bad += 1
             o, n = os.path.getsize(sp), os.path.getsize(dp)
             reason = '+'.join(info['reasons']) if info['reasons'] else '仅超屏缩放'
-            print('%-16s 🔧 已修复  %+6.0f%%  %s | %s%s'
-                  % (fn, (n - o) / o * 100, info['detail'], reason, resize_note))
+            print('%-16s 🔧 已修复  %+6.0f%%  %s | %s%s%s'
+                  % (fn, (n - o) / o * 100, info['detail'], reason, resize_note,
+                     '' if ok else '  ⚠️背景索引复检未通过 帧=%s' % bad[:6]))
             n_fixed += 1
         else:
             shutil.copy2(sp, dp)
-            print('%-16s ✅ 安全    原样复制  %s' % (fn, info['detail']))
+            # B3:原样复制的文件不改动,但同样体检"索引 0 是否黑",只报告不改
+            ok, bad = verify_black_at_index0(dp)
+            if not ok:
+                n_bg_bad += 1
+            print('%-16s ✅ 安全    原样复制  %s%s'
+                  % (fn, info['detail'],
+                     '' if ok else '  ⚠️背景索引非黑(原样保留) 帧=%s' % bad[:6]))
             n_safe += 1
 
     print('-' * 78)
     print(f'✅ 安全直接用: {n_safe} 个   🔧 已自动修复: {n_fixed} 个'
           + (f'(其中缩放 {n_resized} 个)' if n_resized else ''))
+    # B3 复检结论:LSD 背景索引固定为 0,只有让索引 0 恒为黑,那个 0 才等于黑。
+    if n_bg_bad:
+        print(f'⚠️ B3 复检: {n_bg_bad} 个文件的调色板索引 0 不是黑 —— '
+              f'LVGL 一旦走"含透明像素/disposal=2"分支就会填白色(看着像颜色反转),需人工确认')
+    else:
+        print('✅ B3 复检: 全部文件的调色板索引 0 都是黑(LSD 背景索引=0 即等于黑)')
     print(f'\n输出目录: {out_abs}')
     print('下一步: python 2.py   (打包 assets/ → storage.bin)')
     return 0

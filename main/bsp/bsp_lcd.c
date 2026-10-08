@@ -1,6 +1,6 @@
 #include "bsp_board.h"
 #include "driver/gpio.h"
-#include "driver/ledc.h" // 背光 PWM 调光（LEDC 外设）
+#include "driver/ledc.h"      // 背光 PWM 调光（LEDC 外设）
 #include "esp_lcd_panel_io.h" // esp_lcd_panel_io_tx_param（写 ST7789 厂商寄存器）
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
@@ -265,6 +265,12 @@ void bsp_board_lcd_fade_brightness_fine(uint8_t from_pct, uint8_t to_pct, uint32
 /// 故用本标志早退。
 static bool s_lcd_inited = false;
 
+/// @brief 显示控制器当前是否处于"已打开"状态（DISPON 已发、DISP OFF 未发）。
+/// ★ 仅用于 bsp_board_lcd_reassert_state() 的早退判据：显示还没打开时不要去
+/// 补发 DISPON，否则会抢在开机"先关显示 → 渐亮背光"的流程前面把画面亮出来。
+/// 由 bsp_board_lcd_on()/disp_on() 置位、bsp_board_lcd_off()/disp_off() 清零。
+static bool s_lcd_display_on = false;
+
 void bsp_board_lcd_init(bsp_board_t *bsp_board)
 {
     if (s_lcd_inited)
@@ -355,14 +361,14 @@ void bsp_board_lcd_init(bsp_board_t *bsp_board)
         .lcd_cmd_bits = 8,             // 命令字段位宽（ST7789 固定 8-bit）
         .lcd_param_bits = 8,           // 参数字段位宽（ST7789 固定 8-bit）
         .spi_mode = 0,                 // SPI 模式 0（CPOL=0，CPHA=0）
-        .trans_queue_depth = 10,       // 事务队列深度（最多 10 个异步事务排队）
+        .trans_queue_depth = 1,        // 事务队列深度（最多 10 个异步事务排队）
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(
         (esp_lcd_spi_bus_handle_t)SPI2_HOST, &io_config, &bsp_board->lcd_io));
 
     // ── 步骤 4：初始化 ST7789 LCD 面板驱动 ───────────────────────────────────
     esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num = BSP_LCD_RST_PIN,          // 复位引脚（GPIO14），低电平复位
+        .reset_gpio_num = BSP_LCD_RST_PIN,
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB, // RGB 像素排列顺序（R高位，B低位）
         .bits_per_pixel = 16,                       // 每像素 16-bit（RGB565 格式）
         .data_endian = LCD_RGB_DATA_ENDIAN_LITTLE,  // 小端字节序（ESP32 原生字节序）
@@ -443,6 +449,7 @@ void bsp_board_lcd_on(bsp_board_t *bsp_board)
     // 先启用 ST7789 显示输出（DISPON 命令），再点亮背光
     // 顺序：控制器输出 → 背光点亮，避免背光亮时显示未就绪的画面
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(bsp_board->lcd_panel, true)); // 启用显示
+    s_lcd_display_on = true;                                                // 供 reassert 早退判据用
     bsp_lcd_bk_set_percent(BSP_LCD_BK_DEFAULT_PCT);                         // 点亮背光（默认 100%）
 }
 
@@ -463,6 +470,7 @@ void bsp_board_lcd_off(bsp_board_t *bsp_board)
     // 先关背光（用户立即看不到画面），再关显示控制器
     bsp_lcd_bk_set_percent(0);                                               // 关闭背光（PWM 占空比 0）
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(bsp_board->lcd_panel, false)); // 关闭显示
+    s_lcd_display_on = false;                                                // 供 reassert 早退判据用
 }
 
 void bsp_board_lcd_disp_off(bsp_board_t *bsp_board)
@@ -470,6 +478,7 @@ void bsp_board_lcd_disp_off(bsp_board_t *bsp_board)
     // 只关显示控制器，背光不动（调用方应已通过 bsp_board_lcd_fade_brightness
     // 把背光线性渐暗到 0，此时关显示不会有可见跳变）
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(bsp_board->lcd_panel, false));
+    s_lcd_display_on = false; // 供 reassert 早退判据用
 }
 
 void bsp_board_lcd_disp_on(bsp_board_t *bsp_board)
@@ -477,4 +486,167 @@ void bsp_board_lcd_disp_on(bsp_board_t *bsp_board)
     // 只开显示控制器，背光不动（此刻背光仍为 0，调用方随后应用
     // bsp_board_lcd_fade_brightness 把背光线性渐亮，不会有可见跳变）
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(bsp_board->lcd_panel, true));
+    s_lcd_display_on = true; // 供 reassert 早退判据用
+}
+
+/**
+ * @brief 重新断言面板关键状态：SLPOUT → INVON → DISPON（幂等，画面无跳变）
+ *
+ * 【为什么需要它 —— 2026-09-29 现场故障】
+ *   运行中偶发两种症状，且【一旦出现就永久保持】：
+ *     · 【整片全黑】背光正常亮着，但屏幕全黑；此时手动切到功能盘（LVGL 换掉
+ *       整屏内容）依旧全黑，而触摸、日志、舵机全部正常。
+ *       → 说明面板处于"display off"态：面板不输出 GRAM，所以 LVGL 画什么都是黑，
+ *         与画面内容、与 GIF 素材【完全无关】。
+ *     · 【整幅反相】画面变成底片负片，同样永久保持。
+ *       → INV 位被关。正常态是 bsp_board_lcd_init() 步骤 8 打开的那一次
+ *         esp_lcd_panel_invert_color(true)（INVON），即"反相 = 那一位被关掉了"。
+ *
+ * 【为什么判定是"被写坏"而不是"固件关的"】全工程没有任何运行时路径会发这几条
+ *   命令，逐条查证：
+ *     · invert_color() 只在初始化调用一次，且参数恒为 true（只发 INVON，不发 INVOFF）
+ *     · esp_lcd_panel_disp_on_off(false)（DISPOFF）无任何活跃调用 —— 实现见
+ *       bsp_board_lcd_off()/disp_off()，standby.c 里那处已整段删除（见 standby.c 注释）
+ *     · SLPIN/SLPOUT 全工程无调用
+ *   所以只能是 SPI 传输中命令/数据相位错乱，把某个数据/参数字节当命令执行了：
+ *   撞上 0x28/0x10 → 全黑，撞上 0x20 → 反相，撞上 0x11/0x29 → 恰好恢复。
+ *   本机 SPI 跑 80MHz（见 io_config.pclk_hz），约为 ST7789 串行写规格的 5.3 倍，
+ *   而 [BUG-017] 已记录过「40MHz 余量已不足」。故障集中在"切图那一刻"（一次整屏
+ *   153,600 字节的连续突发，出错窗口最大）也与此吻合。
+ *
+ * 【本函数做什么】把三条命令重发一遍，把面板状态掰回已知正确值。三条都是重设
+ *   同一个状态位，幂等，不改变画面内容，无可见跳变。调用点在切图收口，于是
+ *   "永久保持"被降级为"最长到下一次切图（约 5~6 秒）就自动恢复"。
+ *
+ * 【为什么不在本函数里加 delay】ST7789 的 SLPOUT 需要面板内部约 120ms 才真正
+ *   醒来，紧接着发的 DISPON 有被丢弃的可能。本函数的调用节拍就是切图节拍
+ *   （约 5~6 秒一次），下一次切图会自然补发 —— 用切图节拍代替 delay，避免在
+ *   LVGL 线程里插入最长 120ms 的阻塞造成切图卡顿。
+ *
+ * 【限制·必须知道】面板没有 MISO（见 spi_bus_config.miso_io_num = -1），状态
+ *   不可回读：本函数既无法确认面板当前是否真的异常，也无法验证写回是否生效，
+ *   只能靠"故障是否消失"来判定。
+ *
+ * @param bsp_board BSP 实例指针（访问 lcd_io 句柄）
+ * @return void（失败只打警告，不做 ESP_ERROR_CHECK：这只是补救，不该让整机挂掉）
+ */
+
+/* ── 观测埋点：重断言统计（2026-09-29 加，纯为排查「颜色翻转 / 整片全黑」偶发故障）──
+ *
+ * 【为什么必须加】常规日志里【没有任何一行】记录"我们往面板重发了状态"这件事，所以
+ *   现场看到的翻转/全黑在日志里完全不可见 —— 用户原话："颜色翻转之后还是日志正常"。
+ *   于是故障发生了多少次、什么节奏、跟什么时刻对齐，全都没有数据。
+ *
+ * 【这一版要回答的三个问题】
+ *   ① 重断言的真实频率是多少？—— 若恒为每 5~6 秒一次，说明它只是"切图节拍"的副产物，
+ *      与故障无关；若间隔忽长忽短、甚至出现"远小于 5 秒"的间隔，说明另有触发源
+ *      （唤醒 / 预载 / 以后新增的挂点），故障的时间轴才对得上。
+ *   ② 故障到底是"没有被修"还是"修了但看不见"？—— 用户报"翻转了"的时刻，对着日志看
+ *      那一秒前后有没有重断言行：有 ⇒ 是补发在起作用（或补发没起作用）；没有 ⇒ 损坏
+ *      发生在两次切图之间，且当时没有任何补发动作。
+ *   ③ 损坏节奏是否均匀？—— 30 秒汇总里的 最小/最大/均值 一眼看得出是"匀速节拍"还是
+ *      "突发成簇"（成簇往往指向电源/EMI/温度这类外部诱因）。
+ *
+ * 【为什么限流】逐条日志最快 250ms 一条。当前节拍（每 5~6 秒）远低于此，限流不会丢任何
+ *   一条现场数据；它只在"有人把补发挂到更高频的调用点"时才生效 —— 那种情况下 flood 本身
+ *   就会变成新的时序干扰源，还会把用户依赖的"日志正常"淹没。计数不受限流影响，始终精确。
+ *
+ * 【可整段删除】本段不参与任何控制流，删掉即恢复原样。 */
+#define BSP_LCD_REASSERT_TAG "LCDST"               // 独立 tag：现场可单独筛这一路观测数据，不与 BSP_LCD 混
+#define BSP_LCD_REASSERT_LOG_MIN_US (250 * 1000)   // 逐条日志限流下限：250ms
+#define BSP_LCD_REASSERT_WIN_US (30 * 1000 * 1000) // 汇总窗口：30 秒
+
+static uint32_t s_reassert_total = 0;       ///< 上电以来累计重断言次数（权威计数，不受限流影响）
+static int64_t s_reassert_prev_us = 0;      ///< 上一次重断言时刻（0 = 尚未发生过）
+static int64_t s_reassert_win_start_us = 0; ///< 当前汇总窗口起点（0 = 尚未开窗）
+static uint32_t s_reassert_win_cnt = 0;     ///< 当前窗口内次数
+static int64_t s_reassert_win_sum_us = 0;   ///< 当前窗口内间隔合计（用于算均值）
+static int64_t s_reassert_win_min_us = -1;  ///< 当前窗口内最小间隔（-1 = 无样本）
+static int64_t s_reassert_win_max_us = 0;   ///< 当前窗口内最大间隔
+static int64_t s_reassert_log_last_us = 0;  ///< 上一次打逐条日志的时刻（限流用）
+
+void bsp_board_lcd_reassert_state(bsp_board_t *bsp_board)
+{
+    if (bsp_board == NULL || bsp_board->lcd_io == NULL)
+        return;
+    if (!s_lcd_display_on)
+        return; // 显示尚未打开（开机渐亮前 / 待机关屏后）：不抢状态
+
+    /* ── 观测埋点：统计 + 打点（纯日志，不参与控制流；删掉即可恢复原样）──────
+     * 顺序说明：先"关旧窗口"，再把本次计入新窗口，最后打本次日志。
+     * 这样窗口汇总统计的永远是【已经发生完的】那一段，不会把本次算半截。 */
+    const int64_t now_us = esp_timer_get_time();
+    const int64_t gap_us = (s_reassert_prev_us > 0) ? (now_us - s_reassert_prev_us) : -1;
+
+    /* ① 关掉已满 30 秒的旧窗口：打一行汇总（不影响任何面板动作） */
+    if (s_reassert_win_start_us != 0 && now_us - s_reassert_win_start_us >= BSP_LCD_REASSERT_WIN_US)
+    {
+        const int64_t avg_us = (s_reassert_win_cnt > 0) ? (s_reassert_win_sum_us / s_reassert_win_cnt) : 0;
+        const int64_t min_us = (s_reassert_win_min_us >= 0) ? s_reassert_win_min_us : 0;
+        ESP_LOGI(BSP_LCD_REASSERT_TAG,
+                 "30秒汇总：重断言 %u 次，间隔 均=%lld 最小=%lld 最大=%lld ms（最小≈最大 ⇒ 匀速节拍，悬殊 ⇒ 突发成簇）",
+                 (unsigned)s_reassert_win_cnt,
+                 (long long)(avg_us / 1000), (long long)(min_us / 1000), (long long)(s_reassert_win_max_us / 1000));
+        s_reassert_win_start_us = now_us;
+        s_reassert_win_cnt = 0;
+        s_reassert_win_sum_us = 0;
+        s_reassert_win_min_us = -1;
+        s_reassert_win_max_us = 0;
+    }
+
+    /* ② 计入本次 */
+    if (s_reassert_win_start_us == 0)
+    {
+        s_reassert_win_start_us = now_us;
+        /* 首条日志必须打得出来：把"上次打日志时刻"往前推一个限流周期 */
+        s_reassert_log_last_us = now_us - BSP_LCD_REASSERT_LOG_MIN_US;
+    }
+    s_reassert_prev_us = now_us;
+    s_reassert_total++;
+    s_reassert_win_cnt++;
+    if (gap_us > 0)
+    {
+        s_reassert_win_sum_us += gap_us;
+        if (s_reassert_win_min_us < 0 || gap_us < s_reassert_win_min_us)
+            s_reassert_win_min_us = gap_us;
+        if (gap_us > s_reassert_win_max_us)
+            s_reassert_win_max_us = gap_us;
+    }
+
+    /* ③ 本次日志（限流，见上方宏注释） */
+    if (now_us - s_reassert_log_last_us >= BSP_LCD_REASSERT_LOG_MIN_US)
+    {
+        s_reassert_log_last_us = now_us;
+        if (gap_us < 0)
+            ESP_LOGI(BSP_LCD_REASSERT_TAG, "重断言 #%u（首次）", (unsigned)s_reassert_total);
+        else
+            ESP_LOGI(BSP_LCD_REASSERT_TAG, "重断言 #%u 距上次=%lld ms",
+                     (unsigned)s_reassert_total, (long long)(gap_us / 1000));
+    }
+
+    /* 顺序不可换：
+     *   1) 0x11 SLPOUT —— 面板若被 SLPIN 睡下，只发 DISPON 是唤不醒的，必须先醒
+     *   2) 0x21 INVON  —— 修"整幅反相"
+     *   3) 0x29 DISPON —— 修"整片全黑"
+     * 三条都走 esp_lcd_panel_io_tx_param 直发（与步骤 7 发 0xC6 同一个口子），
+     * 不走 esp_lcd_panel_* 高层接口，避免引入额外副作用。 */
+    static const struct
+    {
+        uint8_t cmd;
+        const char *name;
+    } seq[] = {
+        {0x11, "SLPOUT"},
+        {0x21, "INVON"},
+        {0x29, "DISPON"},
+    };
+    for (size_t i = 0; i < sizeof(seq) / sizeof(seq[0]); i++)
+    {
+        esp_err_t err = esp_lcd_panel_io_tx_param(bsp_board->lcd_io, seq[i].cmd, NULL, 0);
+        if (err != ESP_OK)
+        {
+            // 只警告：这是补救性动作，写失败不该让整机起不来
+            ESP_LOGW("BSP_LCD", "重断言面板状态失败(%s/0x%02X): %s",
+                     seq[i].name, seq[i].cmd, esp_err_to_name(err));
+        }
+    }
 }

@@ -340,6 +340,23 @@ void bsp_board_lcd_disp_off(bsp_board_t *bsp_board);
 void bsp_board_lcd_disp_on(bsp_board_t *bsp_board);
 
 /**
+ * @brief 重新断言面板关键状态：SLPOUT → INVON → DISPON（幂等，画面无跳变）
+ *
+ * 用于对抗"运行中面板寄存器被偶发写坏"：症状为【整片全黑】（背光正常亮、换页
+ * 也一样黑，触摸/日志全正常）或【整幅反相】并从此永久保持。全工程没有任何
+ * 运行时路径会主动发 DISPOFF/SLPIN/INVOFF（见 bsp_lcd.c 本函数实现处的完整说明），
+ * 故判定为 SPI 传输中命令/数据相位错乱把某个字节当命令执行了。
+ *
+ * 三条命令都是重设同一个状态位，幂等、无可见跳变。仅在
+ * bsp_board_lcd_on()/bsp_board_lcd_disp_on() 之后生效（显示尚未打开时直接早退，
+ * 避免抢在开机渐亮流程前面把显示打开）。
+ *
+ * @param bsp_board BSP 实例指针
+ * @note 调用者：ui_port.c 切图收口（LVGL 线程内）
+ */
+void bsp_board_lcd_reassert_state(bsp_board_t *bsp_board);
+
+/**
  * @brief 设置 LCD 背光亮度（LEDC PWM 调光，0~100%）
  *
  * 背光由 LEDC PWM 驱动，可在运行时无级调节亮度。0=熄灭，100=最亮。
