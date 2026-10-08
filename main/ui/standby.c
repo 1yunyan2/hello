@@ -39,7 +39,7 @@ static const char *TAG = "STANDBY";
  */
 #define STANDBY_REMINDER_GUARD_SEC 15
 
-#define STANDBY_SHUTDOWN_ENABLE 0       ///< 三级开关，插电测试
+#define STANDBY_SHUTDOWN_ENABLE 1       ///< 三级开关，插电测试，1=开启，0=关闭
 #define STANDBY_PWR_RECHECK_RISE_MV 200 ///< 深度待机复查：相对基准电压上升≥此值(mV)判为中途插USB→取消关机
 #define STANDBY_CHECK_MS 1000           ///< 周期任务检查间隔（1 秒）
 /**
@@ -60,7 +60,7 @@ static const char *TAG = "STANDBY";
  * 实测本任务在走完 NVS 读取后仅剩 3588 字节（见 [栈水位] 日志），
  * 再叠一条 UI 渲染链余量不足，加 2KB。内部 SRAM 当时空闲约 52KB，代价可接受。 */
 #define STANDBY_TASK_STACK 8192
-#define STANDBY_DEBUG_ALLOW_USB_SLEEP 1 ///< 1=插USB也进低功耗（仅调试用）；0=正常拦截
+#define STANDBY_DEBUG_ALLOW_USB_SLEEP 0 ///< 1=插USB也进低功耗（仅调试用）；0=正常拦截
 #define STANDBY_USB_SETTLE_MS 5000      ///< 进深度待机后等此时长让回弹稳定，再捕获充电检测基准
 #define STANDBY_USB_RISE_MV 150         ///< 待机期电压相对基准上升≥此值(mV)记一次「疑似插USB」
 #define STANDBY_USB_RISE_CNT 3          ///< 连续命中次数达此值判为插USB→唤醒（约数秒，滤回弹）

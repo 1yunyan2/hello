@@ -44,7 +44,7 @@ static const char *MQTT_TAG = "MQTT"; ///< 日志 TAG
 //   PC 端启动命令：cd D:\new\baidu\Mosquitto && .\mosquitto.exe -c local.conf -v
 //   local.conf 内容：listener 1883 0.0.0.0 / allow_anonymous true
 // ⚠️ 设备与 PC 必须在同一局域网；PC 换网络后 IP 会变，需同步修改下方地址。
-#define MQTT_USE_LOCAL_BROKER 1 ///< 1=连本地 PC Broker（调试）, 0=连云端（生产）
+#define MQTT_USE_LOCAL_BROKER 0 ///< 1=连本地 PC Broker（调试）, 0=连云端（生产）
 
 // ─── MQTT 凭证（运行时从 NVS 加载，回退到编译期默认值）────────────────────
 #if MQTT_USE_LOCAL_BROKER
@@ -660,8 +660,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     //           "head"      → CH_HEAD  头部
                     //           "left_arm"  → CH_L_ARM 左臂
                     //           "right_arm" → CH_R_ARM 右臂
-                    //   angle : 【相对中位的偏移角】-90~+90（度），0 = 中位（正前方）。
-                    //           内部换算成舵机物理绝对角：-90→0°, 0→90°, +90→180°。
+                    //   angle : 【相对 90° 的偏移角】-90~+90（度），换算公式恒为
+                    //           绝对角 = 90 + angle。
+                    //           ★2026-09-28 更正：90° 只是【换算基准】，不是每根轴的"中位" ——
+                    //             · head      ：中位就是 90° ⇒ 下发 0 = 正前方，符合直觉；
+                    //             · left/right_arm：中位是 15°（ARM_CENTER_DEG，自然下垂），
+                    //               故要让手臂垂下必须下发 -75（90 + (-75) = 15）。
+                    //               下发 0 得到 90°，那是手臂抬平指向前方，不是中位。
                     //           前端用正负表达左右更直观，故协议层保持偏移语义。
                     //           超出范围由 bsp_servo 内部软限位裁剪。
                     // 一条指令只控一个舵机（app 是点击式交互，不存在多轴同时下发）。

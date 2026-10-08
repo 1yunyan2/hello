@@ -400,8 +400,11 @@ bool remote_control_submit_servo(uint8_t channel, float angle)
     rc_cmd_t cmd = {
         .type = RC_CMD_SERVO,
         .channel = channel,
-        // 【偏移语义】app 下发的是相对中位的偏移角 -90~+90（0=中位/正前方），
-        // 在此换算成舵机物理绝对角：-90→0°, 0→90°, +90→180°。
+        // 【偏移语义】app 下发偏移角 -90~+90，此处一律换算成绝对角 abs = 90 + angle。
+        // ★2026-09-28 更正：90° 只是【换算基准】，不等于每根轴的"中位" ——
+        //   · head 中位就是 90°（SERVO_CENTER_DEG）⇒ 下发 0 = 正前方，符合直觉；
+        //   · 两臂中位是 15°（ARM_CENTER_DEG，自然下垂）⇒ 要让手臂垂下须下发 -75，
+        //     下发 0 会得到 90°（手臂抬平指向前方），那不是中位。
         // 前端用偏移量表达更直观（正负=左右），故协议层保持偏移、驱动层用绝对角。
         // 超范围由 bsp_servo 的 clamp_safe_angle 软限位裁剪。
         .angle = 90.0f + angle,

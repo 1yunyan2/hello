@@ -865,9 +865,9 @@ void bsp_board_servo_init(bsp_board_t *bsp_board)
         .timer_number = LEDC_TIMER_0, // 使用 LEDC 定时器 0（4 个可选，避免与 LED/蜂鸣器冲突）
         .channels = {
             .servo_pin = {
-                BSP_SERVO_HEAD_PIN,  // GPIO38：头部舵机
-                BSP_SERVO_L_ARM_PIN, // GPIO47：左臂舵机
-                BSP_SERVO_R_ARM_PIN, // GPIO21：右臂舵机
+                BSP_SERVO_HEAD_PIN,
+                BSP_SERVO_L_ARM_PIN,
+                BSP_SERVO_R_ARM_PIN,
             },
             .ch = {LEDC_CHANNEL_0, LEDC_CHANNEL_1, LEDC_CHANNEL_2}, // 三路独立 LEDC 通道
         },
