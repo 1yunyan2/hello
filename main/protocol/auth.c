@@ -57,11 +57,17 @@ static esp_err_t auth_http_event_handler(esp_http_client_event_t *evt)
     case HTTP_EVENT_ON_DATA:
     {
         // ─── 逻辑块 2：处理分块传输到达的数据 ────────────────────────
-        // 说明：校验状态码（仅收录 200/201 的正常 JSON 体）。扩展缓冲区内存大小并将新的 chunk 拷入末尾。
-        // API：esp_http_client_get_status_code, realloc, memcpy
+        // 说明：【2026-09-29 诊断改动】任何状态码的响应体都收进来，不再只收 200/201。
+        //   原实现只收录 200/201，遇到 401 会把响应体【整条丢弃】，于是 ON_FINISH 打印的
+        //   "Auth API Response:" 永远是空的 —— 服务器给的原因（一般是带 code/message 的 JSON）
+        //   就这么被吃掉了，401 的真正理由一直看不见，排查一直在盲猜。
+        //   安全性：响应缓冲只有两个用途 —— ① 下方 ON_FINISH 打印；② 拿 token 时用 cJSON 解析。
+        //   而 ② 之前有状态码判定早退（见 auth_perform 逻辑块 3 之前），所以收到 4xx/5xx 的
+        //   响应体【不会】改变任何业务行为。
+        //   ★ 排查完想恢复极简，把原来的状态码过滤加回来即可。
+        // API：realloc, memcpy
         // 数据：修改 wrapper->response 和 wrapper->response_len
-        int status_code = esp_http_client_get_status_code(evt->client);
-        if (status_code != 200 && status_code != 201)
+        if (evt->data_len <= 0)
             return ESP_OK;
 
         size_t new_len = wrapper->response_len + evt->data_len;
@@ -138,6 +144,32 @@ void auth_perform(auth_t *auth, const char *device_token)
     wrapper->response = NULL;
     wrapper->response_len = 0;
 
+    // ─── 逻辑块 1.5：【2026-09-29 诊断改动 2】打印 deviceToken 指纹 ──────────────
+    // 背景：A40C90 这台的日志里明明打了「检测到 deviceToken」，服务器却一直回 401。
+    //   而 device-login 的请求体【只有 deviceToken 一个字段】、请求头只有 Content-Type
+    //   （见下方逻辑块 2），没有 Device-Id / MAC / Client-Id —— 服务器能据以判别身份的
+    //   唯有这个值本身。同一固件在另一台设备上能正常连通 ⇒ 差异只能出在这个值上。
+    // 所以必须看清它到底长什么样，据此二分：
+    //   ① 空 / 长度异常 / 带尾随 '\r' '\n' / 是 test123 之类的旧测试值
+    //      ⇒ 是设备 NVS 里的陈旧脏数据，重新配网让 App 重下发即可解决；
+    //   ② 长度正常却仍被拒 ⇒ 服务器侧未绑定或已注销，需后端介入查这台设备的记录。
+    // 只打长度与首尾少量字符，不整条打印（避免把完整凭证刷进日志）。
+    // API：strlen
+    // 数据：只读 device_token，不修改
+    {
+        size_t dt_len = (device_token != NULL) ? strlen(device_token) : 0;
+        if (dt_len == 0)
+        {
+            ESP_LOGW(TAG, "[诊断] deviceToken 为空（长度=0）！本次将以空凭证请求，必然被拒");
+        }
+        else
+        {
+            ESP_LOGW(TAG, "[诊断] deviceToken 长度=%u，前8字符='%.8s'，后4字符='%.4s'",
+                     (unsigned)dt_len, device_token,
+                     device_token + ((dt_len > 4) ? (dt_len - 4) : 0));
+        }
+    }
+
     // ─── 逻辑块 2：配置并发起 HTTP POST 请求（含 1 次重试）─────
     // 说明：组装 JSON 格式的 deviceToken 字段，调用 ESP-IDF HTTP 客户端发起 POST 阻塞请求。
     //       失败后等待 1 秒重试 1 次，两次均失败则标记服务器不可达。
@@ -154,6 +186,14 @@ void auth_perform(auth_t *auth, const char *device_token)
     PRINT_MEM_INFO(TAG, "Auth HTTP 请求前"); // 拆分埋点：区分"请求本身开销"与"请求前已有的基线"
     for (int attempt = 0; attempt < max_retries; attempt++)
     {
+        /* 【2026-09-29 诊断改动】每轮重试前清空响应缓冲。
+         * response 在整个 auth_perform 里原本只在函数开头清过一次，多轮重试时上一轮的
+         * 响应体会留在缓冲里被累加，日志里 3 次的 body 首尾相连，读不出哪句属于哪一次。
+         * 释放后置空是安全的：下次 ON_DATA 会重新 realloc。 */
+        free(wrapper->response);
+        wrapper->response = NULL;
+        wrapper->response_len = 0;
+
         esp_http_client_config_t config = {
             .url = AUTH_LOGIN_URL, // 认证 API 地址
             .method = HTTP_METHOD_POST,
